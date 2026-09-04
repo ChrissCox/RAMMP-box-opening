@@ -17,8 +17,9 @@ GRIPPER_ACTION = "/robotiq_gripper_controller/gripper_cmd"
 # its own. 1.0 therefore means "cruise at the cap" (0.9 x the joint limit,
 # RetimeParams.vmax_margin) while keeping the settled arrival that the old
 # uniform 0.75 was bought with (owner 2026-09-02 "slow it down a bit" ->
-# 2026-09-04 "set speed to 1"). The press stroke stays at press_demo.speed.
-TRANSIT_SPEED = 1.0
+# 2026-09-04 "set speed to 1", then back to 0.75 the same day). The press
+# stroke stays at press_demo.speed.
+TRANSIT_SPEED = 0.75
 CONTACT_SPEED = 0.15
 DRIFT_REPLAN_RAD = 0.04  # < server start gate (0.05); catches arrival-tol drift
 SANITY_MARGIN_RAD = 0.35  # per-joint excursion allowance beyond |start->end|
