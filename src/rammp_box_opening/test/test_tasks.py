@@ -549,11 +549,10 @@ def test_park_tool_down_rests_at_the_scan_pose(ctx):
 
     c = ctx
     cfg = _demo_cfg()
-    assert cfg.park_tool_down is True  # shipped ON since 2026-09-03
-    off = replace(cfg, park_tool_down=False)
-    assert press_demo.rest_joints(off) == list(HOME)  # the switch still works
-    on = cfg
-    assert press_demo.rest_joints(on) == list(PARK)
+    assert cfg.park_tool_down is False  # the run ends at HOME (owner 2026-09-04)
+    assert press_demo.rest_joints(cfg) == list(HOME)
+    on = replace(cfg, park_tool_down=True)
+    assert press_demo.rest_joints(on) == list(PARK)  # the switch still works
     legs = press_demo.build_place_legs(c, on)
     assert legs[-1].name == "home" and legs[-1].target == ("joints", list(PARK))
     # "already parked" is judged against the server's own start gate
