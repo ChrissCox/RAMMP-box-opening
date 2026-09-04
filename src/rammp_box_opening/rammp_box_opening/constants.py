@@ -11,9 +11,14 @@ WRIST_FLAT_XYZW = [0.5, 0.5, 0.5, 0.5]
 NODE_NAMESPACE = "/rammp_curobo"
 GRIPPER_ACTION = "/robotiq_gripper_controller/gripper_cmd"
 
-TRANSIT_SPEED = 0.75  # was 1.0: full-speed arrivals read rough and settle
-# imprecisely at the bench (owner 2026-09-02, "slow it down a bit"); the press
-#                      stroke alone stays at press_demo.speed
+# Cruise fraction for free-air motion, NOT a time dilation: since the
+# re-timer (2026-09-03) a leg's speed scales the per-joint velocity cap it
+# cruises at, and the profile eases out of rest and into the arrival on
+# its own. 1.0 therefore means "cruise at the cap" (0.9 x the joint limit,
+# RetimeParams.vmax_margin) while keeping the settled arrival that the old
+# uniform 0.75 was bought with (owner 2026-09-02 "slow it down a bit" ->
+# 2026-09-04 "set speed to 1"). The press stroke stays at press_demo.speed.
+TRANSIT_SPEED = 1.0
 CONTACT_SPEED = 0.15
 DRIFT_REPLAN_RAD = 0.04  # < server start gate (0.05); catches arrival-tol drift
 SANITY_MARGIN_RAD = 0.35  # per-joint excursion allowance beyond |start->end|
