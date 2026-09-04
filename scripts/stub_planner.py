@@ -207,7 +207,11 @@ class StubPlanner(Node):
             while k < len(times) - 1 and times[k] < el:
                 k += 1
             self.q = list(pts[k].positions)
-            if goal_n in TRIP_EXEC_NS and el / dur > 0.88 and not self.injected:
+            # late in a long goal (a stroke's contact comes near its end);
+            # early in a short one — the 4 mm push is ~0.2 s, and a spike at
+            # 88 % of that lands after the goal has already completed
+            spike_at = 0.88 if dur >= 1.0 else 0.3
+            if goal_n in TRIP_EXEC_NS and el / dur > spike_at and not self.injected:
                 print("EFFORT SPIKE injected (goal #%d)" % goal_n, flush=True)
                 self.level += 9.0
                 self.injected = True

@@ -91,3 +91,9 @@ FINGERTIP_FRAMES = (
 # trip and the replayed tool_frame differed by 8.0-8.3 mm). Converts a
 # fingertip TF reading into the frame the planner is commanded in.
 TIP_TO_TOOL_M = 0.008
+
+# Joint-space arc per metre of tool travel along a vertical descent at the
+# press pose: 0.085 rad lifted the tool 20.7-21.0 mm at two placements
+# (recoil calibration, 2026-09-03). Lets a short vertical move be cut
+# from an already-planned trajectory without FK.
+JOINT_ARC_PER_M = 4.05

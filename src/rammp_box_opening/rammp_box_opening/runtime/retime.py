@@ -402,6 +402,39 @@ def reverse_tail(traj, progress, live, arc_rad, min_ds=2e-4):
     return out
 
 
+def forward_tail(traj, live, arc_rad, min_ds=2e-4):
+    """The UNEXECUTED continuation of a stopped descent: from the sample
+    nearest `live` onward, until arc_rad of joint path is covered,
+    starting at `live`.
+
+    A guard stopped the arm partway down a planned, collision-checked
+    stroke; the rest of that stroke is a validated path straight on
+    through the contact. Cutting the push from it needs no planner call
+    while the fingers sit on the button. Returns None when less than half
+    the asked arc remains (the caller then plans the push instead).
+    """
+    pts = list(traj.points)
+    if len(pts) < 2:
+        return None
+    q = np.asarray([[float(v) for v in p.positions] for p in pts])
+    live = np.asarray([float(v) for v in live], dtype=float)
+    i = int(np.argmin(np.linalg.norm(q - live[None, :], axis=1)))
+    out, arc = [q[i]], 0.0
+    for k in range(i, len(q) - 1):
+        arc += float(np.linalg.norm(q[k + 1] - q[k]))
+        out.append(q[k + 1])
+        if arc >= arc_rad:
+            break
+    if arc < 0.5 * arc_rad or len(out) < 2:
+        return None
+    out = np.asarray(out)
+    if np.linalg.norm(out[0] - live) > min_ds:
+        out = np.vstack([live, out])
+    else:
+        out[0] = live
+    return out
+
+
 def check_like_executor(msg, vmax, continuity_slack=3.0):
     """The executor's own gates, mirrored: velocity limits, monotonic time,
     per-interval continuity. Returns a list of problems (empty = go)."""

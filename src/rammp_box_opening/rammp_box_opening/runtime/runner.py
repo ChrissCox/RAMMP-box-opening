@@ -110,6 +110,7 @@ class Runner:
         # commit or on arrival at the hop, joined lazily before anything
         # that needs the fingers settled (audit 2026-09-02)
         self._pending = None  # (leg, handle, t0)
+        self._sent_early = set()  # ids of gripper legs dispatched under a motion
         # the human-motion profile for unguarded groups (retime.py); the
         # mission may replace it with the container's motion: block
         self.retime = RetimeParams()
@@ -301,6 +302,8 @@ class Runner:
                     return results
 
             if lead.kind is Kind.GRIPPER:
+                if id(lead) in self._sent_early:
+                    continue  # dispatched under the previous motion; pending
                 if lead.defer_join and lead.verify is None:
                     handle = self.client.gripper_send(lead.gripper_cmd)
                     if handle is not None:
@@ -364,6 +367,31 @@ class Runner:
                     def hook(_end=end):
                         return lookahead(_end)
 
+                # a deferred gripper leg flagged to ride THIS motion is sent
+                # the moment the goal is accepted (the fingers move while
+                # the arm moves); the usual join still gates what follows
+                early = None
+                if gi + 1 < len(groups):
+                    cand = groups[gi + 1][0]
+                    if (
+                        cand.kind is Kind.GRIPPER
+                        and cand.defer_join
+                        and cand.verify is None
+                        and cand.send_with_previous_motion
+                        and self._pending is None
+                        and all(g.guard is None for g in group)
+                    ):
+                        early = cand
+                if early is not None:
+                    inner = hook
+
+                    def hook(_leg=early, _inner=inner):
+                        handle = self.client.gripper_send(_leg.gripper_cmd)
+                        if handle is not None:
+                            self._pending = (_leg, handle, time.monotonic())
+                            self._sent_early.add(id(_leg))
+                        return _inner() if _inner is not None else None
+
                 res = self._run_motion(group, while_running=hook)
                 if group is host and res.lookahead is not None:
                     self.lookahead_result = res.lookahead
@@ -378,15 +406,16 @@ class Runner:
                 )
                 return results
             if (
-                after_touch
-                and lead.kind is Kind.MOTION
+                lead.kind is Kind.MOTION
                 and lead.guard is not None
                 and lead.guard.trip == "press"
+                and res.outcome in ("touch", "arrived")
             ):
-                # a good press leaves the arm pressed on the button while
-                # the next leg is planned: recoil along the descent first.
-                # A FAILED trip is left holding where it struck — the
-                # operator needs to see that.
+                # a good press leaves the arm on the button — whether the
+                # push met a stop or ran its full bound — while the next leg
+                # is planned: recoil along the stroke first. A FAILED leg is
+                # left holding where it struck — the operator needs to see
+                # that.
                 nxt = next(
                     (g for g in groups[gi + 1 :] if g[0].kind is Kind.MOTION), None
                 )

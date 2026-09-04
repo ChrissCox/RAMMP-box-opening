@@ -171,3 +171,50 @@ def test_press_push_is_bounded_from_the_measured_contact(ctx):
     assert ok and "stop" in d
     ok, _ = push.verify(VerifyCtx(outcome="failed"))
     assert not ok
+
+
+def test_press_push_is_cut_from_the_touch_stroke_when_enough_remains(ctx):
+    """No planner call while the fingers press: the push continues the
+    touch's own trajectory from the live stop, re-timed at press_speed,
+    with the same guard and verify as the planned push."""
+    import numpy as np
+    import pytest
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    from rammp_box_opening.constants import JOINT_ARC_PER_M, TIP_TO_TOOL_M
+    from rammp_box_opening.models.container import load_press_demo
+    from rammp_box_opening.primitives.core import press_push_from_touch
+    from rammp_box_opening.runtime.legs import Leg
+
+    c = ctx
+    cfg = load_press_demo(CFG)
+    # a touch stroke: joint_7 descends 0.5 rad over 60 samples
+    msg = JointTrajectory()
+    msg.joint_names = ["joint_%d" % i for i in range(1, 8)]
+    for k in range(60):
+        pt = JointTrajectoryPoint()
+        pt.positions = [0.0] * 6 + [0.5 * k / 59]
+        pt.velocities = [0.0] * 7
+        pt.accelerations = [0.0] * 7
+        pt.time_from_start.sec = 0
+        pt.time_from_start.nanosec = int((k + 1) * 0.02 * 1e9)
+        msg.points.append(pt)
+    touch = Leg(name="press:down", kind=Kind.MOTION, traj=msg, speed=1.0, guard=None,
+                world="interaction_button", chain=0, target=None, goal_joints=list(msg.points[-1].positions))
+    live = [0.0] * 6 + [0.5 * 30 / 59]  # the guard stopped at sample 30
+    tip = [0.45, -0.15, 0.1024]
+    c.last_pose = ([0.451, -0.151, 0.09], [0.0, 1.0, 0.0, 0.0])
+    out = press_push_from_touch(c, state(), cfg, touch, live, tip, ("interaction_button", "/tmp/w.yaml"))
+    assert out is not None
+    push, st = out
+    q = np.asarray([p.positions for p in push.traj.points])
+    assert np.allclose(q[0], live)  # starts at the live stop
+    arc = float(np.abs(np.diff(q[:, 6])).sum())
+    assert arc == pytest.approx(cfg.button_travel_m * JOINT_ARC_PER_M, rel=0.35)
+    assert push.name == "press:push" and push.guard.trip == "press" and push.speed == 1.0
+    assert push.target[1][2] == pytest.approx(tip[2] - TIP_TO_TOOL_M - cfg.button_travel_m)
+    ok, d = push.verify(VerifyCtx(outcome="arrived"))
+    assert ok and "full" in d
+    # stopped at the very end of the stroke: nothing to cut -> the caller plans
+    assert press_push_from_touch(c, state(), cfg, touch, list(msg.points[-1].positions), tip,
+                                 ("interaction_button", "/tmp/w.yaml")) is None

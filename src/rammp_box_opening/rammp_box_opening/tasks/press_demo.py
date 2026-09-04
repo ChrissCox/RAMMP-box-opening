@@ -73,6 +73,7 @@ from rammp_box_opening.perception.depth_source import BoxTopWatcher
 from rammp_box_opening.perception.vlm_source import resolve_roi
 from rammp_box_opening.primitives.core import (
     press_push,
+    press_push_from_touch,
     tcp_z,
     SETDOWN_OVERDRIVE_M,
     Ctx,
@@ -182,7 +183,7 @@ def build_press_legs(ctx, cfg, include_home=True):
     return list(press_legs)
 
 
-def build_push_legs(ctx, cfg, contact_xyz, include_home=True):
+def build_push_legs(ctx, cfg, contact_xyz, include_home=True, touch_leg=None):
     """After the touch: the bounded push from the measured contact, then
     the retreat, then home (press-only) or grip:open on arrival at the hop.
 
@@ -194,9 +195,17 @@ def build_push_legs(ctx, cfg, contact_xyz, include_home=True):
     boundary, not a guess). The retreat is LAZY: the push may stop on a
     trip, so its start is unknown until then — the Runner plans it (and
     home) from live, once."""
-    st = _state(ctx.client.joints())
+    live = list(ctx.client.joints())
+    st = _state(live)
     world = ctx.last_world or _full_world(ctx)
-    push, st = press_push(ctx, st, cfg, contact_xyz, world)
+    # cut from the touch's own stroke when enough of it remains (no planner
+    # call while the fingers press the button); planned otherwise
+    made = (
+        press_push_from_touch(ctx, st, cfg, touch_leg, live, contact_xyz, world)
+        if touch_leg is not None
+        else None
+    )
+    push, st = made if made is not None else press_push(ctx, st, cfg, contact_xyz, world)
     up_to = cfg.staging_m if include_home else cfg.grip_hop_m
     retreat_legs, st = Retreat(
         up_to + cfg.button_travel_m, speed=TRANSIT_SPEED, lazy=True
@@ -216,7 +225,18 @@ def _grip_open_after_retreat(ctx, st):
     Never at the press bottom: the pads sit in the button recess there and
     the knob pops 15 mm — at the hop they are 35 mm above it."""
     world = ctx.last_world or _full_world(ctx)
-    return _gripper_leg(ctx, st, "grip:open", GRIPPER_CMD_OPEN, world, defer_join=True)
+    # rides the retreat: sent the moment the retreat starts flying, which
+    # is after the recoil has already lifted the pads 29 mm clear of the
+    # popped knob — the fingers open while the arm rises (2026-09-04)
+    return _gripper_leg(
+        ctx,
+        st,
+        "grip:open",
+        GRIPPER_CMD_OPEN,
+        world,
+        defer_join=True,
+        send_with_previous_motion=True,
+    )
 
 
 # time fraction the warp's speed ramp needs to settle after the rebaseline
@@ -495,7 +515,7 @@ def build_demo_legs(ctx, cfg):
     ]
 
 
-def run_push(ctx, cfg, runner, args, touch):
+def run_push(ctx, cfg, runner, args, touch, touch_leg=None):
     """The push stage from the touch's measured contact, then the retreat
     and what follows; the grip phase is planned while the retreat flies.
     Exits honestly when the arm could not measure its contact."""
@@ -512,7 +532,9 @@ def run_push(ctx, cfg, runner, args, touch):
             "bound the push (are %s in the tree?)" % (FINGERTIP_FRAMES[0],),
         )
         sys.exit(1)
-    legs = build_push_legs(ctx, cfg, contact, include_home=args.press_only)
+    legs = build_push_legs(
+        ctx, cfg, contact, include_home=args.press_only, touch_leg=touch_leg
+    )
     res = runner.run(
         legs,
         execute=args.execute,
@@ -733,6 +755,22 @@ def main():
             sys.exit(3)
         if owl is not None:
             owl.enable()  # the node infers only while a detect window is open
+        # The fingers shut NOW and ride the scan flight (they sit in the
+        # bottom rows of the wrist camera's frame, the box in its middle —
+        # no occlusion, capture 20260901-130610). The join lands before the
+        # guarded touch, which needs them closed. No closed fingers = no
+        # press: an open aperture strikes the lid and can still read
+        # "pressed", so a refused close ends the run here.
+        if not args.detect_only and not runner.start_gripper(
+            "press:close", GRIPPER_CMD_CLOSED, args.execute
+        ):
+            try_home(
+                ctx,
+                runner,
+                args.execute,
+                "press:close refused or failed — the fingers are not closed",
+            )
+            sys.exit(1)
         if cfg.park_tool_down and rest_distance(live, PARK) <= REST_TOL_RAD:
             # already parked tool-down at the scan pose: no scan flight.
             # The merged press needs the last COMMANDED pose to judge its
@@ -823,19 +861,6 @@ def main():
             detect_s=round(time.monotonic() - t_detect, 2),
         )
 
-        # the fingers shut NOW, while the press is planned — the join lands
-        # before the guarded stroke, which needs them closed
-        if not runner.start_gripper("press:close", GRIPPER_CMD_CLOSED, args.execute):
-            # no closed fingers = no press: a 7 Nm stroke with an open
-            # aperture strikes the lid and can still read "pressed"
-            try_home(
-                ctx,
-                runner,
-                args.execute,
-                "press:close refused or failed — the fingers are not closed",
-            )
-            sys.exit(1)
-
         if not args.press_only:
             # the box lands wherever it lands: resolve the drop spot NOW,
             # before any container-directed motion — configured lid_place
@@ -924,7 +949,7 @@ def main():
             if bad:
                 sys.exit(1)
             touch = [r for r in res if r.leg_name.startswith("press:down")]
-            res = run_push(ctx, cfg, runner, args, touch)
+            res = run_push(ctx, cfg, runner, args, touch, touch_leg=merged_legs[-1])
             press = [r for r in res if r.leg_name.startswith("press:push")]
             print(
                 "[press_demo] PRESSED — %s"
@@ -1002,16 +1027,13 @@ def main():
                     math.degrees(ctx.cpose.yaw),
                 )
             )
-            res = runner.run(
-                build_press_legs(ctx, cfg, include_home=args.press_only),
-                execute=args.execute,
-                assume_yes=True,
-            )
+            staged_legs = build_press_legs(ctx, cfg, include_home=args.press_only)
+            res = runner.run(staged_legs, execute=args.execute, assume_yes=True)
             bad = [r for r in res if not r.ok]
             if bad:
                 sys.exit(1)
             touch = [r for r in res if r.leg_name.startswith("press")]
-            res = run_push(ctx, cfg, runner, args, touch)
+            res = run_push(ctx, cfg, runner, args, touch, touch_leg=staged_legs[-1])
             press = [r for r in res if r.leg_name.startswith("press:push")]
             print(
                 "[press_demo] PRESSED — %s"

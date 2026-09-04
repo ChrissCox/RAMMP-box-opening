@@ -817,3 +817,49 @@ def test_a_trip_records_where_the_fingertips_were(tmp_path):
     c.exec_script = []
     res2 = runner(c, tmp_path).run([leg("a", Q0, Q1)], execute=True, assume_yes=True)
     assert res2[0].contact_xyz is None
+
+
+def test_flagged_gripper_leg_is_sent_under_the_previous_motion(tmp_path):
+    """grip:open rides the retreat: sent the moment the retreat's goal is
+    accepted, joined before the guarded grip:down as ever."""
+    c = _AsyncGripClient()
+    r = runner(c, tmp_path)
+    retreat = leg("retreat", Q0, Q1, chain=1, world="interaction_b")
+    open_leg = leg("grip:open", kind=Kind.GRIPPER, cmd=0.0, chain=1, world="interaction_b")
+    open_leg.defer_join = True
+    open_leg.send_with_previous_motion = True
+    g = GuardSpec(touch_nm=7.0, trip="obstruction", target_z=0.09)
+    down = leg("grip:down", Q1, Q2, guard=g, world="interaction_b", chain=2)
+    res = r.run([retreat, open_leg, down], execute=True, assume_yes=True)
+    assert [x.leg_name for x in res] == ["retreat", "grip:open", "grip:down"]
+    # the send happened INSIDE the retreat's execute, and the join before grip:down
+    assert c.events == ["execute", "send", "join", "execute"]
+
+
+def test_flagged_gripper_leg_is_not_sent_under_a_guarded_motion(tmp_path):
+    c = _AsyncGripClient()
+    r = runner(c, tmp_path)
+    g = GuardSpec(touch_nm=7.0, trip="obstruction", target_z=0.09)
+    down = leg("grip:down", Q0, Q1, guard=g, world="interaction_b", chain=1)
+    open_leg = leg("grip:open", kind=Kind.GRIPPER, cmd=0.0, chain=1, world="interaction_b")
+    open_leg.defer_join = True
+    open_leg.send_with_previous_motion = True
+    r.run([down, open_leg], execute=True, assume_yes=True)
+    assert c.events[:2] == ["execute", "send"]  # sent after, in order, not during
+    r.finish()
+
+
+def test_recoil_follows_a_push_that_ran_its_bound(tmp_path):
+    """The arm is on the button whether the push met a stop or arrived at
+    its bound: both recoil before the retreat."""
+    c = FakeClient()
+    g = GuardSpec(touch_nm=4.0, trip="press", target_z=0.09)
+    c.exec_script = [("arrived", {"message": "ok", "progress": 1.0, "torque_peak": 1.2})]
+    push = leg("press:push", Q0, Q1, guard=g, world="interaction_button", chain=0)
+    push.verify = lambda v: (v.outcome in ("touch", "arrived"), "pressed")  # as press_push's
+    res = runner(c, tmp_path).run(
+        [push, leg("retreat", Q1, Q2, chain=1, world="interaction_button")],
+        execute=True,
+        assume_yes=True,
+    )
+    assert [x.leg_name for x in res] == ["press:push", "recoil", "retreat"]

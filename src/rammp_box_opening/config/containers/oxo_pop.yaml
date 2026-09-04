@@ -186,10 +186,16 @@ open_box:
 
 # --- press_demo (camera-driven press flow, owner design 2026-08-24) ------
 press_demo:
-  travel_m: 0.010                 # how far below the ESTIMATED button the
+  travel_m: 0.015                 # how far below the ESTIMATED button the
                                   # touch stage may search before reporting
                                   # "no surface" — it must cover the camera's
-                                  # run-to-run lid-height spread (+/-6 mm).
+                                  # run-to-run lid-height spread (+/-6 mm)
+                                  # AND leave the push's 4 mm of validated
+                                  # path below the real top: the push is cut
+                                  # from this stroke's own continuation, so
+                                  # no planner runs while the fingers press
+                                  # (2026-09-04). The touch stops at contact;
+                                  # a deeper plan costs nothing.
                                   # Old note: press depth below the lid plane. This is
                                   # the HARD bound on how deep the stroke can
                                   # go — the guard normally stops it first,

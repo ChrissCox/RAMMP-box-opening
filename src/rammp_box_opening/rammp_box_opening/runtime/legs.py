@@ -52,6 +52,12 @@ class Leg:
     # away from what it dropped before the fingers have settled — the
     # Runner joins it right before that motion executes
     join_before_motion: bool = False
+    # GRIPPER legs only, with defer_join: dispatch the command as soon as
+    # the PRECEDING motion group starts flying, not after it arrives — the
+    # fingers move while the arm moves. Only for a command that is safe at
+    # every point of that motion (an open during a retreat that starts
+    # clear of the box); the usual join still gates the next guarded leg.
+    send_with_previous_motion: bool = False
     world_path: str = None  # generated world YAML to push (SetWorld wants a path)
     # Planning cost, for the preview table. plan_s is the client's round
     # trip; plan_server_s is what the planner reports it spent solving.

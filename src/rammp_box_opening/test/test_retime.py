@@ -248,3 +248,20 @@ def test_reverse_tail_covers_the_cancel_overshoot():
     down = _line([0] * 7, [0.4, 0, 0, 0, 0, 0, 0], 20)
     path = reverse_tail(_traj(down), progress=0.5, live=np.asarray(down[10]), arc_rad=0.05)
     assert path is not None and len(path) >= 3
+
+
+def test_forward_tail_continues_the_stopped_stroke_from_live():
+    """The push is cut from the touch's own unexecuted continuation: it
+    starts at the live stop and runs down the validated path for the
+    asked arc; too little remaining path -> None (the caller plans)."""
+    from rammp_box_opening.runtime.retime import forward_tail
+
+    down = _line([0] * 7, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5], 50)
+    live = np.asarray(down[30])  # the guard stopped at sample 30
+    path = forward_tail(_traj(down), live, arc_rad=0.05)
+    assert np.allclose(path[0], live)
+    depth = [float(q[6]) for q in path]
+    assert all(b >= a - 1e-9 for a, b in zip(depth, depth[1:]))  # only onward
+    assert depth[-1] - depth[0] >= 0.05 - 1e-6
+    # stopped 1 mm from the end: nothing left to continue along
+    assert forward_tail(_traj(down), np.asarray(down[-2]), arc_rad=0.05) is None

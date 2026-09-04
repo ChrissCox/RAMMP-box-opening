@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass
 
 from rammp_box_opening.constants import (
+    JOINT_ARC_PER_M,
+    JOINT_VMAX,
     TCP_OFFSET_M,
     TIP_TO_TOOL_M,
     CONTACT_SPEED,
@@ -207,7 +209,15 @@ def _plan_motion(
 
 
 def _gripper_leg(
-    ctx, state, name, cmd, world, verify=None, defer_join=False, join_before_motion=False
+    ctx,
+    state,
+    name,
+    cmd,
+    world,
+    verify=None,
+    defer_join=False,
+    join_before_motion=False,
+    send_with_previous_motion=False,
 ):
     world_name, world_path = world
     return Leg(
@@ -225,6 +235,7 @@ def _gripper_leg(
         verify=verify,
         defer_join=defer_join,
         join_before_motion=join_before_motion,
+        send_with_previous_motion=send_with_previous_motion,
     )
 
 
@@ -535,6 +546,22 @@ def press_push(ctx, state, cfg, contact_xyz, world, name="press:push"):
     tool_at_contact = tip_z - TIP_TO_TOOL_M
     bottom = tool_at_contact - cfg.button_travel_m
     xy = ctx.last_pose[0][:2] if ctx.last_pose else [button[0], button[1]]
+    guard, verify = _push_guard_and_verify(m, cfg, tool_at_contact)
+
+    return _plan_motion(
+        ctx,
+        state,
+        name,
+        ("pose", [float(xy[0]), float(xy[1]), float(bottom)], quat, 0.0),
+        world,
+        cfg.press_speed,
+        guard=guard,
+        invalidates=True,
+        verify=verify,
+    )
+
+
+def _push_guard_and_verify(m, cfg, tool_at_contact):
     guard = GuardSpec(
         touch_nm=max(0.5, m.touch_nm - cfg.contact_nm),
         trip="press",
@@ -551,17 +578,58 @@ def press_push(ctx, state, cfg, contact_xyz, world, name="press:push"):
             return True, "pressed — full %.0f mm push from the measured contact" % mm
         return False, "push %s" % v.outcome
 
-    return _plan_motion(
-        ctx,
-        state,
-        name,
-        ("pose", [float(xy[0]), float(xy[1]), float(bottom)], quat, 0.0),
-        world,
-        cfg.press_speed,
+    return guard, verify
+
+
+def press_push_from_touch(ctx, state, cfg, touch_leg, live, contact_xyz, world):
+    """The PUSH cut from the touch's own trajectory: its unexecuted
+    continuation past the stop is a validated path straight on through
+    the contact, so the push needs no planner call while the fingers sit
+    on the button (the planner round trip was ~0.5 s of pressing at
+    contact_nm, 2026-09-04). Re-timed like any motion at press_speed.
+    Returns (leg, state) or None when too little of the stroke remains —
+    the caller then plans it (press_push)."""
+    from rammp_box_opening.runtime.retime import (
+        RetimeParams,
+        forward_tail,
+        positions_to_traj,
+        retime_group,
+    )
+
+    m = ctx.model
+    if touch_leg.traj is None:
+        return None
+    path = forward_tail(touch_leg.traj, live, cfg.button_travel_m * JOINT_ARC_PER_M)
+    if path is None:
+        return None
+    traj, _ = retime_group(
+        [positions_to_traj(touch_leg.traj.joint_names, path)],
+        [cfg.press_speed],
+        JOINT_VMAX,
+        RetimeParams(),
+    )
+    tool_at_contact = float(contact_xyz[2]) - TIP_TO_TOOL_M
+    guard, verify = _push_guard_and_verify(m, cfg, tool_at_contact)
+    button = from_container(ctx.cpose, m.button_offset)
+    quat = attitude_quat(m.press_attitude_rpy_deg, math.atan2(button[1], button[0]))
+    xy = ctx.last_pose[0][:2] if ctx.last_pose else [button[0], button[1]]
+    world_name, world_path = world
+    leg = Leg(
+        name="press:push",
+        kind=Kind.MOTION,
+        traj=traj,
+        speed=1.0,  # the profile is baked in
         guard=guard,
-        invalidates=True,
+        world=world_name,
+        world_path=str(world_path),
+        chain=state.chain,
+        # a replan (drift at execution) falls back to the planned push
+        target=("pose", [float(xy[0]), float(xy[1]), tool_at_contact - cfg.button_travel_m], quat, 0.0),
+        goal_joints=[float(v) for v in path[-1]],
         verify=verify,
     )
+    ctx.last_pose = ([float(xy[0]), float(xy[1]), tool_at_contact - cfg.button_travel_m], list(quat))
+    return leg, PlanState(joints=list(path[-1]), chain=state.chain + 1)
 
 
 class PressFixed:

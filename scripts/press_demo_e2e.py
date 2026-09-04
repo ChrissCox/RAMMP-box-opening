@@ -15,7 +15,7 @@ off the camera axis at a 30 deg yaw, so wrong deprojection or rotation
 composition moves the recovered origin and FAILS the 5 mm / 3 deg
 checks (yaw mod 90: the box is square and the depth path says so).
 
-  box:    full flow — exit 0, 9 exec goals, 4 gripper goals, two cancels
+  box:    full flow — exit 0, 10 exec goals, 4 gripper goals, two cancels
           (the guarded set-down trips by design), origin within 5 mm and
           yaw within 3 deg of the geometry the synthetic camera encoded,
           origin z pinned to the calibrated table.
@@ -76,10 +76,13 @@ def run_scenario(tmp, cfg, table_z, mode):
     # (goal 3) is position-bounded. In the trip scenario the push meets its
     # backstop too, which inserts the reflex recoil (one extra goal), so the
     # set-down is goal 9 there and goal 8 otherwise.
+    # the recoil now follows the push whether it met its backstop or ran
+    # its bound (the arm is on the button either way), so both scenarios
+    # carry it: the set-down is goal 9 in both
     stub_env = (
         "export STUB_TRIP_EXEC_N=2,3,9; "
         if mode == "trip"
-        else "export STUB_TRIP_EXEC_N=2,8; "
+        else "export STUB_TRIP_EXEC_N=2,9; "
     )
     stub = cam = cli = None
     try:
@@ -160,7 +163,7 @@ def run_scenario(tmp, cfg, table_z, mode):
     # scan, press:touch, press:push, [recoil], retreat, grip:down, lift,
     # place transit, place:down, place-retreat+home (merged) — the recoil
     # runs only when the PUSH trips, which is the trip scenario's point
-    want_execs = 10 if mode == "trip" else 9
+    want_execs = 10  # scan, touch, push, recoil, retreat, grip:down, lift, transit, set-down, retreat+home
     if execs != want_execs:
         fails.append("exec goals %d != %d" % (execs, want_execs))
     if said.count("GRIPPER GOAL") != 4:
