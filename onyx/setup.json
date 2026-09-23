@@ -1,0 +1,152 @@
+{
+  "schemaVersion": 2,
+  "goal": "Find and locate the box at any reachable placement, with no false detections: offline replay of a recorded, labelled detection set through the mission's own perception code (scene camera first, wrist search second).",
+  "projectPath": "",
+  "scope": {
+    "editable": [
+      "src/rammp_box_opening/rammp_box_opening/perception/scene_source.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/depth_source.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/owl_source.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/planes.py",
+      "src/rammp_box_opening/config/containers/"
+    ],
+    "protected": [
+      "onyx/",
+      "src/rammp_box_opening/rammp_box_opening/runtime/",
+      "src/rammp_box_opening/rammp_box_opening/primitives/",
+      "src/rammp_box_opening/rammp_box_opening/tasks/",
+      "src/rammp_box_opening/rammp_box_opening/models/",
+      "src/rammp_box_opening/rammp_box_opening/detection_set.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/button_aim.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/owl_node.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/d405.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/scene.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/scene_calib.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/scene_refine.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/lag.py",
+      "src/rammp_box_opening/rammp_box_opening/perception/vlm_source.py",
+      "src/rammp_box_opening/config/camera_scene.yaml",
+      "src/rammp_box_opening/config/camera_d405_wrist.yaml",
+      "src/rammp_box_opening/config/world_bench.yaml",
+      "src/rammp_box_opening/launch/",
+      "src/rammp_box_opening/test/",
+      "scripts/"
+    ]
+  },
+  "metric": {
+    "name": "found_rate",
+    "unit": "fraction",
+    "direction": "maximize"
+  },
+  "resources": {
+    "gpu": {
+      "slots": 1,
+      "description": "The Jetson's GPU (OWLv2). Shared with the live bench stack: research runs while the bench is idle."
+    }
+  },
+  "tools": {
+    "guard.offline": {
+      "description": "Before the metric, no motion, no ROS graph: container configs pinned outside their vlm: section, no candidate code reads the recorded set or its labels, and the unit suite passes.",
+      "command": "bash",
+      "args": [
+        "onyx/tools/guard/run.sh"
+      ],
+      "shell": false,
+      "cwd": "project",
+      "env": {},
+      "resources": [],
+      "timeoutSeconds": 420,
+      "leaseTimeoutSeconds": 120,
+      "outputLimitBytes": 4000,
+      "fingerprintPaths": [
+        "onyx/tools/guard"
+      ]
+    },
+    "readiness.check": {
+      "description": "Before the metric: waits (up to 10 min) until the bench is idle \u2014 no attended arm command running (the evaluator's OWLv2 would share the GPU with the live detectors) \u2014 and 3 GiB of memory is available.",
+      "command": "python3",
+      "args": [
+        "onyx/tools/readiness/check.py"
+      ],
+      "shell": false,
+      "cwd": "project",
+      "env": {},
+      "resources": [],
+      "timeoutSeconds": 660,
+      "leaseTimeoutSeconds": 120,
+      "outputLimitBytes": 2000,
+      "fingerprintPaths": [
+        "onyx/tools/readiness"
+      ]
+    },
+    "evaluation.run": {
+      "description": "Replay the recorded detection set (onyx/data/detection_set.json, sha256-pinned) through this worktree's perception code: scene camera (OWLv2 + lid-slab lift through the committed calibration), then the wrist search (box-top detector on the still search frames). found_rate = placements where either answer lands within 40 mm of the recorded close-up-aim truth. Scrubbed environment, never joins ROS.",
+      "command": "bash",
+      "args": [
+        "onyx/tools/evaluation/run.sh"
+      ],
+      "shell": false,
+      "cwd": "project",
+      "env": {},
+      "resources": [
+        "gpu"
+      ],
+      "timeoutSeconds": 900,
+      "leaseTimeoutSeconds": 120,
+      "outputLimitBytes": 4000,
+      "fingerprintPaths": [
+        "onyx/tools/evaluation",
+        "onyx/data/detection_set.json",
+        "src/rammp_box_opening/config/camera_scene.yaml"
+      ]
+    },
+    "guardrails.check": {
+      "description": "After the metric: zero boxes answered on the empty scenes, and detection time within budget on this Jetson (scene frame <= 2.0 s, wrist frame <= 0.15 s).",
+      "command": "python3",
+      "args": [
+        "onyx/tools/guardrails/check.py"
+      ],
+      "shell": false,
+      "cwd": "project",
+      "env": {},
+      "resources": [],
+      "timeoutSeconds": 60,
+      "leaseTimeoutSeconds": 60,
+      "outputLimitBytes": 2000,
+      "fingerprintPaths": [
+        "onyx/tools/guardrails"
+      ]
+    }
+  },
+  "workflow": [
+    {
+      "id": "edit",
+      "agent": "Read onyx/onyx.md and the last result's missed placements (.onyx_eval/report.json after a run). Make ONE detection change in the editable perception files or a container's vlm: section, commit it, then resume.",
+      "optional": false
+    },
+    {
+      "id": "guard",
+      "run": "guard.offline",
+      "guardrail": true,
+      "optional": false
+    },
+    {
+      "id": "readiness",
+      "run": "readiness.check",
+      "guardrail": true,
+      "optional": false
+    },
+    {
+      "id": "evaluate",
+      "run": "evaluation.run",
+      "metric": true,
+      "optional": false
+    },
+    {
+      "id": "guardrails",
+      "run": "guardrails.check",
+      "guardrail": true,
+      "optional": false
+    }
+  ]
+}

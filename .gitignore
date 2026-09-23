@@ -11,3 +11,6 @@ dist/
 # editor state: machine-specific paths and a 14 MB symbol cache
 .vscode/
 *.code-workspace
+
+# Onyx: the evaluator's report and validation run state
+.onyx_eval/

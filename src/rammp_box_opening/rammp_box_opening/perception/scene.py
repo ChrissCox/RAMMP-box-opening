@@ -177,18 +177,29 @@ class SceneGrabber:
         """(points (N,3) in the colour optical frame, their colour pixels
         (N,2)) for the valid depth pixels. None until depth, intrinsics and
         the depth<-colour extrinsic have all arrived."""
-        import cv2
-
         d = self.depth if depth is None else depth
         T_c_d = self.depth_to_color()
         if d is None or self.kd is None or self.k is None or T_c_d is None:
             return None
-        pts, _u, _v = cloud_from_depth(d, self.kd, stride=stride)
-        pc = pts @ T_c_d[:3, :3].T + T_c_d[:3, 3]
-        uv, _ = cv2.projectPoints(
-            pc.reshape(-1, 1, 3).astype(np.float64), np.zeros(3), np.zeros(3), self.k, self.dist
-        )
-        return pc, uv.reshape(-1, 2)
+        return color_cloud(d, self.kd, self.k, self.dist, T_c_d, stride=stride)
+
+
+def color_cloud(depth, kd, k, dist, T_color_depth, stride=1):
+    """(points (N,3) in the colour optical frame, their colour pixels (N,2))
+    for the valid pixels of a depth image with intrinsics `kd`, moved into
+    the colour camera by `T_color_depth` and projected with its `k` and
+    `dist`. The live grabber and an offline replay of recorded arrays both
+    compute it here."""
+    import cv2
+
+    pts, _u, _v = cloud_from_depth(depth, kd, stride=stride)
+    T = np.asarray(T_color_depth, float)
+    pc = pts @ T[:3, :3].T + T[:3, 3]
+    uv, _ = cv2.projectPoints(
+        pc.reshape(-1, 1, 3).astype(np.float64), np.zeros(3), np.zeros(3), np.asarray(k, float),
+        None if dist is None or not len(np.atleast_1d(dist)) else np.asarray(dist, float),
+    )
+    return pc, uv.reshape(-1, 2)
 
 
 def load_scene_calibration(path=None):

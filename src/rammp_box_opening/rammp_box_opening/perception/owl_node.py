@@ -31,7 +31,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Float32MultiArray, String
 
-from rammp_box_opening.perception.owl_source import BLIND, CONTAINER_TOPIC, HEARTBEAT, blind_heartbeat_due, container_changed, top_boxes, topics_for
+from rammp_box_opening.perception.owl_source import BLIND, CONTAINER_TOPIC, HEARTBEAT, blind_heartbeat_due, container_changed, owl_detect, owl_floor, topics_for
 
 # The mission enables inference only around its detect windows: OWLv2 at
 # 100 % GPU duty doubled every cuRobo solve (0.22 s -> 0.47 s measured
@@ -77,7 +77,7 @@ class OwlDetector(Node):
         # from the YAML follows the YAML
         self._min_score_from_launch = self.min_score >= 0
         if self.min_score < 0:
-            self.min_score = float(self.cfg.owl_min_score)
+            self.min_score = owl_floor(self.cfg, self.camera)
 
         self.get_logger().info("loading %s ..." % self.cfg.owl_model)
         t0 = time.monotonic()
@@ -149,7 +149,7 @@ class OwlDetector(Node):
             return
         self.cfg, self._cfg_path = cfg, path
         if not self._min_score_from_launch:
-            self.min_score = float(cfg.owl_min_score)
+            self.min_score = owl_floor(cfg, self.camera)
         self.get_logger().info(
             "container -> %s: queries %s, min score %.2f" % (path, list(cfg.owl_queries), self.min_score)
         )
@@ -201,29 +201,9 @@ class OwlDetector(Node):
             self.pub.publish(msg)
             return
 
-        import torch
-
-        h, w = g.color.shape[:2]
-        queries = list(self.cfg.owl_queries)
         # D405Grabber stores BGR; the processor expects RGB (measured
         # harmless on the capture set, but it is the wrong buffer)
-        rgb = g.color[:, :, ::-1]
-        inputs = self._proc(text=[queries], images=[rgb], return_tensors="pt").to(
-            "cuda"
-        )
-        with torch.no_grad():
-            out = self._model(**inputs)
-        res = self._proc.post_process_object_detection(
-            out,
-            threshold=float(self.min_score),
-            target_sizes=torch.tensor([[h, w]]).cuda(),
-        )[0]
-        top = top_boxes(
-            res["scores"].tolist(),
-            res["labels"].tolist(),
-            [b.tolist() for b in res["boxes"]],
-            self.min_score,
-        )
+        top = owl_detect(self._proc, self._model, g.color[:, :, ::-1], self.cfg.owl_queries, self.min_score)
         best = top[0] if top else None
         msg = Float32MultiArray()
         now = self.get_clock().now().nanoseconds * 1e-9

@@ -155,10 +155,9 @@ def _nodes(context, *_args, **_kwargs):
                     executable="owl_detector",
                     name="owl_scene",
                     output="screen",
-                    # a lower floor than the wrist's: from a metre the box
-                    # scores 0.18-0.23, and the lid-slab geometry behind
-                    # this box rejects anything that is not a box top
-                    parameters=[{"camera": "scene", "min_score": 0.12}],
+                    # its floor is the container config's owl_min_score_scene
+                    # (lower than the wrist's: the box is small from a metre)
+                    parameters=[{"camera": "scene"}],
                 )
             )
     if flag("camera"):

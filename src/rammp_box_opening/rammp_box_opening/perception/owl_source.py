@@ -49,6 +49,30 @@ def container_changed(current, announced):
     return Path(announced).resolve() != Path(current).resolve()
 
 
+def owl_floor(cfg, camera):
+    """The score floor for `camera`'s detector, from the container config."""
+    return float(cfg.owl_min_score_scene if camera == "scene" else cfg.owl_min_score)
+
+
+def owl_detect(proc, model, rgb, queries, floor, device="cuda", k=None):
+    """OWLv2 on one RGB frame: the top boxes above `floor`, best first —
+    [(score, [x0, y0, x1, y1])]. What the owl_detector node publishes, and
+    what an offline replay of recorded frames computes the same way."""
+    import torch
+
+    h, w = rgb.shape[:2]
+    inputs = proc(text=[list(queries)], images=[rgb], return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = model(**inputs)
+    res = proc.post_process_object_detection(
+        out, threshold=float(floor), target_sizes=torch.tensor([[h, w]]).to(device)
+    )[0]
+    return top_boxes(
+        res["scores"].tolist(), res["labels"].tolist(), [b.tolist() for b in res["boxes"]], floor,
+        **({} if k is None else {"k": k}),
+    )
+
+
 def topics_for(camera):
     """(bbox topic, enable topic) of the owl_detector instance watching
     `camera`. The wrist keeps the original names; the scene camera's

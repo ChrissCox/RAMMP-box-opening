@@ -122,6 +122,29 @@ def box_from_scene_points(pts_base, uv, bbox, table_z, model):
     return pose, (float(centre[0]), float(centre[1]), float(centre[2])), n
 
 
+@dataclass(frozen=True)
+class SceneBoxFix:
+    pose: object  # ContainerPose, or None when no box was this container
+    top: tuple  # the lid top's centre (base) — None without a pose
+    n: int  # lid points behind it
+    box: object  # the OWL candidate that won ([x0, y0, x1, y1]), or None
+    tried: tuple  # why each refused candidate was refused, in order
+
+
+def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model):
+    """The OWL's candidates (score, [x0, y0, x1, y1]) best first, each
+    lifted to the lid slab (box_from_scene_points); the first that is this
+    container's size wins. What the live locate() does with every message,
+    and what an offline replay of recorded frames computes the same way."""
+    tried = []
+    for score, box in boxes:
+        pose, top, n = box_from_scene_points(pts_base, uv, box, table_z, model)
+        if pose is not None:
+            return SceneBoxFix(pose, top, n, box, tuple(tried))
+        tried.append("%s (OWL %.2f)" % (top, score))
+    return SceneBoxFix(None, None, 0, None, tuple(tried))
+
+
 def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6):
     """The table height the scene depth shows, from a plane fit over the
     lower part of the image; nan when there is no clean plane. Logged
@@ -229,12 +252,14 @@ class SceneLocator:
                 pc, uv = cloud
                 T_base_color = self.T_base_link @ self.grab.link_to_color()
                 pts_base = pc @ T_base_color[:3, :3].T + T_base_color[:3, 3]
-                for cand in bboxes_in_msg(m):
-                    pose, top, n = box_from_scene_points(pts_base, uv, cand[:4], self.table_z, self.model)
-                    if pose is not None:
-                        found = (cand, pose, top, n, pts_base, uv)
-                        break
-                    tried.append("%s (OWL %.2f)" % (top, cand[4]))
+                cands = bboxes_in_msg(m)
+                got = scene_fix_from_boxes(
+                    [(c[4], c[:4]) for c in cands], pts_base, uv, self.table_z, self.model
+                )
+                tried.extend(got.tried)
+                if got.pose is not None:
+                    cand = next(c for c in cands if c[:4] == got.box)
+                    found = (cand, got.pose, got.top, got.n, pts_base, uv)
                 if found is not None:
                     self.last_timing["lift_s"] = round(time.monotonic() - t_cloud, 2)
                     break

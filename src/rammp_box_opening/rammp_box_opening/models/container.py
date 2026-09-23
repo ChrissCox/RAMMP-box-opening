@@ -126,6 +126,7 @@ class PressDemoCfg:
     owl_model: str
     owl_queries: tuple
     owl_min_score: float
+    owl_min_score_scene: float  # the scene camera's floor: the box is small from a metre
     vlm_target: str  # what to ask Claude to box — plain English
     vlm_timeout_s: float
     vlm_pad_px: int
@@ -180,6 +181,7 @@ def load_press_demo(path):
             raw.get("vlm", {}).get("owl_queries", ("a small white square box",))
         ),
         owl_min_score=float(raw.get("vlm", {}).get("owl_min_score", 0.18)),
+        owl_min_score_scene=float(raw.get("vlm", {}).get("owl_min_score_scene", 0.12)),
         vlm_target=str(raw.get("vlm", {}).get("target", "the food-storage container")),
         vlm_timeout_s=float(raw.get("vlm", {}).get("timeout_s", 20.0)),
         vlm_pad_px=int(raw.get("vlm", {}).get("pad_px", 20)),
@@ -251,6 +253,8 @@ def load_press_demo(path):
         raise ValueError("vlm.backends must be a non-empty subset of ['owl', 'claude']")
     if not 0.0 < cfg.owl_min_score < 1.0:
         raise ValueError("vlm.owl_min_score must be in (0, 1)")
+    if not 0.0 < cfg.owl_min_score_scene < 1.0:
+        raise ValueError("vlm.owl_min_score_scene must be in (0, 1)")
     if not 0.0 < cfg.vlm_timeout_s <= 60.0:
         raise ValueError("vlm.timeout_s must be in (0, 60] s")
     if not 0.0 < cfg.detect_period_s <= 0.5:

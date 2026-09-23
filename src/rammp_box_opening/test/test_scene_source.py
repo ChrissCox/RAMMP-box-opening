@@ -144,3 +144,31 @@ def test_another_larger_container_in_the_pixel_box_is_not_this_one(model):
     pose, _top, _n = box_from_scene_points(pts, uv, _bbox_around(pts, uv, (0.45, -0.12)), TABLE_Z, model)
     assert pose is not None
 
+
+
+def test_the_scene_fix_is_the_first_owl_box_whose_top_is_this_container():
+    """scene_fix_from_boxes: the loop the live locate ran inline, as one
+    function an offline replay can call — the OWL's boxes best first, each
+    lifted to the lid slab, the first that is this container's size wins."""
+    import numpy as np
+
+    from rammp_box_opening.models.container import ContainerModel
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    model = ContainerModel.load("src/rammp_box_opening/config/containers/ankou_pink.yaml")
+    table_z = -0.027
+    top = table_z + model.dims[2]
+    # a lid of the model's size at [0.45, 0.05], seen as points with pixels
+    xs, ys = np.meshgrid(np.linspace(-0.05, 0.05, 30), np.linspace(-0.05, 0.05, 30))
+    lid = np.stack([0.45 + xs.ravel(), 0.05 + ys.ravel(), np.full(xs.size, top)], 1)
+    table = np.stack([0.20 + xs.ravel(), -0.20 + ys.ravel(), np.full(xs.size, table_z)], 1)
+    pts = np.vstack([lid, table])
+    uv = np.vstack([np.stack([100 + 30 * (xs.ravel() + 0.05) / 0.1, 100 + 30 * (ys.ravel() + 0.05) / 0.1], 1),
+                    np.stack([400 + 30 * (xs.ravel() + 0.05) / 0.1, 400 + 30 * (ys.ravel() + 0.05) / 0.1], 1)])
+    boxes = [(0.60, [390, 390, 440, 440]), (0.40, [90, 90, 140, 140])]  # the best box is the bare table
+    got = scene_fix_from_boxes(boxes, pts, uv, table_z, model)
+    assert got.pose is not None and got.box == boxes[1][1]
+    assert abs(got.top[0] - 0.45) < 0.005 and abs(got.top[1] - 0.05) < 0.005
+    assert len(got.tried) == 1  # the table box, refused and said why
+    none = scene_fix_from_boxes(boxes[:1], pts, uv, table_z, model)
+    assert none.pose is None and none.tried

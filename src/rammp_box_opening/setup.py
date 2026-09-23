@@ -32,6 +32,7 @@ setup(
             "home_arm = rammp_box_opening.tasks.home_arm:main",
             "preflight = rammp_box_opening.tasks.preflight:main",
             "owl_detector = rammp_box_opening.perception.owl_node:main",
+            "record_detection_set = rammp_box_opening.tasks.record_detection_set:main",
         ],
     },
 )

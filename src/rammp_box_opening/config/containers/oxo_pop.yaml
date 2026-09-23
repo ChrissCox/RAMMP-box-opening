@@ -261,6 +261,10 @@ vlm:                              # detect.source: vlm — the semantic gate
     - a white plastic container with a lid  # bbox stable to +/-1 px
   owl_min_score: 0.18             # false positives sat at 0.12-0.18 on the
                                   # captures; the true box at 0.235-0.249
+  owl_min_score_scene: 0.12       # the scene camera's floor (was the launch
+                                  # file's): from a metre the box scores lower,
+                                  # and the lid-slab geometry behind it rejects
+                                  # anything that is not this box's top
   model: claude-opus-5            # measured 2026-09-01: 3.3 s, box dead-on;
                                   # claude-haiku-4-5 was 0.4 s faster and
                                   # boxed the ROBOT'S OWN BASE. Fast loses.

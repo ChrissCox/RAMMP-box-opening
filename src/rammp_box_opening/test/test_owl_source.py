@@ -1,5 +1,8 @@
 """The OWL bbox topic contract."""
 
+import numpy as np
+import pytest
+
 
 
 def test_top_boxes_are_best_first_above_the_floor():
@@ -132,3 +135,50 @@ def test_a_heartbeat_right_after_a_box_does_not_hide_it():
     assert box is not None and box[4] == 0.45  # ... and the box is still there
     now[0] += 10.0
     assert rung.fresh_box() is None  # but not forever
+
+
+def test_each_camera_has_its_own_floor_in_the_container_config():
+    """The scene instance's floor (0.12) lived in the launch file, out of
+    reach of anything that tunes detection; it is the container's now, next
+    to the prompts it goes with."""
+    from rammp_box_opening.models.container import load_press_demo
+    from rammp_box_opening.perception.owl_source import owl_floor
+
+    cfg = load_press_demo("src/rammp_box_opening/config/containers/ankou_pink.yaml")
+    assert owl_floor(cfg, "scene") == cfg.owl_min_score_scene == 0.12
+    assert owl_floor(cfg, "wrist") == cfg.owl_min_score == 0.18
+
+
+def test_detection_is_one_function_the_node_and_an_offline_replay_share():
+    """owl_detect: processor + model + frame -> the top boxes above the
+    floor, best first — what the node publishes, and what an evaluator
+    replaying recorded frames must compute the same way."""
+    import torch
+
+    from rammp_box_opening.perception.owl_source import owl_detect
+
+    seen = {}
+
+    class Batch(dict):
+        def to(self, device):
+            seen["device"] = device
+            return self
+
+    class Proc:
+        def __call__(self, text, images, return_tensors):
+            seen["text"], seen["shape"] = text, images[0].shape
+            return Batch()
+
+        def post_process_object_detection(self, out, threshold, target_sizes):
+            seen["threshold"] = threshold
+            return [{
+                "scores": torch.tensor([0.20, 0.47, 0.13]),
+                "labels": torch.tensor([0, 1, 0]),
+                "boxes": torch.tensor([[1.0, 2, 3, 4], [10, 20, 60, 80], [5, 5, 9, 9]]),
+            }]
+
+    rgb = np.zeros((720, 1280, 3), np.uint8)
+    top = owl_detect(Proc(), lambda **kw: "out", rgb, ["a pink lid", "a round pink lid"], 0.15, device="cpu")
+    assert [s for s, _b in top] == pytest.approx([0.47, 0.20])  # best first; 0.13 is under the floor
+    assert top[0][1] == [10, 20, 60, 80]
+    assert seen["text"] == [["a pink lid", "a round pink lid"]] and seen["threshold"] == 0.15 and seen["device"] == "cpu"
