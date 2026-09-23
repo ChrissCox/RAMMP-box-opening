@@ -25,11 +25,10 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray
 from tf2_ros import StaticTransformBroadcaster
 
-from rammp_curobo.perception import mat_to_quat_xyzw, quat_to_mat
-from rammp_curobo_ros.cameras import load_camera_config
+from rammp_box_opening.perception.d405 import camera_config, mat_to_quat_xyzw, quat_to_mat
 
 REPO = Path(__file__).resolve().parent.parent
 # one renderer for the unit tests and for this stub: the geometry the
@@ -42,6 +41,10 @@ from rammp_box_opening.perception.owl_source import BBOX_TOPIC  # noqa: E402
 
 # camera looking straight down: x -> world +x, image-down -> world -y
 R_CAM = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+KNOB_UP_M = 0.016  # the stub knob's height when popped (the real one: 15-18 mm)
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
+
+KNOB_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 OWL_SCORE = 0.25  # what the real node reports for the bench box
 
 
@@ -82,6 +85,10 @@ def main():
     ap.add_argument(
         "--no-box", action="store_true", help="an empty table (no-box scenario)"
     )
+    ap.add_argument(
+        "--knob-up", action="store_true",
+        help="the box is ALREADY OPEN when the run starts: the knob stands up from the first frame",
+    )
     a = ap.parse_args()
 
     model = ContainerModel.load(a.container)
@@ -105,25 +112,33 @@ def main():
         u, v, rng = project([a.box_x, a.box_y, top_z], t_cam)
         r_px = int(round(K[0, 0] * (model.button_diameter_m / 2.0) / rng))
         cv2.circle(canvas, (int(round(u)), int(round(v))), r_px, (60, 60, 60), -1)
-    depth_m = render_depth(boxes, rot_cam=R_CAM, t_cam=t_cam, table_z=a.table_z)
-    depth = (
-        np.where(np.isfinite(depth_m), depth_m * 1000.0, 0.0).round().astype(np.uint16)
-    )
+    def render(knob_up):
+        shapes = list(boxes)
+        if knob_up and not a.no_box:
+            # the popped knob: a 35 mm cap standing KNOB_UP_M above the lid
+            shapes.append((a.box_x, a.box_y, top_z + KNOB_UP_M, 0.035, 0.035, np.radians(a.box_yaw_deg)))
+        depth_m = render_depth(shapes, rot_cam=R_CAM, t_cam=t_cam, table_z=a.table_z)
+        return np.where(np.isfinite(depth_m), depth_m * 1000.0, 0.0).round().astype(np.uint16)
+
+    frame = {"depth": render(a.knob_up)}
 
     rclpy.init()
     node = rclpy.create_node("stub_d405")
-    pub_c = node.create_publisher(Image, "/d405/d405/color/image_raw", 10)
+    # the same names the mission subscribes to, from the same config: the
+    # camera sheppy runs (/wrist_camera/...)
+    cfg = camera_config()
+    ns = cfg["depth_topic"].rsplit("/depth/", 1)[0]
+    pub_c = node.create_publisher(Image, ns + "/color/image_raw", 10)
     pub_d = node.create_publisher(
-        Image, "/d405/d405/aligned_depth_to_color/image_raw", 10
+        Image, ns + "/aligned_depth_to_color/image_raw", 10
     )
-    pub_i = node.create_publisher(CameraInfo, "/d405/d405/color/camera_info", 10)
+    pub_i = node.create_publisher(CameraInfo, ns + "/color/camera_info", 10)
     pub_owl = node.create_publisher(Float32MultiArray, BBOX_TOPIC, 1)
 
     # static TF so the grabber's mount composition lands the camera at
     # exactly R_CAM/t_cam: T_base_ee = T_base_cam o inv(T_mount). No
     # tool_frame is published: the real bringup's tree has none either
     # (field 2026-08-25) and nothing in the mission looks it up.
-    cfg = load_camera_config("camera_d405_wrist.yaml")
     qx, qy, qz, qw = cfg["mount_quat_xyzw"]
     r_mount = quat_to_mat(qx, qy, qz, qw)
     r_ee = R_CAM @ r_mount.T
@@ -157,12 +172,19 @@ def main():
 
     last_frame = {"t": None}
 
+    def on_knob(msg):
+        if msg.data:
+            frame["depth"] = render(True)
+            print("STUB D405: knob up — rendering the popped button", flush=True)
+
+    node.create_subscription(Bool, "/stub_bench/knob_up", on_knob, KNOB_QOS)
+
     def publish():
         stamp = node.get_clock().now().to_msg()
         last_frame["t"] = stamp.sec + stamp.nanosec * 1e-9
         im = Image()
         im.header.stamp = stamp
-        im.header.frame_id = "d405_color_optical_frame"
+        im.header.frame_id = "wrist_camera_color_optical_frame"
         im.height, im.width = H, W
         im.encoding = "bgr8"
         im.step = W * 3
@@ -170,11 +192,11 @@ def main():
         pub_c.publish(im)
         dm = Image()
         dm.header.stamp = stamp
-        dm.header.frame_id = "d405_color_optical_frame"
+        dm.header.frame_id = "wrist_camera_color_optical_frame"
         dm.height, dm.width = H, W
         dm.encoding = "16UC1"
         dm.step = W * 2
-        dm.data = depth.tobytes()
+        dm.data = frame["depth"].tobytes()
         pub_d.publish(dm)
         info = CameraInfo()
         info.header.stamp = stamp

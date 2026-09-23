@@ -1,8 +1,9 @@
 """Collision-world generation: bench + container-derived cuboid variants.
 
 Worlds are a plan-time concern (spec §6). SetWorld is write-only, so the
-Runner tracks what it last pushed; this module only builds and writes the
-variants. Cuboids only — v0.7.8 drops other shapes.
+client tracks the one it last pushed (PlannerClient.set_world); this module
+only builds and writes the variants. Cuboids only — the planner drops
+other shapes.
 """
 
 import hashlib
@@ -10,15 +11,38 @@ from pathlib import Path
 
 import yaml
 
+from rammp_box_opening.constants import state_dir
+
 ERR_TALL_M = 0.02  # container cuboid extra height (err tall, spec §3)
-APERTURE_HALF_M = 0.06  # half-extent of the free descent corridor
-RING_THICK_M = 0.05  # aperture ring wall thickness
-RING_HEIGHT_M = 0.25  # ring wall height above the reduction plane
 # Reduction plane below the deepest command. EMPIRICAL 2026-08-25 (margin
 # probe vs the real planner): the finger collision spheres reach ~4 cm
 # below tool_frame and padding adds 2 cm — at 0.03 the hover AND press
 # goals were in collision (IK_FAIL); 0.08 plans.
 PLANE_MARGIN_M = 0.08
+# The planner pads every obstacle by this much per side, except the names on
+# its no_pad list — which RAMMP-CuRobo v1.0.0 keeps to the pedestal alone
+# (core/rammp_curobo/config.py PLANNER_DEFAULTS). The planner this repo first
+# ran against exempted the table too. Padded, a table written at its TRUE
+# height sits 2 cm too tall and swallows the arm's own base collision
+# spheres: every start state reads as in collision. So a world FILE carries
+# these true surfaces lowered by the padding the planner adds back; the
+# builders below, and table_top_z, keep the true geometry.
+PLANNER_PADDING_M = 0.02
+PADDED_TRUE_SURFACES = ("table",)
+
+
+def _as_planned(world):
+    """`world` as the planner must be given it: every TRUE surface lowered by
+    the padding the planner adds back. Applied last, after any capping, so a
+    table capped at the reduction plane still ends at the plane once padded."""
+    obstacles = []
+    for o in world["obstacles"]:
+        if o.get("name") in PADDED_TRUE_SURFACES:
+            o = dict(o)
+            x, y, z = o["position"]
+            o["position"] = [x, y, z - PLANNER_PADDING_M]
+        obstacles.append(o)
+    return dict(world, obstacles=obstacles)
 
 
 def _bench_obstacles(bench):
@@ -147,52 +171,23 @@ def reduction_plane_z(contact_z, depth_max):
     return contact_z - depth_max - PLANE_MARGIN_M
 
 
-def interaction_world(
-    bench, model, cpose, target_xyz, contact_z, depth_max, lid_at=None, ring=True
-):
+def interaction_world(bench, model, cpose, contact_z, depth_max, lid_at=None):
+    """The world a CONTACT leg plans in: everything above the reduction
+    plane under the contact is removed, so a goal at or below a surface is
+    plannable. Descents come from directly overhead (the vertical final
+    approach), never laterally through what this world leaves out — and
+    only guarded or slow legs may plan in it (the Runner's transit gate)."""
     plane = reduction_plane_z(contact_z, depth_max)
     # bench obstacles cap at the reduction plane too: a set-down ONTO the
     # bench must be plannable to its commanded overdrive depth, same
     # spec §6 rule as the container body (field 2026-08-26: IK_FAIL at a
     # set-down goal 25 mm over the solid table). For button-height
-    # contacts the plane sits below every bench top — a no-op. Only
-    # guarded/slow legs live in this world; the transit gate stands.
+    # contacts the plane sits below every bench top — a no-op.
     obstacles = [c for c in (_cap_top(o, plane) for o in _bench_obstacles(bench)) if c]
     if plane > cpose.xyz[2]:  # body below the plane stays solid
         obstacles.append(
             _container_cuboid(model, cpose, name="container_body", top_z=plane)
         )
-    if ring:
-        # Aperture ring: lateral entry forbidden, vertical corridor free.
-        # Sized for Phase-1's deep grasp descents; at press-demo hover
-        # heights its walls collide with the gripper body (empirical
-        # 2026-08-25) — PressFixed passes ring=False.
-        tx, ty = target_xyz[0], target_xyz[1]
-        a, w, h = APERTURE_HALF_M, RING_THICK_M, RING_HEIGHT_M
-        zc = plane + h / 2
-        span = 2 * (a + w)
-        obstacles += [
-            {
-                "name": "ring_xp",
-                "position": [tx + a + w / 2, ty, zc],
-                "dims": [w, span, h],
-            },
-            {
-                "name": "ring_xn",
-                "position": [tx - a - w / 2, ty, zc],
-                "dims": [w, span, h],
-            },
-            {
-                "name": "ring_yp",
-                "position": [tx, ty + a + w / 2, zc],
-                "dims": [span, w, h],
-            },
-            {
-                "name": "ring_yn",
-                "position": [tx, ty - a - w / 2, zc],
-                "dims": [span, w, h],
-            },
-        ]
     if lid_at is not None:
         obstacles.append(_lid_cuboid(model, lid_at))
     return {
@@ -210,7 +205,7 @@ class WorldStore:
         self._dir = Path(
             out_dir
             if out_dir is not None
-            else Path.home() / ".ros" / "rammp_box_opening" / "worlds"
+            else state_dir() / "worlds"
         )
         self._dir.mkdir(parents=True, exist_ok=True)
 
@@ -220,17 +215,24 @@ class WorldStore:
         source bands container candidates above this."""
         return _table_top_z(self._bench)
 
+    @property
+    def table_normal(self):
+        """The table's normal in base_link as measured (see the yaml), or
+        exactly +z when the bench file does not say."""
+        n = self._bench.get("table_normal_base", [0.0, 0.0, 1.0])
+        n = [float(v) for v in n]
+        s = sum(v * v for v in n) ** 0.5 or 1.0
+        return [v / s for v in n]
+
     def push_name(
         self,
         kind,
         model=None,
         cpose=None,
-        target_xyz=None,
         contact_z=None,
         depth_max=None,
         lid_at=None,
         tag="",
-        ring=True,
         container_pad_xy=0.0,
     ):
         if kind == "bench":
@@ -247,14 +249,7 @@ class WorldStore:
             name = "full" + (("_" + tag) if tag else "")
         elif kind == "interaction":
             world = interaction_world(
-                self._bench,
-                model,
-                cpose,
-                target_xyz,
-                contact_z,
-                depth_max,
-                lid_at=lid_at,
-                ring=ring,
+                self._bench, model, cpose, contact_z, depth_max, lid_at=lid_at
             )
             name = "interaction" + (("_" + tag) if tag else "")
         else:
@@ -268,7 +263,7 @@ class WorldStore:
         # corrected container pose under the SAME path, the dedup skipped
         # the push, and the re-approach was planned against the stale
         # container position (found by review 2026-08-28).
-        text = yaml.safe_dump(world, sort_keys=False)
+        text = yaml.safe_dump(_as_planned(world), sort_keys=False)
         digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
         path = self._dir / ("%s-%s.yaml" % (name, digest))
         if not path.exists():

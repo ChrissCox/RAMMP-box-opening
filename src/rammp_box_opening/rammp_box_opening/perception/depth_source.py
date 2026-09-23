@@ -25,6 +25,7 @@ or see a box whose lid is off — fine here, the mission starts lid-on.
 """
 
 import math
+import threading
 import time
 from dataclasses import dataclass
 
@@ -49,6 +50,15 @@ TOP_RESIDUAL_MAX_M = 0.012
 # a residual this big is not noise: dims.z (or table_z) needs re-deriving.
 # Well inside the refusal above, so it warns long before it refuses.
 CALIBRATION_DRIFT_MM = 6.0
+# The COARSE window: sightings taken while the camera is MOVING, to answer
+# "is there a box, roughly where" so a search can stop. In-flight samples carry
+# a systematic TF-versus-exposure lag bias (10-15 mm, field 2026-09-01) — which
+# is exactly why the still gate guards the committing window — so these agree
+# loosely, need fewer of them, and may never aim a press.
+COARSE_MIN_HITS = 2
+COARSE_TOL_M = 0.04
+COARSE_WINDOW_S = 1.5
+
 # a real surface is locally SMOOTH; passive-stereo speckle on the blank
 # table is locally wild. Local z-std above this is not a surface.
 SURFACE_STD_M = 0.006
@@ -60,6 +70,9 @@ MIN_FILL = 0.35
 PLATEAU_TOL_M = 0.02
 # blob footprint sanity vs the model's xy dims (per side)
 FOOT_TOL_M = 0.035
+# a PARTIAL top (cut or hidden) must still show at least this much of the
+# model's shorter side: the run-1 lid of 2026-09-23 showed 0.06 of 0.105
+PARTIAL_MIN_FRAC = 0.45
 # blobs touching the image border are cut off — their centroid is biased
 BORDER_PX = 6
 # depth trust range (D405 close-range envelope, same spirit as refine_point)
@@ -77,22 +90,30 @@ STILL_TRANS_M = 0.004
 STILL_ROT_RAD = 0.02
 
 
-def camera_pose_at(g):
-    """base_link <- camera AT THE FRAME'S STAMP (mount composition as in
-    D405Grabber.shot(), which cannot be used here: it spins).
+def camera_pose_at(g, offset_s=None):
+    """base_link <- camera AT THE FRAME'S STAMP: the TF of the grabber's
+    parent frame composed with its mount (config/camera_d405_wrist.yaml).
+
+    `offset_s` shifts the stamp by the camera's measured timestamp lag
+    (the grabber's stamp_offset_s when None; perception/lag.py measures it),
+    so a frame shot while the arm moved is placed where the arm was when
+    the shutter fired, not where the stamp says.
 
     No latest-TF fallback: upstream documents that fallback as safe only
     while parked, and the watcher runs during motion — at continuous frame
     rates a dropped frame costs nothing, a wrong-pose frame poisons the fix
     (2026-08-24 review)."""
     import rclpy.time as rt
+    from rclpy.duration import Duration
 
-    from rammp_curobo.perception import quat_to_mat
+    from rammp_box_opening.perception.d405 import quat_to_mat
 
+    off = getattr(g, "stamp_offset_s", 0.0) if offset_s is None else float(offset_s)
+    when = rt.Time.from_msg(g.color_stamp)
+    if off:
+        when = when + Duration(nanoseconds=int(round(off * 1e9)))
     try:
-        tr = g.tf_buffer.lookup_transform(
-            "base_link", g.parent, rt.Time.from_msg(g.color_stamp)
-        )
+        tr = g.tf_buffer.lookup_transform("base_link", g.parent, when)
     except Exception:
         return None
     q, t = tr.transform.rotation, tr.transform.translation
@@ -106,7 +127,7 @@ def camera_pose_at(g):
 class FixWindow:
     """Rolling sightings -> a fresh, stable (position, yaw) fix.
 
-    Position stability goes through the consumed `stable_fix` (median of
+    Position stability goes through `stable_fix` (perception/d405.py: median of
     the last min_hits when they agree pairwise within tol_m); the yaw is
     the latest sighting's (joint-7-absorbed, spec'd second-order). A fix
     older than fresh_s never commits — the arm only acts on what the
@@ -129,7 +150,7 @@ class FixWindow:
         self.last_seen = t
 
     def fix(self, now):
-        from rammp_curobo_ros.seek_core import stable_fix
+        from rammp_box_opening.perception.d405 import stable_fix
 
         if self.last_seen is None or now - self.last_seen > self.fresh_s:
             return None
@@ -158,6 +179,11 @@ class TopFaceFix:
     yaw: float  # footprint yaw, mod pi/2
     footprint: tuple  # min-area-rect (w, h) in metres
     n_px: int  # plateau pixels (at STRIDE) backing the fix
+    # part of the top is out of sight — cut by the image border, or hidden
+    # by the gripper's fingers, which hang at the bottom of every wrist
+    # frame. Its centroid is biased toward the visible part: a place to
+    # look from (the coarse window, staging), never an aim (2026-09-23)
+    partial: bool = False
 
 
 def top_face_from_depth(depth, k, rot_cam, trans_cam, table_z, model, roi=None):
@@ -235,15 +261,13 @@ def top_face_from_depth(depth, k, rot_cam, trans_cam, table_z, model, roi=None):
     ex, ey = float(model.dims[0]), float(model.dims[1])
     lo, hi = min(ex, ey) - FOOT_TOL_M, max(ex, ey) + FOOT_TOL_M
 
-    candidates, reasons = [], []
+    candidates, partials, reasons = [], [], []
     order = 1 + np.argsort(stats[1:, cv2.CC_STAT_AREA])[::-1]
     for label in order[:8]:
         blob = labels == label
         if int(blob.sum()) < 12:
             continue
-        if (blob & edge).any():
-            reasons.append("a top touches the image border")
-            continue
+        cut = bool((blob & edge).any())
         zb = z_base[blob]
         top_z0 = float(np.median(zb))
         plateau = blob & (np.abs(z_base - top_z0) < PLATEAU_TOL_M)
@@ -261,9 +285,20 @@ def top_face_from_depth(depth, k, rot_cam, trans_cam, table_z, model, roi=None):
         xy = sel[:, :2].astype(np.float32)
         (rcx, rcy), (w, h), angle = cv2.minAreaRect(xy)
         w, h = float(w), float(h)
-        if not (lo <= min(w, h) and max(w, h) <= hi):
+        if max(w, h) > hi:
             reasons.append("footprint %.2fx%.2f m vs model %.2fx%.2f" % (w, h, ex, ey))
-            continue
+            continue  # too BIG is never this box, whole or in part
+        narrow = min(w, h) < lo
+        if cut or narrow:
+            # part of a top: out of the frame, or behind the fingers. Kept
+            # as a PARTIAL (coarse only) when enough of it shows to be a
+            # box-sized top and not a strip; refused otherwise.
+            if min(w, h) < PARTIAL_MIN_FRAC * min(ex, ey):
+                reasons.append(
+                    "a top touches the image border" if cut
+                    else "footprint %.2fx%.2f m vs model %.2fx%.2f" % (w, h, ex, ey)
+                )
+                continue
         # a real top face is SOLID; a noise archipelago that happens to
         # span a box-sized rect is not (fill = cells / rect area in cells)
         ys, xs = np.nonzero(plateau)
@@ -273,17 +308,24 @@ def top_face_from_depth(depth, k, rot_cam, trans_cam, table_z, model, roi=None):
         if fill < MIN_FILL:
             reasons.append("top not solid (fill %.2f)" % fill)
             continue
-        candidates.append(
+        (partials if (cut or narrow) else candidates).append(
             TopFaceFix(
                 center=(float(rcx), float(rcy), float(np.median(sel[:, 2]))),
                 yaw=math.radians(angle) % (math.pi / 2),
                 footprint=(w, h),
                 n_px=int(plateau.sum()),
+                partial=bool(cut or narrow),
             )
         )
 
+    if not candidates and len(partials) == 1:
+        p = partials[0]
+        return p, "partial top %.2fx%.2f m (cut by the image edge or the fingers) — coarse only" % p.footprint
     if not candidates:
-        return None, (reasons[0] if reasons else "no plateau")
+        return None, (
+            "%d partial tops in view — ambiguous" % len(partials) if partials
+            else reasons[0] if reasons else "no plateau"
+        )
     if len(candidates) > 1:
         # two box-sized tops and no roi to disambiguate: guessing which
         # to press is exactly the mistake this gate exists to refuse
@@ -344,7 +386,6 @@ def button_circle_refine(color_rgb, depth, k, rot_cam, trans_cam, center, button
     )
     if circles is None:
         return None
-    cx = cy = None
     best = None
     for c in circles[0]:
         d = math.hypot(c[0] - half, c[1] - half)
@@ -409,12 +450,17 @@ class BoxTopWatcher:
     detect during the flip, 2026-09-01)."""
 
     def __init__(self, node, cfg, model, table_z, period_s=None):
-        from rammp_curobo_ros.seek_core import D405Grabber
+        from rammp_box_opening.perception.d405 import D405Grabber
 
         if period_s is None:
             period_s = float(getattr(cfg, "detect_period_s", 0.15))
         self.cfg = cfg
         self.model = model
+        # The SURVEYED table. Not fitted from the camera: passive stereo reads
+        # a blank bench as a broad smear whose mode sits ~35 mm above the real
+        # surface, and a table fitted from it moved the lid band off the lid
+        # (field 2026-09-16: box right under the look, not found in 438
+        # frames; replaying the 1 Sep capture, 39/94 hits fell to 7/94).
         self.table_z = float(table_z)
         # Only sightings whose BUTTON CIRCLE was found may vote. The
         # plateau centroid finds the lid, not the button: on the bench
@@ -425,11 +471,19 @@ class BoxTopWatcher:
         # 97 % of plateau frames yield a circle, so this costs almost
         # nothing; when it does refuse, it refuses honestly.
         self.require_circle = bool(getattr(cfg, "require_button_circle", True))
+        # With the camera's timestamp lag measured, a frame shot in motion is
+        # placed where the shutter fired and may feed the PRECISE window too
+        # (the circle is still required). This is what lets the wrist confirm
+        # the box while the arm is still descending toward it.
+        self.moving_ok = bool(getattr(cfg, "confirm_in_flight", False))
         self.grab = D405Grabber(node, need_depth=True)
         self.window = FixWindow(cfg.min_hits, cfg.tol_m, cfg.window_s, cfg.fresh_s)
+        self.coarse_window = FixWindow(
+            COARSE_MIN_HITS, COARSE_TOL_M, COARSE_WINDOW_S, cfg.fresh_s
+        )
+        self._last_coarse = None  # last_coarse()
         self.frames = 0
         self.hits = 0
-        self.refined_hits = 0  # == hits: every depth sighting IS refined
         self.circle_hits = 0  # sightings where the BUTTON circle aimed
         self.last_debug = None  # the last TopFaceFix (bench diagnostics)
         # pixel-space gate from the VLM source; None = whole frame. Set
@@ -448,6 +502,11 @@ class BoxTopWatcher:
         # not gate the parked frames (review 2026-09-02)
         self._still_since = None  # frame stamp when the camera became still
         self._pending_roi = None  # (roi, frame_t) waiting for a still epoch
+        # The tick runs on whatever thread spins this node — the mission
+        # spins perception on its own thread so the control loop's spin
+        # cadence never starves it — while fix() is read from the mission's
+        # thread. One lock covers the windows and the counters.
+        self._lock = threading.Lock()
         node.create_timer(period_s, self._tick)
 
     def offer_roi(self, roi, frame_t):
@@ -465,9 +524,20 @@ class BoxTopWatcher:
             if t >= self._still_since:
                 self.roi = roi
 
+    def tick_now(self):
+        """Process the newest frame right now, without waiting for the
+        timer. Harmless when perception has its own thread (the frame is
+        deduplicated by its stamp); what a caller polling in a tight loop
+        relies on when it does not."""
+        self._tick()
+
     def _tick(self):
         if not self.active:
             return
+        with self._lock:
+            self._tick_locked()
+
+    def _tick_locked(self):
         g = self.grab
         if g.depth is None or g.k is None or g.color_stamp is None:
             return
@@ -483,22 +553,27 @@ class BoxTopWatcher:
         still = camera_is_still(self._last_cam, cam)
         self._last_cam = cam
         self._apply_pending_roi(still, g.color_stamp.sec + g.color_stamp.nanosec * 1e-9)
-        if not still:
-            self.last_reject = "camera moving"
-            return
+        table_z = self.table_z
         fix, why = top_face_from_depth(
-            g.depth, g.k, rot_cam, trans_cam, self.table_z, self.model, roi=self.roi
+            g.depth, g.k, rot_cam, trans_cam, table_z, self.model, roi=self.roi
         )
         if fix is None:
             self.last_reject = why
             return
-        bad = top_residual_reject(fix.center[2], self.table_z, self.model)
+        bad = top_residual_reject(fix.center[2], table_z, self.model)
         if bad is not None:
             self.last_reject = bad
             return
         self.hits += 1
-        self.refined_hits += 1
-        circle = button_circle_refine(
+        if fix.partial:
+            # a place to look from, never an aim: coarse only, no circle
+            self.coarse_window.add(np.asarray(fix.center), fix.yaw, time.monotonic())
+            self._remember_coarse()
+            self.last_reject = why
+            return
+        # the circle is the press's aim, and only a still frame can be trusted
+        # to place it — a moving frame votes coarse, on the plateau centroid
+        circle = None if not still else button_circle_refine(
             g.color,
             g.depth,
             g.k,
@@ -515,29 +590,63 @@ class BoxTopWatcher:
                 n_px=fix.n_px,
             )
             self.circle_hits += 1
-        elif self.require_circle:
+        self.last_debug = fix
+        # every sighting votes COARSELY: enough to say a box is there and stop
+        # a search, never enough to aim at its button
+        self.coarse_window.add(np.asarray(fix.center), fix.yaw, time.monotonic())
+        self._remember_coarse()
+        if not still and not self.moving_ok:
+            self.last_reject = "camera moving (coarse only)"
+            return
+        if circle is None and self.require_circle:
             # the lid is there but the button is not readable in this
             # frame: the centroid must not stand in for it
             self.last_reject = "container top but no button circle"
             return
-        self.last_debug = fix
         self.window.add(np.asarray(fix.center), fix.yaw, time.monotonic())
+
+    def _remember_coarse(self):
+        got = self.coarse_window.fix(time.monotonic())
+        if got is not None:
+            self._last_coarse = got
+
+    def last_coarse(self):
+        """The last coarse fix the watcher made, however long ago — the box
+        does not move while the mission tries its other ladders, and the
+        coarse window ages out in 1.5 s. None after reset()."""
+        with self._lock:
+            return self._last_coarse
 
     def reset(self):
         """Purge the window AND the counters: status() must describe the
         window it is asked about, not the mission's whole history (the
         pre-grip re-look printed scan-pose hit counts and hid its own
         reject reason for two days, 2026-09-02)."""
+        with self._lock:
+            self._reset_locked()
+
+    def _reset_locked(self):
         self.window.samples = []
         self.window.last_seen = None
+        self.coarse_window.samples = []
+        self.coarse_window.last_seen = None
+        self._last_coarse = None
         self.frames = 0
         self.hits = 0
-        self.refined_hits = 0
         self.circle_hits = 0
         self.last_reject = None
 
     def fix(self, now=None):
-        return self.window.fix(time.monotonic() if now is None else now)
+        with self._lock:
+            return self.window.fix(time.monotonic() if now is None else now)
+
+    def coarse_fix(self, now=None):
+        """A box, roughly — from sightings taken while the camera moved.
+
+        Stops a search and aims nothing: the press and the grip are aimed by
+        fix(), which only still frames with a segmented button circle feed."""
+        with self._lock:
+            return self.coarse_window.fix(time.monotonic() if now is None else now)
 
     def to_container_pose(self, got):
         pos, yaw = got

@@ -19,8 +19,9 @@ The profile, along the path's joint-space arc length:
     acceleration allows — a shallow corner flows, a sharp one slows, a
     reversal (> reversal_deg) is a genuine stop;
   - per-joint velocity never exceeds vmax_margin x the joint limit, so the
-    executor's own gates (URDF velocity limits, per-interval continuity at
-    3 x vmax x dt) hold by construction — and refuse the goal if not.
+    gates runtime/driver.py applies before every goal (URDF velocity
+    limits, per-interval continuity at 3 x vmax x dt) hold by
+    construction — and refuse the goal if not.
 
 Guarded strokes are NOT re-timed here: their fast-then-slow warp and the
 guard's rebaseline/arm fractions are tuned to contact and stay in warp.py.
@@ -31,6 +32,8 @@ from dataclasses import dataclass
 
 import numpy as np
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+from rammp_box_opening.runtime.stamps import secs, set_stamp
 
 
 @dataclass(frozen=True)
@@ -304,10 +307,29 @@ def to_message(joint_names, positions, t, v=None):
         p.positions = [float(x) for x in positions[k]]
         p.velocities = [float(x) for x in vel[k]]
         p.accelerations = [float(x) for x in acc[k]]
-        p.time_from_start.sec = int(t[k])
-        p.time_from_start.nanosec = int(round((t[k] - int(t[k])) * 1e9))
+        set_stamp(p.time_from_start, float(t[k]))
         msg.points.append(p)
     return msg
+
+
+def _segment_start_fracs(seg, t, n_legs):
+    """Time fraction at which each input leg's samples begin.
+
+    A leg whose samples all merged away (a zero-length move) inherits the
+    previous leg's start, so the list always has one entry per input and
+    never points past the end."""
+    total = float(t[-1])
+    out = []
+    for i in range(n_legs):
+        if i == 0:
+            out.append(0.0)  # the motion starts when the goal does
+            continue
+        k = next((j for j in range(len(seg)) if seg[j] == i), None)
+        if k is None:
+            out.append(out[-1])
+        else:
+            out.append(float(t[k]) / total if total > 0 else 0.0)
+    return out
 
 
 def retime_group(trajs, speeds, vmax, params=RetimeParams()):
@@ -333,6 +355,11 @@ def retime_group(trajs, speeds, vmax, params=RetimeParams()):
         "junction_speeds": jspeeds,
         "stops": int(sum(1 for s in jspeeds if s < params.v_floor * 2)),
         "n_points": int(len(positions)),
+        # where each input leg begins as a TIME fraction of the result. A
+        # guarded descent merged behind its approach arms its torque guard
+        # here, so it watches its own regime and not the approach's
+        # dynamics (runner._run_motion).
+        "seg_start_fracs": _segment_start_fracs(seg, t, len(trajs)),
     }
     return to_message(trajs[0].joint_names, positions, t, v), info
 
@@ -347,8 +374,7 @@ def positions_to_traj(joint_names, positions):
         pt.positions = [float(v) for v in q]
         pt.velocities = [0.0] * len(q)
         pt.accelerations = [0.0] * len(q)
-        pt.time_from_start.sec = int((k + 1) * 0.02)
-        pt.time_from_start.nanosec = int(round((((k + 1) * 0.02) % 1.0) * 1e9))
+        set_stamp(pt.time_from_start, (k + 1) * 0.02)
         msg.points.append(pt)
     return msg
 
@@ -370,13 +396,12 @@ def reverse_tail(traj, progress, live, arc_rad, min_ds=2e-4):
     pts = list(traj.points)
     if len(pts) < 2:
         return None
-    end = pts[-1].time_from_start
-    total = end.sec + end.nanosec * 1e-9
+    total = secs(pts[-1].time_from_start)
     cut = total * max(0.0, min(1.0, float(progress)))
     done = [
         p
         for p in pts
-        if p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 <= cut
+        if secs(p.time_from_start) <= cut
     ]
     # cancel latency carries the arm past the last fully elapsed point
     if len(done) < len(pts):
@@ -436,11 +461,13 @@ def forward_tail(traj, live, arc_rad, min_ds=2e-4):
 
 
 def check_like_executor(msg, vmax, continuity_slack=3.0):
-    """The executor's own gates, mirrored: velocity limits, monotonic time,
-    per-interval continuity. Returns a list of problems (empty = go)."""
+    """The gates the old planner-side executor applied: velocity limits,
+    monotonic time, per-interval continuity. The kinova-gen3-ros2 driver
+    applies none of them, so runtime/driver.py runs these in front of every
+    goal. Returns a list of problems (empty = go)."""
     pos = np.asarray([[float(x) for x in p.positions] for p in msg.points])
     vel = np.asarray([[float(x) for x in p.velocities] for p in msg.points])
-    t = np.asarray([p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in msg.points])
+    t = np.asarray([secs(p.time_from_start) for p in msg.points])
     vmax = np.asarray(vmax, dtype=float)
     problems = []
     if (np.abs(vel).max(axis=0) > vmax * 1.01).any():

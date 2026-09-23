@@ -41,15 +41,17 @@ class FakeClient:
     def __init__(self):
         self.live = list(Q0)
         self.efforts = True
-        self.exec_enabled = True
+        self.armed = True  # the client's motion latch (only --execute sets it)
+        self.gripper_sent = []  # every gripper command that went out
         self.executed = []  # (n_points, speed)
         self.exec_starts = []  # first waypoint of each executed trajectory
+        self.guards = []  # the guard object each execution carried (or None)
         self.worlds_pushed = []
         self.plans = []  # scripted plan_to_* responses (FIFO), else auto
         self.exec_script = []  # scripted execute outcomes (FIFO)
-        self.tool_z = 0.08
         self.approach_offsets = []  # per plan_to_pose call
         self.joint_starts = []  # per plan_to_joints call
+        self.joint_targets = []  # the q7 each plan_to_joints was asked for
         self.contact_at = [0.45, 0.0, 0.085]  # fingertip TF at a guard trip
 
     def joints(self):
@@ -63,9 +65,6 @@ class FakeClient:
 
     def contact_xyz(self, timeout_s=0.25):
         return list(self.contact_at) if self.contact_at is not None else None
-
-    def tool_xyz(self, timeout_s=1.5):
-        return [0.45, 0.0, self.tool_z]
 
     def _plan(self, end, start):
         class R:
@@ -83,14 +82,18 @@ class FakeClient:
 
     def plan_to_joints(self, q7, start_joints):
         self.joint_starts.append(list(start_joints))
+        self.joint_targets.append([float(v) for v in q7])
         if self.plans:
             return self.plans.pop(0)
         return self._plan(list(q7), start_joints)
 
-    def execute(self, traj_, speed, guard=None, while_running=None):
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None):
         self.executed.append((len(traj_.points), speed))
         self.exec_starts.append(list(traj_.points[0].positions))
+        self.guards.append(guard)
         info_extra = {}
+        if stop_when is not None:
+            stop_when(0.5)  # the real client polls it while the motion flies
         if while_running is not None and guard is None:
             try:
                 info_extra["while_running"] = while_running()
@@ -117,10 +120,11 @@ class FakeClient:
         self.worlds_pushed.append(str(path_or_name))
         return True, "ok"
 
-    def planner_execute_enabled(self):
-        return self.exec_enabled
+    def motion_enabled(self):
+        return self.armed
 
     def gripper_send(self, position):
+        self.gripper_sent.append(float(position))
         return ("handle", float(position))
 
     def gripper_join(self, handle):
@@ -169,8 +173,7 @@ def leg(
 
 
 def runner(client, tmp_path):
-    r = Runner(client, FakeStore(), log_dir=tmp_path)
-    r.no_motion_retry_delay_s = 0.0  # production waits 3 s; tests must not
+    r = Runner(client, log_dir=tmp_path)
     return r
 
 
@@ -184,3 +187,31 @@ def ctx():
         worlds=FakeStore(),
         config_path=CFG,
     )
+
+
+def predicted_contact(ctx):
+    """Where the fingertip TF WOULD read if the touch met the button exactly
+    at the camera's estimate — the offline stand-in for a measured contact
+    (the tip-link origin sits TIP_TO_TOOL_M + TCP_OFFSET_M above the pad
+    face)."""
+    from rammp_box_opening.constants import TCP_OFFSET_M, TIP_TO_TOOL_M
+    from rammp_box_opening.models.container import from_container
+
+    button = from_container(ctx.cpose, ctx.model.button_offset)
+    return [button[0], button[1], button[2] + TCP_OFFSET_M + TIP_TO_TOOL_M]
+
+
+def build_demo_legs(ctx, cfg):
+    """The whole mission as one leg list, the way main() composes it in
+    phases — with the push starting from the predicted contact, since no
+    touch has measured one offline."""
+    from rammp_box_opening.tasks import press_demo
+
+    approach = press_demo.build_approach_leg(ctx, cfg)
+    return [
+        approach,
+        *press_demo.build_press_legs(ctx, cfg, start_joints=approach.goal_joints),
+        *press_demo.build_push_legs(ctx, cfg, predicted_contact(ctx)),
+        *press_demo.build_grip_legs(ctx, cfg),
+        *press_demo.build_place_legs(ctx, cfg),
+    ]

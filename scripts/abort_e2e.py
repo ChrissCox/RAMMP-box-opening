@@ -3,18 +3,18 @@
 
     python3 scripts/abort_e2e.py            # isolates itself on ROS_DOMAIN_ID=77
 
-RAMMP-CuRobo's abort_checks.py proves the PLANNER's Ctrl+C stops the
-controller. This proves OUR side of the same chain: a rammp_box_opening
-CLI (`home_arm --execute`) driving a STUB planner node — SIGINT mid-stroke
-must deliver an ExecuteTrajectory CANCEL to the server before the process
-exits. The failure this catches is silent and severe: with rclpy's
-default SIGINT handler the context dies before the cancel can be sent —
-the CLI stops WATCHING the arm while the trajectory runs to its end
-(verified on this stack by abort_checks; field lesson 7).
+This proves OUR side of the abort chain: a rammp_box_opening CLI
+(`home_arm --execute`) driving a STUB arm driver (scripts/stub_arm.py) with
+a stub planner beside it — SIGINT mid-stroke must deliver an
+execute_joint_trajectory CANCEL to the driver before the process exits.
+The failure this catches is silent and severe: with rclpy's default
+SIGINT handler the context dies before the cancel can be sent — the CLI
+stops WATCHING the arm while the trajectory runs to its end (field
+lesson 7).
 
 No arm, no GPU, no real planner. The harness refuses to run on a graph
-with a real controller_manager or planner (e2e_common), and audits goal
-counts (CLI-sent == stub-received) per lesson 6.
+with a real driver or planner (e2e_common), and audits goal counts
+(CLI-sent == stub-received) per lesson 6.
 """
 
 import os
@@ -37,15 +37,19 @@ def main():
     tmp = workdir("abort_e2e_")
     SH.refuse_real_stack()
 
-    stub_log = tmp / "stub.log"
+    stub_log = tmp / "arm.log"
+    plan_log = tmp / "planner.log"
     cli_log = tmp / "cli.log"
     cfg = measured_config(tmp)  # --execute refuses while measure_me is true
 
-    stub = cli = None
+    stub = planner = cli = None
     try:
-        stub = SH.spawn("exec python3 %s" % (REPO / "scripts/stub_planner.py"), stub_log)
-        if not wait_for(stub_log, "STUB READY", 30, stub, "stub"):
-            sys.exit("stub never became ready:\n" + stub_log.read_text()[-2000:])
+        stub = SH.spawn("exec python3 %s" % (REPO / "scripts/stub_arm.py"), stub_log)
+        planner = SH.spawn("exec python3 %s" % (REPO / "scripts/stub_planner.py"), plan_log)
+        if not wait_for(stub_log, "STUB ARM READY", 30, stub, "stub arm"):
+            sys.exit("stub arm never became ready:\n" + stub_log.read_text()[-2000:])
+        if not wait_for(plan_log, "STUB PLANNER READY", 30, planner, "stub planner"):
+            sys.exit("stub planner never became ready:\n" + plan_log.read_text()[-2000:])
 
         cli = SH.spawn(
             "exec ros2 run rammp_box_opening home_arm --execute --speed-scale 0.1 --container %s" % cfg,
@@ -53,8 +57,6 @@ def main():
             stdin=subprocess.PIPE,
             text=True,
         )
-        cli.stdin.write("yes\n")
-        cli.stdin.flush()
 
         if not wait_for(
             stub_log, "EXEC GOAL ACCEPTED", 60, cli, "CLI", also_dump=(cli_log,)
@@ -76,6 +78,7 @@ def main():
         time.sleep(1.0)  # let the stub's goal loop notice and log
     finally:
         kill(cli)
+        kill(planner)
         kill(stub)
 
     said = stub_log.read_text()
@@ -85,7 +88,7 @@ def main():
 
     cancelled = "CANCEL RECEIVED" in said and "STOPPED at" in said
     completed = "RAN TO COMPLETION" in said
-    sent = cli_said.count("Type 'yes'")  # one prompt == one run attempt
+    sent = cli_said.count("EXECUTING (human on the physical e-stop")  # one line == one run attempt
     execs = said.count("EXEC GOAL ACCEPTED")
     audit_ok = execs == 1 and sent == 1
     # a cancel that escapes as the context dies is LUCK, not ownership:

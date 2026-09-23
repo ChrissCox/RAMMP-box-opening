@@ -3,9 +3,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from rammp_box_opening.runtime.guards import (
     TorqueGuard,
-    classify_press,
     in_band,
-    press_outcome,
     sanity_violations,
 )
 
@@ -57,18 +55,6 @@ def test_sanity_gate_wrap_aware():
     assert sanity_violations(t, margin_rad=0.35) == []
 
 
-def test_press_classification():
-    window = (0.004, 0.012)
-    assert classify_press(0.008, window) == "pressed"
-    assert classify_press(0.001, window) == "rim"
-    ok, detail = press_outcome("touch", 0.008, window)
-    assert ok
-    ok, detail = press_outcome("touch", 0.001, window)
-    assert not ok and "rim" in detail
-    ok, detail = press_outcome("arrived", None, window)  # bottomed out, no click
-    assert not ok
-
-
 def test_in_band():
     assert in_band(0.6, (0.55, 0.75))
     assert not in_band(0.8, (0.55, 0.75))  # closed on air
@@ -93,3 +79,34 @@ def test_time_fraction_conversion_tracks_the_path_not_the_clock():
     assert time_fraction_at_path_fraction(
         _traj([[0.0]], dt=1.0), 0.42
     ) == pytest.approx(0.42)
+
+
+def test_a_trip_says_what_tripped_it():
+    """Bench 2026-09-21 13:10: a false trip 87 mm above the button, and the
+    log's only number — "torque_peak 12.9" against a 3 Nm threshold — was
+    the deviation from the GROUP-START baseline, seen long before the guard
+    re-took its baseline and armed. Nothing said which joint, how far from
+    the baseline in force, or how soon after it was taken. A trip now
+    carries that, and the peak is measured from the baseline in force."""
+    g = TorqueGuard(3.0, rebaseline_after=0.5, arm_after=0.5)
+    g.on_progress(0.1)
+    assert not g.on_efforts([10.0, 1.0, 1.0, 1.0])
+    assert not g.on_efforts([22.0, 1.0, 1.0, 1.0])  # 12 Nm of free-air dynamics, unarmed
+    assert g.peak == pytest.approx(12.0)
+    g.on_progress(0.5)  # the baseline is re-taken here, and the guard arms
+    assert not g.on_efforts([20.0, 1.0, 1.0, 1.0])
+    assert g.peak == 0.0  # ... so the peak starts again with it
+    assert not g.on_efforts([20.5, 1.0, 2.0, 1.0])
+    assert g.trip_report() is None
+    g.on_progress(0.52)
+    assert g.on_efforts([20.4, 1.0, 4.6, 1.0])
+    assert g.peak == pytest.approx(3.6)
+    rep = g.trip_report()
+    assert rep["joint"] == 2 and rep["dev_nm"] == pytest.approx(3.6)
+    assert rep["baseline"] == [20.0, 1.0, 1.0, 1.0] and rep["efforts"] == [20.4, 1.0, 4.6, 1.0]
+    assert rep["baseline_at_progress"] == pytest.approx(0.5) and rep["progress"] == pytest.approx(0.52)
+    assert rep["baseline_age_s"] >= 0.0
+    # the run-up to the trip: (seconds before the trip, progress, efforts), newest last
+    assert rep["recent"][-1][1:] == [0.52, 20.4, 1.0, 4.6, 1.0]
+    assert rep["recent"][-1][0] == pytest.approx(0.0, abs=1e-3)
+    assert len(rep["recent"]) == 5

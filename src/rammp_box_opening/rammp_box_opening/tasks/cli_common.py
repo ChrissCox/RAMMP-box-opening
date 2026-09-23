@@ -1,12 +1,15 @@
 """Shared CLI plumbing: args, node/client/runner wiring, safety refusals.
 
-Dry-run is the default for every CLI. --execute additionally requires the
-typed 'yes' inside Runner.run (press_demo opts out: --execute alone arms
-it), the planner's own execute:=true for MOTION legs, and a measured
-container config (measure_me: false).
+Dry-run is the default for every CLI. --execute arms the client — the
+only software gate on motion, since the kinova-gen3-ros2 driver executes
+whatever it is sent — and requires a measured container config
+(measure_me: false). There is no typed confirmation (owner, 2026-09-16):
+the human on the physical e-stop is the gate. Every CLI refuses to start
+off Cyclone DDS, the middleware sheppy's driver and planner containers speak.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -17,6 +20,7 @@ from rammp_box_opening.models.container import ContainerModel
 from rammp_box_opening.primitives.core import Ctx
 from rammp_box_opening.runtime.abort import AbortFlag, install_sigint
 from rammp_box_opening.runtime.client import PlannerClient
+from rammp_box_opening.runtime.driver import rmw_refusal
 from rammp_box_opening.runtime.runner import Runner
 from rammp_box_opening.worlds import WorldStore
 
@@ -28,7 +32,11 @@ def _share_path(*parts):
 
 
 def default_container_yaml():
-    return str(_share_path("config", "containers", "oxo_pop.yaml"))
+    """The container every CLI and both OWL detector nodes fall back to:
+    the round clear canister with the pink push-button lid (owner,
+    2026-09-22: "this box is the new default"). The OXOs stay selectable
+    with --container."""
+    return str(_share_path("config", "containers", "ankou_pink.yaml"))
 
 
 def default_bench_yaml():
@@ -42,15 +50,14 @@ def make_parser(desc):
     ap.add_argument(
         "--execute",
         action="store_true",
-        help="after previewing, offer to execute (planner must be launched "
-        "with execute:=true for arm motion; NOTE: gripper closes go over "
-        "the direct gripper action — the runner refuses them while the "
-        "planner is dry-run, planner dry-run alone does not prevent them)",
+        help="after previewing, execute: arms arm AND gripper motion on the "
+        "kinova-gen3-ros2 driver (without it nothing is ever sent to it)",
     )
     ap.add_argument(
         "--container",
         default=None,
-        help="container config YAML (default: installed oxo_pop.yaml)",
+        help="container config YAML (default: installed ankou_pink.yaml, the pink canister; "
+        "oxo_pop.yaml / oxo_pop_small.yaml are the OXOs)",
     )
     ap.add_argument(
         "--bench-world",
@@ -67,8 +74,13 @@ def make_parser(desc):
     return ap
 
 
-def refuse_unmeasured(model, execute):
-    if execute and model.measure_me:
+def refuse_unmeasured(model, execute, measuring=False):
+    """An unmeasured container (measure_me: true — geometry estimated, not
+    taped) may not be flown at. `measuring` is the observation that
+    measures it (press_demo --detect-only: the look pose and home, in the
+    bench world above the keep-out band, never near the container), which
+    the flag must not lock out (2026-09-22: it did)."""
+    if execute and model.measure_me and not measuring:
         sys.exit(
             "container config still carries measure_me: true — run the "
             "measurement worksheet (docs/HARDWARE_BRINGUP.md) and flip it "
@@ -76,17 +88,25 @@ def refuse_unmeasured(model, execute):
         )
 
 
-def init_runtime():
+def init_runtime(execute):
     """rclpy + SIGINT ownership + node + client, shared by every CLI.
+
+    `execute` (the --execute flag) arms the client; nothing else does.
+    A shell off Cyclone is refused before rclpy is touched: Fast DDS
+    discovers the driver and planner containers and then loses their data,
+    which reads as a stalled arm instead of a wiring error.
 
     Owning SIGINT means an in-flight stroke gets its cancel delivered on
     a live context before we exit (runtime/abort.py; proven by
     scripts/abort_e2e.py — rclpy's default handler makes it a race)."""
+    why = rmw_refusal(os.environ)
+    if why:
+        sys.exit(why)
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     abort = AbortFlag()
     install_sigint(abort)
     node = rclpy.create_node("rammp_box_opening")
-    return node, PlannerClient(node, abort=abort)
+    return node, PlannerClient(node, abort=abort, motion_enabled=bool(execute))
 
 
 def build_ctx(args):
@@ -96,7 +116,7 @@ def build_ctx(args):
     bench = args.bench_world or default_bench_yaml()
     model = ContainerModel.load(cfg)
     refuse_unmeasured(model, args.execute)
-    node, client = init_runtime()
+    node, client = init_runtime(args.execute)
     ctx = Ctx(
         model=model,
         cpose=None,
@@ -104,8 +124,7 @@ def build_ctx(args):
         worlds=WorldStore(bench),
         config_path=cfg,
     )
-    runner = Runner(client, ctx.worlds)
-    return ctx, runner
+    return ctx, Runner(client)
 
 
 def apply_speed_scale(runner, args):

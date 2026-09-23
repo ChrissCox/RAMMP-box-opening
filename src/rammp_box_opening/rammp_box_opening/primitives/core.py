@@ -10,11 +10,11 @@ the world it was planned against, so pose-relative primitives (Lift,
 Retreat) need no pose argument of their own.
 """
 
-import math
 import time
 from dataclasses import dataclass
 
 from rammp_box_opening.constants import (
+    JOINTS,
     JOINT_ARC_PER_M,
     JOINT_VMAX,
     TCP_OFFSET_M,
@@ -24,8 +24,7 @@ from rammp_box_opening.constants import (
     HOME,
     TRANSIT_SPEED,
 )
-from rammp_box_opening.models.container import attitude_quat, from_container
-from rammp_box_opening.models.container import wrist_flat_quat
+from rammp_box_opening.models.container import from_container
 from rammp_box_opening.runtime.guards import (
     GuardSpec,
     in_band,
@@ -81,10 +80,6 @@ def tcp_z(z):
     return float(z) + TCP_OFFSET_M
 
 
-def hover_above(xyz, standoff):
-    return [xyz[0], xyz[1], xyz[2] + standoff]
-
-
 def band_verify(band):
     """Grip-band check with an honest fallback when no gripper state exists."""
 
@@ -109,18 +104,23 @@ def _full_world(ctx, tag=""):
     )
 
 
-def _interaction_world(ctx, target_xyz, contact_z, depth_max, tag, ring=True):
+def _interaction_world(ctx, contact_z, depth_max, tag):
     return ctx.worlds.push_name(
         "interaction",
         model=ctx.model,
         cpose=ctx.cpose,
-        target_xyz=target_xyz,
         contact_z=contact_z,
         depth_max=depth_max,
         lid_at=ctx.lid_at,
         tag=tag,
-        ring=ring,
     )
+
+
+def descent_index(plan):
+    """Index into a plan's trajectory where its vertical final descent
+    begins (its approach waypoint), or None for a plan without one."""
+    wp = getattr(plan, "waypoint", None)
+    return None if wp is None else int(wp[0])
 
 
 def _plan_motion(
@@ -184,6 +184,10 @@ def _plan_motion(
             "planning failed for %s: %s"
             % (name, getattr(plan, "message", "no response"))
         )
+    if "PLANNER descent" in str(getattr(plan, "message", "")):
+        # the straight final stretch was refused and the planner's own
+        # (bowing) plan flies instead — say so, a press may land off-centre
+        print("  NOTE %s: %s" % (name, plan.message))
     end = list(plan.trajectory.points[-1].positions)
     leg = Leg(
         name=name,
@@ -199,6 +203,8 @@ def _plan_motion(
         verify=verify,
         plan_s=plan_s,
         plan_server_s=getattr(plan, "planning_time", None),
+        waypoint=getattr(plan, "waypoint", None),
+        guard_from=descent_index(plan),
     )
     if guard is not None:
         # from here on the box may not be exactly where it was detected —
@@ -240,31 +246,23 @@ def _gripper_leg(
 
 
 class Lift:
-    """Planned ascent by dz; re-checks the grip band afterward (slip)."""
+    """Planned ascent by dz from the last commanded pose. No grip-band check
+    here: a verify would close the lift's merge group and cost a dead stop
+    before the carry — the slip check sits at the set-down (Place)."""
 
-    def __init__(self, dz, band=None, name="lift", speed=CONTACT_SPEED):
+    def __init__(self, dz, name="lift", speed=CONTACT_SPEED):
         self.dz = float(dz)
-        self.band = band
         self.name = name
         self.speed = float(speed)
 
     def plan(self, ctx, state):
-        if ctx.last_pose is not None:
-            xyz, quat = ctx.last_pose
-        else:  # isolated CLI use: straight up from wherever the tool is
-            xyz = ctx.client.tool_xyz() or [0.45, 0.0, 0.2]
-            quat = wrist_flat_quat(xyz)
+        if ctx.last_pose is None:
+            raise RuntimeError("lift needs a preceding pose-directed leg")
+        xyz, quat = ctx.last_pose
         target = [xyz[0], xyz[1], xyz[2] + self.dz]
         world = ctx.last_world or _full_world(ctx)
-        verify = band_verify(self.band) if self.band is not None else None
         leg, state = _plan_motion(
-            ctx,
-            state,
-            self.name,
-            ("pose", target, list(quat)),
-            world,
-            self.speed,
-            verify=verify,
+            ctx, state, self.name, ("pose", target, list(quat)), world, self.speed
         )
         return [leg], state
 
@@ -274,13 +272,16 @@ class Place:
     model a held object), guarded descent where a trip = set-down, then
     open the gripper (spec §5, §6)."""
 
-    def __init__(
-        self, target_xyz, quat, open_after=True, name="place", speed=None, touch_nm=None
-    ):
+    def __init__(self, target_xyz, quat, name="place", speed=None, touch_nm=None, band=None):
         self.target_xyz = list(target_xyz)
         self.quat = list(quat)
-        self.open_after = open_after
         self.name = name
+        # grip band to re-check at the bottom, right before the release:
+        # the LAST moment at which still holding the thing is checkable,
+        # and the moment it matters. The lift used to carry this check,
+        # which cost a dead stop between the lift and the carry every run
+        # (they are otherwise one continuous motion).
+        self.band = None if band is None else tuple(band)
         # descent speed; None keeps the conservative contact default for
         # callers that predate the config knob (tests, isolated CLI use)
         self.speed = CONTACT_SPEED if speed is None else float(speed)
@@ -297,10 +298,9 @@ class Place:
         lid-height below the fingertips and the planner cannot see it, so
         the carry must clear the container body even directly overhead."""
         m = ctx.model
-        hover = hover_above(list(target_xyz), m.hover_standoff + m.lid_dims[2])
         carry_floor = ctx.cpose.xyz[2] + m.dims[2] + m.lid_dims[2] + CARRY_CLEAR_M
-        hover[2] = max(hover[2], tcp_z(carry_floor))
-        return hover
+        z = max(target_xyz[2] + m.hover_standoff + m.lid_dims[2], tcp_z(carry_floor))
+        return [target_xyz[0], target_xyz[1], z]
 
     def plan(self, ctx, state):
         m = ctx.model
@@ -315,21 +315,12 @@ class Place:
             TRANSIT_SPEED,
         )
         world = _interaction_world(
-            ctx,
-            self.target_xyz,
-            self.target_xyz[2],
-            SETDOWN_OVERDRIVE_M,
-            self.name,
-            # ring walls collide with the gripper body at hover heights
-            # (empirical 2026-08-25; bit the lid set-down's start state
-            # live 2026-08-26 — INVALID_START_STATE at the hover)
-            ring=False,
+            ctx, self.target_xyz[2], SETDOWN_OVERDRIVE_M, self.name
         )
         ctx.last_world = world
         guard = GuardSpec(
             touch_nm=m.touch_nm if self.touch_nm is None else float(self.touch_nm),
             trip="setdown",
-            target_z=self.target_xyz[2],
             # contact is only possible at the stroke's very end — the
             # fast segment's dynamics must not trip the gentler set-down
             # threshold (lid released 110 mm up, field 2026-09-02)
@@ -337,6 +328,11 @@ class Place:
         )
 
         def verify(v):
+            slipped = (
+                self.band is not None
+                and v.gripper_pos is not None
+                and not in_band(v.gripper_pos, self.band)
+            )
             if v.outcome == "touch":
                 if v.progress is not None and v.progress < 0.5:
                     return False, (
@@ -344,9 +340,21 @@ class Place:
                         "something on the way down, set-down NOT confirmed"
                         % (v.progress * 100)
                     )
+                if slipped:
+                    return False, (
+                        "felt a surface but the fingers read %.3f, outside "
+                        "%s — the lid slipped on the way here and this is "
+                        "the table, not the lid" % (v.gripper_pos, list(self.band))
+                    )
                 peak = "" if v.torque_peak is None else " at %.1f Nm" % v.torque_peak
                 return True, "surface felt%s — set down" % peak
             if v.outcome == "arrived":
+                if slipped:
+                    return False, (
+                        "never felt the surface and the fingers read %.3f, "
+                        "outside %s — the lid slipped"
+                        % (v.gripper_pos, list(self.band))
+                    )
                 return False, (
                     "full stroke with no trip — never felt the surface, "
                     "set-down NOT confirmed"
@@ -374,24 +382,66 @@ class Place:
             invalidates=True,
             verify=verify,
         )
-        legs = [transit, descend]
-        if self.open_after:
-            legs.append(
-                _gripper_leg(
-                    ctx,
-                    state,
-                    self.name + ":open",
-                    GRIPPER_CMD_OPEN,
-                    world,
-                    # dispatched at once; the retreat's post-touch replan
-                    # runs while the fingers open and the join lands right
-                    # before that retreat executes — a release still
-                    # completes before the arm moves away (audit 2026-09-02)
-                    defer_join=True,
-                    join_before_motion=True,
-                )
-            )
-        return legs, state
+        release = _gripper_leg(
+            ctx,
+            state,
+            self.name + ":open",
+            GRIPPER_CMD_OPEN,
+            world,
+            # dispatched at once; the retreat's post-touch replan runs while
+            # the fingers open and the join lands right before that retreat
+            # executes — a release still completes before the arm moves
+            # away (audit 2026-09-02)
+            defer_join=True,
+            join_before_motion=True,
+        )
+        return [transit, descend, release], state
+
+
+class LiftFree:
+    """A plan-free STRAIGHT vertical move from the live joints: the arm's own
+    kinematics (runtime/kinematics), no planner. The recovery the bringup
+    guide used to call "jog clear by hand first": a pose the planner
+    refuses as a start (fingers at the table after an abort or a jog) is
+    lifted straight up — away from the only thing it can be in — until the
+    planner accepts it. Guarded as an obstruction trip: anything met on
+    the way UP is a failure, never pushed through. The attitude is held."""
+
+    def __init__(self, dz, name="lift-free", speed=None, touch_nm=4.0):
+        self.dz = float(dz)
+        self.name = name
+        self.speed = CONTACT_SPEED if speed is None else float(speed)
+        self.touch_nm = float(touch_nm)
+
+    def plan(self, ctx, state):
+        from rammp_box_opening.runtime.approach import _chain, line_trajectory
+        from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
+
+        chain = _chain()
+        q0 = list(state.joints if state.joints is not None else ctx.client.joints())
+        R, t = chain.fk(q0)
+        quat = mat_to_quat_xyzw(R)
+        end_xyz = [float(t[0]), float(t[1]), float(t[2]) + self.dz]
+        pts, why = chain.straight_line(q0, end_xyz, quat)
+        if pts is None:
+            raise RuntimeError("plan-free lift refused: %s" % why)
+        world_name, world_path = ctx.worlds.push_name("bench", model=None, tag="bare")
+        guard = GuardSpec(touch_nm=self.touch_nm, trip="obstruction")
+        leg = Leg(
+            name=self.name,
+            kind=Kind.MOTION,
+            traj=line_trajectory(JOINTS, pts),
+            speed=self.speed,
+            guard=guard,
+            world=world_name,
+            world_path=str(world_path),
+            chain=state.chain,
+            target=("pose", end_xyz, list(quat)),
+            goal_joints=[float(v) for v in pts[-1]],
+            plan_s=0.0,
+        )
+        ctx.last_pose = (end_xyz, list(quat))
+        return [leg], PlanState(joints=list(leg.goal_joints), chain=state.chain + 1)
 
 
 class Retreat:
@@ -426,51 +476,39 @@ class Retreat:
         return [leg], state
 
 
-def press_stroke(ctx, state, cfg, name, approach_offset_m, contact_path_frac):
-    """ONE guarded stroke to travel_m below the button: the press the
-    mission runs, whether it starts at staging (PressFixed) or merged
-    with the descent from the scan pose (press_demo). Returns (leg, state).
+# The last stretch of every press comes STRAIGHT down this far: a diagonal
+# descent touches the button before its lateral convergence finishes (10 mm
+# off-centre at 20 mm height from a 199 mm start — the edge presses of
+# 2026-09-01). runtime/approach.py builds it as the arm's own straight line.
+PRESS_APPROACH_M = 0.06
 
-    The guard arms in free air during the descent. A trip counts as
-    "pressed" only near where contact is EXPECTED — a trip well above the
-    button means the stroke struck something else, and reports as the
-    failure it is. Full travel with no trip also counts as pressed.
 
-    `contact_path_frac` is where along the stroke's PATH contact is
-    expected — but v.progress is a TIME fraction, and the two differ
-    because cuRobo's profile is not constant-speed (live trips landed at
-    0.826/0.835 against a 0.739 floor: 0.087 of margin, less than any
-    velocity-profile change would move it). The conversion needs the
-    trajectory, so it lives in leg.retime: called here on the planned
-    one, by the Runner on every replan, and by a caller that re-times the
-    stroke (a warp changes the time base) after setting
-    leg.contact_path_frac to its own expectation.
+def press_stroke(ctx, state, cfg, name="press:down"):
+    """The TOUCH: one guarded stroke from staging toward travel_m below the
+    button, stopping at first contact (cfg.contact_nm). Returns (leg, state).
 
-    approach_offset_m constrains the final stretch VERTICAL: a diagonal
-    descent touches the button before its lateral convergence finishes
-    (10 mm off-centre at 20 mm height from a 199 mm start — the edge
-    presses of 2026-09-01); the constrained plan measures 0.0-0.3 mm
-    there, and contact happens travel_m above the goal, well inside it.
-    """
+    A single hard stroke pressed the button flush and then compressed the
+    whole container until the torque built up (video, 2026-09-03): a force
+    the button can only produce by bottoming out must not be what ends the
+    stroke. So this stage only FINDS the surface — the arm's fingertip TF
+    at the trip is the button's true top — and press_push completes the
+    press a bounded distance from there.
+
+    A trip counts only near where contact is EXPECTED: one well above the
+    button struck something else, and full travel with no trip found no
+    surface. Both are failures. Contact is expected after
+    staging/(staging+travel) of the stroke's PATH, but execution progress
+    is a TIME fraction and the two differ on any real velocity profile —
+    so the expectation lives in leg.retime, re-evaluated on whatever
+    trajectory actually flies (a replan, a merged group's profile)."""
     m = ctx.model
     button = from_container(ctx.cpose, m.button_offset)
-    quat = attitude_quat(m.press_attitude_rpy_deg, math.atan2(button[1], button[0]))
-    # ring=False: the aperture walls collide with the gripper body at
-    # these heights (live IK_FAIL, margin probe 2026-08-25); the descent
-    # comes from directly overhead
-    world = _interaction_world(ctx, button, button[2], cfg.travel_m, "button", ring=False)
+    quat = m.press_quat(button)
+    world = _interaction_world(ctx, button[2], cfg.travel_m, "button")
     ctx.last_world = world
-    # The TOUCH stage: a light threshold that stops at first contact. The
-    # press is then completed by press_push, a bounded distance from the
-    # contact the arm's own fingertip TF measured. A single 7 Nm stroke
-    # pressed the button flush and then compressed the container until
-    # the torque built up (video, 2026-09-03): a force the button can only
-    # produce by bottoming out must not be what ends the stroke.
     guard = GuardSpec(
         touch_nm=cfg.contact_nm,
         trip="touch",
-        depth_window=(0.0, cfg.travel_m),
-        target_z=button[2],
         # a light threshold must not judge the launch transient; a warped
         # caller raises this to its slow-zone rebaseline (_apply_warp)
         arm_after=0.25,
@@ -508,7 +546,7 @@ def press_stroke(ctx, state, cfg, name, approach_offset_m, contact_path_frac):
         ctx,
         state,
         name,
-        ("pose", target, quat, approach_offset_m),
+        ("pose", target, quat, PRESS_APPROACH_M),
         world,
         cfg.press_speed,
         guard=guard,
@@ -521,7 +559,7 @@ def press_stroke(ctx, state, cfg, name, approach_offset_m, contact_path_frac):
         # must follow the one actually flown (review 2026-09-02)
         expect["frac"] = time_fraction_at_path_fraction(traj, press.contact_path_frac)
 
-    press.contact_path_frac = float(contact_path_frac)
+    press.contact_path_frac = cfg.staging_m / (cfg.staging_m + cfg.travel_m)
     press.retime = retime
     retime(press.traj)
     return press, state
@@ -541,12 +579,12 @@ def press_push(ctx, state, cfg, contact_xyz, world, name="press:push"):
     """
     m = ctx.model
     button = from_container(ctx.cpose, m.button_offset)
-    quat = attitude_quat(m.press_attitude_rpy_deg, math.atan2(button[1], button[0]))
+    quat = m.press_quat(button)
     tip_z = float(contact_xyz[2])
     tool_at_contact = tip_z - TIP_TO_TOOL_M
     bottom = tool_at_contact - cfg.button_travel_m
     xy = ctx.last_pose[0][:2] if ctx.last_pose else [button[0], button[1]]
-    guard, verify = _push_guard_and_verify(m, cfg, tool_at_contact)
+    guard, verify = _push_guard_and_verify(m, cfg)
 
     return _plan_motion(
         ctx,
@@ -561,13 +599,8 @@ def press_push(ctx, state, cfg, contact_xyz, world, name="press:push"):
     )
 
 
-def _push_guard_and_verify(m, cfg, tool_at_contact):
-    guard = GuardSpec(
-        touch_nm=max(0.5, m.touch_nm - cfg.contact_nm),
-        trip="press",
-        depth_window=(0.0, cfg.button_travel_m),
-        target_z=tool_at_contact,
-    )
+def _push_guard_and_verify(m, cfg):
+    guard = GuardSpec(touch_nm=max(0.5, m.touch_nm - cfg.contact_nm), trip="press")
 
     def verify(v):
         mm = cfg.button_travel_m * 1000
@@ -609,9 +642,9 @@ def press_push_from_touch(ctx, state, cfg, touch_leg, live, contact_xyz, world):
         RetimeParams(),
     )
     tool_at_contact = float(contact_xyz[2]) - TIP_TO_TOOL_M
-    guard, verify = _push_guard_and_verify(m, cfg, tool_at_contact)
+    guard, verify = _push_guard_and_verify(m, cfg)
     button = from_container(ctx.cpose, m.button_offset)
-    quat = attitude_quat(m.press_attitude_rpy_deg, math.atan2(button[1], button[0]))
+    quat = m.press_quat(button)
     xy = ctx.last_pose[0][:2] if ctx.last_pose else [button[0], button[1]]
     world_name, world_path = world
     leg = Leg(
@@ -632,34 +665,10 @@ def press_push_from_touch(ctx, state, cfg, touch_leg, live, contact_xyz, world):
     return leg, PlanState(joints=list(path[-1]), chain=state.chain + 1)
 
 
-class PressFixed:
-    """Owner-simplified press v2 (2026-08-25): ONE guarded stroke from the
-    staging pose straight to travel_m below the lid plane — the hover
-    waypoint is gone (owner: fewer pauses; the gripper closes during the
-    approach instead). Contact is expected after staging/(staging+travel)
-    of the stroke's path (see press_stroke)."""
-
-    def __init__(self, cfg, name="press"):
-        self.cfg = cfg
-        self.name = name
-
-    def plan(self, ctx, state):
-        cfg = self.cfg
-        press, state = press_stroke(
-            ctx,
-            state,
-            cfg,
-            self.name + ":down",
-            0.06,
-            cfg.staging_m / (cfg.staging_m + cfg.travel_m),
-        )
-        return [press], state
-
-
 class Home:
-    """Return to the rest joints (factory HOME, or PARK when the mission
-    rests tool-down) via plan_to_joints (spec §5). Lazy when it follows a
-    lazy retreat (its start is unknown until then)."""
+    """Return to the rest joints (factory HOME, or the look pose when the
+    mission rests tool-down) via plan_to_joints (spec §5). Lazy when it
+    follows a lazy retreat (its start is unknown until then)."""
 
     def __init__(self, joints=None):
         self.joints = list(HOME if joints is None else joints)

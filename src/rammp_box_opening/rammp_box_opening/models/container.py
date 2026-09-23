@@ -1,9 +1,8 @@
 """Container model: every mission target derives from this + a detected pose.
 
-Attitudes: transit poses use the wrist-flat family (Rz(bearing) ⊗ q_home,
-spec §3); contact legs use the press attitude from the container config
-(default top-down [180, 0, 0] rpy — wrist-flat tool z is HORIZONTAL, which
-cannot press a lid button from above), steered to the target's bearing.
+Every pose-directed leg uses the press attitude from the container config
+(top-down: the tool z must point at the lid to press its button), either
+fixed in the world or steered to the target's bearing (press_yaw_steer).
 """
 
 import math
@@ -11,9 +10,11 @@ from dataclasses import dataclass
 
 import yaml
 
+from rammp_box_opening.primitives.look import SWEEP_RAD
+
 from rammp_curobo.geometry import euler_deg_to_quat_xyzw, yaw_about_world_z
 
-from rammp_box_opening.constants import WRIST_FLAT_XYZW
+from rammp_box_opening.constants import TRANSIT_SPEED
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,19 @@ class ContainerModel:
     press_attitude_rpy_deg: tuple
     hover_standoff: float  # carry/set-down hover above a target (Place)
     measure_me: bool
+    # True: the attitude's yaw is steered to the box's bearing from the base
+    # (the "bearing family" of 2026-08-25). False: the attitude is FIXED in
+    # the world, whatever the box's bearing — the wrist then keeps one
+    # orientation from LOOK through approach and press instead of turning
+    # up to 105 deg on the way to staging (owner, 2026-09-16: "the arm
+    # keeps flipping"). Reach checked on the live planner: 20/20 positions
+    # over the table, from HOME and from LOOK, straight descents everywhere.
+    press_yaw_steer: bool = True
+
+    def press_quat(self, xyz):
+        """The press/grip/place attitude at a base-frame point (xyzw)."""
+        yaw = math.atan2(float(xyz[1]), float(xyz[0])) if self.press_yaw_steer else 0.0
+        return attitude_quat(self.press_attitude_rpy_deg, yaw)
 
     @classmethod
     def load(cls, path):
@@ -46,6 +60,7 @@ class ContainerModel:
             press_attitude_rpy_deg=tuple(raw["press_attitude_rpy_deg"]),
             hover_standoff=float(raw["hover_standoff"]),
             measure_me=bool(raw.get("measure_me", True)),
+            press_yaw_steer=bool(raw.get("press_yaw_steer", True)),
         )
 
 
@@ -58,12 +73,6 @@ def from_container(cpose, offset):
         cpose.xyz[1] + s * ox + c * oy,
         cpose.xyz[2] + oz,
     ]
-
-
-def wrist_flat_quat(xyz):
-    """Transit attitude: wrist-flat, steered to the point's bearing (xyzw)."""
-    bearing = math.atan2(xyz[1], xyz[0])
-    return list(yaw_about_world_z(WRIST_FLAT_XYZW, bearing))
 
 
 def attitude_quat(rpy_deg, yaw):
@@ -84,9 +93,11 @@ class PressDemoCfg:
     travel_m: float  # how far below the estimated button the TOUCH may search
     contact_nm: float  # first-contact threshold of the touch stage
     button_travel_m: float  # the bounded push from the measured contact
+    push_hold_s: float  # held on the button after a good push, before the recoil
     press_speed: float
     staging_m: float  # full-world approach height above the button
     scan_xyz: tuple
+    search_arc_rad: float  # base-yaw half-arc the sweep pans each way
     timeout_s: float
     min_hits: int
     tol_m: float
@@ -99,11 +110,11 @@ class PressDemoCfg:
     grip_hop_m: float  # retreat height above the plane between press and grip
     setdown_speed: float  # guarded set-down; the trip IS the success
     setdown_touch_nm: float  # set-down trip threshold (gentler than the press)
-    park_tool_down: bool  # rest at the scan pose between runs, not factory HOME
+    park_tool_down: bool  # rest at the LOOK pose between runs, not factory HOME
     require_button_circle: bool  # only button-circle sightings may commit a fix
+    confirm_in_flight: bool  # the wrist confirms the box DURING the approach; no stop
+    recentre_max_moves: int  # moves over the button at staging before pressing (0: aim once, press)
     press_offset_xy: tuple  # base-frame trim of the press target (m)
-    merge_press: bool  # one continuous motion instead of approach+stop+press
-    merge_press_max_lateral_m: float  # xy limit for allowing the merge
     warp_fast_speed: float  # free-air scale of a warped descent
     warp_slow_frac: float  # final path fraction at contact speed
     grip_clear_m: float  # fingertip stop height above the lid plane
@@ -128,9 +139,11 @@ def load_press_demo(path):
         travel_m=float(pd["travel_m"]),
         contact_nm=float(raw["press"].get("contact_nm", 3.0)),
         button_travel_m=float(raw["press"].get("button_travel_m", 0.004)),
+        push_hold_s=float(raw["press"].get("push_hold_s", 0.0)),
         press_speed=float(pd["speed"]),
         staging_m=float(pd["staging_m"]),
         scan_xyz=tuple(raw["scan"]["xyz"]),
+        search_arc_rad=float(raw["scan"].get("search_arc_rad", SWEEP_RAD)),
         timeout_s=float(raw["detect"]["timeout_s"]),
         min_hits=int(raw["detect"]["min_hits"]),
         tol_m=float(raw["detect"]["tol_m"]),
@@ -147,12 +160,10 @@ def load_press_demo(path):
         require_button_circle=bool(
             raw["detect"].get("require_button_circle", True)
         ),
+        confirm_in_flight=bool(raw["detect"].get("confirm_in_flight", False)),
+        recentre_max_moves=int(raw["detect"].get("recentre_max_moves", 2)),
         press_offset_xy=tuple(
             float(v) for v in raw["open_box"].get("press_offset_xy", [0.0, 0.0])
-        ),
-        merge_press=bool(raw["open_box"].get("merge_press", False)),
-        merge_press_max_lateral_m=float(
-            raw["open_box"].get("merge_press_max_lateral_m", 0.05)
         ),
         warp_fast_speed=float(raw["open_box"].get("warp_fast_speed", 0.0)),
         warp_slow_frac=float(raw["open_box"].get("warp_slow_frac", 0.3)),
@@ -190,6 +201,8 @@ def load_press_demo(path):
         )
     if not 0.001 <= cfg.button_travel_m <= 0.015:
         raise ValueError("press.button_travel_m must be 1-15 mm (the button's own travel)")
+    if not 0.0 <= cfg.push_hold_s <= 2.0:
+        raise ValueError("press.push_hold_s must be 0-2 s")
     if not 0.0 <= cfg.grip_clear_m <= 0.02:
         raise ValueError(
             "open_box.grip_clear_m must be in [0, 0.02] m — 0 puts the "
@@ -216,21 +229,23 @@ def load_press_demo(path):
                 "open_box.%s must be in (0, 0.5] — contact/carry legs are "
                 "guard-limited, not transit legs" % field
             )
-    if cfg.warp_fast_speed and not 0.0 < cfg.warp_fast_speed <= 0.6:
+    # The free-air part of a guarded descent may run as fast as a transit
+    # leg, and no faster: past TRANSIT_SPEED the arm would be moving quicker
+    # toward something it is about to touch than it ever moves in the open.
+    # The bound was 0.6 and was raised to 0.75 with it (owner, 2026-09-15),
+    # which is where the chained press approach already cruises.
+    if cfg.warp_fast_speed and not 0.0 < cfg.warp_fast_speed <= TRANSIT_SPEED:
         raise ValueError(
-            "open_box.warp_fast_speed must be in (0, 0.6] — the free-air part "
-            "of a GUARDED descent, not a transit leg"
-        )
-    if not 0.0 < cfg.merge_press_max_lateral_m <= 0.35:
-        raise ValueError(
-            "open_box.merge_press_max_lateral_m must be in (0, 0.35] — past "
-            "the camera's own scan footprint the box could not have been "
-            "seen, and the merged solve plans in the reduced world"
+            "open_box.warp_fast_speed must be in (0, %g] — the free-air part "
+            "of a GUARDED descent, never faster than a transit leg"
+            % TRANSIT_SPEED
         )
     if not 0.0 < cfg.warp_slow_frac < 1.0:
         raise ValueError("open_box.warp_slow_frac must be in (0, 1)")
     if cfg.detect_source not in ("depth", "vlm"):
         raise ValueError("detect.source must be 'depth' or 'vlm'")
+    if not 0 <= int(raw["detect"].get("recentre_max_moves", 2)) <= 5:
+        raise ValueError("detect.recentre_max_moves must be 0-5")
     bad = set(cfg.vlm_backends) - {"owl", "claude"}
     if bad or (cfg.detect_source == "vlm" and not cfg.vlm_backends):
         raise ValueError("vlm.backends must be a non-empty subset of ['owl', 'claude']")

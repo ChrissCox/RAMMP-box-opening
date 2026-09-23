@@ -8,6 +8,7 @@ detector's own math.
 """
 
 import math
+import time
 
 import numpy as np
 import pytest
@@ -106,13 +107,67 @@ def test_wrong_size_plateau_is_rejected(model):
     assert fix is None and "footprint" in why
 
 
-def test_truncated_box_at_the_border_is_refused(model):
-    """Half a box in view = a biased centroid; refusal beats a guess."""
-    # camera footprint at table: ~0.9 x 0.5 m around [0.42, -0.075];
-    # park the box on the image's +x edge
-    depth = render_depth([(0.42 - 0.51, -0.075, 0.080, 0.075, 0.075, 0.0)])
-    fix, why = top_face_from_depth(depth, K, ROT_DOWN, T_CAM, TABLE_Z, model)
+def test_truncated_box_at_the_border_is_partial_never_precise(model):
+    """Half a box in view = a biased centroid: never good enough to press,
+    and it used to be refused outright. But it IS a box, and since every
+    search result gets a close-up aim at staging (2026-09-23), knowing
+    roughly where it is is what the search is for: it comes back marked
+    PARTIAL, and the watcher lets it into the coarse window only."""
+    # camera footprint at table: ~0.9 x 0.5 m around [0.42, -0.075]; the
+    # image's +x edge runs near base x -0.01: a model-sized box at -0.05
+    # shows ~64 % of itself
+    box = (-0.05, -0.075, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)
+    fix, why = top_face_from_depth(render_depth([box]), K, ROT_DOWN, T_CAM, TABLE_Z, model)
+    assert fix is not None and fix.partial and "partial" in why
+    assert abs(fix.center[1] + 0.075) < 0.02  # the cut runs across x: y is still true
+    # a sliver (well under half the box) is still refused: not enough to be a box
+    sliver = (-0.09, -0.075, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)
+    fix, why = top_face_from_depth(render_depth([sliver]), K, ROT_DOWN, T_CAM, TABLE_Z, model)
     assert fix is None
+
+
+def test_a_full_top_is_not_partial(model):
+    truth = (0.45, -0.10, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.3)
+    fix, why = top_face_from_depth(render_depth([truth]), K, ROT_DOWN, T_CAM, TABLE_Z, model)
+    assert fix is not None and not fix.partial
+
+
+def test_a_lid_the_fingers_half_hide_is_a_partial_top():
+    """Bench 2026-09-23, run 1: the box stood 36 cm from the base, at the
+    bottom of the search's view where the gripper's fingers hang in every
+    wrist frame. They hid part of the lid; the rest measured 0.06 x 0.10 m
+    against the 0.105 model and was refused — "NO BOX" with the box in
+    plain view. Now a partial top: roughly where the lid is."""
+    from pathlib import Path
+
+    pink = ContainerModel.load("src/rammp_box_opening/config/containers/ankou_pink.yaml")
+    z = np.load(Path(__file__).parent / "data" / "wrist_search_pink_fingers_20260923.npz")
+    fix, why = top_face_from_depth(z["depth"], z["k"], z["rot_cam"], z["trans_cam"], TABLE_Z, pink)
+    assert fix is not None and fix.partial, why
+    # the lid's pink pixels put its centre at [0.315, 0.179]: the partial
+    # centroid is biased by the hidden part, but it is on the lid
+    assert np.hypot(fix.center[0] - 0.315, fix.center[1] - 0.179) < 0.06
+
+
+def test_a_partial_top_feeds_the_coarse_window_and_is_remembered(model, monkeypatch):
+    """A partial top may stop the search and send the arm to staging; it
+    never aims a press. And what the search saw is remembered after the
+    coarse window has aged out — the box does not move while the mission
+    tries its other ladders."""
+    w = _watcher(model, require_circle=False)
+    w.grab = _Grab()
+    edge = [(-0.05, -0.075, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)]  # cut by the border
+    for n in range(4):  # still frames: a full top would commit precisely
+        _tick_at(w, T_CAM, edge, monkeypatch, n + 1)
+    assert w.fix(now=time.monotonic()) is None  # nothing may aim a press
+    assert w.coarse_fix(now=time.monotonic()) is not None
+    assert "partial" in w.last_reject
+    seen = w.last_coarse()
+    assert seen is not None and abs(seen[0][1] + 0.075) < 0.02
+    assert w.coarse_fix(now=time.monotonic() + 60.0) is None  # the window aged out ...
+    assert w.last_coarse() == seen  # ... the memory did not
+    w.reset()
+    assert w.last_coarse() is None  # a new search forgets the old box
 
 
 def test_wall_points_cannot_drag_the_centroid(model):
@@ -270,13 +325,16 @@ def test_origin_z_is_pinned_to_the_calibrated_table(model):
 def test_watcher_wires_the_table_into_the_pose(model, capsys):
     """The 2026-09-02 regression: a 6-frame plateau median 8 mm high
     became origin z=-0.019 and shifted the press geometry. The wiring
-    under test is BoxTopWatcher.to_container_pose passing its calibrated
+    under test is BoxTopWatcher.to_container_pose passing its surveyed
     table_z through — dropping it must fail THIS test."""
     from rammp_box_opening.perception.depth_source import BoxTopWatcher
 
     w = BoxTopWatcher.__new__(BoxTopWatcher)  # wiring only, no node
     w.model = model
     w.table_z = TABLE_Z
+    import threading
+
+    w._lock = threading.Lock()
     top = (0.38, -0.17, TABLE_Z + model.dims[2] + 0.008)
     cp = w.to_container_pose((top, 0.3))
     assert cp.xyz[2] == TABLE_Z
@@ -330,9 +388,13 @@ def test_watcher_reset_zeroes_the_window_counters(model):
     from rammp_box_opening.perception.depth_source import BoxTopWatcher, FixWindow
 
     w = BoxTopWatcher.__new__(BoxTopWatcher)
+    import threading
+
+    w._lock = threading.Lock()
     w.grab = type("G", (), {"missing": lambda self: []})()
     w.window = FixWindow(3, 0.015, 2.0, 1.0)
-    w.frames, w.hits, w.refined_hits, w.circle_hits = 40, 12, 12, 11
+    w.coarse_window = FixWindow(2, 0.04, 1.5, 1.0)
+    w.frames, w.hits, w.circle_hits = 40, 12, 11
     w.last_reject = "a top touches the image border"
     assert "border" in w.status()  # reported even though hits > 0
     w.reset()
@@ -372,16 +434,22 @@ def _watcher(model, require_circle=True):
     w.model = model
     w.table_z = TABLE_Z
     w.window = FixWindow(3, 0.015, 2.0, 1.0)
-    w.frames = w.hits = w.refined_hits = w.circle_hits = 0
+    w.coarse_window = FixWindow(2, 0.04, 1.5, 1.0)
+    w.frames = w.hits = w.circle_hits = 0
     w.last_reject = None
     w.last_debug = None
     w.roi = None
     w.active = True
     w.require_circle = require_circle
+    w.moving_ok = False
+    import threading
+
+    w._lock = threading.Lock()
     w._last_stamp = None
     w._last_cam = None
     w._still_since = None
     w._pending_roi = None
+    w._last_coarse = None
     return w
 
 
@@ -404,6 +472,7 @@ def test_only_button_circle_sightings_vote(model):
         w.window.add(np.asarray(circle + (0.08,)), 0.0, 1.0)
     got = w.window.fix(1.2)
     assert got is not None and abs(got[0][0] - 0.456) < 1e-9  # the circle centre
+    assert abs(got[0][0] - plateau.center[0]) > 0.005  # not the lid centre
 
     # a centroid-only frame must not enter the window when the circle is
     # required; the reject reason names it
@@ -418,6 +487,121 @@ def test_shipped_config_requires_the_button_circle_and_trims_nothing():
 
     cfg = load_press_demo("src/rammp_box_opening/config/containers/oxo_pop.yaml")
     assert cfg.require_button_circle is True
-    # the press and the grip both aim at the circle centre itself
+    # the press and the grip both aim at the circle centre itself. The
+    # 6 mm radial miss of 2026-09-14..16 was the planner's descent bowing
+    # (runtime/approach.py now flies a straight line) — NOT a pad offset,
+    # so no trim: one here would double-correct.
     assert tuple(cfg.grip_offset_xy) == (0.0, 0.0)
     assert tuple(cfg.press_offset_xy) == (0.0, 0.0)
+
+
+# --- the coarse path: sightings taken while the camera is moving ------------
+
+
+class _Grab:
+    """A grabber whose frames are set by the test, ROS parts left out."""
+
+    def __init__(self):
+        self.color = np.full((H, W, 3), 235, np.uint8)  # a lid, no button disc
+        self.depth = None
+        self.k = K
+        self.color_stamp = type("S", (), {"sec": 0, "nanosec": 0})()
+
+    def missing(self):
+        return []
+
+    def frame(self, boxes, t_cam, n):
+        self.depth = render_depth(boxes, rot_cam=ROT_DOWN, t_cam=t_cam)
+        self.color_stamp = type("S", (), {"sec": n, "nanosec": 0})()
+
+
+def _tick_at(w, t_cam, boxes, monkeypatch, n):
+    """One watcher tick with the camera at t_cam, looking at `boxes`."""
+    from rammp_box_opening.perception import depth_source as ds
+
+    w.grab.frame(boxes, t_cam, n)
+    monkeypatch.setattr(ds, "camera_pose_at", lambda g: (ROT_DOWN, t_cam))
+    w._tick()
+
+
+def test_a_moving_camera_feeds_the_coarse_window_only(model, monkeypatch):
+    """Finding the box and aiming the press are different questions. While the
+    arm sweeps, sightings carry the TF-lag bias that the stillness gate exists
+    to keep out — good enough to stop the search, never good enough to press."""
+    w = _watcher(model)
+    w.grab = _Grab()
+    box = [(0.45, -0.15, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)]
+    for n, dx in enumerate((0.0, 0.02, 0.04)):  # the camera pans 2 cm a frame
+        _tick_at(w, T_CAM + np.array([dx, 0.0, 0.0]), box, monkeypatch, n + 1)
+    coarse = w.coarse_fix(now=time.monotonic())
+    assert coarse is not None
+    assert abs(coarse[0][0] - 0.45) < 0.02 and abs(coarse[0][1] + 0.15) < 0.02
+    assert w.fix(now=time.monotonic()) is None  # nothing may aim a press
+
+
+def test_a_still_camera_still_commits_the_precise_fix(model, monkeypatch):
+    w = _watcher(model, require_circle=False)
+    w.grab = _Grab()
+    box = [(0.45, -0.15, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)]
+    for n in range(4):  # same pose every frame: still
+        _tick_at(w, T_CAM, box, monkeypatch, n + 1)
+    assert w.fix(now=time.monotonic()) is not None
+
+
+def test_coarse_sightings_that_disagree_do_not_commit(model, monkeypatch):
+    """Two different boxes seen in two frames is not a fix, even coarsely."""
+    w = _watcher(model)
+    w.grab = _Grab()
+    for n, (x, dx) in enumerate(((0.45, 0.0), (0.30, 0.02))):
+        box = [(x, -0.15, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)]
+        _tick_at(w, T_CAM + np.array([dx, 0.0, 0.0]), box, monkeypatch, n + 1)
+    assert w.coarse_fix(now=time.monotonic()) is None
+
+
+def test_reset_clears_the_coarse_window_too(model, monkeypatch):
+    w = _watcher(model)
+    w.grab = _Grab()
+    box = [(0.45, -0.15, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)]
+    for n, dx in enumerate((0.0, 0.02)):
+        _tick_at(w, T_CAM + np.array([dx, 0.0, 0.0]), box, monkeypatch, n + 1)
+    assert w.coarse_fix(now=time.monotonic()) is not None
+    w.reset()
+    assert w.coarse_fix(now=time.monotonic()) is None
+
+
+def test_detection_does_not_follow_a_table_the_camera_reads_high(model, monkeypatch):
+    """Regression, field 2026-09-16: the box sat right under the look and was
+    not found in 438 frames across two runs.
+
+    Passive stereo reads a blank bench as a broad smear, not a peak — on the
+    1 September capture it spans -0.07 to +0.02 m around a true -0.027 — and
+    the MODE of that smear sits 35 mm above the real surface. A table fitted
+    from it moved the lid band off the lid: replaying that capture, the hit
+    rate fell from 39/94 frames to 7/94, rejected as "no points at container
+    height". The lid band must stay on the surveyed table no matter what
+    flat surface dominates the frame."""
+    w = _watcher(model, require_circle=False)
+    w.grab = _Grab()
+    box = (0.45, -0.15, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)
+    # most of the view reads as a flat surface 35 mm above the true table
+    smear = (0.45, -0.075, TABLE_Z + 0.035, 1.2, 0.9, 0.0)
+    for n in range(6):
+        _tick_at(w, T_CAM, [smear, box], monkeypatch, n + 1)
+    got = w.fix(now=time.monotonic())
+    assert got is not None, w.status()
+    assert abs(got[0][2] - (TABLE_Z + model.dims[2])) < 0.01
+
+
+def test_with_the_lag_measured_moving_frames_may_confirm_the_box(model, monkeypatch):
+    """detect.confirm_in_flight: frames shot while the arm moves feed the
+    precise window too (the circle is still required), which is what lets
+    the wrist confirm the box during the approach instead of after it."""
+    w = _watcher(model, require_circle=False)
+    w.grab = _Grab()
+    w.moving_ok = True
+    box = [(0.45, -0.15, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)]
+    for n, dx in enumerate((0.0, 0.02, 0.04, 0.06)):  # the camera pans 2 cm a frame
+        _tick_at(w, T_CAM + np.array([dx, 0.0, 0.0]), box, monkeypatch, n + 1)
+    got = w.fix(now=time.monotonic())
+    assert got is not None
+    assert abs(got[0][0] - 0.45) < 0.01 and abs(got[0][1] + 0.15) < 0.01

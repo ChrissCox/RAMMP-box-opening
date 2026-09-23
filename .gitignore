@@ -7,3 +7,7 @@ log/
 dist/
 .pytest_cache/
 .ruff_cache/
+
+# editor state: machine-specific paths and a 14 MB symbol cache
+.vscode/
+*.code-workspace

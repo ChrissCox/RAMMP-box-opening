@@ -10,7 +10,6 @@ from rammp_box_opening.constants import JOINT_VMAX
 from rammp_box_opening.runtime.retime import (
     RetimeParams,
     check_like_executor,
-    concat_paths,
     retime_group,
     speed_profile,
     velocity_caps,
@@ -265,3 +264,21 @@ def test_forward_tail_continues_the_stopped_stroke_from_live():
     assert depth[-1] - depth[0] >= 0.05 - 1e-6
     # stopped 1 mm from the end: nothing left to continue along
     assert forward_tail(_traj(down), np.asarray(down[-2]), arc_rad=0.05) is None
+
+
+def test_the_group_reports_where_each_leg_begins_in_time():
+    """A guarded descent merged behind its approach needs to know WHEN the
+    descent starts, so its torque guard can arm there instead of watching
+    the approach's own dynamics (runner._run_motion)."""
+    a = _line([0] * 7, [0.5, 0, 0, 0, 0, 0, 0], 40)
+    b = _line([0.5, 0, 0, 0, 0, 0, 0], [0.6, 0, 0, 0, 0, 0, 0], 40)  # short, slow
+    out, info = retime_group([_traj(a), _traj(b)], [0.75, 0.15], JOINT_VMAX)
+    fracs = info["seg_start_fracs"]
+    assert len(fracs) == 2
+    assert fracs[0] == 0.0
+    assert 0.0 < fracs[1] < 1.0
+    # and it is a real TIME fraction of the result
+    _q, _v, t = _arrays(out)
+    at = float(t[-1]) * fracs[1]
+    reached = float(np.interp(at, t, np.linalg.norm(_q - _q[0], axis=1)))
+    assert abs(reached - 0.5) < 0.02  # the junction is where leg b starts

@@ -40,14 +40,6 @@ def _box_schema():
     return BoxLocation
 
 
-def __getattr__(name):
-    # tests build BoxLocation results directly; keep the name importable
-    # without paying the pydantic import on the mission's happy path
-    if name == "BoxLocation":
-        return _box_schema()
-    raise AttributeError(name)
-
-
 PROMPT = (
     "This is a %dx%d image from a robot's downward-looking wrist camera "
     "over a workbench. Find %s. Ignore the robot arm, its mount, game "

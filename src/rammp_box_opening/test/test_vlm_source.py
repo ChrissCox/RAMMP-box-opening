@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from rammp_box_opening.models.container import load_press_demo
-from rammp_box_opening.perception.vlm_source import BoxLocation, fetch_box_roi
+from rammp_box_opening.perception.vlm_source import _box_schema, fetch_box_roi
+
+BoxLocation = _box_schema()
 
 CFG = "src/rammp_box_opening/config/containers/oxo_pop.yaml"
 
@@ -117,19 +119,6 @@ def test_ladder_exhausted_means_plain_depth(cfg):
         FRAME, cfg, impls={"owl": _mk(None, "a"), "claude": _mk(None, "b")}
     )
     assert roi is None and len(lines) == 2
-
-
-def test_owl_pick_best_box_floor():
-    from rammp_box_opening.perception.owl_source import pick_best_box
-
-    got = pick_best_box(
-        [0.12, 0.24, 0.19],
-        [0, 0, 1],
-        [[0, 0, 1, 1], [10, 10, 20, 20], [5, 5, 9, 9]],
-        min_score=0.18,
-    )
-    assert got == (0.24, [10, 10, 20, 20])
-    assert pick_best_box([0.1], [0], [[0, 0, 1, 1]], 0.18) is None
 
 
 def test_shipped_ladder_is_local_first(cfg):

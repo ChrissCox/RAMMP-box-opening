@@ -29,13 +29,16 @@ import warnings
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 
-# the mission enables inference only around its detect windows: OWLv2
-# at 100 % GPU duty doubled every cuRobo solve (0.22 s -> 0.47 s measured
+from rammp_box_opening.perception.owl_source import BLIND, CONTAINER_TOPIC, HEARTBEAT, blind_heartbeat_due, container_changed, top_boxes, topics_for
+
+# The mission enables inference only around its detect windows: OWLv2 at
+# 100 % GPU duty doubled every cuRobo solve (0.22 s -> 0.47 s measured
 # offline 2026-09-02). A stale enable cannot pin the GPU forever either.
-ENABLE_TOPIC = "/rammp_box_opening/owl_enable"
 ENABLE_MAX_S = 30.0
+STALE_S = 3.0  # no new frame for this long -> re-subscribe
+RESUB_S = 5.0  # and not more often than this
 
 
 class OwlDetector(Node):
@@ -48,12 +51,33 @@ class OwlDetector(Node):
         warnings.filterwarnings("ignore", category=UserWarning)
 
         container = self.declare_parameter("container", "").value
+        # which camera this instance watches: the wrist D405 (the mission's
+        # close-range aim) or the fixed scene camera (finding the box before
+        # the arm moves). One model per instance; each infers only inside
+        # its own enable window, so two instances never load the GPU at once.
+        self.camera = str(self.declare_parameter("camera", "wrist").value)
+        bbox_topic, enable_topic = topics_for(self.camera)
+        # the score floor; the container yaml's owl_min_score unless the
+        # launch says otherwise. The scene instance runs lower: from a metre
+        # the bench box scores 0.18-0.23 against a 0.18 floor (2026-09-16),
+        # and a geometry gate behind it (the lid slab) rejects false boxes
+        self.min_score = float(self.declare_parameter("min_score", -1.0).value)
         # 2 Hz: at 1 Hz the brief mid-scan view of the box could fall
         # between ticks; inference is ~0.65 s so this saturates only
         # while frames actually change
         period = float(self.declare_parameter("period_s", 0.5).value)
+        # No input downscale knob: OWLv2's processor resizes every frame to
+        # its fixed 960x960 before the model, so a 1280x720 frame and a
+        # 640x360 one both cost 0.62 s on the Orin (measured 2026-09-17),
+        # and the smaller one only scores lower. The time is the model's.
         cfg_path = container or default_container_yaml()
         self.cfg = load_press_demo(str(cfg_path))
+        self._cfg_path = str(cfg_path)
+        # a floor the launch set outlives a container change; one taken
+        # from the YAML follows the YAML
+        self._min_score_from_launch = self.min_score >= 0
+        if self.min_score < 0:
+            self.min_score = float(self.cfg.owl_min_score)
 
         self.get_logger().info("loading %s ..." % self.cfg.owl_model)
         t0 = time.monotonic()
@@ -66,31 +90,69 @@ class OwlDetector(Node):
         self._model = (
             Owlv2ForObjectDetection.from_pretrained(self.cfg.owl_model).eval().cuda()
         )
+        # One inference on a blank frame before saying "ready": the first
+        # CUDA call pays kernel compilation and allocation, and a mission
+        # that enabled a cold instance saw nothing inside its 3 s window
+        # (field 2026-09-16).
+        import numpy as np
+
+        blank = np.zeros((720, 1280, 3), np.uint8)
+        inputs = self._proc(text=[list(self.cfg.owl_queries)], images=[blank], return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            self._model(**inputs)
+        torch.cuda.synchronize()
         self.get_logger().info(
-            "owl_detector ready in %.1f s — %s at %.1f Hz, min score %.2f"
+            "owl_detector (%s camera) ready in %.1f s — %s at %.1f Hz, min score %.2f"
             % (
+                self.camera,
                 time.monotonic() - t0,
                 self.cfg.owl_model,
                 1.0 / period,
-                self.cfg.owl_min_score,
+                self.min_score,
             )
         )
 
-        from rammp_curobo_ros.seek_core import D405Grabber
+        if self.camera == "scene":
+            from rammp_box_opening.perception.scene import SceneGrabber
 
-        self.grab = D405Grabber(self, need_depth=False)
-        self.pub = self.create_publisher(
-            Float32MultiArray, "/rammp_box_opening/owl_bbox", 1
-        )
+            self.grab = SceneGrabber(self, keep=1, need_depth=False)
+        else:
+            from rammp_box_opening.perception.d405 import D405Grabber
+
+            self.grab = D405Grabber(self, need_depth=False)
+        self.pub = self.create_publisher(Float32MultiArray, bbox_topic, 1)
         self._last_stamp = None
+        self._last_new_frame_t = time.monotonic()
+        self._last_resub_t = 0.0
         self._enabled_until = 0.0
         latched = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.create_subscription(Bool, ENABLE_TOPIC, self._on_enable, latched)
+        self.create_subscription(Bool, enable_topic, self._on_enable, latched)
+        # the mission's container (owl_source.announce_container): its
+        # prompts and floor replace this node's own the moment it is run
+        self.create_subscription(String, CONTAINER_TOPIC, self._on_container, latched)
         self.create_timer(period, self._tick)
+
+    def _on_container(self, msg):
+        from rammp_box_opening.models.container import load_press_demo
+
+        path = str(msg.data)
+        if not container_changed(self._cfg_path, path):
+            return
+        try:
+            cfg = load_press_demo(path)
+        except Exception as e:  # a bad announcement must not take the detector down
+            self.get_logger().error("container %s announced by the mission could not be loaded (%s) — keeping %s" % (path, e, self._cfg_path))
+            return
+        self.cfg, self._cfg_path = cfg, path
+        if not self._min_score_from_launch:
+            self.min_score = float(cfg.owl_min_score)
+        self.get_logger().info(
+            "container -> %s: queries %s, min score %.2f" % (path, list(cfg.owl_queries), self.min_score)
+        )
 
     def _on_enable(self, msg):
         self._enabled_until = (time.monotonic() + ENABLE_MAX_S) if msg.data else 0.0
@@ -101,24 +163,45 @@ class OwlDetector(Node):
 
     def _tick(self):
         g = self.grab
-        if g.color is None or g.color_stamp is None:
+        now_m = time.monotonic()
+        stamp = None if g.color_stamp is None else (g.color_stamp.sec, g.color_stamp.nanosec)
+        if g.color is None or stamp is None or stamp == self._last_stamp:
+            # no NEW frame. The camera may be down — or this process's
+            # subscription has gone quiet while the topic streams (a
+            # launch-started scene instance did that minutes after finding
+            # the box, twice, 2026-09-16, while a fresh subscriber elsewhere
+            # got 30 Hz). Re-subscribe after STALE_S, then every RESUB_S.
+            stale = now_m - self._last_new_frame_t
+            # once frames have really stopped, say so every tick: the
+            # mission's rung must tell "up but blind" from "not running"
+            # (bench 2026-09-22). Not on one quiet tick: an inference
+            # outlasts the tick, and BLIND then ended good waits (09-23).
+            if blind_heartbeat_due(stale):
+                blind = Float32MultiArray()
+                blind.data = [0.0, 0.0, 0.0, 0.0, BLIND, 0.0]
+                self.pub.publish(blind)
+            if stale > STALE_S and now_m - self._last_resub_t > RESUB_S:
+                self._last_resub_t = now_m
+                g.resubscribe()
+                self.get_logger().warning(
+                    "no new %s frame for %.0f s — re-subscribed (#%d)"
+                    % (self.camera, stale, g.resubscribes)
+                )
             return
-        stamp = (g.color_stamp.sec, g.color_stamp.nanosec)
-        if stamp == self._last_stamp:
-            return
+        if self._last_stamp is not None and now_m - self._last_new_frame_t > STALE_S:
+            self.get_logger().info("%s frames back after %.0f s" % (self.camera, now_m - self._last_new_frame_t))
         self._last_stamp = stamp
+        self._last_new_frame_t = now_m
         frame_t = g.color_stamp.sec + g.color_stamp.nanosec * 1e-9
         if not self.enabled:
             # heartbeat only: the mission's rung must still tell "node
             # alive, idle" from "node absent"
             msg = Float32MultiArray()
-            msg.data = [0.0, 0.0, 0.0, 0.0, -1.0, 0.0]
+            msg.data = [0.0, 0.0, 0.0, 0.0, HEARTBEAT, 0.0]
             self.pub.publish(msg)
             return
 
         import torch
-
-        from rammp_box_opening.perception.owl_source import pick_best_box
 
         h, w = g.color.shape[:2]
         queries = list(self.cfg.owl_queries)
@@ -132,15 +215,16 @@ class OwlDetector(Node):
             out = self._model(**inputs)
         res = self._proc.post_process_object_detection(
             out,
-            threshold=float(self.cfg.owl_min_score),
+            threshold=float(self.min_score),
             target_sizes=torch.tensor([[h, w]]).cuda(),
         )[0]
-        best = pick_best_box(
+        top = top_boxes(
             res["scores"].tolist(),
             res["labels"].tolist(),
             [b.tolist() for b in res["boxes"]],
-            self.cfg.owl_min_score,
+            self.min_score,
         )
+        best = top[0] if top else None
         msg = Float32MultiArray()
         now = self.get_clock().now().nanoseconds * 1e-9
         # slot 5 is the frame's AGE at publish, never an absolute time: a
@@ -154,11 +238,16 @@ class OwlDetector(Node):
             # heartbeat: the mission can tell "node alive, keep waiting"
             # from "node absent, fall back" (field 2026-09-01: without
             # this, one missed window cost a cold in-process model load)
-            msg.data = [0.0, 0.0, 0.0, 0.0, -1.0, 0.0]
+            msg.data = [0.0, 0.0, 0.0, 0.0, HEARTBEAT, 0.0]
         else:
-            score, (x0, y0, x1, y1) = best
+            # the best box first (six fields: what every consumer read
+            # before), then the runners-up: a scene with two containers
+            # gives the locator both, and its footprint gate picks
             age = max(0.0, now - frame_t)
-            msg.data = [float(x0), float(y0), float(x1), float(y1), float(score), age]
+            data = []
+            for score, (x0, y0, x1, y1) in top:
+                data += [float(x0), float(y0), float(x1), float(y1), float(score), age]
+            msg.data = data
         self.pub.publish(msg)
 
 

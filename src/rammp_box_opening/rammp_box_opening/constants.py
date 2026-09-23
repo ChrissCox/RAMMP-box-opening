@@ -1,27 +1,54 @@
 """Shared constants: arm facts and runner defaults (spec §3, §6)."""
 
+import os
+from pathlib import Path
+
+
+def state_dir(env=None):
+    """Where run logs, captures, generated worlds and calibration residuals
+    are kept: ~/.ros/rammp_box_opening, or $RAMMP_BOX_OPENING_STATE. The
+    stub harnesses point it at their own folder — their synthetic runs once
+    filled the real residuals file (2026-09-17), and the every-run captures
+    are pruned to the newest few, real or not."""
+    env = os.environ if env is None else env
+    return Path(env.get("RAMMP_BOX_OPENING_STATE") or Path.home() / ".ros" / "rammp_box_opening")
+
+
 # Gen3 home joints in controller order — FK-verified in RAMMP-CuRobo's
 # tour_demo.py; joint_3 sits AT +pi (every comparison uses ang_diff).
 HOME = [0.0, 0.262, 3.142, -2.269, 0.0, 0.960, 1.571]
 JOINTS = ["joint_%d" % i for i in range(1, 8)]
 
-# tool_frame attitude at HOME: tool z level along world +x, wrist flat.
-WRIST_FLAT_XYZW = [0.5, 0.5, 0.5, 0.5]
+NODE_NAMESPACE = "/rammp_curobo"  # the planner container's actions and service
+# The kinova-gen3-ros2 driver (sheppy's `arm` node): trajectories and the gripper.
+EXECUTE_ACTION = "/execute_joint_trajectory"
+GRIPPER_SETPOINT_TOPIC = "/setpoint/gripper"
+GRIPPER_STATE_TOPIC = "/gripper_state"
+# Sent with every gripper setpoint — the driver keeps neither between commands.
+# speed: fraction of the maximum closing speed. force: a CURRENT CEILING
+# (fraction of 1.0 A) the fingers stall at, not a force setpoint. Both are the
+# driver's defaults; tune at the bench against open_box.grip_band.
+GRIPPER_SPEED = 1.0
+GRIPPER_FORCE = 0.5
 
-NODE_NAMESPACE = "/rammp_curobo"
-GRIPPER_ACTION = "/robotiq_gripper_controller/gripper_cmd"
-
-# Cruise fraction for free-air motion, NOT a time dilation: since the
-# re-timer (2026-09-03) a leg's speed scales the per-joint velocity cap it
-# cruises at, and the profile eases out of rest and into the arrival on
-# its own. 1.0 therefore means "cruise at the cap" (0.9 x the joint limit,
-# RetimeParams.vmax_margin) while keeping the settled arrival that the old
-# uniform 0.75 was bought with (owner 2026-09-02 "slow it down a bit" ->
-# 2026-09-04 "set speed to 1", then back to 0.75 the same day). The press
-# stroke stays at press_demo.speed.
-TRANSIT_SPEED = 0.75
+# Cruise fraction for free-air motion, NOT a time dilation: a leg's speed
+# scales the per-joint velocity cap it cruises at (0.9 x the joint limit,
+# RetimeParams.vmax_margin), and the re-timed profile eases out of rest and
+# into the arrival on its own — which is what gives a full-speed cruise the
+# settled arrival a uniform 0.75 was once bought for (owner, 2026-09-16).
+# The press stroke has its own speed (press_demo.speed).
+TRANSIT_SPEED = 1.0
+# The base sweep that looks for the box. Slower than a transit because it
+# exists to SEE, not to arrive: the coarse detector needs frames it can lift
+# through TF while the arm is moving, and the leg is cancelled the instant
+# one of them commits (runtime/legs.py stop_when).
+SEARCH_SPEED = 0.35
 CONTACT_SPEED = 0.15
-DRIFT_REPLAN_RAD = 0.04  # < server start gate (0.05); catches arrival-tol drift
+DRIFT_REPLAN_RAD = 0.04  # < START_GATE_RAD: replan before the gate would refuse
+# The driver commands a trajectory's first waypoint at once, wherever the arm
+# is; runtime/driver.py refuses a goal whose start is farther than this from
+# the live joints (the old planner-side executor's own start gate).
+START_GATE_RAD = 0.05
 SANITY_MARGIN_RAD = 0.35  # per-joint excursion allowance beyond |start->end|
 # A mission must START near HOME: every legit run begins there, so a
 # distant start means the last run ended badly. Refuse before any motion
@@ -33,26 +60,14 @@ SANITY_MARGIN_RAD = 0.35  # per-joint excursion allowance beyond |start->end|
 # 2.4-2.9 rad on wrist/elbow joints for the tool-down reorientation.
 HOME_START_TOL_RAD = 1.2
 
-POSE_UNCERTAINTY_M = 0.02  # calibration floor (spec §3)
-TIP_BIAS_M = 0.021  # 2F-85 pad face beyond tool_frame (disabled in gen3.yaml)
-BASELINE_TRAVEL_M = 0.01  # descent distance budget while the guard baselines
-
-GRIPPER_CMD_CLOSED = 0.8  # GripperCommand position at full close
+GRIPPER_CMD_CLOSED = 0.8  # knuckle rad at full close (the driver's setpoint 1.0)
 GRIPPER_CMD_OPEN = 0.0  # ~85 mm aperture
 
-# Tool-down rest pose at the scan pose [0.42, 0, 0.45] (open_box.park_tool_down).
-# HOME is the wrist-flat factory pose and every mission pose is tool-down —
-# a different IK family — so each run paid a 2.4-2.9 rad wrist/elbow flip
-# twice (scan flight 3.7-4.7 s, final home 3.5-5.5 s). Parked here, the
-# scan leg vanishes and the mission ends with a same-family move. Planned
-# from HOME with the real planner 2026-09-02: FK lands on the scan pose to
-# the mm, valid in the bench world, and PARK -> HOME plans clean.
-PARK = [0.608, 0.8905, 1.1224, -1.1386, -2.1213, 2.1767, 2.2738]
-REST_TOL_RAD = 0.05  # "already there": the server's own start gate
+REST_TOL_RAD = 0.05  # "already there": the start gate's tolerance
 
 # Joint velocity limits the planner plans against (cuRobo gen3_real.yaml, the
-# URDF's): the re-timer caps every joint below these and the executor refuses
-# a goal above them — two independent gates on the same numbers.
+# URDF's): the re-timer caps every joint below these and runtime/driver.py
+# refuses a goal above them — two independent gates on the same numbers.
 JOINT_VMAX = [1.396, 1.396, 1.396, 1.396, 1.222, 1.222, 1.222]
 
 # Reflex recoil after a press trip: how much of the descent's own path to
@@ -83,9 +98,9 @@ RECOIL_SPEED = 0.5
 TCP_OFFSET_M = 0.011
 
 # The fingertip links, for measuring a contact with the arm's own
-# kinematics. These EXIST in the live TF tree; tool_frame does not once a
-# gripper is attached (kortex_robot.xacro defines it only in the
-# gripper-less branch — which is also why tool_xyz never resolved).
+# kinematics. These EXIST in the live TF tree (kinova_gen3_description:
+# kortex_description's arm macro plus robotiq_description); tool_frame does
+# not once a gripper is attached.
 FINGERTIP_FRAMES = (
     "robotiq_85_left_finger_tip_link",
     "robotiq_85_right_finger_tip_link",

@@ -1,15 +1,13 @@
 """Legs (the unit of planning/execution) and the merge rules (spec §5, §6).
 
-MOTION legs merge into one trajectory only when dynamically valid: same
-planning chain (B planned from A's predicted endpoint), same speed, no
-guard on either, and a verify closes its group. Guarded legs always
-execute alone. `world` is a checked precondition, never a merge key.
+MOTION legs merge into one re-timed execution (runtime/retime.py) only when
+dynamically valid: same planning chain (B planned from A's predicted
+endpoint), and nothing after a contact — a guarded leg may END a group,
+never sit inside one. `world` is a checked precondition, never a merge key.
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
-
-from trajectory_msgs.msg import JointTrajectory
 
 
 class Kind(Enum):
@@ -20,7 +18,6 @@ class Kind(Enum):
 @dataclass
 class VerifyCtx:
     outcome: str
-    depth_m: float = None
     gripper_pos: float = None
     progress: float = None
     torque_peak: float = None
@@ -59,6 +56,28 @@ class Leg:
     # clear of the box); the usual join still gates the next guarded leg.
     send_with_previous_motion: bool = False
     world_path: str = None  # generated world YAML to push (SetWorld wants a path)
+    # MOTION legs planned with a vertical approach: (index into traj.points,
+    # joints) of the waypoint the final straight line starts from, at rest.
+    # A leg that has one can be re-fitted to a corrected target without a
+    # planner round trip (runtime/approach.refit_descent), which moves it
+    # to above the new target.
+    waypoint: tuple = None
+    # MOTION legs with a guard: index into traj.points where the final
+    # straight DESCENT begins (the waypoint's). Flown on its own, the leg's
+    # guard takes its baseline and arms there plus a settle
+    # (runner._run_motion): everything before it is free-air approach,
+    # whose braking into the waypoint read as a 3 Nm "touch" three inches
+    # above the box (bench 2026-09-21).
+    guard_from: int = None
+    # MOTION legs with a "press" guard: after a good push (stop met or bound
+    # run), hold still on the button this long before the recoil lets go —
+    # a latch may need a moment held down (2026-09-23: a push that met its
+    # stop and let go at once left the box shut)
+    hold_s: float = 0.0
+    # MOTION legs only: polled while the leg flies; the first True cancels it
+    # and the leg reads as 'stopped' — a SEARCH, which exists to find
+    # something rather than to arrive (the look and the sweep).
+    stop_when: object = None
     # Planning cost, for the preview table. plan_s is the client's round
     # trip; plan_server_s is what the planner reports it spent solving.
     # The gap between them is action/transport overhead — worth watching:
@@ -69,9 +88,23 @@ class Leg:
     # (fast_scale, slow_scale, slow_path_fraction) when a guarded descent
     # was time-warped; display only — leg.speed is 1.0 once it is baked in
     warp: tuple = field(default=None, compare=False)
+    # A touch stroke expects contact at this fraction of its own PATH, and
+    # judges the trip against the matching TIME fraction of whatever
+    # trajectory actually flies: `retime(traj)` recomputes that, and is
+    # called on every replan, warp and merge (primitives.core.press_stroke)
+    contact_path_frac: float = field(default=None, compare=False)
+    retime: object = field(default=None, compare=False)
 
 
 def can_merge(a, b):
+    """May `b` join the execution `a` ends?
+
+    A guarded leg may be the TAIL of a group: the approach and the descent
+    it leads into fly as one re-timed trajectory, with the guard armed from
+    the point the descent begins (runtime/runner.py _run_motion). That
+    removes the controller round trip and the full stop between them — the
+    pause a person does not make when reaching for something. Nothing ever
+    merges AFTER a guarded leg: a trip must not strand queued motion."""
     return (
         a.kind is Kind.MOTION
         and b.kind is Kind.MOTION
@@ -79,17 +112,23 @@ def can_merge(a, b):
         # speeds may differ: the re-timer builds ONE profile for the group,
         # each leg's speed becoming its cruise fraction (retime.py)
         # a planned lead never merges with a lazy tail (or vice versa):
-        # merge_trajectories cannot chain a trajectory that does not exist
+        # a group profile cannot chain a trajectory that does not exist yet
         and (a.traj is None) == (b.traj is None)
+        # a contact ENDS its execution: never merge past one
         and a.guard is None
-        and b.guard is None
         and a.verify is None  # a verify CLOSES its merge group
         # ...and a verify cannot be ABSORBED into one either: only the
-        # execution's owning member is verified, so appending a
+        # execution's OWNING member is verified, so appending a
         # verify-carrying leg as a non-lead member silently discarded its
-        # check (review 2026-08-28 — latent, never yet triggered because
-        # every verify-carrying MOTION leg today also carries a guard).
-        and b.verify is None
+        # check (review 2026-08-28). A guarded tail IS the owner
+        # (_run_motion picks it), so its verify still runs.
+        and (b.verify is None or b.guard is not None)
+        # a leg whose timing is already baked in (a warped descent: its
+        # fast-then-slow profile and speed 1.0) cannot join a group
+        # profile — re-timing it would discard the warp and cruise it into
+        # contact at full speed
+        and b.warp is None
+        and a.warp is None
     )
 
 
@@ -101,27 +140,3 @@ def merge_groups(legs):
         else:
             groups.append([leg])
     return groups
-
-
-def merge_trajectories(trajs):
-    """Chained per-segment trajectories -> ONE continuous JointTrajectory.
-
-    tour_demo.py pattern: zero controller goal transitions is the
-    no-motion-fault mitigation. Callers guarantee chaining validity
-    (merge_groups)."""
-    merged = JointTrajectory()
-    merged.joint_names = list(trajs[0].joint_names)
-    offset = 0.0
-    for traj in trajs:
-        for pt in traj.points:
-            t = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9 + offset
-            q = type(pt)()
-            q.positions = list(pt.positions)
-            q.velocities = list(pt.velocities)
-            q.accelerations = list(pt.accelerations)
-            q.time_from_start.sec = int(t)
-            q.time_from_start.nanosec = int(round((t - int(t)) * 1e9))
-            merged.points.append(q)
-        last = traj.points[-1].time_from_start
-        offset += last.sec + last.nanosec * 1e-9
-    return merged

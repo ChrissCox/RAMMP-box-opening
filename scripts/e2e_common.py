@@ -1,8 +1,8 @@
 """Shared plumbing for the stub-isolated e2e harnesses.
 
 Every harness process runs under one sourced shell chain on an isolated
-ROS domain. A harness refuses to start beside a real controller_manager
-or planner — the stubs serve the real /rammp_curobo names, and discovery
+ROS domain. A harness refuses to start beside a real arm driver or
+planner — the stubs serve the real driver and /rammp_curobo names, and discovery
 binding on a shared graph is a coin flip — and puts the ros2 CLI daemon
 back down on exit: a daemon left bound to the isolated domain makes
 `ros2 node list` in normal shells come up empty (field lesson 8).
@@ -23,14 +23,15 @@ CONTAINER_YAML = REPO / "src/rammp_box_opening/config/containers/oxo_pop.yaml"
 
 class Shell:
     """The sourced zsh every harness process runs under: the isolated
-    domain, the harness's own stub knobs, then the humble -> RAMMP-CuRobo
-    -> this-repo overlays."""
+    domain on Cyclone DDS (the driver's middleware), the harness's own stub
+    knobs, then the humble -> ~/rammp_deps_ws -> this-repo overlays."""
 
     def __init__(self, stub_env=""):
         self.chain = (
-            "export ROS_DOMAIN_ID=%s; export ROS_LOCALHOST_ONLY=1; %s"
+            "export ROS_DOMAIN_ID=%s; export ROS_LOCALHOST_ONLY=1; "
+            "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; %s"
             "source /opt/ros/humble/setup.zsh; "
-            "source ~/RAMMP-CuRobo/install/setup.zsh; "
+            "source ~/rammp_deps_ws/install/setup.zsh; "
             "source %s/install/setup.zsh; " % (DOMAIN, stub_env, REPO)
         )
 
@@ -54,10 +55,10 @@ class Shell:
         self.run("ros2 daemon stop", timeout=30)  # a daemon bound elsewhere lies
         probe = self.run("timeout 20 ros2 node list", timeout=30)
         nodes = probe.stdout
-        if "/controller_manager" in nodes or "/rammp_curobo" in nodes:
+        if any(n in nodes for n in ("/kinova_gen3_node", "/rammp_curobo", "/controller_manager")):
             sys.exit(
                 "REAL arm stack or planner visible on ROS_DOMAIN_ID=%s:\n%s\n"
-                "This harness serves fake /rammp_curobo names — refusing "
+                "This harness serves fake driver and planner names — refusing "
                 "(discovery binding on a shared graph is a coin flip)."
                 % (DOMAIN, nodes)
             )
@@ -69,18 +70,29 @@ class Shell:
 
 
 def workdir(prefix):
+    """The harness's scratch folder. Every process it spawns also keeps its
+    STATE there (run logs, captures, generated worlds, calibration
+    residuals — constants.state_dir): synthetic runs do not belong beside
+    the bench's, and the every-run captures are pruned to the newest few."""
     tmp = Path(tempfile.mkdtemp(prefix=prefix))
+    os.environ["RAMMP_BOX_OPENING_STATE"] = str(tmp / "state")
     print("workdir %s (domain %s)" % (tmp, DOMAIN))
     return tmp
 
 
-def measured_config(tmp, edit=None):
+def measured_config(tmp, edit=None, name="oxo_measured.yaml"):
     """A copy of the shipped container yaml with measure_me flipped
-    (--execute refuses an unmeasured config), `edit`ed further if asked."""
+    (--execute refuses an unmeasured config), `edit`ed further if asked.
+    `name` lets one harness keep several variants side by side."""
     text = CONTAINER_YAML.read_text().replace("measure_me: true", "measure_me: false")
+    # no re-centring over the button: the stub planner has no real IK (the
+    # arm's forward kinematics say nothing about where it "stands") and the
+    # stub camera does not ride the arm, so the loop could never converge.
+    # Unit-tested instead (test_tasks: recentre*).
+    text = text.replace("recentre_max_moves: 2", "recentre_max_moves: 0", 1)
     if edit is not None:
         text = edit(text)
-    cfg = tmp / "oxo_measured.yaml"
+    cfg = tmp / name
     cfg.write_text(text)
     return cfg
 

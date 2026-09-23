@@ -8,13 +8,15 @@ def test_protocol_surface():
         "joints": [],
         "wrist_efforts": [],
         "efforts_present": [],
-        "tool_xyz": ["timeout_s"],
         "plan_to_pose": ["xyz", "quat_xyzw", "start_joints"],
         "plan_to_joints": ["q7", "start_joints"],
         "execute": ["traj", "speed", "guard"],
         "set_world": ["path_or_name"],
-        "planner_execute_enabled": [],
+        "motion_enabled": [],
         "gripper_cmd": ["position"],
+        "gripper_send": ["position"],
+        "gripper_join": ["handle"],
+        "contact_xyz": ["timeout_s"],
     }
     for name, params in required.items():
         fn = getattr(PlannerClient, name)

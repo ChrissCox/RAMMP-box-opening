@@ -43,7 +43,7 @@ def test_bench_obstacles_survive_in_all_variants():
     m, cp = _model_pose()
     names_full = set(_cuboids(full_world(_bench(), m, cp)))
     w = interaction_world(
-        _bench(), m, cp, target_xyz=[0.45, 0.0, 0.09], contact_z=0.09, depth_max=0.012
+        _bench(), m, cp, contact_z=0.09, depth_max=0.012
     )
     names_int = set(_cuboids(w))
     assert {"pedestal", "table"} <= names_full
@@ -55,19 +55,10 @@ def test_reduction_plane_below_deepest_command():
     assert z <= 0.09 - 0.012 - PLANE_MARGIN_M + 1e-9
 
 
-def test_interaction_ring_leaves_corridor_but_blocks_lateral():
+def test_interaction_world_keeps_the_container_body_below_the_plane():
     m, cp = _model_pose()
-    tx = [0.45, 0.0, 0.09]
-    w = interaction_world(
-        _bench(), m, cp, target_xyz=tx, contact_z=0.09, depth_max=0.012
-    )
+    w = interaction_world(_bench(), m, cp, contact_z=0.09, depth_max=0.012)
     cs = _cuboids(w)
-    ring = [o for n, o in cs.items() if n.startswith("ring_")]
-    assert len(ring) == 4
-    for o in ring:  # corridor xy stays free
-        dx = abs(o["position"][0] - tx[0]) - o["dims"][0] / 2
-        dy = abs(o["position"][1] - tx[1]) - o["dims"][1] / 2
-        assert max(dx, dy) >= 0.0  # ring outside corridor
     body = cs["container_body"]
     body_top = body["position"][2] + body["dims"][2] / 2
     assert body_top <= reduction_plane_z(0.09, 0.012) + 1e-9
@@ -96,7 +87,7 @@ def test_bench_world_is_bench_only(tmp_path):
     w = bench_world(_bench())
     names = set(_cuboids(w))
     assert {"pedestal", "table"} <= names
-    assert not any(n.startswith(("container", "ring", "placed_lid")) for n in names)
+    assert not any(n.startswith(("container", "placed_lid")) for n in names)
     store = WorldStore(BENCH, out_dir=tmp_path)
     n, p = store.push_name("bench")
     assert n == "bench" and p.exists()
@@ -115,20 +106,6 @@ def test_bench_world_keepout_band_when_container_unseen():
     assert band["dims"][0] >= 0.5 and band["dims"][1] >= 0.9  # covers the band
 
 
-def test_interaction_world_ring_optional():
-    m, cp = _model_pose()
-    w = interaction_world(
-        _bench(),
-        m,
-        cp,
-        target_xyz=[0.45, 0.0, 0.09],
-        contact_z=0.09,
-        depth_max=0.012,
-        ring=False,
-    )
-    assert not any(n.startswith("ring_") for n in _cuboids(w))
-
-
 def test_interaction_world_caps_bench_at_the_reduction_plane():
     """A set-down onto the bench must be PLANNABLE to its overdrive depth
     (field 2026-08-26: IK_FAIL 25 mm over the solid table); a
@@ -138,15 +115,15 @@ def test_interaction_world_caps_bench_at_the_reduction_plane():
     table = next(o for o in bench["obstacles"] if o["name"] == "table")
     table_top = table["position"][2] + table["dims"][2] / 2
     contact = table_top + 0.03  # lid-height above the table
-    w = interaction_world(bench, m, cp, [0.54, -0.27, contact], contact, 0.005)
+    w = interaction_world(bench, m, cp, contact, 0.005)
     plane = reduction_plane_z(contact, 0.005)
     assert plane < table_top
     for o in w["obstacles"]:
-        if o["name"].startswith(("container", "ring", "placed_lid", "pedestal")):
+        if o["name"].startswith(("container", "placed_lid", "pedestal")):
             continue
         assert o["position"][2] + o["dims"][2] / 2 <= plane + 1e-9
     # press-like: contact at button height leaves the bench untouched
-    w = interaction_world(bench, m, cp, [0.45, 0.0, 0.09], 0.09, 0.015)
+    w = interaction_world(bench, m, cp, 0.09, 0.015)
     tops = {o["name"]: o["position"][2] + o["dims"][2] / 2 for o in w["obstacles"]}
     assert tops["table"] == pytest.approx(table_top)
 
@@ -166,7 +143,7 @@ def test_pedestal_survives_a_plane_below_its_base():
     plane = reduction_plane_z(contact, 0.005)
     assert plane < base, "test needs a plane under the pedestal base"
 
-    w = interaction_world(bench, m, cp, [0.54, -0.27, contact], contact, 0.005)
+    w = interaction_world(bench, m, cp, contact, 0.005)
     kept = [o for o in w["obstacles"] if o["name"] == "pedestal"]
     assert kept, "pedestal must never be dropped from a collision world"
     stub = kept[0]
@@ -210,3 +187,36 @@ def test_full_world_container_pad_inflates_xy_only(tmp_path):
     _, p1 = store.push_name("full", model=m, cpose=cp)
     _, p2 = store.push_name("full", model=m, cpose=cp, container_pad_xy=0.03)
     assert p1 != p2  # content-hashed: the padded world is its own file
+
+
+def test_written_worlds_keep_the_padded_table_on_its_true_surface(tmp_path):
+    """RAMMP-CuRobo v1.0.0 pads the table (its no_pad_names is the pedestal
+    alone): written at its true height, the table reads 2 cm too tall to the
+    planner and swallows the arm's own base spheres. The file carries it that
+    much lower; the pedestal is still exempt, and the floor_* keep-outs were
+    always meant to be padded. Perception keeps the true surface."""
+    store = WorldStore(BENCH, out_dir=tmp_path)
+    _, path = store.push_name("bench")
+    written = _cuboids(yaml.safe_load(path.read_text()))
+    table = written["table"]
+    assert table["position"][2] + table["dims"][2] / 2 + 0.02 == pytest.approx(-0.027)
+    assert written["pedestal"]["position"] == [0.0, 0.0, -0.05]
+    assert written["floor_front"]["position"][2] == pytest.approx(-0.057)
+    assert store.table_top_z == pytest.approx(-0.027)
+
+
+def test_a_table_capped_at_the_reduction_plane_still_ends_there_when_padded(tmp_path):
+    """A set-down's interaction world caps the table at the reduction plane
+    (-0.082 here); padded, it must end AT the plane, not 2 cm above it."""
+    m, cp = _model_pose()
+    store = WorldStore(BENCH, out_dir=tmp_path)
+    contact = -0.027 + 0.03
+    _, path = store.push_name(
+        "interaction",
+        model=m,
+        cpose=cp,
+        contact_z=contact,
+        depth_max=0.005,
+    )
+    table = _cuboids(yaml.safe_load(path.read_text()))["table"]
+    assert table["position"][2] + table["dims"][2] / 2 + 0.02 == pytest.approx(-0.082)

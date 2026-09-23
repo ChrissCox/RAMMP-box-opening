@@ -11,6 +11,7 @@ def state():
 
 def test_chaining_start_joints_flow(ctx):
     c = ctx
+    c.last_pose = ([0.45, 0.0, 0.10], [0.0, 1.0, 0.0, 0.0])
     st = state()
     legs_a, st = Lift(0.10).plan(c, st)
     legs_b, st = Home().plan(c, st)
@@ -37,10 +38,9 @@ def test_place_sequence_and_release(ctx):
     assert descend.guard.trip == "setdown"
     assert open_.chain == descend.chain + 1  # contact breaks the chain
     assert open_.gripper_cmd == 0.0
-    # field 2026-08-26: the hover start state sat inside the aperture-ring
-    # walls (INVALID_START_STATE) — the set-down world must be ring-free
+    # the set-down plans in an interaction world capped under ITS contact
     interaction = [kw for k, kw in c.worlds.pushes if k == "interaction"]
-    assert interaction and interaction[-1]["ring"] is False
+    assert interaction and interaction[-1]["contact_z"] == pytest.approx(target_z)
     # the carried lid hangs below the fingertips, invisible to the
     # planner: the transit hover must clear the container top by a
     # lid-height plus margin (field 2026-08-26: lid clipped the box line)
@@ -49,32 +49,33 @@ def test_place_sequence_and_release(ctx):
     # success is the TOUCH: the stroke overdrives past nominal surface
     # contact so an exact-height 'arrived' can't slip through untripped
     assert descend.target[1][2] == pytest.approx(target_z - SETDOWN_OVERDRIVE_M)
-    assert descend.guard.target_z == pytest.approx(target_z)
 
 
-def test_lift_reverifies_band(ctx):
+def test_lift_rises_from_the_last_commanded_pose_and_carries_no_verify(ctx):
+    """A verify would close the lift's merge group (a dead stop before the
+    carry); the slip check sits at the set-down. With no pose commanded
+    yet there is nothing to rise from, and it says so."""
+    import pytest
+
     c = ctx
-    legs, _ = Lift(0.10, band=(0.55, 0.75)).plan(c, state())
-    assert len(legs) == 1 and legs[0].verify is not None
-    ok, _ = legs[0].verify(VerifyCtx(outcome="arrived", gripper_pos=0.6))
-    assert ok
-    ok, _ = legs[0].verify(VerifyCtx(outcome="arrived", gripper_pos=0.79))
-    assert not ok  # slipped to fully closed
-    ok, detail = legs[0].verify(VerifyCtx(outcome="arrived", gripper_pos=None))
-    assert ok and "unchecked" in detail  # honest fallback, logged
+    with pytest.raises(RuntimeError, match="preceding pose"):
+        Lift(0.10).plan(c, state())
+    c.last_pose = ([0.45, 0.0, 0.10], [0.0, 1.0, 0.0, 0.0])
+    legs, _ = Lift(0.10).plan(c, state())
+    assert len(legs) == 1 and legs[0].verify is None
+    assert legs[0].target[1] == pytest.approx([0.45, 0.0, 0.20])
 
 
-def test_press_fixed_single_stroke_from_staging(ctx):
+def test_press_stroke_is_one_touch_stroke_from_staging(ctx):
     import pytest
 
     from rammp_box_opening.models.container import load_press_demo
-    from rammp_box_opening.primitives.core import PressFixed
+    from rammp_box_opening.primitives.core import PRESS_APPROACH_M, press_stroke
 
     c = ctx
     cfg = load_press_demo(CFG)
-    legs, st = PressFixed(cfg).plan(c, state())
-    assert len(legs) == 1  # v2: no hover, no close (close rides the approach)
-    press = legs[0]
+    press, st = press_stroke(c, state(), cfg)
+    assert press.name == "press:down" and press.target[3] == PRESS_APPROACH_M  # vertical final
     button = from_container(c.cpose, c.model.button_offset)
     assert press.kind is Kind.MOTION and press.world.startswith("interaction")
     # the TOUCH stage: a light threshold that finds the surface; the push
@@ -86,13 +87,12 @@ def test_press_fixed_single_stroke_from_staging(ctx):
     assert st.chain == press.chain + 1  # contact breaks the chain
 
 
-def test_press_fixed_verify_expected_depth_semantics(ctx):
+def test_press_stroke_verify_expected_contact_semantics(ctx):
     from rammp_box_opening.models.container import load_press_demo
-    from rammp_box_opening.primitives.core import PressFixed
+    from rammp_box_opening.primitives.core import press_stroke
 
     cfg = load_press_demo(CFG)
-    legs, _ = PressFixed(cfg).plan(ctx, state())
-    press = legs[0]
+    press, _ = press_stroke(ctx, state(), cfg)
     expected = cfg.staging_m / (cfg.staging_m + cfg.travel_m)
     # trip near the expected contact depth = pressed
     ok, detail = press.verify(VerifyCtx(outcome="touch", progress=expected))
@@ -113,12 +113,12 @@ def test_worlds_are_pushed_at_plan_time(ctx):
     # requested — execution-time pushes alone mean every trajectory was
     # planned against the previous world (2026-08-24 review, critical)
     from rammp_box_opening.models.container import load_press_demo
-    from rammp_box_opening.primitives.core import PressFixed
+    from rammp_box_opening.primitives.core import press_stroke
 
     c = ctx
     Home().plan(c, state())
     assert c.client.worlds_pushed == ["full.yaml"]
-    PressFixed(load_press_demo(CFG)).plan(c, state())
+    press_stroke(c, state(), load_press_demo(CFG))
     assert c.client.worlds_pushed == ["full.yaml", "interaction_button.yaml"]
 
 
@@ -127,8 +127,8 @@ def test_contact_sets_the_container_pad_for_later_full_worlds(ctx):
     FULL world allows for a scooted container."""
     from rammp_box_opening.primitives.core import (
         CONTACT_SHIFT_PAD_M,
-        PressFixed,
         _full_world,
+        press_stroke,
     )
 
     c, st = ctx, state()
@@ -138,7 +138,7 @@ def test_contact_sets_the_container_pad_for_later_full_worlds(ctx):
     from rammp_box_opening.models.container import load_press_demo
 
     cfg = load_press_demo(CFG)
-    PressFixed(cfg).plan(c, st)
+    press_stroke(c, st, cfg)
     assert c.contact_pad == CONTACT_SHIFT_PAD_M
     _full_world(c)
     assert c.worlds.pushes[-1][1]["container_pad_xy"] == CONTACT_SHIFT_PAD_M

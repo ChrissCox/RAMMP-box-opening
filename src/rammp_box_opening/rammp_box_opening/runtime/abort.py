@@ -1,7 +1,7 @@
 """SIGINT ownership for motion CLIs: cancel-then-exit (spec §1, lesson 7).
 
 rclpy's default SIGINT handler shuts the context down out from under an
-in-flight ExecuteTrajectory goal. On this stack the cancel request
+in-flight trajectory goal. On this stack the cancel request
 usually still escapes onto the wire, but the confirmation spin dies on
 the invalidated context — a traceback instead of an answer to "did the
 arm stop?", and delivery itself is a version/timing race, not a

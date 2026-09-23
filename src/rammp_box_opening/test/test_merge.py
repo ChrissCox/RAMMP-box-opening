@@ -1,4 +1,3 @@
-import pytest
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from rammp_box_opening.runtime.guards import GuardSpec
@@ -8,7 +7,6 @@ from rammp_box_opening.runtime.legs import (
     VerifyCtx,
     can_merge,
     merge_groups,
-    merge_trajectories,
 )
 
 
@@ -58,10 +56,50 @@ def test_speed_change_no_longer_splits():
     assert [len(g) for g in groups] == [2]
 
 
-def test_guarded_leg_always_alone():
+def test_a_guarded_leg_takes_its_approach_with_it():
+    """The approach and the descent it leads into fly as ONE execution.
+
+    They used to be two goals with a controller round trip and a full stop
+    between them, which is the pause a person does not make when reaching
+    for something. Nothing merges AFTER the guarded leg: a trip must never
+    strand queued motion behind it."""
     g = GuardSpec(touch_nm=3.0, trip="press")
     groups = merge_groups([leg("a"), leg("b", guard=g), leg("c")])
-    assert [len(g) for g in groups] == [1, 1, 1]
+    assert [len(x) for x in groups] == [2, 1]
+    assert groups[0][-1].guard is g
+
+
+def test_a_guarded_leg_owns_its_group_so_it_may_carry_a_verify():
+    """A verify normally cannot be absorbed as a non-lead member — only the
+    execution's owner is verified. A guarded tail IS that owner."""
+
+    def v(ctx):
+        return True, ""
+
+    g = GuardSpec(touch_nm=3.0, trip="press")
+    groups = merge_groups([leg("a"), leg("b", guard=g, verify=v)])
+    assert [len(x) for x in groups] == [2]
+    # ... but an unguarded verify-carrier still closes the group it ends
+    groups = merge_groups([leg("a"), leg("b", verify=v)])
+    assert [len(x) for x in groups] == [1, 1]
+
+
+def test_a_warped_descent_keeps_its_own_execution():
+    """Warping and the group profile are two ways to do one job. A warped
+    leg's timing is already baked in (speed 1.0), so re-timing it as part of
+    a group would throw that profile away and cruise it at full speed into
+    contact — the set-down and the grip descent stay alone."""
+    g = GuardSpec(touch_nm=3.0, trip="setdown")
+    down = leg("place:lid:down", guard=g, speed=1.0)
+    down.warp = (0.5, 0.15, 0.3)
+    groups = merge_groups([leg("place:lid:transit"), down])
+    assert [len(x) for x in groups] == [1, 1]
+
+
+def test_two_guarded_legs_never_share_an_execution():
+    g = GuardSpec(touch_nm=3.0, trip="press")
+    groups = merge_groups([leg("a", guard=g), leg("b", guard=g)])
+    assert [len(x) for x in groups] == [1, 1]
 
 
 def test_verify_closes_group():
@@ -94,19 +132,9 @@ def test_can_merge_is_symmetric_gate():
     assert not can_merge(leg("a", chain=0), leg("b", chain=1))
 
 
-def test_merge_trajectories_offsets_time():
-    merged = merge_trajectories([_traj([0.0, 0.1]), _traj([0.1, 0.2])])
-    times = [
-        p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in merged.points
-    ]
-    assert times == sorted(times)
-    assert times[-1] == pytest.approx(2.0)  # 1 s + 1 s, offset applied
-    assert merged.points[-1].positions[0] == pytest.approx(0.2)
-
-
 def test_verify_ctx_defaults():
     ctx = VerifyCtx(outcome="arrived")
-    assert ctx.depth_m is None and ctx.gripper_pos is None
+    assert ctx.gripper_pos is None
 
 
 def test_a_verify_carrying_leg_is_never_absorbed_into_a_group():

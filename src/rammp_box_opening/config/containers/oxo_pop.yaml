@@ -5,7 +5,12 @@
 # button travel is still worth 2 minutes.
 measure_me: false
 
-dims: [0.075, 0.075, 0.112]       # z = the closed box's TOP height above
+dims: [0.104, 0.104, 0.112]       # xy: the 4.1-inch OXO on the bench since
+                                  # 2026-09-16 pm — its lid plateau measured
+                                  # 0.098-0.104 m square from the wrist at
+                                  # 25 cm (frame test/data/wrist_staging_big
+                                  # _box.npz; the 2.9-inch box is oxo_pop_
+                                  # small.yaml). z = the closed box's TOP height above
                                   # the table. RE-DERIVED 2026-09-03 from
                                   # depth: 39 parked capture frames put the
                                   # button top at 0.0851 (std 1.4 mm) and the
@@ -21,12 +26,17 @@ dims: [0.075, 0.075, 0.112]       # z = the closed box's TOP height above
                                   # The depth path re-checks this every run —
                                   # watch the "[depth] measured top" line. xy
                                   # still nominal — tape when convenient
-lid_dims: [0.075, 0.075, 0.03]
+lid_dims: [0.104, 0.104, 0.03]
 button_offset: [0.0, 0.0, 0.112]  # the flush button top IS the container
                                   # top: the detected lid plateau is the
                                   # press plane. Moves with dims.z — they are
                                   # the same surface, re-derived 2026-09-03.
-button_diameter_m: 0.036          # the round button's diameter — NOMINAL,
+button_diameter_m: 0.047          # the round button's diameter — MEASURED
+                                  # 0.047 on the 4.1-inch box (Hough radius
+                                  # 41 px at 0.250 m, 2026-09-17); the small
+                                  # box's is 0.036. Drives the staging aim's
+                                  # and the circle-refine radius windows.
+                                  # Was: NOMINAL,
                                   # caliper it when convenient. Drives the
                                   # circle-refine radius window: the press
                                   # aims at the DETECTED CIRCLE's centre,
@@ -40,19 +50,30 @@ press:
                                   # below is measured from THAT — not from
                                   # the camera's lid height, which swings
                                   # +/-6 mm run to run (2026-09-03).
-  button_travel_m: 0.004          # the PUSH stage: how far past first contact
-                                  # to drive, position-bounded. The button
-                                  # latches within its own travel; the video
-                                  # of 2026-09-03 showed the old single
-                                  # 7 Nm stroke pressing it flush and then
-                                  # compressing the whole container until the
-                                  # torque built up. Caliper the travel; if
-                                  # the knob does not pop, raise this by 1 mm.
-  touch_nm: 7.0                   # now the push's BACKSTOP: the push trips at
+  button_travel_m: 0.010          # the PUSH stage's BOUND: how far past first
+                                  # contact the pads may drive. The push
+                                  # normally ends EARLIER, when the button's
+                                  # own stop is felt (touch_nm below): that
+                                  # is the press. 0.004 -> 0.010 (owner,
+                                  # 2026-09-17: "press until it feels the
+                                  # force, it's barely touching the button"):
+                                  # the touch stops at a light 3 Nm contact
+                                  # with the 4.1-inch button barely loaded,
+                                  # and 4 mm from there popped it only when
+                                  # the contact read +2 mm (10:52), not at
+                                  # +6 mm. Still a bound: the 2026-09-03
+                                  # video showed an unbounded 7 Nm stroke
+                                  # compressing the whole container.
+  touch_nm: 7.5                   # now the push's BACKSTOP: the push trips at
                                   # (touch_nm - contact_nm) above its own
                                   # in-contact baseline, i.e. the same ~7 Nm
                                   # total as before, but reaching it is the
                                   # exception, not how the press ends.
+                                  # 7.0 -> 7.5 (2026-09-16): a press 6 mm off
+                                  # centre met the 7.0 backstop at 5.6 Nm over
+                                  # its baseline without popping the button;
+                                  # 8.1 scooted the box, so this is the room
+                                  # there is.
                                   # Old note: torque-guard trip threshold (spec §6).
                                   # Bisected at the bench: 6.1 Nm stopped
                                   # short of releasing the seal at the crisp
@@ -61,7 +82,15 @@ press:
                                   # ~2 cm (fix moved 0.458->0.438 between
                                   # runs, and the stale cuboid then clipped
                                   # the home sweep). 7.0 splits the bracket.
-press_attitude_rpy_deg: [180.0, 0.0, 0.0]   # top-down; yaw steered per pose
+press_attitude_rpy_deg: [180.0, 0.0, 90.0]  # top-down, wrist facing straight
+                                  # ahead: the LOOK pose's own orientation
+                                  # (0.02 deg apart), so nothing turns
+                                  # between look, approach and press
+press_yaw_steer: false            # FIXED in the world (above). true = yaw
+                                  # steered to the box's bearing (2026-08-25
+                                  # family), which turned the wrist up to
+                                  # 105 deg on the way to staging — "the arm
+                                  # keeps flipping" (owner, 2026-09-16)
 hover_standoff: 0.08              # m above the lid set-down spot for the carry
                                   # hover (plus a lid height; Place.hover_for)
 open_container:
@@ -93,41 +122,13 @@ open_box:
                                   # keeps the full retreat, because its home
                                   # is planned in the FULL world where the
                                   # finger spheres need ~0.10 m of clearance.
-  grip_speed: 0.15                # descent onto the popped button. NOT yet
-                                  # raised: a trip here means FAILURE and the
-                                  # stop height is 2 mm above the lid, vs
-                                  # POSE_UNCERTAINTY_M 0.02. Ramp at the bench
-                                  # 0.15 -> 0.25 -> 0.35, three descents each,
-                                  # watching torque_peak in the run jsonl.
-  merge_press: true               # ONE continuous motion from the scan pose
-                                  # straight to the button, replacing
-                                  # [transit to staging] STOP [press down].
-                                  # No seam and no splice: a single cuRobo
-                                  # solve is continuous by construction, and
-                                  # the warp below supplies the slow-into-
-                                  # contact profile. Only legal because the
-                                  # scan pose is already NEAR-OVERHEAD of
-                                  # the box — the descent is near-vertical,
-                                  # so the container being unmodelled above
-                                  # the reduction plane costs no real
-                                  # clearance. Guarded by
-                                  # merge_press_max_lateral_m.
-  merge_press_max_lateral_m: 0.20 # refuse the merge (and fall back to the
-                                  # two-leg path) when the scan pose is
-                                  # further than this from the button in xy.
-                                  # Why 0.20 is defensible (field 2026-09-01,
-                                  # a real box sat 152 mm off-axis): the
-                                  # descent converges over the button as it
-                                  # falls — by container-top height only ~9%
-                                  # of the initial offset remains (<2 cm at
-                                  # 0.20), the warp has it at press speed
-                                  # well before box height, and the guard is
-                                  # armed the whole way, so an edge strike
-                                  # trips as an honest early-contact failure.
-                                  # The merged solve still plans in the
-                                  # reduced world; past 0.20 the lateral run
-                                  # through it is too long — staged fallback.
-  warp_fast_speed: 0.5            # free-air portion of a GUARDED descent.
+  grip_speed: 0.35                # descent onto the popped button. Raised
+                                  # 0.15 -> 0.35 (owner, 2026-09-16) to match
+                                  # the guarded set-down, which has run at
+                                  # 0.35 since 2026-09-02. A trip here still
+                                  # means FAILURE (struck the knob or the lid);
+                                  # watch torque_peak in the run jsonl.
+  warp_fast_speed: 0.75           # free-air portion of a GUARDED descent.
                                   # A guarded leg used one scale for its whole
                                   # length, so grip:down crawled 118 mm at 0.15
                                   # (4.16 s) when only the last stretch is near
@@ -137,6 +138,21 @@ open_box:
                                   # already limit-checked. The guard stays
                                   # armed throughout and re-baselines at the
                                   # transition. 0 disables warping entirely.
+                                  # Raised 0.5 -> 0.75 (owner, 2026-09-15) to
+                                  # match the free-air cruise the chained
+                                  # press approach already runs at. The only
+                                  # leg this still governs is grip:down: the
+                                  # set-down gave up its warp to join the
+                                  # carry's merge group, and the press flies
+                                  # as the tail of its approach's group.
+                                  # KNOW WHAT THIS BUYS AND COSTS: the
+                                  # fast segment is planned in the reduced
+                                  # world, where the container top is absent,
+                                  # and the guard cannot TRIP before its
+                                  # slow-zone rebaseline settles — so a
+                                  # strike in free air is a collision, not a
+                                  # caught contact. warp_slow_frac decides
+                                  # how much of the path is protected.
   warp_slow_frac: 0.30            # final fraction of the PATH at contact speed
   setdown_speed: 0.35             # guarded set-down; a trip IS the success
                                   # here. The guard observes the whole stroke
@@ -144,11 +160,11 @@ open_box:
                                   # (arm_after 0.5, and never before the
                                   # warp's slow zone): a fast-segment trip
                                   # released the lid 110 mm up (2026-09-02).
-  park_tool_down: false           # true: the arm RESTS tool-down at the scan
-                                  # pose between runs instead of the factory
+  park_tool_down: false           # true: the arm RESTS at the LOOK pose
+                                  # between runs instead of the factory
                                   # HOME, skipping the 2.4-2.9 rad wrist flip
-                                  # twice a run (~5-7 s) — but it then hovers
-                                  # 0.45 m over the bench where the box goes.
+                                  # twice a run (~5-7 s) — but it then holds
+                                  # the tool out over where the box goes.
                                   # Tried ON 2026-09-03; the owner wants the
                                   # run to END AT HOME (2026-09-04), so off.
   setdown_touch_nm: 4.0           # set-down trip threshold — a lid on a
@@ -168,11 +184,14 @@ open_box:
                                   # trip the guard (field 2026-08-26, first
                                   # grip attempt)
   press_offset_xy: [0.0, 0.0]     # base-frame trim of where the CLOSED pads
-                                  # land on the button (m). Dial at the bench:
-                                  # if the pads land +x of the button centre,
-                                  # set x negative by that much. +/-0.02 max —
-                                  # a bigger trim means the fix or the camera
-                                  # mount is wrong, not the pads.
+                                  # land on the button (m), for a pad-vs-tool
+                                  # offset ONLY. Zero: the constant 6 mm miss
+                                  # of 2026-09-14..16 was the planner's
+                                  # descent bowing sideways (runtime/approach
+                                  # .py), not the pads — a trim here would
+                                  # have double-corrected once the line
+                                  # replaced it. Dial only from a run whose
+                                  # PRESS line reports a straight descent.
   grip_offset_xy: [0.0, 0.0]      # base-frame grasp trim, on top of the
                                   # button circle. ZEROED 2026-09-03: the
                                   # -3 mm was measured when the pose came
@@ -218,8 +237,18 @@ press_demo:
                                   # err-tall + padding eat ~0.10); 0.10 is
                                   # the measured boundary
 scan:
-  xyz: [0.42, 0.0, 0.45]          # tool-down look pose; camera sees ~0.6 x
-                                  # 0.4 m of bench around it at lid height
+  # The mission no longer FLIES to a scan pose: it turns the wrist down
+  # from wherever the arm rests and sweeps the base to search (the look,
+  # primitives/look.py). What is left here is the sweep's arc and an xyz
+  # that only scripts/reach_probe.py still surveys.
+  search_arc_rad: 0.6             # base yaw each way when the look sees
+                                  # nothing: at the look the camera stands
+                                  # 0.49 m out, so this carries the view
+                                  # centre to [0.41, +/-0.28] and reaches
+                                  # the corners of the placement band. The
+                                  # look alone covers x 0.28-0.71, y +/-0.38
+                                  # at LID height (its narrow axis is x)
+  xyz: [0.42, 0.0, 0.45]          # reach-probe survey point only
 vlm:                              # detect.source: vlm — the semantic gate
   backends: [owl, claude]         # tried in order, first bbox wins. LOCAL
                                   # first: the wheelchair will not always
@@ -240,6 +269,28 @@ vlm:                              # detect.source: vlm — the semantic gate
                                   # back to plain depth, never stalls
   pad_px: 20                      # bbox padding before it gates the depth
 detect:
+  confirm_in_flight: false        # true: with the scene camera's coarse fix,
+                                  # the approach and the guarded descent fly
+                                  # as ONE goal and the wrist confirms the
+                                  # box DURING the approach; the arm never
+                                  # stops above the box. The goal is cut at
+                                  # the junction only when the wrist has not
+                                  # confirmed by then, or disagrees with the
+                                  # scene by more than 5 mm. Needs the
+                                  # camera's timestamp lag MEASURED first
+                                  # (camera_d405_wrist.yaml stamp_offset_s):
+                                  # moving frames are otherwise placed where
+                                  # the arm was, not where the shutter fired.
+  recentre_max_moves: 2           # at staging, when the aim finds the button
+                                  # more than 5 mm from under the tool: move
+                                  # over it and aim again, up to this many
+                                  # times, then press from the last aim. Every
+                                  # press that landed dead centre was aimed
+                                  # with the button under the tool; aimed 11
+                                  # cm off, one hit the button's edge and did
+                                  # not open the box (2026-09-23). 0: aim once
+                                  # and press (the stub harness: its planner
+                                  # has no real IK and its camera is fixed).
   require_button_circle: true     # only a sighting whose BUTTON CIRCLE was
                                   # segmented (OpenCV Hough on the button's
                                   # seam) may commit a fix — that circle's

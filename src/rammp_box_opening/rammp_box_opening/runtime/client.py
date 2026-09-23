@@ -1,38 +1,56 @@
-"""The single ROS surface: planner action clients + gripper + TF + params.
+"""The single ROS surface: the arm driver, the planner, the gripper, TF.
 
-Every pattern here is lifted from proven RAMMP-CuRobo clients:
-spin_until_done/cancel-on-Ctrl+C from tour_demo.py, the guarded execute
-loop from the recovered palm_demo.py — with the spec §6 hardening: the
-guard is ARMED by ExecuteTrajectory feedback progress > 0 (never at
-goal-accept) and efforts come from the /joint_states stream.
+Two containers answer it, sheppy's arm module. The kinova-gen3-ros2 driver
+executes (/execute_joint_trajectory), reports (/joint_states, the gripper
+knuckle included) and takes gripper commands on /setpoint/gripper. The
+RAMMP-CuRobo v1.0.0 planner plans (/rammp_curobo/plan_to_pose,
+plan_to_joints, set_world) and never moves anything. TF comes from
+kinova_gen3_description's robot_state_publisher, which the launch starts.
+
+The spec §6 hardening stands: the guard is ARMED by execution feedback
+progress > 0 (never at goal-accept) and efforts come from the /joint_states
+stream. What the driver does not check before it moves — the start state,
+velocity limits, timing — is checked here (runtime/driver.py), and nothing
+moves at all unless this client was armed by --execute.
 """
 
 import sys
 import time
+from collections import namedtuple
 
 import rclpy
-from control_msgs.action import GripperCommand
-from rcl_interfaces.srv import GetParameters
 from rclpy.action import ActionClient
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
 
-from rammp_curobo_interfaces.action import (
-    ExecuteTrajectory,
-    PlanToJoints,
-    PlanToPose,
-)
+from rammp_arm_interfaces.action import ExecuteJointTrajectory
+from rammp_arm_interfaces.msg import GripperSetpoint
+from rammp_curobo_interfaces.action import PlanToJoints, PlanToPose
 from rammp_curobo_interfaces.srv import SetWorld
 
 from rammp_box_opening.constants import (
+    EXECUTE_ACTION,
     FINGERTIP_FRAMES,
-    GRIPPER_ACTION,
+    GRIPPER_FORCE,
+    GRIPPER_SETPOINT_TOPIC,
+    GRIPPER_SPEED,
+    JOINT_VMAX,
     JOINTS,
     NODE_NAMESPACE,
 )
+from rammp_box_opening.runtime import driver
+from rammp_box_opening.runtime.approach import plan_with_vertical_approach
 
 _GRIPPER_JOINT_HINTS = ("robotiq", "knuckle", "finger")
+
+# ExecuteJointTrajectory.Goal.control_mode / .preemption (rammp_arm_interfaces)
+POSITION = 0
+QUEUE = 0
+
+# a gripper command in flight: knuckle-radian target, the knuckle at send, when
+GripperHandle = namedtuple("GripperHandle", "target start t0")
 
 
 def spin_until_done(node, future, timeout_s, abort=None):
@@ -50,29 +68,47 @@ def spin_until_done(node, future, timeout_s, abort=None):
 
 
 class PlannerClient:
-    def __init__(self, node, abort=None):
+    # a pending gripper setpoint is re-sent this often: the topic is
+    # best-effort and latest-wins, so one lost message must not strand a
+    # command, and re-sending the same absolute setpoint changes nothing
+    GRIPPER_RESEND_S = 0.1
+    GRIPPER_TIMEOUT_S = 10.0
+    # a knuckle reading older than this is a stream gap, never "settled"
+    GRIPPER_STREAM_GAP_S = 0.2
+
+    def __init__(self, node, abort=None, motion_enabled=False):
         self.node = node
         self._abort = abort  # AbortFlag when the CLI owns SIGINT (abort.py)
+        # The motion latch, set only by --execute. The driver executes
+        # whatever it receives and has no dry-run parameter, so this is the
+        # software gate on arm AND gripper motion.
+        self._armed = bool(motion_enabled)
         self._q = None
         self._eff = None
         self._eff_at = 0.0  # monotonic stamp of the last joint_states message
         self._gripper_pos = None
+        self._gripper_target = None  # driver setpoint (0..1) re-sent while pending
         self.world_held = None  # path of the world the planner holds
-        node.create_subscription(JointState, "/joint_states", self._js_cb, 10)
+        # the driver publishes /joint_states best-effort (SensorDataQoS): a
+        # reliable subscription would match nothing and hear nothing
+        node.create_subscription(
+            JointState, "/joint_states", self._js_cb, qos_profile_sensor_data
+        )
         self._plan_pose = ActionClient(
             node, PlanToPose, NODE_NAMESPACE + "/plan_to_pose"
         )
         self._plan_joints = ActionClient(
             node, PlanToJoints, NODE_NAMESPACE + "/plan_to_joints"
         )
-        self._execute = ActionClient(
-            node, ExecuteTrajectory, NODE_NAMESPACE + "/execute_trajectory"
-        )
-        self._gripper = ActionClient(node, GripperCommand, GRIPPER_ACTION)
+        self._execute = ActionClient(node, ExecuteJointTrajectory, EXECUTE_ACTION)
         self._set_world = node.create_client(SetWorld, NODE_NAMESPACE + "/set_world")
-        self._params = node.create_client(
-            GetParameters, NODE_NAMESPACE + "/get_parameters"
+        # latest-wins, best-effort depth 1: the driver subscribes exactly so
+        self._gripper_pub = node.create_publisher(
+            GripperSetpoint,
+            GRIPPER_SETPOINT_TOPIC,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
         )
+        node.create_timer(self.GRIPPER_RESEND_S, self._publish_gripper)
         self._tf = Buffer()
         self._tf_listener = TransformListener(self._tf, node)
 
@@ -96,16 +132,18 @@ class PlannerClient:
                 self._gripper_pos = float(msg.position[idx[name]])
                 break
 
+    def motion_enabled(self):
+        """Whether this client may move the arm or the gripper (--execute)."""
+        return self._armed
+
     def joints(self):
         t0 = time.monotonic()
         while self._q is None:
             rclpy.spin_once(self.node, timeout_sec=0.2)
             if time.monotonic() - t0 > 10:
                 sys.exit(
-                    "no /joint_states — start the arm bringup (RAMMP-Kinova "
-                    "workspace) and the planner first:\n"
-                    "  ros2 launch rammp_curobo_ros planner.launch.py "
-                    "config:=gen3_real.yaml"
+                    "no /joint_states — is sheppy's `arm` node up, and does this "
+                    "shell export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp?"
                 )
         return list(self._q)
 
@@ -128,11 +166,25 @@ class PlannerClient:
         self.joints()  # ensure at least one message arrived
         return self._eff is not None
 
+    def _fresh_joints(self, timeout_s=1.0):
+        """The live joints while /joint_states is flowing, else None: a
+        start gate judged against a frozen sample is no gate."""
+        t0 = time.monotonic()
+        while True:
+            if (
+                self._q is not None
+                and time.monotonic() - self._eff_at <= self.EFFORT_STALE_S
+            ):
+                return list(self._q)
+            if time.monotonic() - t0 > timeout_s:
+                return None
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+
     def contact_xyz(self, timeout_s=0.25):
         """Where the FINGERTIPS are right now, from TF: the midpoint of the
         two finger-tip links, or None.
 
-        Called the instant a guard trips, this is the arm measuring the
+        Called the instant a guard trip lands, this is the arm measuring the
         surface it just touched with its own kinematics — no camera, no
         model constant. Unlike tool_frame these frames exist in the live
         tree, so the lookup resolves instead of stalling."""
@@ -153,38 +205,26 @@ class PlannerClient:
         print("[client] no %s in TF — contact heights unavailable" % (FINGERTIP_FRAMES[0],))
         return None
 
-    def tool_xyz(self, timeout_s=0.5):
-        """Live base_link -> tool_frame translation via TF, or None.
-
-        This bringup's TF tree has NO tool_frame (field 2026-08-25): the
-        first full timeout is remembered so later calls return instantly
-        instead of stalling telemetry — a 1.5 s lookup at the bottom of
-        every press stroke was most of the 'pause while pressed'."""
-        if getattr(self, "_tool_frame_missing", False):
-            return None
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout_s:
-            try:
-                tf = self._tf.lookup_transform("base_link", "tool_frame", Time())
-                tr = tf.transform.translation
-                return [tr.x, tr.y, tr.z]
-            except Exception:
-                rclpy.spin_once(self.node, timeout_sec=0.1)
-        self._tool_frame_missing = True
-        return None
-
     def planner_reachable(self, timeout_s=5.0):
-        """True when all three planner action servers respond."""
+        """True when both planner actions AND its set_world service respond.
+
+        set_world is the first thing every plan calls, and it is advertised
+        only once cuRobo has finished loading, so an action that answers
+        before it does is not a planner that can plan yet."""
         return (
             self._plan_pose.wait_for_server(timeout_sec=timeout_s)
             and self._plan_joints.wait_for_server(timeout_sec=2.0)
-            and self._execute.wait_for_server(timeout_sec=2.0)
+            and self._set_world.wait_for_service(timeout_sec=2.0)
         )
+
+    def driver_reachable(self, timeout_s=5.0):
+        """True when the driver's trajectory action responds."""
+        return self._execute.wait_for_server(timeout_sec=timeout_s)
 
     # -- planning ----------------------------------------------------------
     def _call(self, client, goal, timeout_s=120.0):
         if not client.wait_for_server(timeout_sec=5.0):
-            sys.exit("planner node not running")
+            sys.exit("planner not reachable — is sheppy's `planner` node up?")
         send = spin_until_done(
             self.node, client.send_goal_async(goal), 10.0, abort=self._abort
         )
@@ -196,12 +236,17 @@ class PlannerClient:
         return None if wrapped is None else wrapped.result
 
     def plan_to_pose(self, xyz, quat_xyzw, start_joints, approach_offset_m=0.0):
+        """>0 approach_offset_m: arrive from a waypoint that far straight above
+        the goal — a diagonal descent touches a surface before its lateral
+        convergence finishes (edge presses, field 2026-09-01). The v1.0.0
+        planner cannot constrain that, so it is two plans flown as one
+        trajectory (runtime/approach.py)."""
+        return plan_with_vertical_approach(
+            self._plan_pose_once, xyz, quat_xyzw, start_joints, float(approach_offset_m)
+        )
+
+    def _plan_pose_once(self, xyz, quat_xyzw, start_joints):
         g = PlanToPose.Goal()
-        # >0: the planner constrains the FINAL approach_offset_m metres to
-        # a straight -z descent onto the goal — a diagonal descent touches
-        # a surface before its lateral convergence finishes (edge presses,
-        # field 2026-09-01)
-        g.approach_offset_m = float(approach_offset_m)
         g.target.position.x, g.target.position.y, g.target.position.z = (
             float(v) for v in xyz
         )
@@ -221,41 +266,70 @@ class PlannerClient:
 
     # -- execution ---------------------------------------------------------
     def _cancel_confirm(self, send, result_future):
-        """Ctrl+C path: cancel on a live context and report what the server
+        """Ctrl+C path: cancel on a live context and report what the driver
         actually confirmed — never claim a stop that wasn't answered."""
         spin_until_done(self.node, send.cancel_goal_async(), 5.0)
         wrapped = spin_until_done(self.node, result_future, 10.0)
         if wrapped is not None:
-            print("\nCtrl+C — cancel delivered; controller stops and holds")
+            print("\nCtrl+C — cancel delivered; the driver stops and holds")
         else:
             print(
                 "\nCtrl+C — cancel sent; no result confirmation in 10 s — "
                 "check the arm"
             )
 
-    def execute(self, traj, speed, guard=None, while_running=None):
-        """Run one trajectory; outcome 'arrived' | 'touch' | 'failed'.
+    def execute(self, traj, speed, guard=None, while_running=None, stop_when=None):
+        """Run one trajectory on the driver; outcome 'arrived' | 'touch' | 'failed'.
 
-        With a guard: feedback progress arms it, /joint_states efforts
-        feed it; a trip cancels the goal (controller stops and holds).
+        `speed` dilates the trajectory's time base (the driver has no speed
+        scale of its own); 1.0 flies it as planned or re-timed. Nothing is
+        sent unless the client is armed and the trajectory passes the gates
+        the driver lacks (runtime/driver.py): fresh live joints at its start,
+        velocities under the limits, time running forward.
+
+        With a guard: feedback progress arms it, /joint_states efforts feed
+        it; a trip cancels the goal — the driver stops and holds its last
+        reference, so the contact load stays on.
+
+        `stop_when(progress)`: polled while the motion flies with the
+        driver's progress fraction; the first True cancels the goal and
+        returns 'stopped'. This is how a search ends the moment it finds
+        what it was looking for, leaving the arm where it saw it — and how
+        a reach that carries its own descent stops at the junction when the
+        box has not been confirmed by then.
 
         `while_running` (UNGUARDED legs only): a callable run once right
-        after the goal is accepted — the next phase's planning, hidden
-        under this motion instead of after it (the planner service plans
-        and executes under separate locks). Its blocking plans spin this
-        same node, so feedback keeps flowing; its result lands in
-        info["while_running"], an exception in info["while_running_error"]
-        — never past the cancel path."""
+        after the goal is accepted — the next phase's planning, hidden under
+        this motion instead of after it (the planner is its own container).
+        Its blocking plans spin this same node, so feedback keeps flowing;
+        its result lands in info["while_running"], an exception in
+        info["while_running_error"] — never past the cancel path."""
         info = {"message": "", "progress": 0.0, "torque_peak": None}
-        goal = ExecuteTrajectory.Goal(trajectory=traj, speed_scale=float(speed))
         if self._abort is not None and self._abort.requested:
             raise KeyboardInterrupt  # aborted before this leg ever started
-        if not self._execute.wait_for_server(timeout_sec=5.0):
-            info["message"] = "execute_trajectory server not available"
+        if not self._armed:
+            info["message"] = "motion disabled: the client was not armed (--execute)"
             return "failed", info
+        if not self._execute.wait_for_server(timeout_sec=5.0):
+            info["message"] = "execute_joint_trajectory not available — is the arm node up?"
+            return "failed", info
+        flown = traj if float(speed) == 1.0 else driver.dilate(traj, speed)
+        live = self._fresh_joints()
+        if live is None:
+            info["message"] = "no fresh /joint_states — refusing to send a trajectory"
+            return "failed", info
+        why = driver.refusal(flown, live, JOINT_VMAX)
+        if why:
+            info["message"] = "refused before sending: " + why
+            return "failed", info
+        goal = ExecuteJointTrajectory.Goal()
+        goal.trajectory = flown
+        goal.control_mode = POSITION
+        goal.preemption = QUEUE  # never displace a goal that is still settling
+        goal.sender_id = "rammp_box_opening"
 
         def _fb(msg):
-            info["progress"] = float(msg.feedback.progress)
+            info["progress"] = float(msg.feedback.fraction_complete)
             if guard is not None:
                 guard.on_progress(info["progress"])
 
@@ -270,10 +344,14 @@ class PlannerClient:
                 10.0,
             )
             if send is None or not send.accepted:
-                info["message"] = "goal not accepted"
+                info["message"] = (
+                    "goal rejected by the driver (a stream session open, or a "
+                    "mode change while moving)"
+                )
                 return "failed", info
             result_future = send.get_result_async()
             contact = False
+            stopped = False
             aborted = False
             t0 = time.monotonic()
             efforts_ok_at = time.monotonic()
@@ -299,6 +377,11 @@ class PlannerClient:
                         aborted = True
                         break
                     rclpy.spin_once(self.node, timeout_sec=0.05)
+                    if stop_when is not None and stop_when(info["progress"]):
+                        spin_until_done(self.node, send.cancel_goal_async(), 3.0)
+                        spin_until_done(self.node, result_future, 10.0)
+                        stopped = True
+                        break
                     if guard is not None:
                         eff = self.wrist_efforts()
                         if eff is not None:
@@ -338,11 +421,18 @@ class PlannerClient:
         if contact:
             info["message"] = "torque guard trip"
             return "touch", info
+        if stopped:
+            info["message"] = "stopped part-way: what it was watching for happened"
+            return "stopped", info
         wrapped = result_future.result()
-        if wrapped is not None and wrapped.result.success:
-            info["message"] = wrapped.result.message
+        if wrapped is None:
+            info["message"] = "no result"
+            return "failed", info
+        result = wrapped.result
+        if result.error_code == driver.SUCCESSFUL:
+            info["message"] = "arrived"
             return "arrived", info
-        info["message"] = wrapped.result.message if wrapped is not None else "no result"
+        info["message"] = driver.result_message(result.error_code, result.error_string)
         return "failed", info
 
     # -- services / gripper ------------------------------------------------
@@ -350,7 +440,8 @@ class PlannerClient:
         """Push a world; a no-op when the planner already holds it. This is
         the ONE record of what the planner holds (plan-time pushes and
         replans both route here; two trackers drifted, review 2026-09-02).
-        Worlds are content-hashed paths, so equal path == equal world."""
+        Worlds are content-hashed paths, so equal path == equal world. The
+        planner runs in a container: the path must exist inside it too."""
         key = str(path_or_name)
         if key == self.world_held:
             return True, "held"
@@ -364,91 +455,75 @@ class PlannerClient:
         self.world_held = key
         return True, resp.message
 
-    def planner_execute_enabled(self):
-        """Read the planner's LIVE execute parameter; False if unreachable
-        (fail closed — the gripper action itself is not server-gated)."""
-        if not self._params.wait_for_service(timeout_sec=3.0):
-            return False
-        req = GetParameters.Request(names=["execute"])
-        resp = spin_until_done(self.node, self._params.call_async(req), 5.0)
-        if resp is None or not resp.values:
-            return False
-        return bool(resp.values[0].bool_value)
-
     def gripper_cmd(self, position):
-        """Command the gripper (0.0 open … 0.8 closed); position None =
-        query only (live joint-state position, no motion)."""
+        """Command the gripper and wait (knuckle rad: 0.0 open .. 0.8 closed);
+        position None = query only (the live knuckle, no motion).
+        Returns (ok, position, stalled)."""
         if position is None:
             return self._gripper_pos is not None, self._gripper_pos or 0.0, False
-        goal = GripperCommand.Goal()
-        goal.command.position = float(position)
-        goal.command.max_effort = 100.0
-        if not self._gripper.wait_for_server(timeout_sec=2.0):
-            return False, 0.0, False
         handle = self.gripper_send(position)
         if handle is None:
             return False, 0.0, False
         return self.gripper_join(handle)
 
     def gripper_send(self, position):
-        """Start a gripper command and return a handle WITHOUT waiting.
+        """Start a gripper command (knuckle rad) and return a handle WITHOUT
+        waiting, or None when it cannot be sent.
 
         Lets a close overlap the motion that follows it — the fingers shut
-        while the arm transits instead of the arm standing still for a
-        full action round trip. The caller MUST join before anything that
-        depends on the fingers having arrived.
-        """
-        goal = GripperCommand.Goal()
-        goal.command.position = float(position)
-        goal.command.max_effort = 100.0
-        if not self._gripper.wait_for_server(timeout_sec=2.0):
+        while the arm transits instead of the arm standing still for the
+        whole close; the driver's gripper is not a control mode, so it rides
+        alongside a trajectory by design. The caller MUST join before
+        anything that depends on the fingers having arrived."""
+        if not self._armed:
             return None
-        send = spin_until_done(self.node, self._gripper.send_goal_async(goal), 5.0)
-        if send is None or not send.accepted:
-            return None
-        return send
+        if self._gripper_pos is None:
+            t0 = time.monotonic()
+            while self._gripper_pos is None and time.monotonic() - t0 < 2.0:
+                rclpy.spin_once(self.node, timeout_sec=0.1)
+            if self._gripper_pos is None:
+                return None  # no knuckle reading: nothing could confirm the command
+        self._gripper_target = driver.setpoint_position(position)
+        self._publish_gripper()
+        return GripperHandle(float(position), float(self._gripper_pos), time.monotonic())
 
-    GRIPPER_SETTLE_S = 0.15
-    GRIPPER_MOVED_MIN = 0.01
-    GRIPPER_SETTLE_TOL = 0.003
+    def _publish_gripper(self):
+        """Send the pending setpoint; also the re-send timer's callback."""
+        if self._gripper_target is None:
+            return
+        msg = GripperSetpoint()
+        msg.position = float(self._gripper_target)
+        # sent on every message: the driver keeps neither speed nor force
+        msg.speed = GRIPPER_SPEED
+        msg.force = GRIPPER_FORCE
+        self._gripper_pub.publish(msg)
 
     def gripper_join(self, handle):
-        """Wait out a gripper_send. Same (ok, position, stalled) as
-        gripper_cmd — the overlap must not change what callers verify.
+        """Wait out a gripper_send: (ok, position, stalled), the same verdict
+        as gripper_cmd — the overlap must not change what callers verify.
 
-        Returns as soon as EITHER the action result arrives OR the live
-        knuckle position has moved and then held still for
-        GRIPPER_SETTLE_S: the Robotiq controller only reports its result
-        after a 1.0 s stall timer, long after the fingers have settled on
-        the knob (~0.6 s per grip:close, review 2026-09-02). The verify
-        reads the same live position either way."""
-        fut = handle.get_result_async()
-        start = self._gripper_pos
-        last_pos = start
-        settled_since = None
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < 10.0:
-            rclpy.spin_once(self.node, timeout_sec=0.02)
-            if fut.done():
-                wrapped = fut.result()
-                if wrapped is None:
-                    return False, 0.0, False
-                return True, float(wrapped.result.position), bool(wrapped.result.stalled)
-            pos = self._gripper_pos
-            if pos is None or start is None:
-                continue
-            if time.monotonic() - self._eff_at > 0.2:
-                # no fresh /joint_states: a stream gap must not read as
-                # "fingers settled" (review 2026-09-02)
-                settled_since = None
-                continue
-            moved = abs(pos - start) >= self.GRIPPER_MOVED_MIN
-            if last_pos is not None and abs(pos - last_pos) > self.GRIPPER_SETTLE_TOL:
-                settled_since = None
-            elif moved and settled_since is None:
-                settled_since = time.monotonic()
-            last_pos = pos
-            if moved and settled_since is not None:
-                if time.monotonic() - settled_since >= self.GRIPPER_SETTLE_S:
-                    return True, float(pos), False
-        return False, 0.0, False
+        The driver's gripper reports no result, so completion is read off the
+        knuckle in /joint_states (driver.GripperWait): at the target; moved
+        and then still (closed on the knob, a stall the grip band judges);
+        or never moved at all (a failure). Re-sending stops once it is in.
+
+        The wait is timed from HERE, not from the dispatch: a deferred command
+        is meant to sit pending through the motion it overlaps, and that motion
+        can outlast the timeout on its own — in slow mode the scan flight did,
+        and the join reported a closed gripper as a failure without ever
+        reading it (field 2026-09-14). GripperWait still counts "never moved"
+        from the dispatch, where that question belongs."""
+        wait = driver.GripperWait(handle.target, handle.start, handle.t0)
+        deadline = time.monotonic() + self.GRIPPER_TIMEOUT_S
+        try:
+            while time.monotonic() < deadline:
+                rclpy.spin_once(self.node, timeout_sec=0.02)
+                now = time.monotonic()
+                pos = self._gripper_pos
+                fresh = pos is not None and now - self._eff_at <= self.GRIPPER_STREAM_GAP_S
+                done = wait.update(handle.start if pos is None else pos, now, fresh)
+                if done is not None:
+                    return done
+            return False, float(self._gripper_pos or 0.0), False
+        finally:
+            self._gripper_target = None

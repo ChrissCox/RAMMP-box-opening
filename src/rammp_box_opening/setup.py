@@ -23,7 +23,7 @@ setup(
     zip_safe=True,
     maintainer="RAMMP",
     maintainer_email="chrisman4247@gmail.com",
-    description="Box-opening primitives over the RAMMP-CuRobo planning service",
+    description="Box opening on the kinova-gen3-ros2 driver and the RAMMP-CuRobo planner",
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={
@@ -32,7 +32,6 @@ setup(
             "home_arm = rammp_box_opening.tasks.home_arm:main",
             "preflight = rammp_box_opening.tasks.preflight:main",
             "owl_detector = rammp_box_opening.perception.owl_node:main",
-            "joint_state_relay = rammp_box_opening.runtime.joint_state_relay:main",
         ],
     },
 )

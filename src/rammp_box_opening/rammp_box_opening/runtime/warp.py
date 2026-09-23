@@ -31,6 +31,8 @@ import math
 
 from trajectory_msgs.msg import JointTrajectory
 
+from rammp_box_opening.runtime.stamps import secs, set_stamp
+
 RAMP_POINTS = 8  # over how many points the scale eases from fast to slow
 
 
@@ -78,16 +80,13 @@ def warp_trajectory(traj, slow_frac, fast_scale, slow_scale):
         else:
             scales.append(fast_scale)
 
-    def stamp(p):
-        return p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
-
     out = JointTrajectory()
     out.joint_names = list(traj.joint_names)
     t_acc, arm_time = 0.0, None
     prev_t = 0.0
     for i, p in enumerate(pts):
-        dt = stamp(p) - prev_t
-        prev_t = stamp(p)
+        dt = secs(p.time_from_start) - prev_t
+        prev_t = secs(p.time_from_start)
         t_acc += dt / scales[i] if dt > 0 else 0.0
         q = copy.deepcopy(p)
         if p.velocities:
@@ -96,8 +95,7 @@ def warp_trajectory(traj, slow_frac, fast_scale, slow_scale):
             q.accelerations = [
                 float(a) * scales[i] * scales[i] for a in p.accelerations
             ]
-        q.time_from_start.sec = int(t_acc)
-        q.time_from_start.nanosec = int(round((t_acc - int(t_acc)) * 1e9))
+        set_stamp(q.time_from_start, t_acc)
         out.points.append(q)
         if arm_time is None and cum[i] >= slow_starts:
             arm_time = t_acc

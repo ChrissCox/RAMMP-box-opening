@@ -1,0 +1,16 @@
+parent_frame: base_link
+child_frame: scene_camera_link
+xyz:
+- -0.07672
+- 0.68364
+- 0.38833
+quat_xyzw:
+- 0.026522
+- 0.043627
+- -0.28454
+- 0.957304
+note: tag position via the wrist camera + door and table planes; 20260923-112915;
+  mismatch 1.17 deg; 20 frames per camera
+tag_px:
+- 711.5
+- 217.6
