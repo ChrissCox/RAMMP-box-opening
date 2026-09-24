@@ -120,11 +120,20 @@ def _restore_execution_profile(leg):
     actually fly) gets it called on the final trajectory."""
     w = leg.warp
     if w is not None:
-        fast, slow_speed, slow_frac = w
+        fast, slow_speed, slow_frac = w[:3]
+        # a 4th element: seconds into the slow zone the guard takes its
+        # baseline AND arms (press_demo.fly_free_air_fast: a slow zone that
+        # starts from rest, where the warp's own rule would baseline still)
+        settle_s = w[3] if len(w) > 3 else None
         warped, arm_frac = warp_trajectory(leg.traj, slow_frac, fast, slow_speed)
         if arm_frac is None:
             leg.speed = float(slow_speed)
             leg.guard = replace(leg.guard, rebaseline_after=None)
+        elif settle_s is not None:
+            leg.traj = warped
+            total = secs(warped.points[-1].time_from_start)
+            armed_at = min(arm_frac + max(WARP_SETTLE_FRAC, settle_s / max(total, 1e-6)), ARM_AFTER_CAP)
+            leg.guard = replace(leg.guard, rebaseline_after=armed_at, arm_after=armed_at)
         else:
             leg.traj = warped
             # arm_after rides with the rebaseline: the fresh trajectory has

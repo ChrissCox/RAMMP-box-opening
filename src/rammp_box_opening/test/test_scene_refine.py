@@ -14,12 +14,17 @@ def _rot_z(deg):
 
 
 def test_pairs_at_one_spot_fit_a_translation_only():
+    """...and a HORIZONTAL one: the scene camera's box-top height is not the
+    arm's (the pink lid reads ~3 cm low with the table exactly right,
+    2026-09-24), so the pairs' heights are not fitted — the table plane
+    owns height and tilt."""
     scene = np.array([[0.57, -0.03, 0.065], [0.58, -0.03, 0.066]])
     wrist = scene + np.array([0.006, -0.004, 0.024])
     r = fit(scene, wrist)
     assert r.mode == "translation" and r.n == 2
-    assert np.allclose(r.D[:3, 3], [0.006, -0.004, 0.024], atol=1e-9)
-    assert r.rms_after_mm < 1e-6 and r.rms_before_mm == pytest.approx(25.1, abs=0.2)
+    assert np.allclose(r.D[:3, 3], [0.006, -0.004, 0.0], atol=1e-9)
+    assert np.allclose(r.D[:3, :3], np.eye(3))
+    assert r.rms_after_mm < 1e-6 and r.rms_before_mm == pytest.approx(7.2, abs=0.1)
 
 
 def test_spread_pairs_recover_a_rotation_and_a_shift():
@@ -29,7 +34,8 @@ def test_spread_pairs_recover_a_rotation_and_a_shift():
     wrist = scene @ R.T + t + rng.normal(0, 0.0005, scene.shape)
     r = fit(scene, wrist)
     assert r.mode == "rigid" and r.spread_m > 0.15
-    assert np.allclose(r.D[:3, :3], R, atol=2e-3) and np.allclose(r.D[:3, 3], t, atol=2e-3)
+    assert np.allclose(r.D[:3, :3], R, atol=2e-3) and np.allclose(r.D[:2, 3], t[:2], atol=2e-3)
+    assert r.D[2, 3] == 0.0  # the height is the table plane's (above)
     assert r.rms_after_mm < 1.5
     T = np.eye(4); T[:3, 3] = [0.0, 0.6, 0.38]
     T2 = apply(T, r)

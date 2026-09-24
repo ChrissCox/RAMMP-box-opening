@@ -220,16 +220,14 @@ class SceneLocator:
                 if t_ready is None:
                     t_ready = time.monotonic()
                     self.last_timing["streams_s"] = round(t_ready - t0, 2)
-                    # before any fix: is the camera where it was calibrated?
-                    # A re-aimed camera put every fix 9-11 cm off, run after
-                    # run, and nothing noticed (2026-09-23)
+                    # is the calibration's tag where it was? Said, never
+                    # refused: it rides the cabinet door (scene_calib
+                    # TAG_MOVED_PX); a re-aimed camera is caught by what its
+                    # fixes measure instead (press_demo.scene_trust)
                     from rammp_box_opening.perception.scene_calib import scene_camera_moved
 
-                    moved, why = scene_camera_moved(self.grab.color, self.tag_px)
+                    _moved, why = scene_camera_moved(self.grab.color, self.tag_px)
                     self.moved_note = why
-                    if moved:
-                        self.last_why = why
-                        return None
                 if self.owl.latest is None:
                     continue
                 heard = True

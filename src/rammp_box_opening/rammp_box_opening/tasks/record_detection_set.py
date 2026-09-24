@@ -37,9 +37,7 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-
-from rammp_box_opening.detection_set import grid_points, write_manifest
+from rammp_box_opening.detection_set import grid_points, scene_frame, write_frame, write_manifest
 from rammp_box_opening.constants import GRIPPER_CMD_CLOSED, HOME, HOME_START_TOL_RAD, TRANSIT_SPEED, state_dir
 from rammp_box_opening.models.container import ContainerModel, ContainerPose, load_press_demo
 from rammp_box_opening.tasks import cli_common
@@ -59,18 +57,7 @@ def save_scene_frame(scene, folder, T_base_link):
     """One scene capture — everything the scene locator uses, raw: colour
     (BGR), the median depth of the kept frames, both intrinsics, the depth
     -> colour extrinsic, link -> colour, and the calibration in force."""
-    folder.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        folder / "frame_000.npz",
-        color=scene.color,
-        depth=scene.depth_median(),
-        k=np.asarray(scene.k, float),
-        kd=np.asarray(scene.kd, float),
-        dist=np.asarray(scene.dist if scene.dist is not None else [], float),
-        T_color_depth=np.asarray(scene.depth_to_color(), float),
-        T_link_color=np.asarray(scene.link_to_color(), float),
-        T_base_link=np.asarray(T_base_link, float),
-    )
+    write_frame(folder, scene_frame(scene, T_base_link))
 
 
 def main():

@@ -491,6 +491,8 @@ class BoxTopWatcher:
         # from a different pose — a bbox is only valid where it was taken.
         self.roi = None
         self.last_reject = None  # why the last non-hit frame was refused
+        self.last_aim = None  # the last close-up aim's press point (press_demo.aim_button_at_staging)
+        self.last_aim_capture = None  # ... and the folder its frame was saved in
         self._last_stamp = None
         self._last_cam = None  # previous frame's camera pose (still filter)
         # detection runs only inside a detect window (wait_for_fix and the

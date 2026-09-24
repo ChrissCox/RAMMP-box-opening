@@ -125,21 +125,8 @@ class SceneGrabber:
         return self.depths[-1] if self.depths else None
 
     def depth_median(self):
-        """The median of the kept depth frames, zeros ignored — a steadier
-        surface than any single frame."""
-        if not self.depths:
-            return None
-        import warnings
-
-        stack = np.stack(self.depths)
-        stack = np.where(stack > 0, stack, np.nan)
-        # pixels with no depth in any frame are all-NaN columns: nanmedian
-        # warns once per such column (83k warnings, 50 ms, and the noise at
-        # every mission start) — they are simply holes
-        with np.errstate(all="ignore"), warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            med = np.nanmedian(stack, axis=0)
-        return np.nan_to_num(med, nan=0.0)
+        """The median of the kept depth frames (median_depth)."""
+        return median_depth(self.depths)
 
     def missing(self):
         out = []
@@ -182,6 +169,24 @@ class SceneGrabber:
         if d is None or self.kd is None or self.k is None or T_c_d is None:
             return None
         return color_cloud(d, self.kd, self.k, self.dist, T_c_d, stride=stride)
+
+
+def median_depth(depths):
+    """The median of depth frames (m), zeros ignored — a steadier surface
+    than any single frame. None for no frames."""
+    if not depths:
+        return None
+    import warnings
+
+    stack = np.stack(depths)
+    stack = np.where(stack > 0, stack, np.nan)
+    # pixels with no depth in any frame are all-NaN columns: nanmedian
+    # warns once per such column (83k warnings, 50 ms, and the noise at
+    # every mission start) — they are simply holes
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        med = np.nanmedian(stack, axis=0)
+    return np.nan_to_num(med, nan=0.0)
 
 
 def color_cloud(depth, kd, k, dist, T_color_depth, stride=1):

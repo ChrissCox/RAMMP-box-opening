@@ -113,10 +113,15 @@ def optical_to_link(T_base_optical, T_link_optical):
 # from HOME and by the scene camera (scripts/calibrate_scene_camera.py).
 TAG_DICT = cv2.aruco.DICT_4X4_50
 TAG_ID = 0
-# The tag this far (px) from where the calibration saw it: the scene camera
-# has moved since, and its fixes cannot be trusted. It sits steady to
-# 0.12 px; 5 px at its 1.07 m is ~0.3 deg of camera rotation — ~5 mm at the
-# box.
+# The tag this far (px) from where the calibration saw it: the tag, or the
+# camera, has moved. It sits steady to 0.12 px; 5 px at its 1.07 m is ~0.3
+# deg of camera rotation — ~5 mm at the box. This used to REFUSE the scene
+# camera, and it misfired: the tag rides the cabinet DOOR — at 35 px on
+# 2026-09-24 12:30 and 5 px at 15:22, with the arm at the same pixel in both
+# scene frames and the fixes' error unchanged — and a refused scene camera
+# is a 3 s wrist search. It is a note now; what the scene camera is trusted
+# on is what it measured (press_demo.scene_trust: how far its box was from
+# the button the wrist found, on the last run).
 TAG_MOVED_PX = 5.0
 
 
@@ -145,9 +150,10 @@ def scene_camera_moved(color_bgr, tag_px_cal, tol_px=TAG_MOVED_PX):
     d = float(np.hypot(c[0] - tag_px_cal[0], c[1] - tag_px_cal[1]))
     if d > tol_px:
         return True, (
-            "the SCENE CAMERA HAS MOVED since its calibration: the tag is at (%.0f, %.0f), calibrated at "
-            "(%.0f, %.0f) — %.0f px. Its fixes would be off by an unknown amount. Recalibrate, arm at HOME: "
-            "python3 scripts/calibrate_scene_camera.py" % (c[0], c[1], tag_px_cal[0], tag_px_cal[1], d)
+            "the calibration tag has moved %.0f px (at (%.0f, %.0f), calibrated at (%.0f, %.0f)): the cabinet door "
+            "moved, or the camera did. Its fix is flown all the same — the close-up aim corrects it, and a camera "
+            "that really moved shows as a large scene-vs-wrist error, which stops it being trusted. If it did move: "
+            "python3 scripts/calibrate_scene_camera.py" % (d, c[0], c[1], tag_px_cal[0], tag_px_cal[1])
         )
     return False, None
 

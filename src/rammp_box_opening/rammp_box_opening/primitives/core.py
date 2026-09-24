@@ -60,6 +60,7 @@ class Ctx:
     last_pose: tuple = None  # (xyz, quat_xyzw) of the last commanded pose
     last_world: tuple = None  # (name, path) of the last interaction world
     contact_pad: float = 0.0  # container xy padding once contact has happened
+    mission_frames: object = None  # this run's detection record (detection_set.MissionFrames), --execute missions
 
 
 @dataclass

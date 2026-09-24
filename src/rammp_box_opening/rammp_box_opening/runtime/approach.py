@@ -150,13 +150,51 @@ def plan_with_vertical_approach(plan_pose, xyz, quat_xyzw, start_joints, offset_
     )
 
 
+def human_timed_above_waypoint(leg):
+    """Re-time the PLANNER's part of a planned-with-vertical-approach leg —
+    the free air above its waypoint — on the mission's human-motion profile
+    (runtime/retime: what every unguarded motion flies, per-joint velocity
+    capped under the limits), the straight line below it untouched and the
+    rest at the waypoint kept. Positions are never moved. Returns True when
+    it made the leg faster (and moves leg.waypoint / guard_from to the new
+    indices); a leg it would not speed up is left as it was.
+
+    cuRobo times a short segment by its own horizon, not by its length: a
+    guarded descent flown on its own kept that timing, so the few
+    centimetres above the waypoint flew like a long move (bench
+    2026-09-24: 1.66 s for grip:down's 45 mm)."""
+    if leg.waypoint is None or leg.traj is None:
+        return False
+    idx = int(leg.waypoint[0])
+    pts = leg.traj.points
+    if idx < 1 or idx >= len(pts) - 1:
+        return False
+    names = list(leg.traj.joint_names)
+    upper = line_trajectory(names, [list(p.positions) for p in pts[: idx + 1]])
+    if secs(upper.points[-1].time_from_start) >= secs(pts[idx].time_from_start):
+        return False  # the planner's own timing was already as brisk
+    lower = JointTrajectory()
+    lower.joint_names = names
+    t0 = secs(pts[idx].time_from_start)
+    for p in pts[idx:]:
+        lower.points.append(_point(p, secs(p.time_from_start) - t0))
+    leg.traj = chain(upper, lower)
+    k = len(upper.points) - 1
+    leg.waypoint = (k, list(leg.waypoint[1]))
+    if leg.guard_from is not None:
+        leg.guard_from = k
+    return True
+
+
 REFIT_MAX_M = 0.03  # a corrected target further than this from the planned one is re-planned
 
 
-def refit_descent(leg, xyz, quat_xyzw, chain_model=None):
+def refit_descent(leg, xyz, quat_xyzw, chain_model=None, start_joints=None):
     """Re-fit a planned-with-vertical-approach leg to a corrected target
     `xyz` WITHOUT the planner, from the arm's own kinematics: a short level
-    move at the height the leg STARTS from, to above the new target; one
+    move at the height the leg STARTS from (or from `start_joints`, where
+    the arm stands now: after a move over the button at staging height the
+    leg's own start is behind it), to above the new target; one
     straight line down to the approach offset above it; and from there the
     same final line a planned leg ends with, from rest — the guarded part
     keeps the dynamics it has on every other press. Returns True and
@@ -182,7 +220,7 @@ def refit_descent(leg, xyz, quat_xyzw, chain_model=None):
         return False
     kin = chain_model if chain_model is not None else _chain()
     _idx, q_wp = leg.waypoint
-    q0 = [float(v) for v in leg.traj.points[0].positions]
+    q0 = [float(v) for v in (leg.traj.points[0].positions if start_joints is None else start_joints)]
     _R, t0 = kin.fk(q0)
     _R, t_wp = kin.fk(q_wp)
     _R, t_end = kin.fk(leg.traj.points[-1].positions)

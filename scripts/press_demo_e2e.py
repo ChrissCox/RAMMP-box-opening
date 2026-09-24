@@ -361,8 +361,11 @@ def run_scenario(tmp, cfg, table_z, mode, cfg_override=None):
                 fails.append(what)
         if "\nlook " in cli_said:
             fails.append("the wrist search ran — the scene fix should have made it unnecessary")
-        m = re.search(r"scene camera was off by \[([-+\d.]+), ([-+\d.]+), ([-+\d.]+)\] mm", cli_said)
-        if m and max(abs(float(v)) for v in m.groups()) > 15.0:
+        # horizontal (x, y): heights are not compared (perception/scene_refine)
+        m = re.search(r"scene camera was off by \[([-+\d.]+), ([-+\d.]+)\] mm", cli_said)
+        if m is None:
+            fails.append("the scene-vs-wrist residual line did not parse")
+        elif max(abs(float(v)) for v in m.groups()) > 15.0:
             fails.append("scene-vs-wrist residual %s mm > 15 on a synthetic scene" % list(m.groups()))
     if "approach:staging" not in cli_said:
         fails.append("no approach:staging leg in the chained press")

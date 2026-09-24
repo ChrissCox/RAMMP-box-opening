@@ -244,6 +244,41 @@ def test_the_search_that_finds_nothing_reports_no_box(ctx, tmp_path, monkeypatch
     assert len(ctx.client.joint_targets) == 3  # look, then both ways
 
 
+def test_the_search_keeps_the_frame_each_step_stood_at(ctx, tmp_path, monkeypatch):
+    """A mission's record (ctx.mission_frames) gets one wrist frame per
+    search step, named for the step, in the order flown."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.detection_set import MissionFrames
+    from rammp_box_opening.perception import depth_source
+
+    press_demo = _search_env(monkeypatch)
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g: (np.eye(3), np.zeros(3)))
+    cfg = load_press_demo(CFG)
+    ctx.mission_frames = MissionFrames(tmp_path / "missions", "oxo_pop.yaml", 0.05)
+    watcher = _Watcher()
+    watcher.grab = SimpleNamespace(
+        color=np.zeros((4, 6, 3), np.uint8), depth=np.zeros((4, 6), np.float32), k=np.eye(3),
+        color_stamp=SimpleNamespace(sec=1, nanosec=2), dist=None,
+    )
+    got, failed = press_demo.search_for_box(None, ctx, cfg, make_runner(ctx.client, tmp_path), watcher, True)
+    assert got is None and failed is None
+    assert [n for n, _ in ctx.mission_frames.frames] == ["wrist_look_0", "wrist_sweep:left_0", "wrist_sweep:right_0"]
+
+
+def test_the_press_point_is_the_aims_only_when_it_is_the_last_close_up_aim():
+    from rammp_box_opening.tasks import press_demo
+
+    w = _Watcher()
+    assert press_demo.aim_source(w, (0.4, 0.0, 0.15)) == "fix"  # never aimed
+    w.last_aim = (0.4, 0.0, 0.15)
+    assert press_demo.aim_source(w, [0.4, 0.0, 0.15]) == "aim"
+    assert press_demo.aim_source(w, (0.41, 0.0, 0.15)) == "fix"  # a fix from elsewhere
+
+
 def test_a_coarse_sighting_that_never_confirms_cannot_eat_the_search(
     ctx, tmp_path, monkeypatch
 ):
@@ -907,8 +942,71 @@ def test_the_calibration_report_counts_only_pairs_made_under_this_calibration(tm
     f.write_text("".join(json.dumps(r) + "\n" for r in rows))
     press_demo.residual_hint(f, calib)
     said = capsys.readouterr().out
-    assert "2 pair(s) on file, mean offset [-0, -12, -6] mm" in said
+    assert "2 pair(s) on file, mean offset [-0, -12] mm" in said  # horizontal: heights are not compared
     assert "2 older pair(s) were made under an earlier calibration" in said
+
+
+def _pairs_file(tmp_path, offsets_mm, t0=3000.0, spots=((0.325, -0.291), (0.312, -0.158), (0.406, -0.219))):
+    """A calibration file (in force from t=2000) and a residuals file with
+    one pair per spot: the scene camera's box `offsets_mm` from the wrist's."""
+    import json
+    import os
+
+    calib = tmp_path / "camera_scene.yaml"
+    calib.write_text("xyz: [-0.0767, 0.6836, 0.3883]\nquat_xyzw: [0.026522, 0.043627, -0.28454, 0.957304]\n")
+    os.utime(calib, (2000.0, 2000.0))
+    f = tmp_path / "residuals.jsonl"
+    rows = []
+    for i, ((x, y), (dx, dy)) in enumerate(zip(spots, offsets_mm)):
+        rows.append({"t": t0 + i, "scene_top": [x + dx / 1000.0, y + dy / 1000.0, 0.062], "wrist_top": [x, y, 0.095]})
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return f, calib
+
+
+def test_the_scene_camera_is_trusted_on_what_it_last_measured(tmp_path):
+    """Bench 2026-09-24: the cabinet-door tag refused the scene camera at
+    6 px (a 3 s wrist search) while the camera had not moved — and at 5 px
+    it would have flown to a box 12 cm off. What decides now is the last
+    pair recorded under the calibration in force."""
+    from rammp_box_opening.tasks import press_demo
+
+    f, calib = _pairs_file(tmp_path, [(-126, -28), (-3, 2)])  # 12 cm off, then corrected
+    assert press_demo.scene_trust(f, calib) == (True, None)
+    f, calib = _pairs_file(tmp_path, [(-3, 2), (-118, -31)])
+    trusted, why = press_demo.scene_trust(f, calib)
+    assert trusted is False and "122 mm" in why
+    f, calib = _pairs_file(tmp_path, [(-118, -31)], t0=1000.0)  # made under an earlier calibration
+    assert press_demo.scene_trust(f, calib) == (True, None)
+    assert press_demo.scene_trust(tmp_path / "none.jsonl", calib) == (True, None)
+
+
+def test_the_scene_calibration_corrects_itself_from_pairs_that_agree(tmp_path):
+    """Three runs that all found the scene camera ~12 cm off the same way
+    (2026-09-24) are a calibration error, not noise: the mission corrects
+    it, keeps a backup, and the pairs retire with the calibration they
+    measured."""
+    import yaml
+
+    from rammp_box_opening.perception.scene_refine import calibrated_at, load_pairs
+    from rammp_box_opening.tasks import press_demo
+
+    f, calib = _pairs_file(tmp_path, [(-126, -28), (-119, -30), (-118, -31)])
+    before = yaml.safe_load(calib.read_text())
+    said = press_demo.auto_refine(f, calib)
+    assert said is not None and "REFINED" in said and "3 pairs" in said
+    after = yaml.safe_load(calib.read_text())
+    assert after["xyz"][0] == pytest.approx(before["xyz"][0] + 0.121, abs=0.002)  # moved by the pairs' mean, in x
+    assert after["xyz"][1] == pytest.approx(before["xyz"][1] + 0.0297, abs=0.002)
+    assert after["xyz"][2] == pytest.approx(before["xyz"][2])  # heights are the table's, not the pairs'
+    assert list(tmp_path.glob("camera_scene.yaml.bak-*"))  # the old one kept
+    assert len(load_pairs(f, since=calibrated_at(calib))[0]) == 0  # the pairs retired with it
+    # pairs that disagree, or a camera already right, are left alone
+    f, calib = _pairs_file(tmp_path, [(-126, -28), (40, 60), (-10, 5)])
+    assert press_demo.auto_refine(f, calib) is None
+    f, calib = _pairs_file(tmp_path, [(4, -3), (-5, 2), (3, 6)])
+    assert press_demo.auto_refine(f, calib) is None
+    f, calib = _pairs_file(tmp_path, [(-126, -28), (-119, -30)], spots=((0.325, -0.291), (0.312, -0.158)))
+    assert press_demo.auto_refine(f, calib) is None  # two are not enough
 
 
 def test_the_scene_approach_falls_back_to_the_search_when_the_wrist_sees_nothing(ctx, tmp_path, monkeypatch):
@@ -1493,7 +1591,7 @@ def test_recentring_gives_up_after_two_moves_and_presses_from_the_last_aim(ctx, 
     taken nearest the button — is pressed."""
     a = [((0.450, 0.0, 0.085), 0.0), ((0.452, 0.0, 0.085), 0.0), ((0.454, 0.0, 0.085), 0.0)]
     press_demo, r, watcher, state = _centring_env(
-        ctx, tmp_path, monkeypatch, tool_xys=[(0.45, 0.05), (0.45, 0.02), (0.45, 0.02)], aims=a[1:]
+        ctx, tmp_path, monkeypatch, tool_xys=[(0.45, 0.05), (0.45, 0.04), (0.45, 0.04)], aims=a[1:]
     )
     got, moves, off = press_demo.centre_over_button(None, ctx, _demo_cfg(), r, watcher, True, a[0])
     assert moves == press_demo.RECENTRE_MAX == 2
@@ -1515,6 +1613,109 @@ def test_a_dry_run_says_it_would_recentre_and_moves_nothing(ctx, tmp_path, monke
     got, moves, off = press_demo.centre_over_button(None, ctx, _demo_cfg(), r, watcher, False, first)
     assert (got, moves) == (first, 0) and ctx.client.executed == []
     assert "would move 40 mm" in capsys.readouterr().out
+
+
+def _descent_leg():
+    """A press descent as the planner client builds it: a planned segment
+    from staging to the waypoint 60 mm above the target, at rest there,
+    then the arm's own straight line (runtime/approach), guarded."""
+    from rammp_box_opening.models.container import attitude_quat
+    from rammp_box_opening.runtime.approach import plan_with_vertical_approach
+    from rammp_box_opening.runtime.guards import GuardSpec
+    from rammp_box_opening.runtime.kinematics import ArmChain
+    from rammp_box_opening.runtime.legs import Kind, Leg
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    chain = ArmChain()
+    q_wp = [0.1208, 0.5375, 3.3522, -1.8057, -0.1478, -0.8136, 0.1407]  # a live planner waypoint
+    goal = [0.4264, -0.1151, 0.0815]
+    quat = attitude_quat([180.0, 0.0, 0.0], math.atan2(goal[1], goal[0]))
+    _R, t_wp = chain.fk(q_wp)
+    up, _why = chain.straight_line(q_wp, [t_wp[0], t_wp[1], t_wp[2] + 0.075], quat)
+    first = JointTrajectory()
+    first.joint_names = ["joint_%d" % i for i in range(1, 8)]
+    for i, q in enumerate(list(reversed(up))):  # staging down to the waypoint, 1 s, at rest at both ends
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(v) for v in q]
+        pt.velocities = [0.0] * 7
+        t = i / (len(up) - 1)
+        pt.time_from_start.sec, pt.time_from_start.nanosec = int(t), int(round((t - int(t)) * 1e9))
+        first.points.append(pt)
+
+    class Plan:
+        success, message, trajectory, planning_time = True, "ok", first, 0.2
+
+    plan = plan_with_vertical_approach(lambda xyz, q, start: Plan(), goal, quat, list(up[-1]), 0.06, chain_model=chain)
+    return Leg(name="press:down", kind=Kind.MOTION, traj=plan.trajectory, speed=0.35,
+               guard=GuardSpec(touch_nm=3.0, trip="touch", arm_after=0.25), world="interaction_button", chain=0,
+               target=("pose", goal, list(quat), 0.06), goal_joints=list(plan.trajectory.points[-1].positions),
+               waypoint=plan.waypoint, guard_from=plan.waypoint[0])
+
+
+def test_the_press_descent_flies_its_free_air_fast_and_its_guard_arms_where_it_did():
+    """Bench 2026-09-24: 2.6 s from staging to the touch, all of it at
+    contact speed — though the guard of a descent flown on its own cannot
+    trip above its straight line (it takes its baseline and arms where the
+    line begins, plus a settle). Now the free air above the line flies at
+    warp_fast_speed; the line, and where the guard arms on it, are as
+    before."""
+    from rammp_box_opening.runtime.guards import GROUP_SETTLE_S
+    from rammp_box_opening.runtime.runner import _restore_execution_profile
+    from rammp_box_opening.runtime.stamps import secs
+    from rammp_box_opening.tasks import press_demo
+
+    cfg = _demo_cfg()
+    leg = _descent_leg()
+    idx0, waypoint0 = leg.waypoint[0], leg.waypoint
+    unwarped = leg.traj
+    # as the runner flew it unwarped: dilated by the contact speed, armed a
+    # settle into the line
+    total0 = secs(unwarped.points[-1].time_from_start) / leg.speed
+    line0 = total0 - secs(unwarped.points[idx0].time_from_start) / leg.speed
+    assert press_demo.fly_free_air_fast(leg, cfg)
+    idx = leg.waypoint[0]
+    total1 = secs(leg.traj.points[-1].time_from_start)  # baked in: flown at the 1.0 sentinel
+    start1 = secs(leg.traj.points[idx].time_from_start)
+    assert leg.speed == 1.0 and leg.warp[:2] == (cfg.warp_fast_speed, 0.35)
+    assert total1 < total0 - 0.5  # the free air is faster ...
+    assert total1 - start1 == pytest.approx(line0, rel=0.02)  # ... the line is not
+    assert list(leg.traj.points[idx].positions) == pytest.approx(list(waypoint0[1]))  # the line starts where it did
+    assert max(abs(v) for v in leg.traj.points[idx].velocities) < 1e-9  # ... from rest
+    # the guard takes its baseline and arms a settle into the line, never above it
+    assert leg.guard.rebaseline_after == leg.guard.arm_after
+    assert leg.guard.arm_after * total1 == pytest.approx(start1 + GROUP_SETTLE_S, abs=0.01)
+    # positions untouched: only samples of the planned, checked path are flown
+    planned = {tuple(round(v, 9) for v in p.positions) for p in unwarped.points}
+    assert all(tuple(round(v, 9) for v in p.positions) in planned for p in leg.traj.points)
+    # a replan re-warps it the same way (runner._restore_execution_profile)
+    leg.traj, leg.waypoint = unwarped, waypoint0
+    _restore_execution_profile(leg)
+    start_r = secs(leg.traj.points[idx0].time_from_start)
+    assert leg.guard.arm_after * secs(leg.traj.points[-1].time_from_start) == pytest.approx(start_r + GROUP_SETTLE_S, abs=0.01)
+    # warp_fast_speed 0 turns it off, as for grip:down
+    off = _descent_leg()
+    assert not press_demo.fly_free_air_fast(off, replace(cfg, warp_fast_speed=0.0)) and off.speed == 0.35
+
+
+def test_the_free_air_is_only_ever_re_timed_to_be_faster():
+    """The planner's part of a descent is re-timed on the human profile
+    only when that is quicker; a brisk plan is left as it was."""
+    from rammp_box_opening.runtime.approach import human_timed_above_waypoint
+    from rammp_box_opening.runtime.stamps import secs, set_stamp
+
+    leg = _descent_leg()
+    idx = leg.waypoint[0]
+    t_line = [secs(p.time_from_start) for p in leg.traj.points[idx:]]
+    assert human_timed_above_waypoint(leg)
+    idx2 = leg.waypoint[0]
+    assert [secs(p.time_from_start) - secs(leg.traj.points[idx2].time_from_start) for p in leg.traj.points[idx2:]] == (
+        pytest.approx([t - t_line[0] for t in t_line], abs=1e-6))  # the line itself untouched
+    brisk = _descent_leg()
+    for i, p in enumerate(brisk.traj.points[: brisk.waypoint[0] + 1]):
+        set_stamp(p.time_from_start, 1e-3 * i)  # already faster than any profile
+    before = [secs(p.time_from_start) for p in brisk.traj.points]
+    assert not human_timed_above_waypoint(brisk)
+    assert [secs(p.time_from_start) for p in brisk.traj.points] == before
 
 
 def test_a_press_from_staging_without_a_scene_fix_is_planned_fresh(ctx):
@@ -1626,8 +1827,11 @@ def test_a_coarse_search_fix_is_only_ever_a_place_to_look_from(ctx, tmp_path, mo
     with pytest.raises(SystemExit):
         press_demo.stage_over_search_fix(None, ctx, _demo_cfg(), r, watcher, True, FIX, coarse=True)
     # a precise search fix, as before, may still be pressed from
-    got, at_staging = press_demo.stage_over_search_fix(None, ctx, _demo_cfg(), r, watcher, True, FIX)
+    got, at_staging, preplanned, planned_for = press_demo.stage_over_search_fix(None, ctx, _demo_cfg(), r, watcher, True, FIX)
     assert got == FIX and at_staging
+    # the descent was planned while the arm flew to staging, for the pose it flew to
+    assert [leg.name for leg in preplanned] == ["press:down"]
+    assert planned_for.xyz[:2] == pytest.approx(FIX[0][:2])
 
 
 

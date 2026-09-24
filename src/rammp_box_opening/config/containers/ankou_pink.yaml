@@ -154,11 +154,13 @@ open_box:
                                   # transition. 0 disables warping entirely.
                                   # Raised 0.5 -> 0.75 (owner, 2026-09-15) to
                                   # match the free-air cruise the chained
-                                  # press approach already runs at. The only
-                                  # leg this still governs is grip:down: the
-                                  # set-down gave up its warp to join the
-                                  # carry's merge group, and the press flies
-                                  # as the tail of its approach's group.
+                                  # press approach already runs at. It governs
+                                  # grip:down, and the press descent FROM
+                                  # STAGING above its straight line (the last
+                                  # 60 mm, where that descent's guard arms;
+                                  # press_demo.fly_free_air_fast, 2026-09-24).
+                                  # The set-down gave up its warp to join the
+                                  # carry's merge group.
                                   # KNOW WHAT THIS BUYS AND COSTS: the
                                   # fast segment is planned in the reduced
                                   # world, where the container top is absent,
@@ -317,7 +319,7 @@ detect:
                                   # moving frames are otherwise placed where
                                   # the arm was, not where the shutter fired.
   recentre_max_moves: 2           # at staging, when the aim finds the button
-                                  # more than 5 mm from under the tool: move
+                                  # more than 25 mm from under the tool: move
                                   # over it and aim again, up to this many
                                   # times, then press from the last aim. Every
                                   # press that landed dead centre was aimed

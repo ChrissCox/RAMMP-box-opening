@@ -44,6 +44,14 @@ def _cumulative_path(points):
     return cum, total
 
 
+def path_fraction_after(traj, index):
+    """The fraction of `traj`'s path (joint space, as warp_trajectory
+    measures it) that lies after point `index`: the slow_frac that starts
+    the slow zone exactly there."""
+    cum, total = _cumulative_path(list(traj.points))
+    return 0.0 if total <= 0.0 else (total - cum[int(index)]) / total
+
+
 def warp_trajectory(traj, slow_frac, fast_scale, slow_scale):
     """Retime `traj` fast-then-slow. Returns (new_traj, arm_frac).
 

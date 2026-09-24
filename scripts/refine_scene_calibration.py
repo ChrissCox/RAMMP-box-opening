@@ -11,19 +11,17 @@ next runs to get there. Nothing here moves the arm; the launch's static TF
 picks the new yaml up on its next start, the mission on its next run.
 """
 import argparse
-import shutil
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "rammp_box_opening"))
-from rammp_box_opening.perception.d405 import mat_to_quat_xyzw, quat_to_mat  # noqa: E402
+from rammp_box_opening.perception.d405 import quat_to_mat  # noqa: E402
 from rammp_box_opening.perception.scene_calib import transform  # noqa: E402
 from rammp_box_opening.perception.scene_refine import (  # noqa: E402
-    MIN_PAIRS_ROTATION, MIN_SPREAD_M, apply, calibrated_at, fit, load_pairs,
+    MIN_PAIRS_ROTATION, MIN_SPREAD_M, apply, calibrated_at, fit, load_pairs, write_refinement,
 )
 
 RESIDUALS = Path.home() / ".ros" / "rammp_box_opening" / "scene_calib" / "residuals.jsonl"
@@ -47,31 +45,22 @@ def main():
         sys.exit("no real pairs in %s made under this calibration" % a.residuals)
     r = fit(scene, wrist)
     print("%d pair(s), spread %.2f m -> %s fit: rms %.1f mm -> %.1f mm" % (r.n, r.spread_m, r.mode, r.rms_before_mm, r.rms_after_mm))
-    print("correction: shift [%+.1f %+.1f %+.1f] mm, rotation %.2f deg" % (
-        *(1000 * r.D[:3, 3]), np.degrees(np.arccos(np.clip((np.trace(r.D[:3, :3]) - 1) / 2, -1, 1)))))
+    print("correction (horizontal): shift [%+.1f %+.1f] mm, turn %.2f deg" % (
+        *(1000 * r.D[:2, 3]), np.degrees(np.arctan2(r.D[1, 0], r.D[0, 0]))))
     for s_, w in zip(scene, wrist):
         f = r.D[:3, :3] @ s_ + r.D[:3, 3]
-        print("  scene %s -> fitted %s vs wrist %s (left %.1f mm)" % (np.round(s_, 4), np.round(f, 4), np.round(w, 4), 1000 * np.linalg.norm(f - w)))
+        print("  scene %s -> fitted %s vs wrist %s (left %.1f mm in xy)" % (
+            np.round(s_[:2], 4), np.round(f[:2], 4), np.round(w[:2], 4), 1000 * np.linalg.norm(f[:2] - w[:2])))
     if r.mode == "translation":
         print("a rotation needs >= %d pairs spanning >= %.2f m: place the box at other spots on the next runs" % (MIN_PAIRS_ROTATION, MIN_SPREAD_M))
     doc = yaml.safe_load(open(a.calib))
-    T = transform(quat_to_mat(*doc["quat_xyzw"]), doc["xyz"])
-    T2 = apply(T, r)
-    xyz = [round(float(v), 5) for v in T2[:3, 3]]; q = [round(float(v), 6) for v in mat_to_quat_xyzw(T2[:3, :3])]
-    print("camera: %s -> %s" % ([round(v, 4) for v in doc["xyz"]], [round(v, 4) for v in xyz]))
+    T2 = apply(transform(quat_to_mat(*doc["quat_xyzw"]), doc["xyz"]), r)
+    print("camera: %s -> %s" % ([round(v, 4) for v in doc["xyz"]], [round(float(v), 4) for v in T2[:3, 3]]))
     if not a.apply:
         print("(report only — add --apply to write %s)" % a.calib)
         return
     # backups beside the residuals, not in the package's config dir
-    backup = Path(a.residuals).parent / ("camera_scene.yaml.bak-%s" % time.strftime("%Y%m%d-%H%M%S"))
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(a.calib, backup)
-    doc["xyz"], doc["quat_xyzw"] = xyz, q
-    doc["refined_at"] = round(time.time(), 1)  # pairs recorded before this no longer count (calibrated_at)
-    doc["note"] = (str(doc.get("note", "")).strip() + " Refined %s from %d wrist pairs (%s fit, rms %.1f -> %.1f mm)." % (
-        time.strftime("%Y-%m-%d %H:%M"), r.n, r.mode, r.rms_before_mm, r.rms_after_mm)).strip()
-    with open(a.calib, "w") as f:
-        yaml.safe_dump(doc, f, sort_keys=False)
+    backup = write_refinement(a.calib, r, Path(a.residuals).parent, "by hand")
     print("written %s (backup %s)" % (a.calib, backup))
 
 
