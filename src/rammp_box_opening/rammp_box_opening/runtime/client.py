@@ -42,6 +42,7 @@ from rammp_box_opening.constants import (
 )
 from rammp_box_opening.runtime import driver
 from rammp_box_opening.runtime.approach import plan_with_vertical_approach
+from rammp_box_opening.runtime.branches import planner_branch
 
 _GRIPPER_JOINT_HINTS = ("robotiq", "knuckle", "finger")
 
@@ -242,8 +243,32 @@ class PlannerClient:
         planner cannot constrain that, so it is two plans flown as one
         trajectory (runtime/approach.py)."""
         return plan_with_vertical_approach(
-            self._plan_pose_once, xyz, quat_xyzw, start_joints, float(approach_offset_m)
+            self._plan_pose_near, xyz, quat_xyzw, start_joints, float(approach_offset_m)
         )
+
+    def _plan_pose_near(self, xyz, quat_xyzw, start_joints):
+        """A pose goal planned as a JOINT goal: the IK solution quickest to
+        fly to from the start (kinematics.ArmChain.nearest_solution), so the
+        planner cannot pick a far one of the redundant arm's solutions —
+        handed the pose, it turned the wrist 3.2-3.6 rad on some plans (a
+        4.7 s approach to a box on the left, bench 2026-09-25). The planner
+        still plans and collision-checks the path; when no solution is found
+        or its plan fails, the pose goes to it as before."""
+        if start_joints:
+            try:
+                from rammp_box_opening.constants import HOME
+                from rammp_box_opening.primitives.look import look_joints
+                from rammp_box_opening.runtime.approach import _chain
+
+                start = planner_branch(start_joints)
+                q_goal = _chain().nearest_solution(start, xyz, quat_xyzw, seeds=(look_joints(HOME),))
+            except Exception:  # a kinematics problem must never cost the plan
+                q_goal = None
+            if q_goal is not None:
+                res = self.plan_to_joints(q_goal, start_joints)
+                if res is not None and res.success:
+                    return res
+        return self._plan_pose_once(xyz, quat_xyzw, start_joints)
 
     def _plan_pose_once(self, xyz, quat_xyzw, start_joints):
         g = PlanToPose.Goal()
@@ -256,12 +281,14 @@ class PlannerClient:
             g.target.orientation.z,
             g.target.orientation.w,
         ) = (float(v) for v in quat_xyzw)
-        g.start_joints = [float(v) for v in start_joints] if start_joints else []
+        # on HOME's side of the wrap: the planner plans between the numbers
+        # it is given, and a start written the other way round is a full turn
+        g.start_joints = planner_branch(start_joints) if start_joints else []
         return self._call(self._plan_pose, g)
 
     def plan_to_joints(self, q7, start_joints):
         g = PlanToJoints.Goal(target_joints=[float(v) for v in q7])
-        g.start_joints = [float(v) for v in start_joints] if start_joints else []
+        g.start_joints = planner_branch(start_joints) if start_joints else []  # (plan_to_pose)
         return self._call(self._plan_joints, g)
 
     # -- execution ---------------------------------------------------------

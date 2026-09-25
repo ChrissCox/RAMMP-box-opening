@@ -877,8 +877,12 @@ def descent_from_staging(ctx, cfg, planned_for, preplanned):
     if not preplanned or planned_for is None:
         legs, how = build_press_legs(ctx, cfg), "descent planned from over the button"
     else:
+        from rammp_box_opening.runtime.branches import on_branch
+
         leg = preplanned[0]
-        live = ctx.client.joints()
+        # the live reading on the pre-planned leg's side of the wrap: the
+        # re-fitted lines are solved from it (runtime/branches)
+        live = on_branch(ctx.client.joints(), leg.traj.points[0].positions)
         at_start = rest_distance(live, leg.traj.points[0].positions) <= AT_START_RAD
         button = from_container(ctx.cpose, ctx.model.button_offset)
         moved = math.hypot(button[0] - planned_for.xyz[0], button[1] - planned_for.xyz[1])

@@ -408,8 +408,10 @@ def reverse_tail(traj, progress, live, arc_rad, min_ds=2e-4):
         done.append(pts[len(done)])
     if len(done) < 2:
         return None
+    from rammp_box_opening.runtime.branches import on_branch
+
     q = np.asarray([[float(v) for v in p.positions] for p in done])
-    live = np.asarray([float(v) for v in live], dtype=float)
+    live = np.asarray(on_branch(live, q[-1]), dtype=float)  # (forward_tail)
     i = int(np.argmin(np.linalg.norm(q - live[None, :], axis=1)))
     out, arc = [q[i]], 0.0
     for k in range(i, 0, -1):
@@ -438,11 +440,15 @@ def forward_tail(traj, live, arc_rad, min_ds=2e-4):
     while the fingers sit on the button. Returns None when less than half
     the asked arc remains (the caller then plans the push instead).
     """
+    from rammp_box_opening.runtime.branches import on_branch
+
     pts = list(traj.points)
     if len(pts) < 2:
         return None
     q = np.asarray([[float(v) for v in p.positions] for p in pts])
-    live = np.asarray([float(v) for v in live], dtype=float)
+    # the reading is wrapped into (-pi, pi], the path is on the planner's
+    # branch: a continuous joint past +/-pi would read 2*pi from its own path
+    live = np.asarray(on_branch(live, q[0]), dtype=float)
     i = int(np.argmin(np.linalg.norm(q - live[None, :], axis=1)))
     out, arc = [q[i]], 0.0
     for k in range(i, len(q) - 1):

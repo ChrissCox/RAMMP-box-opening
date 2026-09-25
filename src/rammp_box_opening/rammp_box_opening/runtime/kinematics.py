@@ -34,6 +34,9 @@ CONVERGE_M = 5e-5
 CONVERGE_RAD = 1e-4
 MAX_ITERS = 12
 MAX_STEP_RAD = 0.15  # a bigger joint jump per 2 mm is a singularity, refuse
+REACH_STEP_M = 0.02  # reach(): the pose walked in steps this long ...
+REACH_STEP_RAD = math.radians(6.0)  # ... and this much turn
+MAX_REACH_STEP_RAD = 0.6  # a bigger joint jump over one such step is a branch change, refuse
 
 
 def _rpy(r, p, y):
@@ -155,6 +158,79 @@ class ArmChain:
         if np.linalg.norm(err[:3]) < CONVERGE_M and np.linalg.norm(err[3:]) < CONVERGE_RAD:
             return q
         return None
+
+    def reach(self, q_start, xyz, quat_xyzw, step_m=REACH_STEP_M, step_rad=REACH_STEP_RAD):
+        """Joints putting tool_frame at (xyz, quat_xyzw), found by
+        CONTINUATION from q_start: the pose is walked from where the tool is
+        to the goal — position in a straight line, orientation about one
+        axis — each step solved from the last. The solution is the one on
+        q_start's own branch: the elbow and the wrist the arm already has,
+        not whichever of the redundant arm's solutions an IK seed lands on
+        (the planner's, handed a pose, turned the wrist 3.2-3.6 rad on some
+        plans to a box on the left, bench 2026-09-25). None when a step
+        does not converge, jumps (a singularity) or hits a limit.
+
+        The walk is only a way to FIND the goal joints; it is not flown. The
+        planner still plans, and collision-checks, the path to them."""
+        q = np.array(q_start, float)
+        R0, t0 = self.fk(q)
+        R_goal = quat_to_mat(*quat_xyzw)
+        xyz = np.asarray(xyz, float)
+        w = rotvec(R_goal @ R0.T)
+        ang = float(np.linalg.norm(w))
+        axis = w / ang if ang > 1e-9 else np.array([0.0, 0.0, 1.0])
+        n = max(1, int(math.ceil(max(float(np.linalg.norm(xyz - t0)) / step_m, ang / step_rad))))
+        for k in range(1, n + 1):
+            f = k / n
+            nxt = self.solve_pose(q, t0 + (xyz - t0) * f, _axis_rot(axis, ang * f) @ R0)
+            if nxt is None or float(np.abs(nxt - q).max()) > MAX_REACH_STEP_RAD or not self.within_limits(nxt):
+                return None
+            q = nxt
+        return q
+
+    def nearest_solution(self, q_start, xyz, quat_xyzw, seeds=()):
+        """Of the redundant arm's IK solutions for tool_frame at (xyz,
+        quat_xyzw), the one QUICKEST to fly to from q_start: the slowest
+        joint's travel over its velocity limit, the travel counted as the
+        planner flies it (the literal difference; runtime/branches). The
+        candidates: reach() from q_start and from each of `seeds`, and each
+        of those with its wrist folded the other way (joint_5 and joint_7 a
+        half turn round, joint_6 mirrored — the same tool pose, re-solved).
+        None when there is none inside every limit.
+
+        Measured from HOME to staging over boxes across the table (2026-09-25):
+        the planner's own pick took 2.4-4.7 s and turned the wrist 3.2-3.6
+        rad; the walk from HOME 2.4-2.5 s; the folded wrist 1.6 s."""
+        from rammp_box_opening.constants import JOINT_VMAX
+        from rammp_box_opening.runtime.branches import CONTINUOUS_JOINTS, PLANNER_CONTINUOUS_LIMIT_RAD
+
+        start = np.array(q_start, float)
+        R_goal = quat_to_mat(*quat_xyzw)
+
+        def solutions(seed):
+            q = self.reach(seed, xyz, quat_xyzw)
+            if q is None:
+                return []
+            out = [q]
+            for d5 in (math.pi, -math.pi):
+                for d7 in (math.pi, -math.pi):
+                    flip = np.array(q, float)
+                    flip[4] += d5
+                    flip[5] = -flip[5]
+                    flip[6] += d7
+                    qf = self.solve_pose(flip, xyz, R_goal)
+                    if qf is not None and self.within_limits(qf):
+                        out.append(qf)
+            return [s for s in out if all(abs(s[i]) <= PLANNER_CONTINUOUS_LIMIT_RAD for i in CONTINUOUS_JOINTS)]
+
+        cands = solutions(start)
+        for seed in seeds:  # only when the walk from where the arm is found nothing
+            if cands:
+                break
+            cands = solutions(np.array(seed, float))
+        if not cands:
+            return None
+        return min(cands, key=lambda q: max(abs(a - b) / v for a, b, v in zip(q, start, JOINT_VMAX)))
 
     def straight_line(self, q_start, xyz_end, quat_xyzw, step_m=STEP_M):
         """Joint waypoints from q_start along the straight line from
