@@ -31,14 +31,31 @@ def on_branch(q, ref):
     return out
 
 
+def nearest_branch(q, ref):
+    """`q` with each continuous joint moved by whole turns to the value
+    nearest `ref`'s — the same physical angle, reached from `ref` the short
+    way round — unless that falls outside the planner's bounds, where it is
+    left as it was. A goal written this way can never be a winding: no
+    continuous joint is more than half a turn from where it starts."""
+    out = [float(v) for v in q]
+    for i in CONTINUOUS_JOINTS:
+        c = float(ref[i]) + ang_diff(out[i], float(ref[i]))
+        if abs(c) <= PLANNER_CONTINUOUS_LIMIT_RAD:
+            out[i] = c
+    return out
+
+
 def planner_branch(q):
     """`q` as the planner should be handed it: each continuous joint on the
     branch of HOME — the planner's retract config, which its IK solutions
     sit near — unless that falls outside the planner's bounds, where it is
     left as reported."""
-    out = [float(v) for v in q]
-    for i in CONTINUOUS_JOINTS:
-        c = float(HOME[i]) + ang_diff(out[i], float(HOME[i]))
-        if abs(c) <= PLANNER_CONTINUOUS_LIMIT_RAD:
-            out[i] = c
-    return out
+    return nearest_branch(q, HOME)
+
+
+def joint_time(a, b):
+    """Seconds the slowest joint needs from `a` to `b` at its velocity limit
+    (the planner flies the literal difference) — how long a move must take."""
+    from rammp_box_opening.constants import JOINT_VMAX
+
+    return max(abs(float(x) - float(y)) / v for x, y, v in zip(a, b, JOINT_VMAX))

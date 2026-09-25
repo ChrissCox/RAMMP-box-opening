@@ -42,7 +42,7 @@ from rammp_box_opening.constants import (
 )
 from rammp_box_opening.runtime import driver
 from rammp_box_opening.runtime.approach import plan_with_vertical_approach
-from rammp_box_opening.runtime.branches import planner_branch
+from rammp_box_opening.runtime.branches import joint_time, nearest_branch, planner_branch
 
 _GRIPPER_JOINT_HINTS = ("robotiq", "knuckle", "finger")
 
@@ -268,7 +268,37 @@ class PlannerClient:
                 res = self.plan_to_joints(q_goal, start_joints)
                 if res is not None and res.success:
                     return res
-        return self._plan_pose_once(xyz, quat_xyzw, start_joints)
+        return self._no_long_way(self._plan_pose_once(xyz, quat_xyzw, start_joints), start_joints)
+
+    # A plan is re-planned when an equivalent end is at least this much quicker
+    # to fly to: a continuous joint the long way round is up to ~5 s of it.
+    QUICKER_BY_S = 0.3
+
+    def _no_long_way(self, res, start_joints):
+        """The planner's own pose plan — flown when no quicker solution was
+        found up front (the table's far edge) — unless it ends somewhere the
+        same tool pose is quicker to reach: a continuous joint turned the long
+        way round, or the wrist folded the far way (kinematics.equivalents).
+        Then it is re-planned to that end (plan_to_joints); the original stands
+        if that plan fails. The arm does not turn a joint round when it does
+        not need to (owner, 2026-09-25)."""
+        if res is None or not res.success or not start_joints or res.trajectory is None or not res.trajectory.points:
+            return res
+        try:
+            from rammp_box_opening.runtime.approach import _chain
+
+            start = planner_branch(start_joints)
+            end = [float(v) for v in res.trajectory.points[-1].positions]
+            alts = _chain().equivalents(start, end)
+        except Exception:  # a kinematics problem must never cost the plan
+            return res
+        if not alts:
+            return res
+        best = min(alts, key=lambda q: joint_time(start, q))
+        if joint_time(start, best) > joint_time(start, end) - self.QUICKER_BY_S:
+            return res
+        better = self.plan_to_joints(best, start_joints)
+        return better if better is not None and better.success else res
 
     def _plan_pose_once(self, xyz, quat_xyzw, start_joints):
         g = PlanToPose.Goal()
@@ -287,8 +317,14 @@ class PlannerClient:
         return self._call(self._plan_pose, g)
 
     def plan_to_joints(self, q7, start_joints):
-        g = PlanToJoints.Goal(target_joints=[float(v) for v in q7])
-        g.start_joints = planner_branch(start_joints) if start_joints else []  # (plan_to_pose)
+        """A joint goal, each continuous joint taken the short way round from
+        the start (branches.nearest_branch): the same arm configuration,
+        never a winding. The planner does this for itself since 1.0.0
+        (_nearest_branch); done here too, it does not depend on that."""
+        start = planner_branch(start_joints) if start_joints else None
+        goal = nearest_branch(q7, start) if start is not None else [float(v) for v in q7]
+        g = PlanToJoints.Goal(target_joints=goal)
+        g.start_joints = start or []  # on HOME's side of the wrap (plan_to_pose)
         return self._call(self._plan_joints, g)
 
     # -- execution ---------------------------------------------------------

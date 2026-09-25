@@ -201,36 +201,47 @@ class ArmChain:
         Measured from HOME to staging over boxes across the table (2026-09-25):
         the planner's own pick took 2.4-4.7 s and turned the wrist 3.2-3.6
         rad; the walk from HOME 2.4-2.5 s; the folded wrist 1.6 s."""
-        from rammp_box_opening.constants import JOINT_VMAX
-        from rammp_box_opening.runtime.branches import CONTINUOUS_JOINTS, PLANNER_CONTINUOUS_LIMIT_RAD
+        from rammp_box_opening.runtime.branches import joint_time
 
         start = np.array(q_start, float)
-        R_goal = quat_to_mat(*quat_xyzw)
-
-        def solutions(seed):
-            q = self.reach(seed, xyz, quat_xyzw)
-            if q is None:
-                return []
-            out = [q]
-            for d5 in (math.pi, -math.pi):
-                for d7 in (math.pi, -math.pi):
-                    flip = np.array(q, float)
-                    flip[4] += d5
-                    flip[5] = -flip[5]
-                    flip[6] += d7
-                    qf = self.solve_pose(flip, xyz, R_goal)
-                    if qf is not None and self.within_limits(qf):
-                        out.append(qf)
-            return [s for s in out if all(abs(s[i]) <= PLANNER_CONTINUOUS_LIMIT_RAD for i in CONTINUOUS_JOINTS)]
-
-        cands = solutions(start)
-        for seed in seeds:  # only when the walk from where the arm is found nothing
+        cands = []
+        for seed in [start, *[np.array(s, float) for s in seeds]]:
             if cands:
-                break
-            cands = solutions(np.array(seed, float))
+                break  # the seeds are only for when the walk from where the arm is found nothing
+            q = self.reach(seed, xyz, quat_xyzw)
+            if q is not None:
+                cands = self.equivalents(start, q)
         if not cands:
             return None
-        return min(cands, key=lambda q: max(abs(a - b) / v for a, b, v in zip(q, start, JOINT_VMAX)))
+        return min(cands, key=lambda q: joint_time(start, q))
+
+    def equivalents(self, q_start, q):
+        """Every way this arm can hold tool_frame where `q` holds it, written
+        to be flown from q_start: `q` itself and `q` with its wrist folded
+        the other way (joint_5 and joint_7 a half turn round, joint_6
+        mirrored, re-solved to the same tool pose), each continuous joint
+        taken the short way round from q_start (branches.nearest_branch) —
+        those inside every limit."""
+        from rammp_box_opening.runtime.branches import (
+            CONTINUOUS_JOINTS, PLANNER_CONTINUOUS_LIMIT_RAD, nearest_branch,
+        )
+
+        R, t = self.fk(q)
+        out = [np.array(q, float)]
+        for d5 in (math.pi, -math.pi):
+            for d7 in (math.pi, -math.pi):
+                flip = np.array(q, float)
+                flip[4] += d5
+                flip[5] = -flip[5]
+                flip[6] += d7
+                qf = self.solve_pose(flip, t, R)
+                if qf is not None:
+                    out.append(qf)
+        out = [np.array(nearest_branch(c, q_start), float) for c in out]
+        return [
+            c for c in out
+            if self.within_limits(c) and all(abs(c[i]) <= PLANNER_CONTINUOUS_LIMIT_RAD for i in CONTINUOUS_JOINTS)
+        ]
 
     def straight_line(self, q_start, xyz_end, quat_xyzw, step_m=STEP_M):
         """Joint waypoints from q_start along the straight line from
