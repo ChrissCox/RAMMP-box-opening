@@ -222,6 +222,27 @@ class PlannerClient:
         """True when the driver's trajectory action responds."""
         return self._execute.wait_for_server(timeout_sec=timeout_s)
 
+    def tf_ready(self, target, source, timeout_s=2.0):
+        """True once TF can give `target` <- `source` (the latest): the arm's
+        TF comes from robot_state_publisher in sheppy's box_opening node."""
+        from rclpy.time import Time
+
+        t0 = time.monotonic()
+        while True:
+            if self._tf.can_transform(target, source, Time()):
+                return True
+            if time.monotonic() - t0 > timeout_s:
+                return False
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+
+    # Programs that move this arm on their own: one of these running beside a
+    # mission is two controllers on one arm.
+    OTHER_ARM_CLIENTS = ("rammp_adl_runtime",)
+
+    def other_arm_clients(self):
+        """The OTHER_ARM_CLIENTS on the ROS graph now."""
+        return sorted({n for n, _ns in self.node.get_node_names_and_namespaces() if n in self.OTHER_ARM_CLIENTS})
+
     # -- planning ----------------------------------------------------------
     def _call(self, client, goal, timeout_s=120.0):
         if not client.wait_for_server(timeout_sec=5.0):

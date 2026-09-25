@@ -117,6 +117,7 @@ from rammp_box_opening.primitives.core import (
     tcp_z,
 )
 from rammp_box_opening.runtime.guards import ARM_AFTER_CAP, GuardSpec, WARP_SETTLE_FRAC
+from rammp_box_opening.runtime import fingers
 from rammp_box_opening.runtime.warp import warp_trajectory
 from rammp_box_opening.models.container import from_container
 from rammp_box_opening.runtime.runner import Runner
@@ -280,8 +281,12 @@ def record_residual(scene_fix, wrist_top, wrist_yaw, path=RESIDUALS_FILE):
 # a few centimetres by itself (RECENTRE_TOL_M, a move over the button).
 SCENE_TRUST_M = 0.05
 # The pairs recorded under the calibration in force correct it by
-# themselves (auto_refine) when at least this many say it is this far off
-# (rms, xy) and a horizontal fit leaves them this close.
+# themselves (auto_refine) when the LAST this-many say it is this far off
+# (rms, xy) and a horizontal fit leaves them this close. Only the last
+# ones: a camera knocked since the calibration leaves its older pairs
+# describing where it was (2026-09-25: -2/-6 mm at 11:50, -39/-53 and
+# -53/-59 at the same spot after 14:04), and fitted together they never
+# agree.
 AUTO_REFINE_MIN_PAIRS = 3
 AUTO_REFINE_BEFORE_MM = 15.0
 AUTO_REFINE_AFTER_MM = 8.0
@@ -323,7 +328,7 @@ def auto_refine(path, calib):
         scene, wrist = load_pairs(path, since=calibrated_at(calib))
         if len(scene) < AUTO_REFINE_MIN_PAIRS:
             return None
-        r = fit(scene, wrist)
+        r = fit(scene[-AUTO_REFINE_MIN_PAIRS:], wrist[-AUTO_REFINE_MIN_PAIRS:])
         if r.rms_before_mm < AUTO_REFINE_BEFORE_MM or r.rms_after_mm > AUTO_REFINE_AFTER_MM:
             return None
         backup = write_refinement(calib, r, Path(path).parent, "automatic, by the mission")
@@ -1694,6 +1699,28 @@ def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S):
             "the arm driver is not answering — is sheppy's `arm` node up? "
             "(its log is in ~/.sheppy/logs/arm/). Nothing moved."
         )
+    if execute:
+        others = client.other_arm_clients()
+        if others:
+            # bench 2026-09-25: ADL ran a cabinet task on this arm minutes
+            # after a mission, and its move home ended guard-tripped, the
+            # arm held wherever that was
+            return (
+                "another program that moves this arm is running (%s — the ADL runtime) — two controllers on "
+                "one arm. `sheppy up box-opening` stops it and brings up what the mission needs. Nothing moved."
+                % ", ".join(others)
+            )
+        from rammp_box_opening.perception.d405 import camera_config
+
+        parent = camera_config()["parent_frame"]
+        if not client.tf_ready("base_link", parent, timeout_s=2.0):
+            # bench 2026-09-25: box_opening stopped, no /tf at all; the run
+            # flew to staging and then could not place one wrist frame
+            # ("no camera pose for the frame", 0/60)
+            return (
+                "no TF from base_link to %s — sheppy's `box_opening` node (the arm's TF, the scene camera's and "
+                "the OWL detectors) is not running: `sheppy up box-opening`. Nothing moved." % parent
+            )
     return None
 
 
@@ -1873,6 +1900,9 @@ def main():
     bench = args.bench_world or cli_common.default_bench_yaml()
     model = ContainerModel.load(cfg_path)
     cfg = load_press_demo(cfg_path)
+    # the grip band in this gripper's current readings (runtime/fingers: an
+    # empty close read 0.793 when it was measured, 0.636 since 2026-09-25)
+    cfg = replace(cfg, grip_band=fingers.scaled_band(cfg.grip_band))
     cli_common.refuse_unmeasured(model, args.execute, measuring=args.detect_only)
     node, client = cli_common.init_runtime(args.execute)
     worlds = WorldStore(bench)
@@ -1979,7 +2009,12 @@ def main():
         # guarded touch, which needs them closed. No closed fingers = no
         # press: an open aperture strikes the lid and can still read
         # "pressed", so a refused close ends the run here.
-        if not args.detect_only and not runner.start_gripper(
+        _ok, finger_pos, _s = client.gripper_cmd(None)  # a query: nothing moves
+        if not args.detect_only and fingers.already_closed(finger_pos):
+            # already shut (the last run left them so): a close would not
+            # move them, and "never moved" is a failed close (runtime/fingers)
+            print("[press_demo] the fingers are already closed (%.3f)" % finger_pos)
+        elif not args.detect_only and not runner.start_gripper(
             "press:close", GRIPPER_CMD_CLOSED, args.execute
         ):
             try_home(
@@ -2283,6 +2318,11 @@ def main():
             if any(not r.ok for r in touched):
                 sys.exit(1)
         touch = [r for r in touched if r.leg_name.startswith("press")]
+        if args.execute:
+            # the fingers are shut on nothing in the air above the button up
+            # to the touch: what their knuckle reads now is this gripper's
+            # empty close (runtime/fingers)
+            fingers.learn_closed(client.gripper_cmd(None)[1])
         res, touch = run_push(
             ctx, cfg, runner, args, touch, touch_leg=touch_leg, node=node, watcher=watcher
         )

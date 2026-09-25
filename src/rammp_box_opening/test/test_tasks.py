@@ -821,10 +821,18 @@ def test_press_offset_trims_the_press_target_only(ctx):
 class _Readiness:
     """Client double for the pre-actuation readiness check."""
 
-    def __init__(self, planner=(True,), driver=True):
+    def __init__(self, planner=(True,), driver=True, tf=True, others=()):
         self.planner = list(planner)
         self.driver = driver
+        self.tf = tf
+        self.others = list(others)
         self.planner_waits = []
+
+    def tf_ready(self, target, source, timeout_s=2.0):
+        return self.tf
+
+    def other_arm_clients(self):
+        return self.others
 
     def planner_reachable(self, timeout_s=5.0):
         self.planner_waits.append(timeout_s)
@@ -863,6 +871,21 @@ def test_the_driver_is_required_only_when_executing():
     why = press_demo.readiness_refusal(down, execute=True)
     assert why is not None and "driver" in why
     assert press_demo.readiness_refusal(_Readiness(driver=False), execute=False) is None
+
+
+def test_a_run_refuses_before_any_motion_without_the_arms_tf_or_beside_adl():
+    """Bench 2026-09-25: box_opening had stopped (no /tf at all) and the run
+    flew to staging before it could not place a single wrist frame; and the
+    ADL runtime, which moves this arm on its own, was running. Both now stop
+    the run before anything moves, and name the one command that fixes both."""
+    from rammp_box_opening.tasks import press_demo
+
+    why = press_demo.readiness_refusal(_Readiness(tf=False), execute=True)
+    assert why is not None and "TF" in why and "sheppy up box-opening" in why and "Nothing moved" in why
+    why = press_demo.readiness_refusal(_Readiness(others=["rammp_adl_runtime"]), execute=True)
+    assert why is not None and "rammp_adl_runtime" in why and "sheppy up box-opening" in why
+    assert press_demo.readiness_refusal(_Readiness(), execute=True) is None
+    assert press_demo.readiness_refusal(_Readiness(tf=False, others=["rammp_adl_runtime"]), execute=False) is None
 
 
 class _SceneFix:
@@ -1007,6 +1030,20 @@ def test_the_scene_calibration_corrects_itself_from_pairs_that_agree(tmp_path):
     assert press_demo.auto_refine(f, calib) is None
     f, calib = _pairs_file(tmp_path, [(-126, -28), (-119, -30)], spots=((0.325, -0.291), (0.312, -0.158)))
     assert press_demo.auto_refine(f, calib) is None  # two are not enough
+
+
+def test_a_camera_knocked_since_its_calibration_is_corrected_from_the_pairs_since(tmp_path):
+    """Bench 2026-09-25: -2/-6 mm at 11:50, then -39/-53 and -53/-59 at the
+    same spot once the camera had moved. Fitted with the old pair, the new
+    ones never agree; the last three alone do."""
+    from rammp_box_opening.tasks import press_demo
+
+    spot = (0.422, 0.216)
+    f, calib = _pairs_file(tmp_path, [(-2, -6), (-39, -53), (-53, -59)], spots=(spot,) * 3)
+    assert press_demo.auto_refine(f, calib) is None  # the old pair is still one of the last three
+    f, calib = _pairs_file(tmp_path, [(-2, -6), (-39, -53), (-53, -59), (-46, -55)], spots=(spot,) * 4)
+    said = press_demo.auto_refine(f, calib)
+    assert said is not None and "REFINED" in said
 
 
 def test_the_scene_approach_falls_back_to_the_search_when_the_wrist_sees_nothing(ctx, tmp_path, monkeypatch):
