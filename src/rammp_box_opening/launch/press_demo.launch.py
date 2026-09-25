@@ -3,7 +3,7 @@
     ros2 launch rammp_box_opening press_demo.launch.py
 
 sheppy runs exactly this as its `box_opening` node (rammp-deployments,
-december_2026 manifest, `bench` profile), so `sheppy up bench` is the whole
+december_2026 manifest, `box-opening` profile), so `sheppy up box-opening` is the whole
 bringup; the line above is the no-sheppy bench. Then, in its own shell (the
 CLI is human-run; --execute alone arms it):
 

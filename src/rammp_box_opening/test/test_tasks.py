@@ -1859,3 +1859,45 @@ def test_without_a_close_up_aim_to_follow_the_search_sweeps_on(ctx, tmp_path, mo
     got, failed = press_demo.search_for_box(None, ctx, cfg, make_runner(ctx.client, tmp_path), watcher, True)
     assert (got, failed) == (None, None)
     assert len(ctx.client.joint_targets) == 3  # look, left, right — as before
+
+
+def test_the_run_starts_by_going_home_unless_already_there(ctx, tmp_path, capsys):
+    """Owner, 2026-09-25: the first thing a run does is send the arm to its
+    exact rest pose, if it is not already there — one joint goal to HOME,
+    planned in the bench world like home_arm's."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import HOME
+    from rammp_box_opening.tasks import press_demo
+
+    ctx.client.live = list(HOME)
+    ctx.client.live[2] = HOME[2] - 2 * math.pi + 0.004  # home as the driver reports it (-3.1412): already there
+    assert press_demo.home_first(ctx, make_runner(ctx.client, tmp_path), True, list(HOME))
+    assert ctx.client.executed == [] and ctx.client.joint_targets == []
+
+    ctx.client.live = [v + 0.3 for v in HOME]  # anywhere else
+    assert press_demo.home_first(ctx, make_runner(ctx.client, tmp_path), True, list(HOME))
+    assert len(ctx.client.executed) == 1
+    assert ctx.client.joint_targets[-1] == pytest.approx(list(HOME), abs=1e-9)
+    assert "HOME FIRST" in capsys.readouterr().out
+
+
+def test_a_home_the_bench_world_refuses_moves_nothing_and_names_the_recovery(ctx, tmp_path, capsys):
+    """An arm down at the table is home_arm's case (bare-world and
+    lift-first fallbacks, the operator's eye on the bench): the run does not
+    start, and says so."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import HOME
+    from rammp_box_opening.tasks import press_demo
+
+    class Refused:
+        success = False
+        message = "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION"
+        trajectory = None
+
+    ctx.client.live = [v + 0.3 for v in HOME]
+    ctx.client.plans = [Refused()]
+    assert not press_demo.home_first(ctx, make_runner(ctx.client, tmp_path), True, list(HOME))
+    assert ctx.client.executed == []
+    assert "home_arm --execute" in capsys.readouterr().out

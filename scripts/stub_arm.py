@@ -44,7 +44,14 @@ from std_msgs.msg import Bool
 from rammp_arm_interfaces.action import ExecuteJointTrajectory
 from rammp_arm_interfaces.msg import GripperSetpoint, GripperState
 
-START = [0.4, 0.262, 3.142, -2.269, 0.0, 0.960, 1.571]  # off-home: a real move
+# HOME: every mission run now starts there, flying there first when it is not
+# (press_demo.home_first). STUB_START_OFF_HOME=1 starts the stub 0.4 rad off
+# it (joint_1) — the scenario that proves that first move.
+START = (
+    [0.4, 0.262, 3.142, -2.269, 0.0, 0.960, 1.571]
+    if os.environ.get("STUB_START_OFF_HOME") == "1"
+    else [0.0, 0.262, 3.142, -2.269, 0.0, 0.960, 1.571]
+)
 NAMES = ["joint_%d" % i for i in range(1, 8)]
 KNUCKLE = "robotiq_85_left_knuckle_joint"
 KNUCKLE_CLOSED = 0.8

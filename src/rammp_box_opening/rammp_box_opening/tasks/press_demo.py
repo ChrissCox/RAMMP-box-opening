@@ -83,7 +83,6 @@ from rammp_box_opening.constants import (
     GRIPPER_CMD_CLOSED,
     GRIPPER_CMD_OPEN,
     HOME,
-    HOME_START_TOL_RAD,
     SEARCH_SPEED,
     TRANSIT_SPEED,
     state_dir,
@@ -1774,6 +1773,47 @@ def detect_only_report(node, watcher, ctx, cfg, runner, execute):
     )
 
 
+# This close (every joint, wrap-aware) to the rest pose is AT it; anywhere
+# else, the run's first motion goes there (home_first).
+AT_REST_RAD = 0.01
+
+
+def home_first(ctx, runner, execute, rest):
+    """The mission's first motion: the arm to its exact rest pose (`rest`,
+    HOME) unless it already stands there, so every run starts from the same
+    place (owner, 2026-09-25). Planned like home_arm's move: in the bench
+    world, whose keep-out band keeps it above wherever a box may stand.
+    Returns False — nothing moved — when that is refused, with the
+    recovery named: an arm that far down (holding at the table after an
+    abort) is home_arm's case, whose bare-world and lift-first fallbacks
+    want the operator's eye on the bench, not an automatic start.
+
+    It used to REFUSE any start more than 1.2 rad from a rest pose and fly
+    from wherever it stood inside that; planning from a failure pose had
+    swung the arm half upside down once (2026-09-01) — every joint goal
+    now goes the short way round (runtime/branches), and the bench world
+    and the trajectory sanity gate still stand between it and that."""
+    live = ctx.client.joints()
+    off = rest_distance(live, rest)
+    if off <= AT_REST_RAD:
+        return True
+    print(
+        "[press_demo] HOME FIRST: the arm is %.2f rad from its rest pose — going there before anything else" % off
+    )
+    world = ctx.worlds.push_name("bench", model=ctx.model)
+    try:
+        leg, _ = _plan_motion(ctx, _state(live), "home", ("joints", list(rest)), world, TRANSIT_SPEED)
+    except RuntimeError as e:
+        print(
+            "[press_demo] not starting: the move home was refused in the bench world (%s) — the arm is "
+            "probably down at the table. Clear the bench and recover by hand:\n"
+            "    ros2 run rammp_box_opening home_arm --execute    (add --lift-first 0.08 if that is refused too)" % e
+        )
+        return False
+    res = runner.run([leg], execute=execute)
+    return all(r.ok for r in res)
+
+
 def keep_mission_frames(frames, exc):
     """Write this run's detection record (ctx.mission_frames), with how the
     run ended (`exc`: the SystemExit in flight, or None), and say where it
@@ -1924,21 +1964,11 @@ def main():
         why = readiness_refusal(client, args.execute)
         if why:
             sys.exit("[press_demo] not starting: %s" % why)
-        live = client.joints()
-        rests = [HOME] + ([look_joints(HOME)] if cfg.park_tool_down else [])
-        worst = min(rest_distance(live, r) for r in rests)
-        if worst > HOME_START_TOL_RAD:
-            # every legitimate run starts near a rest pose; a distant start
-            # means the previous run ended badly. Planning anything from
-            # wreckage produced a half-inverted swing in the field
-            # (2026-09-01) — refuse BEFORE any motion and name the recovery.
-            print(
-                "[press_demo] arm starts %.2f rad from any rest pose (tol %.1f) "
-                "— refusing to plan from a failure pose. Recover first:\n"
-                "    ros2 run rammp_box_opening home_arm --execute"
-                % (worst, HOME_START_TOL_RAD)
-            )
+        # THE FIRST MOTION: the arm to its exact rest pose, when it is not
+        # already there (home_first) — every run starts from the same place
+        if not home_first(ctx, runner, args.execute, rest_joints(cfg)):
             sys.exit(3)
+        live = client.joints()
         # The wrist's OWL is enabled where the wrist starts looking (the
         # reach, or the search), NOT here: the scene camera's instance runs
         # first, and two instances inferring at once on this GPU is the

@@ -47,9 +47,12 @@ checks (yaw mod 90: the box is square and the depth path says so).
           CLI reports the push meeting a stop, the arm recoils along the
           descent it just flew while the retreat is planned from the
           recoil's end, exit 0, 8 exec goals. Exactly four cancels.
-  no-box: an empty table — the look and both sweeps find nothing, the owl
-          rung is consulted (the stub heartbeats), a detect wait that
-          provably lasts timeout_s, home, exit 2, exactly 4 exec goals.
+  no-box: the arm starts 0.4 rad off HOME, so the run's first move takes
+          it home (press_demo.home_first); then an empty table — the look
+          and both sweeps find nothing, the owl rung is consulted (the stub
+          heartbeats), a detect wait that provably lasts timeout_s, home,
+          exit 2, exactly 5 exec goals. Every other scenario starts AT
+          home, and makes no such move.
 
 Goal counts are audited (lesson 6); the harness refuses to run beside a
 real arm driver or planner.
@@ -132,6 +135,7 @@ def run_scenario(tmp, cfg, table_z, mode, cfg_override=None):
         # goal 1 and the set-down goal 6
         else "export STUB_TRIP_EXEC_N=1,6; " if mode == "flight"
         else "export STUB_TRIP_EXEC_N=3,8; " if mode == "box"
+        else "export STUB_START_OFF_HOME=1; " if mode == "no-box"
         else "export STUB_TRIP_EXEC_N=2,7; "
     )
     stub = planner = cam = cli = scene = None
@@ -233,10 +237,12 @@ def run_scenario(tmp, cfg, table_z, mode, cfg_override=None):
     if mode == "no-box":
         if code != 2:
             fails.append("exit %s != 2" % code)
-        if execs != 4:
+        if execs != 5:
             fails.append(
-                "exec goals %d != 4 (look, both sweeps, home)" % execs
+                "exec goals %d != 5 (home first, look, both sweeps, home)" % execs
             )
+        if "HOME FIRST" not in cli_said:
+            fails.append("the run did not start by going home from off-home")
         if "NO BOX" not in cli_said:
             fails.append("no NO BOX line")
         # depth found nothing in its first beat, so the ladder ran and the

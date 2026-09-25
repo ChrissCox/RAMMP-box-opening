@@ -139,7 +139,7 @@ One launch, one command, autonomous once started:
 ```zsh
 # rammp-deployments/december_2026: arm, planner, both cameras AND this
 # package's launch (robot TF, scene TF, two OWL nodes — the `box_opening` node)
-sheppy up bench
+sheppy up box-opening
 ros2 run rammp_box_opening press_demo --execute      # in its own shell
 ```
 

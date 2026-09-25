@@ -30,7 +30,8 @@ from e2e_common import REPO, Shell, kill, measured_config, wait_for, workdir
 # client-side (retime.py) — the stub's 0.4 rad home path would take ~0.7 s
 # — so the drill runs home_arm in the operator's slow mode
 # (--speed-scale 0.1 -> ~7 s), which is also the real first-run safety knob
-SH = Shell("export STUB_PLAN_S=6.0; unset STUB_TRIP_EXEC_N STUB_GRIP_POS; ")
+# off HOME (joint_1 0.4 rad): the drill interrupts a real move home
+SH = Shell("export STUB_PLAN_S=6.0 STUB_START_OFF_HOME=1; unset STUB_TRIP_EXEC_N STUB_GRIP_POS; ")
 
 
 def main():
