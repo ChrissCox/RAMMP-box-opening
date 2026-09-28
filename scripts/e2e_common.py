@@ -27,8 +27,14 @@ class Shell:
     knobs, then the humble -> ~/rammp_deps_ws -> this-repo overlays."""
 
     def __init__(self, stub_env=""):
+        # loopback only: ROS_LOCALHOST_ONLY, unless a Cyclone config is
+        # already loaded — the bench's (~/.config/rammp-bench/
+        # cyclonedds-local.xml, from ~/.profile since 2026-09-28) pins DDS to
+        # loopback itself, and Cyclone refuses a participant when both
+        # configure the interfaces ("rcl node's rmw handle is invalid")
         self.chain = (
-            "export ROS_DOMAIN_ID=%s; export ROS_LOCALHOST_ONLY=1; "
+            "export ROS_DOMAIN_ID=%s; "
+            "if [ -n \"$CYCLONEDDS_URI\" ]; then export ROS_LOCALHOST_ONLY=0; else export ROS_LOCALHOST_ONLY=1; fi; "
             "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; %s"
             "source /opt/ros/humble/setup.zsh; "
             "source ~/rammp_deps_ws/install/setup.zsh; "

@@ -1902,7 +1902,7 @@ def main():
     cfg = load_press_demo(cfg_path)
     # the grip band in this gripper's current readings (runtime/fingers: an
     # empty close read 0.793 when it was measured, 0.636 since 2026-09-25)
-    cfg = replace(cfg, grip_band=fingers.scaled_band(cfg.grip_band))
+    cfg = replace(cfg, grip_band=tuple(round(v, 3) for v in fingers.scaled_band(cfg.grip_band)))
     cli_common.refuse_unmeasured(model, args.execute, measuring=args.detect_only)
     node, client = cli_common.init_runtime(args.execute)
     worlds = WorldStore(bench)

@@ -62,9 +62,20 @@ def already_closed(pos, closed=None):
     return pos is not None and float(pos) >= closed - CLOSED_TOL
 
 
+AIR_MARGIN = 0.05  # the band's top stays this far under an empty close: closed on air must fail
+
+
 def scaled_band(band, closed=None):
-    """The grip band (lo, hi), measured against the NOMINAL_CLOSED reading,
-    in this gripper's current readings."""
+    """The grip band (lo, hi), measured when an empty close read
+    NOMINAL_CLOSED, for the reading in force: the bottom follows a lower
+    empty-close reading down (should every reading have shrunk with it), the
+    top stays where it was measured (should the knob read as it always did)
+    but always AIR_MARGIN under an empty close — whichever the gripper is
+    doing, a grip on the knob passes and a close on air or on the box fails.
+
+    It was scaled as a whole at first; the gripper went back to 0.793 the
+    next run, the band computed from 0.636 topped out at 0.441, and the knob
+    read its usual 0.419 (2026-09-28)."""
     closed = learned_closed() if closed is None else closed
-    f = closed / NOMINAL_CLOSED
-    return (float(band[0]) * f, float(band[1]) * f)
+    f = min(1.0, closed / NOMINAL_CLOSED)
+    return (float(band[0]) * f, min(float(band[1]), closed - AIR_MARGIN))

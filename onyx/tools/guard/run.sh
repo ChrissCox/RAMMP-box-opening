@@ -4,7 +4,10 @@
 # loopback only — nothing here can reach the robot's graph.
 set -eo pipefail
 cd "$(dirname "$0")/../../.."
-export ROS_DOMAIN_ID=199 ROS_LOCALHOST_ONLY=1 PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+export ROS_DOMAIN_ID=199 PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+# loopback: ROS_LOCALHOST_ONLY, unless a Cyclone config already pins it (the
+# bench's does; Cyclone refuses a participant when both configure interfaces)
+if [ -n "$CYCLONEDDS_URI" ]; then export ROS_LOCALHOST_ONLY=0; else export ROS_LOCALHOST_ONLY=1; fi
 set +u
 source /opt/ros/humble/setup.bash
 source "$HOME/rammp_deps_ws/install/setup.bash"

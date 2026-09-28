@@ -35,12 +35,15 @@ def test_only_an_empty_close_is_ever_learned(state):
     assert fingers.learned_closed() == pytest.approx(0.79)
 
 
-def test_the_grip_band_follows_the_reading(state):
-    """The band [0.3, 0.55] was measured when an empty close read 0.793: a
-    knob grip read 0.41 then. At 0.636 every reading is 0.8 of what it was."""
+def test_the_grip_band_holds_the_knob_in_either_gripper_state(state):
+    """The band [0.3, 0.55] was measured when an empty close read 0.793, a
+    knob grip 0.41. With an empty close at 0.636, the knob may read 0.33 (if
+    every reading shrank) or its usual 0.419 (2026-09-28): both must pass,
+    and a close on air or on the box must not."""
     fingers.learn_closed(0.636)
     lo, hi = fingers.scaled_band((0.3, 0.55))
-    assert lo == pytest.approx(0.3 * 0.636 / 0.793) and hi == pytest.approx(0.55 * 0.636 / 0.793)
-    assert lo < 0.41 * 0.636 / 0.793 < hi  # the knob, as it now reads
-    assert hi < 0.636  # a close on air still fails the band
+    for knob in (0.41 * 0.636 / 0.793, 0.419):
+        assert lo < knob < hi
+    assert hi <= 0.636 - fingers.AIR_MARGIN  # a close on air fails
+    assert lo > 0.09  # a close on the box fails
     assert fingers.scaled_band((0.3, 0.55), closed=0.793) == pytest.approx((0.3, 0.55))
