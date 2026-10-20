@@ -3,22 +3,26 @@
 <package format="3">
   <name>rammp_box_opening</name>
   <version>0.1.0</version>
-  <description>Open and pick up an OXO POP container with the Kinova Gen3:
-    composable primitives over the RAMMP-CuRobo planning service. Client
-    only — interfaces come from the ~/RAMMP-CuRobo/install overlay.</description>
+  <description>Open an OXO POP container with the Kinova Gen3: composable
+    primitives over the kinova-gen3-ros2 driver and the RAMMP-CuRobo planner,
+    both run by sheppy. Client only — interfaces and the robot description
+    come from the ~/rammp_deps_ws overlay.</description>
   <maintainer email="chrisman4247@gmail.com">RAMMP</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
+  <depend>rammp_arm_interfaces</depend>
   <depend>rammp_curobo_interfaces</depend>
   <depend>trajectory_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
-  <depend>control_msgs</depend>
-  <depend>std_srvs</depend>
+  <depend>std_msgs</depend>
   <depend>builtin_interfaces</depend>
   <depend>tf2_ros</depend>
-  <depend>controller_manager_msgs</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>kinova_gen3_description</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 

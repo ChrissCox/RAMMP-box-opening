@@ -3,126 +3,61 @@
 
     python3 scripts/abort_e2e.py            # isolates itself on ROS_DOMAIN_ID=77
 
-RAMMP-CuRobo's abort_checks.py proves the PLANNER's Ctrl+C stops the
-controller. This proves OUR side of the same chain: a rammp_box_opening
-CLI (`home_arm --execute`) driving a STUB planner node — SIGINT mid-stroke
-must deliver an ExecuteTrajectory CANCEL to the server before the process
-exits. The failure this catches is silent and severe: with rclpy's
-default SIGINT handler the context dies before the cancel can be sent —
-the CLI stops WATCHING the arm while the trajectory runs to its end
-(verified on this stack by abort_checks; field lesson 7).
+This proves OUR side of the abort chain: a rammp_box_opening CLI
+(`home_arm --execute`) driving a STUB arm driver (scripts/stub_arm.py) with
+a stub planner beside it — SIGINT mid-stroke must deliver an
+execute_joint_trajectory CANCEL to the driver before the process exits.
+The failure this catches is silent and severe: with rclpy's default
+SIGINT handler the context dies before the cancel can be sent — the CLI
+stops WATCHING the arm while the trajectory runs to its end (field
+lesson 7).
 
 No arm, no GPU, no real planner. The harness refuses to run on a graph
-with a real controller_manager or planner (the stub serves the real
-/rammp_curobo names — on a shared graph, discovery binding is a coin
-flip), and audits goal counts (CLI-sent == stub-received) per lesson 6.
+with a real driver or planner (e2e_common), and audits goal counts
+(CLI-sent == stub-received) per lesson 6.
 """
 
 import os
 import signal
 import subprocess
 import sys
-import tempfile
 import time
-from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-DOMAIN = os.environ.get("ABORT_E2E_DOMAIN", "77")
+from e2e_common import REPO, Shell, kill, measured_config, wait_for, workdir
 
-CHAIN = (
-    "export ROS_DOMAIN_ID=%s; export ROS_LOCALHOST_ONLY=1; "
-    # pin the stub stroke: the mid-stroke SIGINT premise (~24 s at 0.25)
-    # must not bend to an inherited STUB_PLAN_S from the environment
-    "export STUB_PLAN_S=6.0; unset STUB_TRIP_EXEC_N STUB_GRIP_POS; "
-    "source /opt/ros/humble/setup.zsh; "
-    "source ~/RAMMP-CuRobo/install/setup.zsh; "
-    "source %s/install/setup.zsh; " % (DOMAIN, REPO)
-)
-
-
-def sh(cmd, **kw):
-    return subprocess.run(
-        ["zsh", "-c", CHAIN + cmd], capture_output=True, text=True, **kw
-    )
-
-
-def kill(proc):
-    if proc is None:
-        return
-    for sig in (signal.SIGINT, signal.SIGKILL):
-        try:
-            os.killpg(os.getpgid(proc.pid), sig)
-            proc.wait(timeout=5)
-            return
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            continue
-
-
-def wait_for(path, needle, timeout, proc=None, what="", also_dump=()):
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
-        if needle in Path(path).read_text():
-            return True
-        if proc is not None and proc.poll() is not None:
-            dumps = "".join(
-                "\n--- %s ---\n%s" % (p.name, Path(p).read_text()[-2000:])
-                for p in (path, *also_dump)
-            )
-            sys.exit("%s died before %r:%s" % (what, needle, dumps))
-        time.sleep(0.2)
-    return False
+# pin the stub stroke: the mid-stroke SIGINT premise must not bend to an
+# inherited STUB_PLAN_S from the environment. Unguarded motion is re-timed
+# client-side (retime.py) — the stub's 0.4 rad home path would take ~0.7 s
+# — so the drill runs home_arm in the operator's slow mode
+# (--speed-scale 0.1 -> ~7 s), which is also the real first-run safety knob
+# off HOME (joint_1 0.4 rad): the drill interrupts a real move home
+SH = Shell("export STUB_PLAN_S=6.0 STUB_START_OFF_HOME=1; unset STUB_TRIP_EXEC_N STUB_GRIP_POS; ")
 
 
 def main():
-    tmp = Path(tempfile.mkdtemp(prefix="abort_e2e_"))
-    print("workdir %s (domain %s)" % (tmp, DOMAIN))
+    tmp = workdir("abort_e2e_")
+    SH.refuse_real_stack()
 
-    sh("ros2 daemon stop", timeout=30)  # a daemon bound to another domain lies
-    probe = sh("timeout 20 ros2 node list", timeout=30)
-    nodes = probe.stdout
-    if "/controller_manager" in nodes or "/rammp_curobo" in nodes:
-        sys.exit(
-            "REAL arm stack or planner visible on ROS_DOMAIN_ID=%s:\n%s\n"
-            "This harness serves fake /rammp_curobo names — refusing "
-            "(discovery binding on a shared graph is a coin flip)." % (DOMAIN, nodes)
-        )
-
-    stub_py = REPO / "scripts" / "stub_planner.py"
-    stub_log = tmp / "stub.log"
+    stub_log = tmp / "arm.log"
+    plan_log = tmp / "planner.log"
     cli_log = tmp / "cli.log"
+    cfg = measured_config(tmp)  # --execute refuses while measure_me is true
 
-    # measured-config copy: --execute refuses while measure_me is true
-    cfg = tmp / "oxo_measured.yaml"
-    src_cfg = REPO / "src/rammp_box_opening/config/containers/oxo_pop.yaml"
-    cfg.write_text(src_cfg.read_text().replace("measure_me: true", "measure_me: false"))
-
-    stub = cli = None
+    stub = planner = cli = None
     try:
-        stub = subprocess.Popen(
-            ["zsh", "-c", CHAIN + "exec python3 %s" % stub_py],
-            stdout=open(stub_log, "w"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        if not wait_for(stub_log, "STUB READY", 30, stub, "stub"):
-            sys.exit("stub never became ready:\n" + stub_log.read_text()[-2000:])
+        stub = SH.spawn("exec python3 %s" % (REPO / "scripts/stub_arm.py"), stub_log)
+        planner = SH.spawn("exec python3 %s" % (REPO / "scripts/stub_planner.py"), plan_log)
+        if not wait_for(stub_log, "STUB ARM READY", 30, stub, "stub arm"):
+            sys.exit("stub arm never became ready:\n" + stub_log.read_text()[-2000:])
+        if not wait_for(plan_log, "STUB PLANNER READY", 30, planner, "stub planner"):
+            sys.exit("stub planner never became ready:\n" + plan_log.read_text()[-2000:])
 
-        cli = subprocess.Popen(
-            [
-                "zsh",
-                "-c",
-                CHAIN
-                + "exec ros2 run rammp_box_opening home_arm --execute --container %s"
-                % cfg,
-            ],
+        cli = SH.spawn(
+            "exec ros2 run rammp_box_opening home_arm --execute --speed-scale 0.1 --container %s" % cfg,
+            cli_log,
             stdin=subprocess.PIPE,
-            stdout=open(cli_log, "w"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
             text=True,
         )
-        cli.stdin.write("yes\n")
-        cli.stdin.flush()
 
         if not wait_for(
             stub_log, "EXEC GOAL ACCEPTED", 60, cli, "CLI", also_dump=(cli_log,)
@@ -131,7 +66,7 @@ def main():
                 "no execution goal reached the stub:\n--- cli ---\n%s\n--- stub ---\n%s"
                 % (cli_log.read_text()[-2000:], stub_log.read_text()[-2000:])
             )
-        time.sleep(2.0)  # mid-stroke (stub stroke is ~24 s at speed 0.25)
+        time.sleep(2.0)  # mid-stroke (stub stroke is ~7 s in slow mode)
 
         print("SIGINT to the CLI, mid-stroke...")
         os.killpg(os.getpgid(cli.pid), signal.SIGINT)
@@ -144,6 +79,7 @@ def main():
         time.sleep(1.0)  # let the stub's goal loop notice and log
     finally:
         kill(cli)
+        kill(planner)
         kill(stub)
 
     said = stub_log.read_text()
@@ -153,7 +89,7 @@ def main():
 
     cancelled = "CANCEL RECEIVED" in said and "STOPPED at" in said
     completed = "RAN TO COMPLETION" in said
-    sent = cli_said.count("Type 'yes'")  # one prompt == one run attempt
+    sent = cli_said.count("EXECUTING (human on the physical e-stop")  # one line == one run attempt
     execs = said.count("EXEC GOAL ACCEPTED")
     audit_ok = execs == 1 and sent == 1
     # a cancel that escapes as the context dies is LUCK, not ownership:
@@ -185,7 +121,7 @@ def main():
         (not confirmed, "CLI never confirmed the cancel round-trip"),
         (
             double_spoke,
-            "owned path AND backstop both spoke — contradictory " "abort report",
+            "owned path AND backstop both spoke — contradictory abort report",
         ),
         (hung, "CLI did not exit after SIGINT"),
         (not audit_ok, "goal-count audit failed (%d exec goals seen)" % execs),
@@ -199,7 +135,4 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        # the probe above rebinds the ros2 CLI daemon to the isolated
-        # domain; leaving it there makes `ros2 node list` in normal shells
-        # come up empty (field lesson 8) — put it back down on the way out
-        sh("ros2 daemon stop", timeout=30)
+        SH.daemon_reset()

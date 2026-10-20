@@ -3,13 +3,11 @@ import math
 import pytest
 
 from rammp_box_opening.models.container import (
-    ConfigPoseSource,
     ContainerModel,
     ContainerPose,
     attitude_quat,
     from_container,
     load_lid_place,
-    wrist_flat_quat,
 )
 
 CFG = "src/rammp_box_opening/config/containers/oxo_pop.yaml"
@@ -18,31 +16,15 @@ CFG = "src/rammp_box_opening/config/containers/oxo_pop.yaml"
 def test_load_and_validate():
     m = ContainerModel.load(CFG)
     assert m.measure_me is False  # owner accepted values 2026-08-25
-    assert m.press_depth_window[0] < m.press_depth_window[1]
-    assert m.lid_grasp.width_m <= m.aperture_at_0  # graspable
-    assert m.body_grasp.width_m <= m.aperture_at_0
-
-
-def test_width_to_command_endpoints_and_refusal():
-    m = ContainerModel.load(CFG)
-    assert m.width_to_command(m.aperture_at_0) == pytest.approx(0.0)
-    assert m.width_to_command(m.aperture_at_08) == pytest.approx(0.8)
-    with pytest.raises(ValueError):
-        m.width_to_command(m.aperture_at_0 + 0.01)
+    assert len(m.dims) == 3 and len(m.lid_dims) == 3
+    assert m.button_offset[2] == pytest.approx(m.dims[2])  # button = top
+    assert m.touch_nm > 0 and m.hover_standoff > 0
 
 
 def test_from_container_rotates_by_yaw():
     cpose = ContainerPose(xyz=(1.0, 2.0, 0.0), yaw=math.pi / 2)
     # +x offset in container frame maps to +y in base at yaw 90 deg
     assert from_container(cpose, (0.1, 0.0, 0.05)) == pytest.approx([1.0, 2.1, 0.05])
-
-
-def test_wrist_flat_quat_is_bearing_steered_xyzw():
-    q0 = wrist_flat_quat([1.0, 0.0, 0.5])  # bearing 0 -> home attitude
-    assert q0 == pytest.approx([0.5, 0.5, 0.5, 0.5])
-    q90 = wrist_flat_quat([0.0, 1.0, 0.5])
-    assert q90 != pytest.approx(q0)  # steered, unit
-    assert sum(v * v for v in q90) == pytest.approx(1.0)
 
 
 def test_attitude_quat_top_down_points_tool_down():
@@ -53,8 +35,172 @@ def test_attitude_quat_top_down_points_tool_down():
     assert ax[2] == pytest.approx(-1.0, abs=1e-6)  # tool z straight down
 
 
-def test_pose_source_and_lid_place():
-    cp = ConfigPoseSource(CFG).container_pose()
-    assert len(cp.xyz) == 3
+def test_lid_place_is_a_table_height_pose():
     lid = load_lid_place(CFG)
-    assert lid.xyz != cp.xyz  # set-down spot is elsewhere
+    assert len(lid.xyz) == 3
+    assert lid.xyz[2] == pytest.approx(-0.027)  # the measured table top
+
+
+def test_load_press_demo_cfg():
+    from rammp_box_opening.models.container import load_press_demo
+
+    cfg = load_press_demo(CFG)
+    assert cfg.detect_source in ("depth", "vlm")
+    assert cfg.grip_band[0] < cfg.grip_band[1] < 0.8
+    assert 0.0 <= cfg.grip_clear_m <= 0.02
+    assert all(abs(v) <= 0.02 for v in cfg.grip_offset_xy)
+    assert cfg.lift_m > 0 and 0 < cfg.lift_speed <= 1.0
+    assert cfg.press_speed == pytest.approx(0.35)  # owner decision 2026-08-25
+    assert cfg.travel_m > 0
+    assert cfg.min_hits >= 2 and cfg.timeout_s > 0
+
+
+def _cfg_variant(tmp_path, old, new):
+    p = tmp_path / "variant.yaml"
+    p.write_text(open(CFG).read().replace(old, new))
+    return str(p)
+
+
+def test_loader_validates_staging_against_real_container_geometry(tmp_path):
+    from rammp_box_opening.models.container import load_press_demo
+
+    # recessed button: dims.z 0.112, button_offset.z 0.05 -> staging
+    # must clear 0.112 - 0.05 + 0.10 = 0.162; the shipped 0.12 fails
+    with pytest.raises(ValueError, match="staging_m"):
+        load_press_demo(
+            _cfg_variant(
+                tmp_path,
+                "button_offset: [0.0, 0.0, 0.112]",
+                "button_offset: [0.0, 0.0, 0.05]",
+            )
+        )
+
+
+def test_loader_refuses_the_retired_tag_source(tmp_path):
+    from rammp_box_opening.models.container import load_press_demo
+
+    with pytest.raises(ValueError, match="detect.source"):
+        load_press_demo(_cfg_variant(tmp_path, "source: vlm", "source: tag"))
+
+
+def test_a_guarded_descent_never_flies_faster_than_a_transit(tmp_path):
+    """warp_fast_speed is the free-air part of a stroke that ends in
+    contact. It may run as fast as the arm ever moves in the open and no
+    faster: past that the arm would be travelling quicker toward something
+    it is about to touch than it does anywhere else. (With TRANSIT_SPEED at
+    1.0 that bound coincides with the warp's own hard cap.)"""
+    from rammp_box_opening.constants import TRANSIT_SPEED
+    from rammp_box_opening.models.container import load_press_demo
+
+    at_the_limit = load_press_demo(
+        _cfg_variant(tmp_path, "warp_fast_speed: 0.75", "warp_fast_speed: %g" % TRANSIT_SPEED)
+    )
+    assert at_the_limit.warp_fast_speed == pytest.approx(TRANSIT_SPEED)
+    with pytest.raises(ValueError, match="warp_fast_speed"):
+        load_press_demo(
+            _cfg_variant(tmp_path, "warp_fast_speed: 0.75", "warp_fast_speed: 1.1")
+        )
+
+
+def test_shipped_press_attitude_is_fixed_and_faces_ahead_looking_down():
+    """The wrist keeps ONE orientation from LOOK through the press: the
+    shipped attitude is the LOOK pose's own (tool z down, tool x along
+    world +y, the camera side toward +x) and does not turn with the box's
+    bearing (owner 2026-09-16: no more flipping)."""
+    import numpy as np
+
+    from rammp_box_opening.models.container import ContainerModel
+    from rammp_box_opening.perception.d405 import quat_to_mat
+
+    m = ContainerModel.load("src/rammp_box_opening/config/containers/oxo_pop.yaml")
+    assert m.press_yaw_steer is False
+    R = quat_to_mat(*m.press_quat([0.45, -0.15, 0.08]))
+    assert np.allclose(R[:, 2], [0.0, 0.0, -1.0], atol=1e-6)  # looking down
+    assert np.allclose(R[:, 0], [0.0, 1.0, 0.0], atol=1e-6)  # facing ahead
+    for xyz in ([0.3, 0.3, 0.1], [0.6, -0.3, 0.1]):
+        assert np.allclose(quat_to_mat(*m.press_quat(xyz)), R, atol=1e-9)
+
+
+def test_bearing_steering_still_turns_with_the_box_when_enabled():
+    import math
+    from dataclasses import replace
+
+    import numpy as np
+
+    from rammp_box_opening.models.container import ContainerModel, attitude_quat
+    from rammp_box_opening.perception.d405 import quat_to_mat
+
+    m = ContainerModel.load("src/rammp_box_opening/config/containers/oxo_pop.yaml")
+    steered = replace(m, press_yaw_steer=True, press_attitude_rpy_deg=(180.0, 0.0, 0.0))
+    xyz = [0.4, -0.2, 0.1]
+    want = quat_to_mat(*attitude_quat([180.0, 0.0, 0.0], math.atan2(-0.2, 0.4)))
+    assert np.allclose(quat_to_mat(*steered.press_quat(xyz)), want, atol=1e-9)
+
+
+def test_every_shipped_container_config_loads_and_validates():
+    """A typo in a container YAML must fail here, not at the bench. The
+    new round container (ankou_pink.yaml, 2026-09-22) ships with photo-
+    estimated geometry the owner accepted flying on; its detector prompts are the ones the
+    phrasing sweep chose (a pink lid is the anchor; 'clear', 'jar',
+    'canister' alone all scored 0.00)."""
+    from pathlib import Path
+
+    from rammp_box_opening.models.container import ContainerModel, load_lid_place, load_press_demo
+
+    folder = Path("src/rammp_box_opening/config/containers")
+    files = sorted(folder.glob("*.yaml"))
+    assert {f.name for f in files} >= {"oxo_pop.yaml", "oxo_pop_small.yaml", "ankou_pink.yaml"}
+    for f in files:
+        model = ContainerModel.load(str(f))
+        cfg = load_press_demo(str(f))
+        load_lid_place(str(f))
+        assert len(model.dims) == 3 and all(v > 0 for v in model.dims), f.name
+        assert cfg.owl_queries and cfg.owl_min_score > 0, f.name
+    pink = ContainerModel.load(str(folder / "ankou_pink.yaml"))
+    # estimated from photos; the owner accepted flying on the estimates
+    # (2026-09-22) — every one of them fails safe, and the first press
+    # measures the button's height and diameter itself
+    assert not pink.measure_me
+    assert pink.dims[0] == pink.dims[1]  # round: the lid's diameter both ways
+    cfg = load_press_demo(str(folder / "ankou_pink.yaml"))
+    assert all("pink lid" in q for q in cfg.owl_queries)
+    assert not any("button" in q for q in cfg.owl_queries)  # a button-only box fails the footprint floor
+    oxo = load_press_demo(str(folder / "oxo_pop.yaml"))
+    assert oxo.owl_queries != cfg.owl_queries
+
+
+def test_the_default_container_is_the_pink_canister(monkeypatch):
+    """Owner, 2026-09-22: "this box is the new default". Every CLI that
+    takes --container, and both OWL detector nodes, fall back to this one.
+    The same function serves them all, so they cannot disagree. (The
+    installed share dir comes from the ament index, which the unit-test
+    shell does not carry: pointed at the source tree here.)"""
+    from pathlib import Path
+
+    import ament_index_python.packages as pk
+
+    from rammp_box_opening.tasks.cli_common import default_container_yaml
+
+    share = Path("src/rammp_box_opening").resolve()
+    monkeypatch.setattr(pk, "get_package_share_directory", lambda name: str(share))
+    got = default_container_yaml()
+    assert got.endswith("/config/containers/ankou_pink.yaml")
+    assert Path(got).exists()
+
+
+def test_an_unmeasured_container_may_be_observed_but_not_flown_at():
+    """measure_me: true refuses --execute — except for the observation that
+    does the measuring (--detect-only), which never goes near the box."""
+    import pytest
+
+    from rammp_box_opening.tasks.cli_common import refuse_unmeasured
+
+    class M:
+        measure_me = True
+
+    refuse_unmeasured(M(), execute=False)  # a dry run is always fine
+    refuse_unmeasured(M(), execute=True, measuring=True)  # the look, the report, home
+    with pytest.raises(SystemExit):
+        refuse_unmeasured(M(), execute=True)
+    M.measure_me = False
+    refuse_unmeasured(M(), execute=True)
