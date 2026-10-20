@@ -58,6 +58,8 @@ ARGS = [
     ("tf", "true", "start robot_state_publisher for the arm (false: TF comes from elsewhere)"),
     ("camera", "false", "start a host D405 driver (default: sheppy's wrist_camera node runs it)"),
     ("owl", "true", "start the persistent OWL bbox detector (loads once)"),
+    ("bench_world", "", "world YAML to use (default: installed world_bench.yaml); "
+                        "pass world_flatbot.yaml for the wheelchair platform"),
 ]
 
 
@@ -102,6 +104,14 @@ def _nodes(context, *_args, **_kwargs):
             "on",
         )
 
+    from rammp_box_opening.tasks.cli_common import default_bench_yaml
+    from rammp_box_opening.worlds import WorldStore
+    bench_world_arg = LaunchConfiguration("bench_world").perform(context).strip()
+    _store = WorldStore(bench_world_arg or default_bench_yaml())
+    # camera config YAML names for the OWL nodes; empty string = use bench defaults
+    wrist_cam_cfg = _store.wrist_camera_config or ""
+    scene_cam_cfg = _store._bench.get("scene_camera_config") or ""
+
     nodes = []
     if flag("tf"):
         nodes.append(
@@ -137,18 +147,25 @@ def _nodes(context, *_args, **_kwargs):
         # persistent semantic gate: the OWL model loads ONCE here instead of
         # once per CLI run (field 2026-09-01: per-run loading made every
         # detect wait)
+        wrist_params = {}
+        if wrist_cam_cfg:
+            wrist_params["camera_config"] = wrist_cam_cfg
         nodes.append(
             Node(
                 package="rammp_box_opening",
                 executable="owl_detector",
                 name="owl_detector",
                 output="screen",
+                parameters=[wrist_params] if wrist_params else [],
             )
         )
         if scene_calib.exists():
             # ... and a second instance watching the scene camera, which finds
             # the box before the arm moves. Each infers only inside its own
             # enable window, so the two never load the GPU together.
+            scene_params = {"camera": "scene"}
+            if scene_cam_cfg:
+                scene_params["camera_config"] = scene_cam_cfg
             nodes.append(
                 Node(
                     package="rammp_box_opening",
@@ -157,7 +174,7 @@ def _nodes(context, *_args, **_kwargs):
                     output="screen",
                     # its floor is the container config's owl_min_score_scene
                     # (lower than the wrist's: the box is small from a metre)
-                    parameters=[{"camera": "scene"}],
+                    parameters=[scene_params],
                 )
             )
     if flag("camera"):
