@@ -10,11 +10,9 @@
 # (depth_collision: true) — RAMMP-CuRobo must expose a depth-world interface
 # for this to be active; until then the planner runs without surface obstacles.
 #
-# Calibration still needed:
-#   1. Measure the adapter-plate bounding box (calipers or FK snapshot)
-#      and update pedestal position/dims.
-#   2. Confirm the floor keepout clears the wheelchair seat.
-#   3. Implement depth-world push in RAMMP-CuRobo (issue to file).
+# TODO: Confirm the floor keepout clears the wheelchair seat (tape measure).
+# TODO: Implement depth-world push in RAMMP-CuRobo (depth_collision: true is
+#       set but the planner interface is not yet wired).
 #
 # Names are load-bearing:
 #   pedestal : arm adapter-plate block; cuRobo marks it no_pad and never
@@ -34,15 +32,6 @@ depth_collision: true
 external_static_tf: true
 
 obstacles:
-  # Adapter plate (new_adapter_plate_v3) connecting the arm to the wheelchair.
-  # arm_base_link's -Z points to [-0.50, 0, -0.87] in arm_mount (30° tilt),
-  # so mounting hardware ~30 mm below arm_base_link's origin lands near
-  # [-0.02, 0, -0.02] in arm_mount. Box is oversized to bound the tilted slab
-  # conservatively. ESTIMATED — measure and update.
-  - name: pedestal
-    position: [-0.02, 0.0, -0.02]
-    dims: [0.20, 0.18, 0.08]
-
   # Keep-out below the arm — prevents planning into the wheelchair seat and
   # frame. 30 cm below arm_mount origin. ESTIMATED — verify with tape.
   - name: floor
