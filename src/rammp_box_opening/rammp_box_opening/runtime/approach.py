@@ -43,13 +43,19 @@ from rammp_box_opening.runtime.stamps import secs, set_stamp
 
 _CHAIN = None
 _ROOT = "base_link"
+_URDF_PATH = None  # None = use kinematics.urdf_path() (the installed bench URDF)
 
 
-def set_chain_root(root):
+def set_chain_root(root, urdf_path=None):
     """Switch the URDF chain's root frame ('base_link' on bench, 'arm_mount'
-    on flatbot). Resets the singleton so the next _chain() call rebuilds."""
-    global _ROOT, _CHAIN
+    on flatbot). `urdf_path` overrides the default installed URDF when the
+    active robot's description differs (e.g. the nightly arm on flatbot, whose
+    URDF is rendered with arm_mount as root and published on
+    /arm/robot_description). Resets the singleton so the next _chain() call
+    rebuilds with the new root and path."""
+    global _ROOT, _URDF_PATH, _CHAIN
     _ROOT = str(root)
+    _URDF_PATH = urdf_path
     _CHAIN = None
 
 
@@ -59,7 +65,7 @@ def _chain():
     if _CHAIN is None:
         from rammp_box_opening.runtime.kinematics import ArmChain
 
-        _CHAIN = ArmChain(root=_ROOT)
+        _CHAIN = ArmChain(root=_ROOT, path=_URDF_PATH)
     return _CHAIN
 
 

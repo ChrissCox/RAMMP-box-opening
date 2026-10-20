@@ -753,6 +753,36 @@ RECENTRE_TOL_M = 0.025
 RECENTRE_MAX = 2  # moves over the button before pressing from the last aim (detect.recentre_max_moves)
 
 
+def _arm_urdf_path(node, base_frame):
+    """Return a temp-file path to the arm's URDF, or None for the bench default.
+
+    On flatbot the nightly arm_state_publisher renders the URDF with arm_mount
+    as root (incorporating the adapter plate tilt) and publishes it latched on
+    /arm/robot_description. The FK chain must use THAT URDF so its root matches
+    the planning frame. On the bench the installed kinova_gen3.urdf is correct."""
+    if base_frame == "base_link":
+        return None
+    import tempfile
+    from std_msgs.msg import String
+
+    got = []
+    sub = node.create_subscription(String, "/arm/robot_description", got.append, 1)
+    t0 = time.monotonic()
+    while not got and time.monotonic() - t0 < 5.0:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    node.destroy_subscription(sub)
+    if not got:
+        node.get_logger().error(
+            "/arm/robot_description not received in 5 s — ArmChain will use the "
+            "bench URDF (base_link root). FK in arm_mount frame will be wrong."
+        )
+        return None
+    f = tempfile.NamedTemporaryFile(suffix=".urdf", delete=False, mode="w")
+    f.write(got[0].data)
+    f.close()
+    return f.name
+
+
 def tool_xy(ctx):
     """Where the tool stands (base xy), from the arm's own kinematics."""
     from rammp_box_opening.runtime.approach import _chain
@@ -1908,7 +1938,7 @@ def main():
     worlds = WorldStore(bench)
     client._base_frame = worlds.base_frame
     from rammp_box_opening.runtime.approach import set_chain_root
-    set_chain_root(worlds.base_frame)
+    set_chain_root(worlds.base_frame, urdf_path=_arm_urdf_path(node, worlds.base_frame))
     runner = Runner(client)
     cli_common.apply_speed_scale(runner, args)
     # The persistent owl_detector node owns the OWL model; there is no
