@@ -219,6 +219,8 @@ def top_face_from_depth(depth, k, rot_cam, trans_cam, table_z, model, roi=None):
     pts = pts_cam @ rot.T + np.asarray(trans_cam, dtype=float)
     z_base = pts[:, 2].reshape(gh, gw)
 
+    if table_z is None:
+        return None, "no table_z yet — run scene camera first to measure surface"
     expected_top = table_z + float(model.dims[2])
     band = (
         valid
@@ -410,6 +412,8 @@ def button_circle_refine(color_rgb, depth, k, rot_cam, trans_cam, center, button
 def top_residual_reject(z_top, table_z, model):
     """None when the measured top is commit-close to nominal, else the
     honest refusal reason. Pure, unit-testable."""
+    if table_z is None:
+        return None
     residual = float(z_top) - (float(table_z) + model.dims[2])
     if abs(residual) <= TOP_RESIDUAL_MAX_M:
         return None
@@ -461,7 +465,7 @@ class BoxTopWatcher:
         # surface, and a table fitted from it moved the lid band off the lid
         # (field 2026-09-16: box right under the look, not found in 438
         # frames; replaying the 1 Sep capture, 39/94 hits fell to 7/94).
-        self.table_z = float(table_z)
+        self.table_z = float(table_z) if table_z is not None else None
         # Only sightings whose BUTTON CIRCLE was found may vote. The
         # plateau centroid finds the lid, not the button: on the bench
         # capture it sits a median 5.9 mm (max 15.4) from the circle and

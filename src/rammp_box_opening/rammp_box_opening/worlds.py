@@ -106,7 +106,9 @@ PLACEMENT_BAND_Y = (-0.50, 0.50)
 
 
 def _table_top_z(bench):
-    t = next(o for o in bench["obstacles"] if o["name"] == "table")
+    t = next((o for o in bench["obstacles"] if o["name"] == "table"), None)
+    if t is None:
+        return None
     return t["position"][2] + t["dims"][2] / 2
 
 
@@ -122,16 +124,17 @@ def bench_world(bench, unseen_model=None):
     obstacles = _bench_obstacles(bench)
     if unseen_model is not None:
         top = _table_top_z(bench)
-        h = unseen_model.dims[2] + ERR_TALL_M
-        x0, x1 = PLACEMENT_BAND_X
-        y0, y1 = PLACEMENT_BAND_Y
-        obstacles.append(
-            {
-                "name": "unseen_container_band",
-                "position": [(x0 + x1) / 2, (y0 + y1) / 2, top + h / 2],
-                "dims": [x1 - x0, y1 - y0, h],
-            }
-        )
+        if top is not None:
+            h = unseen_model.dims[2] + ERR_TALL_M
+            x0, x1 = PLACEMENT_BAND_X
+            y0, y1 = PLACEMENT_BAND_Y
+            obstacles.append(
+                {
+                    "name": "unseen_container_band",
+                    "position": [(x0 + x1) / 2, (y0 + y1) / 2, top + h / 2],
+                    "dims": [x1 - x0, y1 - y0, h],
+                }
+            )
     return {
         "base_frame": bench.get("base_frame", "base_link"),
         "obstacles": obstacles,
@@ -208,12 +211,22 @@ class WorldStore:
             else state_dir() / "worlds"
         )
         self._dir.mkdir(parents=True, exist_ok=True)
+        self._surface_z = None  # runtime-measured surface; overrides YAML when set
 
     @property
     def table_top_z(self):
-        """Measured table-top height (base_link z) — the depth pose
-        source bands container candidates above this."""
+        """Measured table-top height in the planning frame.
+
+        Read from the bench YAML's 'table' obstacle when present; otherwise
+        None until the scene camera measures the surface (set by press_demo
+        after the first SceneFix)."""
+        if self._surface_z is not None:
+            return self._surface_z
         return _table_top_z(self._bench)
+
+    @table_top_z.setter
+    def table_top_z(self, value):
+        self._surface_z = float(value) if value is not None else None
 
     @property
     def table_normal(self):

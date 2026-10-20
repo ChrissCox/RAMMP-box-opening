@@ -2074,12 +2074,17 @@ def main():
                 print("[press_demo] scene camera: %s — searching with the wrist" % locator.last_why)
             if scene_fix is not None:
                 sp = scene_fix.pose
+                if worlds.table_top_z is None and not math.isnan(scene_fix.table_z_scene):
+                    worlds.table_top_z = scene_fix.table_z_scene
+                    watcher.table_z = scene_fix.table_z_scene
+                surveyed = watcher.table_z
                 print(
                     "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points "
-                    "(OWL %.2f; the scene reads the table at %.3f, surveyed %.3f; %.1f s to locate "
+                    "(OWL %.2f; the scene reads the table at %.3f, surveyed %s; %.1f s to locate "
                     "[%s], %.1f s since start) — flying to staging"
                     % (sp.xyz[0], sp.xyz[1], math.degrees(sp.yaw), scene_fix.n_points,
-                       scene_fix.score, scene_fix.table_z_scene, watcher.table_z,
+                       scene_fix.score, scene_fix.table_z_scene,
+                       ("%.3f" % surveyed) if surveyed is not None else "n/a",
                        time.monotonic() - t_scene,
                        " ".join("%s %.2f" % (k[:-2], v) for k, v in locator.last_timing.items()),
                        time.monotonic() - t_main)

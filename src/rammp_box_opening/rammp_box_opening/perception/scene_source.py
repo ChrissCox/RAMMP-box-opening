@@ -179,7 +179,7 @@ class SceneLocator:
         self.spins = bool(spins)
         self.cfg = cfg
         self.model = model
-        self.table_z = float(table_z)
+        self.table_z = float(table_z) if table_z is not None else None
         self.T_base_link = np.asarray(T_base_link, dtype=float)
         self.grab = SceneGrabber(node, keep=3, need_depth=True)
         self.owl = OwlRung(node, cfg, camera="scene")
@@ -251,8 +251,16 @@ class SceneLocator:
                 T_base_color = self.T_base_link @ self.grab.link_to_color()
                 pts_base = pc @ T_base_color[:3, :3].T + T_base_color[:3, 3]
                 cands = bboxes_in_msg(m)
+                effective_table_z = self.table_z
+                if effective_table_z is None:
+                    import math as _math
+                    measured = table_from_scene_points(pts_base, uv, self.grab.color.shape[0])
+                    if _math.isnan(measured):
+                        self.last_why = "no table_z: depth scan found no horizontal plane"
+                        return None
+                    effective_table_z = measured
                 got = scene_fix_from_boxes(
-                    [(c[4], c[:4]) for c in cands], pts_base, uv, self.table_z, self.model
+                    [(c[4], c[:4]) for c in cands], pts_base, uv, effective_table_z, self.model
                 )
                 tried.extend(got.tried)
                 if got.pose is not None:
