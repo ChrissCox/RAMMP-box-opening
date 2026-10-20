@@ -42,6 +42,15 @@ from rammp_box_opening.runtime.retime import RetimeParams, positions_to_traj, re
 from rammp_box_opening.runtime.stamps import secs, set_stamp
 
 _CHAIN = None
+_ROOT = "base_link"
+
+
+def set_chain_root(root):
+    """Switch the URDF chain's root frame ('base_link' on bench, 'arm_mount'
+    on flatbot). Resets the singleton so the next _chain() call rebuilds."""
+    global _ROOT, _CHAIN
+    _ROOT = str(root)
+    _CHAIN = None
 
 
 def _chain():
@@ -50,7 +59,7 @@ def _chain():
     if _CHAIN is None:
         from rammp_box_opening.runtime.kinematics import ArmChain
 
-        _CHAIN = ArmChain()
+        _CHAIN = ArmChain(root=_ROOT)
     return _CHAIN
 
 

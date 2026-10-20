@@ -168,10 +168,10 @@ def scene_tag_px(path):
     return None if t is None else (float(t[0]), float(t[1]))
 
 
-def write_scene_yaml(path, T_base_link, child_frame, note="", tag_px=None):
+def write_scene_yaml(path, T_base_link, child_frame, note="", tag_px=None, parent_frame="base_link"):
     q = mat_to_quat_xyzw(np.asarray(T_base_link)[:3, :3])
     doc = {
-        "parent_frame": "base_link",
+        "parent_frame": parent_frame,
         "child_frame": child_frame,
         "xyz": [round(float(v), 5) for v in np.asarray(T_base_link)[:3, 3]],
         "quat_xyzw": [round(float(v), 6) for v in q],

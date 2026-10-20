@@ -229,6 +229,12 @@ class WorldStore:
         self._surface_z = float(value) if value is not None else None
 
     @property
+    def base_frame(self):
+        """The planning root frame for this robot config ('base_link' on the
+        bench, 'arm_mount' on flatbot)."""
+        return self._bench.get("base_frame", "base_link")
+
+    @property
     def table_normal(self):
         """The table's normal in base_link as measured (see the yaml), or
         exactly +z when the bench file does not say."""

@@ -84,6 +84,7 @@ class PlannerClient:
         # whatever it receives and has no dry-run parameter, so this is the
         # software gate on arm AND gripper motion.
         self._armed = bool(motion_enabled)
+        self._base_frame = "base_link"  # overridden by cli_common/preflight from WorldStore
         self._q = None
         self._eff = None
         self._eff_at = 0.0  # monotonic stamp of the last joint_states message
@@ -196,7 +197,7 @@ class PlannerClient:
             try:
                 pts = []
                 for frame in FINGERTIP_FRAMES:
-                    tf = self._tf.lookup_transform("base_link", frame, Time())
+                    tf = self._tf.lookup_transform(self._base_frame, frame, Time())
                     tr = tf.transform.translation
                     pts.append([tr.x, tr.y, tr.z])
                 return [sum(c) / len(pts) for c in zip(*pts)]

@@ -112,8 +112,9 @@ def camera_pose_at(g, offset_s=None):
     when = rt.Time.from_msg(g.color_stamp)
     if off:
         when = when + Duration(nanoseconds=int(round(off * 1e9)))
+    root = getattr(g, "_base_frame", "base_link")
     try:
-        tr = g.tf_buffer.lookup_transform("base_link", g.parent, when)
+        tr = g.tf_buffer.lookup_transform(root, g.parent, when)
     except Exception:
         return None
     q, t = tr.transform.rotation, tr.transform.translation
@@ -453,13 +454,14 @@ class BoxTopWatcher:
     stands — so the fix is often ready the moment the arm parks (owner:
     detect during the flip, 2026-09-01)."""
 
-    def __init__(self, node, cfg, model, table_z, period_s=None):
+    def __init__(self, node, cfg, model, table_z, period_s=None, base_frame="base_link"):
         from rammp_box_opening.perception.d405 import D405Grabber
 
         if period_s is None:
             period_s = float(getattr(cfg, "detect_period_s", 0.15))
         self.cfg = cfg
         self.model = model
+        self._base_frame = base_frame
         # The SURVEYED table. Not fitted from the camera: passive stereo reads
         # a blank bench as a broad smear whose mode sits ~35 mm above the real
         # surface, and a table fitted from it moved the lid band off the lid
@@ -481,6 +483,7 @@ class BoxTopWatcher:
         # the box while the arm is still descending toward it.
         self.moving_ok = bool(getattr(cfg, "confirm_in_flight", False))
         self.grab = D405Grabber(node, need_depth=True)
+        self.grab._base_frame = self._base_frame
         self.window = FixWindow(cfg.min_hits, cfg.tol_m, cfg.window_s, cfg.fresh_s)
         self.coarse_window = FixWindow(
             COARSE_MIN_HITS, COARSE_TOL_M, COARSE_WINDOW_S, cfg.fresh_s

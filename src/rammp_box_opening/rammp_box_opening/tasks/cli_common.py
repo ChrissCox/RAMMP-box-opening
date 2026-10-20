@@ -117,11 +117,13 @@ def build_ctx(args):
     model = ContainerModel.load(cfg)
     refuse_unmeasured(model, args.execute)
     node, client = init_runtime(args.execute)
+    worlds = WorldStore(bench)
+    client._base_frame = worlds.base_frame
     ctx = Ctx(
         model=model,
         cpose=None,
         client=client,
-        worlds=WorldStore(bench),
+        worlds=worlds,
         config_path=cfg,
     )
     return ctx, Runner(client)

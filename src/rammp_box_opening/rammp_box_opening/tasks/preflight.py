@@ -189,6 +189,7 @@ def main():
     #    container: a path that exists here is invisible there unless its
     #    directory is mounted at the same path.
     store = WorldStore(args.bench_world or cli_common.default_bench_yaml())
+    client._base_frame = store.base_frame
     _name, path = store.push_name("bench")
     ok, msg = client.set_world(path)
     if ok:
@@ -203,7 +204,7 @@ def main():
     # 5. TF for the finger tips (robot_state_publisher from the launch)
     tips = client.contact_xyz(timeout_s=3.0)
     if tips is not None:
-        print("PASS  TF base_link -> %s" % ", ".join(FINGERTIP_FRAMES))
+        print("PASS  TF %s -> %s" % (store.base_frame, ", ".join(FINGERTIP_FRAMES)))
     else:
         print(
             "FAIL  no TF for the finger tips — run press_demo.launch.py "

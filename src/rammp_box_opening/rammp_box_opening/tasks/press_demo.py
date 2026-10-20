@@ -1713,13 +1713,13 @@ def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S):
         from rammp_box_opening.perception.d405 import camera_config
 
         parent = camera_config()["parent_frame"]
-        if not client.tf_ready("base_link", parent, timeout_s=2.0):
+        if not client.tf_ready(client._base_frame, parent, timeout_s=2.0):
             # bench 2026-09-25: box_opening stopped, no /tf at all; the run
             # flew to staging and then could not place one wrist frame
             # ("no camera pose for the frame", 0/60)
             return (
-                "no TF from base_link to %s — sheppy's `box_opening` node (the arm's TF, the scene camera's and "
-                "the OWL detectors) is not running: `sheppy up box-opening`. Nothing moved." % parent
+                "no TF from %s to %s — sheppy's `box_opening` node (the arm's TF, the scene camera's and "
+                "the OWL detectors) is not running: `sheppy up box-opening`. Nothing moved." % (client._base_frame, parent)
             )
     return None
 
@@ -1906,6 +1906,9 @@ def main():
     cli_common.refuse_unmeasured(model, args.execute, measuring=args.detect_only)
     node, client = cli_common.init_runtime(args.execute)
     worlds = WorldStore(bench)
+    client._base_frame = worlds.base_frame
+    from rammp_box_opening.runtime.approach import set_chain_root
+    set_chain_root(worlds.base_frame)
     runner = Runner(client)
     cli_common.apply_speed_scale(runner, args)
     # The persistent owl_detector node owns the OWL model; there is no
@@ -1951,7 +1954,7 @@ def main():
             owl = OwlRung(pnode, cfg, watcher_holder)
             impls["owl"] = owl
     # the box found by geometry: the lid plateau above the surveyed table
-    watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z)
+    watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame)
     watcher_holder["watcher"] = watcher
     # The scene camera, when it has been calibrated to the arm
     # (scripts/calibrate_scene_camera.py): it finds the box before the arm
