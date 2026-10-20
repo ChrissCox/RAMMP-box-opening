@@ -1,0 +1,48 @@
+# Flatbot working-surface geometry — ESTIMATED 2026-10-20, arm_mount frame.
+#
+# arm_mount is gravity-aligned (+Z up). arm_base_link shares this origin but
+# is rotated 30° around Y (forward lean, new_adapter_plate_v3). All obstacle
+# positions here are in arm_mount coordinates.
+#
+# ESTIMATED — reconcile before enabling collision avoidance on flatbot:
+#   1. Run the wrist-scan surface measurement (measure_bench.py equivalent)
+#      to get the TRUE table surface height in arm_mount. Update table z.
+#   2. Measure the adapter-plate bounding box (calipers or FK snapshot).
+#      Update pedestal position and dims.
+#   3. Confirm the floor keepout clears the wheelchair seat (sensor or tape).
+#      Update floor z.
+#   4. Remove this header block and re-annotate with measurement dates.
+#
+# Names are load-bearing — worlds.py and the planner require them verbatim:
+#   table    : TRUE surface height; worlds.py lowers by PLANNER_PADDING_M
+#              (0.02 m) before sending to the planner.
+#   pedestal : arm adapter-plate block; cuRobo marks it no_pad and never
+#              drops it (NEVER_DROP in worlds.py).
+base_frame: arm_mount
+# In a gravity-aligned frame the table normal is purely +Z.
+table_normal_base: [0.0, 0.0, 1.0]
+
+obstacles:
+  # Adapter plate (new_adapter_plate_v3) connecting the arm to the wheelchair.
+  # arm_base_link's -Z points to [-0.50, 0, -0.87] in arm_mount (30° tilt),
+  # so mounting hardware ~30 mm below arm_base_link's origin lands near
+  # [-0.02, 0, -0.02] in arm_mount. Box is oversized to bound the tilted slab
+  # conservatively. ESTIMATED.
+  - name: pedestal
+    position: [-0.02, 0.0, -0.02]
+    dims: [0.20, 0.18, 0.08]
+
+  # Working surface — the table or tray in front of the wheelchair.
+  # TRUE surface height: z = position_z + dims_z/2 = -0.08 + 0.03 = -0.05 m
+  # (5 cm below arm_mount origin). ESTIMATED; must be measured from the arm.
+  # Center at 0.45 m forward covers the primary placement band.
+  # worlds.py will lower this by 0.02 m before writing it to the planner.
+  - name: table
+    position: [0.45, 0.0, -0.08]
+    dims: [0.90, 1.20, 0.06]
+
+  # Keep-out below the arm — prevents planning into the wheelchair seat and
+  # frame. 30 cm below arm_mount origin. ESTIMATED.
+  - name: floor
+    position: [0.0, 0.0, -0.33]
+    dims: [1.50, 1.50, 0.06]
