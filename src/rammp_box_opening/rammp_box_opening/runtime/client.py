@@ -88,6 +88,9 @@ class PlannerClient:
         self._q = None
         self._eff = None
         self._eff_at = 0.0  # monotonic stamp of the last joint_states message
+        # Set on first /joint_states message: 'joint_1..7' on bench,
+        # 'arm_joint_1..7' on flatbot (nightly driver renders arm_mount URDF).
+        self._active_joints = None
         self._gripper_pos = None
         self._gripper_target = None  # driver setpoint (0..1) re-sent while pending
         self.world_held = None  # path of the world the planner holds
@@ -114,13 +117,30 @@ class PlannerClient:
         self._tf = Buffer()
         self._tf_listener = TransformListener(self._tf, node)
 
+    @property
+    def joint_names(self):
+        """The 7 arm joint names as seen in /joint_states.
+
+        'joint_1..7' on bench; 'arm_joint_1..7' on flatbot with the nightly
+        driver (which renders the URDF with arm_mount as root and prefixes
+        every joint). Determined from the first /joint_states message; returns
+        the bench default before any message arrives."""
+        return self._active_joints if self._active_joints is not None else list(JOINTS)
+
     # -- state streams -----------------------------------------------------
     def _js_cb(self, msg):
+        if self._active_joints is None:
+            if "arm_joint_1" in msg.name:
+                self._active_joints = ["arm_joint_%d" % i for i in range(1, 8)]
+            elif "joint_1" in msg.name:
+                self._active_joints = list(JOINTS)
+            else:
+                return  # no recognisable arm joints yet — wait
         idx = {n: i for i, n in enumerate(msg.name)}
         try:
-            q = [float(msg.position[idx[n]]) for n in JOINTS]
+            q = [float(msg.position[idx[n]]) for n in self._active_joints]
             eff = (
-                [float(msg.effort[idx[n]]) for n in JOINTS]
+                [float(msg.effort[idx[n]]) for n in self._active_joints]
                 if len(msg.effort) == len(msg.name)
                 else None
             )

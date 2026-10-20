@@ -14,7 +14,6 @@ import time
 from dataclasses import dataclass
 
 from rammp_box_opening.constants import (
-    JOINTS,
     JOINT_ARC_PER_M,
     JOINT_VMAX,
     TCP_OFFSET_M,
@@ -431,7 +430,7 @@ class LiftFree:
         leg = Leg(
             name=self.name,
             kind=Kind.MOTION,
-            traj=line_trajectory(JOINTS, pts),
+            traj=line_trajectory(ctx.client.joint_names, pts),
             speed=self.speed,
             guard=guard,
             world=world_name,
