@@ -10,7 +10,7 @@
 # would land on the wrong 3-D point.
 color_topic: /wrist_camera/rgb/image_raw
 color_info_topic: /wrist_camera/rgb/camera_info
-aligned_depth_topic: /wrist_camera/stereo/image_raw
+aligned_depth_topic: /wrist_camera/depth/image_raw
 parent_frame: wrist_camera_rgb_camera_optical_frame
 mount_xyz: [0, 0, 0]
 mount_quat_xyzw: [0, 0, 0, 1]

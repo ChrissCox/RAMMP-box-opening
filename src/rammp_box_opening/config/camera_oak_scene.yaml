@@ -6,8 +6,8 @@
 ns: /scene_camera
 color_topic_suffix: /rgb/image_raw
 color_info_topic_suffix: /rgb/camera_info
-depth_topic_suffix: /stereo/image_raw
-depth_info_topic_suffix: /stereo/camera_info
+depth_topic_suffix: /depth/image_raw
+depth_info_topic_suffix: /depth/camera_info
 # The link frame is the camera body in the calibration tree; the colour frame
 # is the optical frame the calibration solves for.  Both are the RGB optical
 # frame for OAK-D because depthai-ros publishes it directly in TF.
