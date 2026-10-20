@@ -14,7 +14,7 @@ to the planner, or lines one up against a planned path, writes it on the
 right branch first.
 """
 
-from rammp_curobo.geometry import ang_diff
+from rammp_box_opening.geometry import ang_diff
 
 from rammp_box_opening.constants import HOME
 

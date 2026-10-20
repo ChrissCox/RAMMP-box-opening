@@ -15,7 +15,7 @@ are translated in one place.
 
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from rammp_curobo.geometry import ang_diff
+from rammp_box_opening.geometry import ang_diff
 
 from rammp_box_opening.constants import START_GATE_RAD
 from rammp_box_opening.runtime.retime import check_like_executor

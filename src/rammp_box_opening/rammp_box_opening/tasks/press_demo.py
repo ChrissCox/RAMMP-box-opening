@@ -87,7 +87,7 @@ from rammp_box_opening.constants import (
     TRANSIT_SPEED,
     state_dir,
 )
-from rammp_curobo.geometry import ang_diff
+from rammp_box_opening.geometry import ang_diff
 from rammp_box_opening.models.container import (
     ContainerModel,
     ContainerPose,
