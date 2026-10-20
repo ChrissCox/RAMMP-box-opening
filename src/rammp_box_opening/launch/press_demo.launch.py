@@ -124,7 +124,10 @@ def _nodes(context, *_args, **_kwargs):
     scene_calib = Path(
         FindPackageShare("rammp_box_opening").perform(context), "config", SCENE_CALIB_FILE
     )
-    if scene_calib.exists():
+    # On flatbot, sheppy's static_tf node (rammp-deployments manifest) already
+    # publishes all camera transforms from transforms/cameras.yaml — do not
+    # also spawn a static_transform_publisher here.
+    if scene_calib.exists() and not _store.external_static_tf:
         # the scene camera joins the arm's TF tree: base_link -> its link
         # frame, from scripts/calibrate_scene_camera.py. The driver hangs its
         # optical frames off that link itself.
@@ -159,7 +162,10 @@ def _nodes(context, *_args, **_kwargs):
                 parameters=[wrist_params] if wrist_params else [],
             )
         )
-        if scene_calib.exists():
+        # The scene OWL starts whenever a scene camera is configured: a
+        # calibration YAML means the bench Gemini is set up; a scene_cam_cfg
+        # means the flatbot OAK-D is configured. The node only needs topics.
+        if scene_calib.exists() or scene_cam_cfg:
             # ... and a second instance watching the scene camera, which finds
             # the box before the arm moves. Each infers only inside its own
             # enable window, so the two never load the GPU together.

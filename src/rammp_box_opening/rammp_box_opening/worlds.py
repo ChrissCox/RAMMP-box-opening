@@ -235,6 +235,12 @@ class WorldStore:
         return self._bench.get("base_frame", "base_link")
 
     @property
+    def external_static_tf(self):
+        """True when an external node (e.g. sheppy's static_tf) already
+        publishes /tf_static — the launch file must not spawn its own."""
+        return bool(self._bench.get("external_static_tf", False))
+
+    @property
     def wrist_camera_config(self):
         """Camera config name for the wrist camera, or None (use default)."""
         return self._bench.get("wrist_camera_config")

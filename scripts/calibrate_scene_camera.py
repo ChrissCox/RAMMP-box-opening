@@ -210,6 +210,32 @@ def report(scene, wrist, T_base_scene, table_pts, table_survey, stamp, base_fram
     print("check: the arm's fingertips drawn on the scene image -> %s (they should sit on the fingers)" % out)
 
 
+def update_transforms_yaml(path, entry_name, parent, child, xyz, quat_xyzw):
+    """Update (or add) one entry in a sheppy static_tf mounts.yaml.
+
+    Reads the existing file, replaces the named entry under
+    mounts.ros__parameters, and writes it back. Other entries are untouched."""
+    import yaml as _yaml
+
+    p = Path(path)
+    doc = _yaml.safe_load(p.read_text()) if p.exists() else {}
+    doc.setdefault("mounts", {}).setdefault("ros__parameters", {})
+    rp = doc["mounts"]["ros__parameters"]
+    transforms = list(rp.get("transforms", []))
+    if entry_name not in transforms:
+        transforms.append(entry_name)
+    rp["transforms"] = transforms
+    rp[entry_name] = {
+        "parent": parent,
+        "child": child,
+        "xyz": [round(float(v), 5) for v in xyz],
+        "quat_xyzw": [round(float(v), 6) for v in quat_xyzw],
+    }
+    p.write_text(_yaml.dump(doc, default_flow_style=False, sort_keys=False))
+    print("updated %s: %s -> %s  xyz %s  quat %s" % (path, parent, child, rp[entry_name]["xyz"], rp[entry_name]["quat_xyzw"]))
+    print("restart sheppy's static_tf node to pick up the calibration: sheppy restart static_tf")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--frames", type=int, default=20, help="captures averaged per camera")
@@ -217,6 +243,9 @@ def main():
     ap.add_argument("--out", default=str(CONFIG_DIR / SCENE_CALIB_FILE), help="where the yaml goes")
     ap.add_argument("--bench-world", default=None,
                     help="world YAML (default: world_bench.yaml); pass world_flatbot.yaml for the wheelchair platform")
+    ap.add_argument("--transforms-out", default=None,
+                    help="also write the calibrated scene_camera entry to this transforms/cameras.yaml "
+                         "(sheppy static_tf format); auto-required when the world YAML sets external_static_tf")
     args = ap.parse_args()
 
     import rclpy
@@ -233,6 +262,12 @@ def main():
     # child frame for write_scene_yaml: the camera link in the TF tree
     link_frame = (scene_cfg or {}).get("link_frame", LINK_FRAME)
     color_frame = (scene_cfg or {}).get("color_frame", COLOR_FRAME)
+    transforms_out = args.transforms_out
+    if transforms_out is None and store.external_static_tf:
+        sys.exit(
+            "world YAML sets external_static_tf — pass --transforms-out <path/to/transforms/cameras.yaml> "
+            "so the calibrated transform reaches sheppy's static_tf node"
+        )
     try:
         # The wrist FIRST, alone on the node. The scene camera's 30 Hz of
         # 2.7 MB colour frames over best-effort loopback starves the wrist
@@ -274,8 +309,19 @@ def main():
         doc = write_scene_yaml(args.out, T_base_link, link_frame, note=note, tag_px=tag_px,
                                parent_frame=base_frame)
         print("wrote %s: xyz %s quat %s" % (args.out, doc["xyz"], doc["quat_xyzw"]))
-        print("rebuild (colcon) to install it; press_demo.launch.py then publishes %s -> %s"
-              % (base_frame, link_frame))
+        if transforms_out:
+            from rammp_box_opening.perception.d405 import mat_to_quat_xyzw
+            update_transforms_yaml(
+                transforms_out,
+                entry_name="scene_camera",
+                parent=base_frame,
+                child=link_frame,
+                xyz=doc["xyz"],
+                quat_xyzw=doc["quat_xyzw"],
+            )
+        else:
+            print("rebuild (colcon) to install it; press_demo.launch.py then publishes %s -> %s"
+                  % (base_frame, link_frame))
     finally:
         node.destroy_node()
         rclpy.shutdown()

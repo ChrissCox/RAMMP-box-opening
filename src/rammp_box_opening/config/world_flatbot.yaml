@@ -28,6 +28,10 @@ scene_camera_config: camera_oak_scene.yaml
 # Signals the runtime to stream OAK-D depth frames into the planner's
 # collision world instead of using a static table cuboid.
 depth_collision: true
+# sheppy's static_tf node (rammp-deployments manifest) publishes all camera
+# and world TF — press_demo.launch.py must not also spawn a
+# static_transform_publisher for the scene camera.
+external_static_tf: true
 
 obstacles:
   # Adapter plate (new_adapter_plate_v3) connecting the arm to the wheelchair.
