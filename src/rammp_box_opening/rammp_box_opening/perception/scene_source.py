@@ -169,7 +169,8 @@ class SceneLocator:
     """The ROS side: the scene grabber, the scene OWL rung and the
     calibration, answering `locate()` with a SceneFix or None."""
 
-    def __init__(self, node, cfg, model, table_z, T_base_link, spins=True, tag_px=None):
+    def __init__(self, node, cfg, model, table_z, T_base_link, spins=True, tag_px=None,
+                 scene_cfg=None):
         from rammp_box_opening.perception.owl_source import OwlRung
         from rammp_box_opening.perception.scene import SceneGrabber
 
@@ -181,7 +182,7 @@ class SceneLocator:
         self.model = model
         self.table_z = float(table_z) if table_z is not None else None
         self.T_base_link = np.asarray(T_base_link, dtype=float)
-        self.grab = SceneGrabber(node, keep=3, need_depth=True)
+        self.grab = SceneGrabber(node, keep=3, need_depth=True, scene_cfg=scene_cfg)
         self.owl = OwlRung(node, cfg, camera="scene")
         self.last_why = None
         self.last_timing = {}

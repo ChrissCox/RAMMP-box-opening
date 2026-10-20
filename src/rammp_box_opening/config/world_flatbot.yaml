@@ -22,6 +22,9 @@
 base_frame: arm_mount
 # In a gravity-aligned frame the table normal is purely +Z.
 table_normal_base: [0.0, 0.0, 1.0]
+# Camera config names — both cameras are OAK-D PoE on flatbot.
+wrist_camera_config: camera_oak_wrist.yaml
+scene_camera_config: camera_oak_scene.yaml
 # Signals the runtime to stream OAK-D depth frames into the planner's
 # collision world instead of using a static table cuboid.
 depth_collision: true

@@ -1954,7 +1954,8 @@ def main():
             owl = OwlRung(pnode, cfg, watcher_holder)
             impls["owl"] = owl
     # the box found by geometry: the lid plateau above the surveyed table
-    watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame)
+    watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame,
+                            camera_cfg_name=worlds.wrist_camera_config)
     watcher_holder["watcher"] = watcher
     # The scene camera, when it has been calibrated to the arm
     # (scripts/calibrate_scene_camera.py): it finds the box before the arm
@@ -1973,6 +1974,7 @@ def main():
             locator = SceneLocator(
                 pnode, cfg, model, worlds.table_top_z, T_base_scene_link, spins=False,
                 tag_px=scene_tag_px(args.scene_calib or scene_calib_path()),
+                scene_cfg=worlds.scene_camera_cfg,
             )
             # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
             # and the readiness checks below are that long — by the time

@@ -235,6 +235,20 @@ class WorldStore:
         return self._bench.get("base_frame", "base_link")
 
     @property
+    def wrist_camera_config(self):
+        """Camera config name for the wrist camera, or None (use default)."""
+        return self._bench.get("wrist_camera_config")
+
+    @property
+    def scene_camera_cfg(self):
+        """Scene camera config dict for SceneGrabber, or None (use Gemini defaults)."""
+        name = self._bench.get("scene_camera_config")
+        if name is None:
+            return None
+        from rammp_box_opening.perception.d405 import camera_config
+        return camera_config(name)
+
+    @property
     def table_normal(self):
         """The table's normal in base_link as measured (see the yaml), or
         exactly +z when the bench file does not say."""

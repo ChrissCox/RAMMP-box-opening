@@ -34,7 +34,7 @@ def scene_calib_path():
 
 
 class SceneGrabber:
-    def __init__(self, node, keep=1, need_depth=True):
+    def __init__(self, node, keep=1, need_depth=True, scene_cfg=None):
         from tf2_ros import Buffer, TransformListener
 
         self.node = node
@@ -46,6 +46,16 @@ class SceneGrabber:
         self.k = self.dist = None  # colour intrinsics
         self.kd = None  # depth intrinsics
         self.depth_frame = None
+        # scene_cfg overrides topic/frame names for non-Gemini cameras (OAK-D).
+        # None = Gemini defaults (bench backward compat).
+        cfg = scene_cfg or {}
+        ns = cfg.get("ns", SCENE_NS)
+        self._color_topic = ns + cfg.get("color_topic_suffix", "/color/image_raw")
+        self._color_info = ns + cfg.get("color_info_topic_suffix", "/color/camera_info")
+        self._depth_topic = ns + cfg.get("depth_topic_suffix", "/depth/image_raw")
+        self._depth_info = ns + cfg.get("depth_info_topic_suffix", "/depth/camera_info")
+        self._link_frame = cfg.get("link_frame", LINK_FRAME)
+        self._color_frame = cfg.get("color_frame", COLOR_FRAME)
         self.tf_buffer = Buffer()
         # spin_thread=False: the listener's own executor thread would spin
         # this node alongside the one that already spins it (the OWL node's
@@ -65,13 +75,13 @@ class SceneGrabber:
 
         node = self.node
         self._subs = [
-            node.create_subscription(Image, COLOR_TOPIC, self._color_cb, qos_profile_sensor_data),
-            node.create_subscription(CameraInfo, COLOR_INFO, self._info_cb, qos_profile_sensor_data),
+            node.create_subscription(Image, self._color_topic, self._color_cb, qos_profile_sensor_data),
+            node.create_subscription(CameraInfo, self._color_info, self._info_cb, qos_profile_sensor_data),
         ]
         if self.need_depth:
             self._subs += [
-                node.create_subscription(Image, DEPTH_TOPIC, self._depth_cb, qos_profile_sensor_data),
-                node.create_subscription(CameraInfo, DEPTH_INFO, self._dinfo_cb, qos_profile_sensor_data),
+                node.create_subscription(Image, self._depth_topic, self._depth_cb, qos_profile_sensor_data),
+                node.create_subscription(CameraInfo, self._depth_info, self._dinfo_cb, qos_profile_sensor_data),
             ]
 
     def resubscribe(self):
@@ -155,10 +165,10 @@ class SceneGrabber:
         """colour optical <- depth optical, from the driver's own tree."""
         if self.depth_frame is None:
             return None
-        return self.lookup(COLOR_FRAME, self.depth_frame)
+        return self.lookup(self._color_frame, self.depth_frame)
 
     def link_to_color(self):
-        return self.lookup(LINK_FRAME, COLOR_FRAME)
+        return self.lookup(self._link_frame, self._color_frame)
 
     def cloud_in_color_frame(self, depth=None, stride=1):
         """(points (N,3) in the colour optical frame, their colour pixels
