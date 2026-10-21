@@ -765,8 +765,14 @@ def _arm_urdf_path(node, base_frame):
     import tempfile
     from std_msgs.msg import String
 
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+    latched = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
     got = []
-    sub = node.create_subscription(String, "/arm/robot_description", got.append, 1)
+    sub = node.create_subscription(String, "/arm/robot_description", got.append, latched)
     t0 = time.monotonic()
     while not got and time.monotonic() - t0 < 5.0:
         rclpy.spin_once(node, timeout_sec=0.1)

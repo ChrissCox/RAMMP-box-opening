@@ -1,17 +1,17 @@
-# Wrist OAK-D PoE (flatbot) — depthai-ros standard topic layout.
+# Wrist OAK-D PoE (flatbot) — rammp-suite-software/oak:0.3.1 topic layout.
 #
 # The arm URDF carries the full TF chain to the camera's optical frame, so
 # mount_xyz/quat are identity: camera_pose_at looks up arm_mount directly to
-# wrist_camera_rgb_camera_optical_frame without any extra math.
+# wrist_camera_color_optical_frame without any extra math.
 #
-# depthai-ros MUST be launched with spatial alignment to RGB so that
-# stereo/image_raw is in the RGB pixel space (same grid as rgb/image_raw).
+# The oak container publishes depth registered to colour (depth_registration:
+# true in the manifest) on depth/image_rect_raw, in the colour pixel grid.
 # find_button samples the depth at colour-image pixels; misaligned depth
 # would land on the wrong 3-D point.
-color_topic: /wrist_camera/rgb/image_raw
-color_info_topic: /wrist_camera/rgb/camera_info
-aligned_depth_topic: /wrist_camera/depth/image_raw
-parent_frame: wrist_camera_rgb_camera_optical_frame
+color_topic: /wrist_camera/color/image_raw
+color_info_topic: /wrist_camera/color/camera_info
+aligned_depth_topic: /wrist_camera/depth/image_rect_raw
+parent_frame: wrist_camera_color_optical_frame
 mount_xyz: [0, 0, 0]
 mount_quat_xyzw: [0, 0, 0, 1]
 stamp_offset_s: 0.0

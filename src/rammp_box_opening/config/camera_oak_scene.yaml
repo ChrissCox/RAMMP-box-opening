@@ -4,12 +4,12 @@
 # for flatbot, run scripts/calibrate_scene_camera.py with this config active so
 # child_frame below matches what the calibration writes.
 ns: /scene_camera
-color_topic_suffix: /rgb/image_raw
-color_info_topic_suffix: /rgb/camera_info
-depth_topic_suffix: /depth/image_raw
+color_topic_suffix: /color/image_raw
+color_info_topic_suffix: /color/camera_info
+depth_topic_suffix: /depth/image_rect_raw
 depth_info_topic_suffix: /depth/camera_info
 # The link frame is the camera body in the calibration tree; the colour frame
-# is the optical frame the calibration solves for.  Both are the RGB optical
-# frame for OAK-D because depthai-ros publishes it directly in TF.
-link_frame: scene_camera_rgb_camera_optical_frame
-color_frame: scene_camera_rgb_camera_optical_frame
+# is the optical frame the calibration solves for.  depthai-ros on this system
+# publishes TF frames as scene_camera_color_* (not rgb_camera_*).
+link_frame: scene_camera_color_optical_frame
+color_frame: scene_camera_color_optical_frame

@@ -14,9 +14,9 @@ def state_dir(env=None):
     return Path(env.get("RAMMP_BOX_OPENING_STATE") or Path.home() / ".ros" / "rammp_box_opening")
 
 
-# Gen3 home joints in controller order — FK-verified in RAMMP-CuRobo's
-# tour_demo.py; joint_3 sits AT +pi (every comparison uses ang_diff).
-HOME = [0.0, 0.262, 3.142, -2.269, 0.0, 0.960, 1.571]
+# Gen3 home joints in controller order (flatbot, new_adapter_plate_v3, 2026-10-21).
+# joint_3 sits AT -pi (every comparison uses ang_diff; -pi and +pi are equivalent).
+HOME = [0.067, -1.897, -3.137, -2.269, -0.211, -0.683, 1.725]
 JOINTS = ["joint_%d" % i for i in range(1, 8)]
 
 NODE_NAMESPACE = "/rammp_curobo"  # the planner container's actions and service
