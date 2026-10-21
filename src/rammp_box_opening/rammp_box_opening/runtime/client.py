@@ -25,10 +25,17 @@ from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
 
-from rammp_arm_interfaces.action import ExecuteJointTrajectory
-from rammp_arm_interfaces.msg import GripperSetpoint
-from rammp_curobo_interfaces.action import PlanToJoints, PlanToPose
-from rammp_curobo_interfaces.srv import SetWorld
+# Interface packages are installed in the driver/planner containers and in
+# ros2_ws on the bench, but may not be available on a fresh flatbot host.
+# Wrap in try/except so that *importing* this module (launch file, CLI arg
+# parsing) does not fail — instantiating PlannerClient still requires them.
+try:
+    from rammp_arm_interfaces.action import ExecuteJointTrajectory
+    from rammp_arm_interfaces.msg import GripperSetpoint
+    from rammp_curobo_interfaces.action import PlanToJoints, PlanToPose
+    from rammp_curobo_interfaces.srv import SetWorld
+except ImportError:
+    ExecuteJointTrajectory = GripperSetpoint = PlanToJoints = PlanToPose = SetWorld = None
 
 from rammp_box_opening.constants import (
     EXECUTE_ACTION,
@@ -84,9 +91,16 @@ class PlannerClient:
         # whatever it receives and has no dry-run parameter, so this is the
         # software gate on arm AND gripper motion.
         self._armed = bool(motion_enabled)
+        self._base_frame = "base_link"  # overridden by cli_common/preflight from WorldStore
         self._q = None
         self._eff = None
         self._eff_at = 0.0  # monotonic stamp of the last joint_states message
+        # Set on first /joint_states message: 'joint_1..7' on bench,
+        # 'arm_joint_1..7' on flatbot (nightly driver renders arm_mount URDF).
+        self._active_joints = None
+        # Fingertip TF frame names — match the URDF's link prefix.
+        # Overridden to "arm_robotiq_*" on flatbot when joint prefix is detected.
+        self._tip_frames = list(FINGERTIP_FRAMES)
         self._gripper_pos = None
         self._gripper_target = None  # driver setpoint (0..1) re-sent while pending
         self.world_held = None  # path of the world the planner holds
@@ -113,13 +127,34 @@ class PlannerClient:
         self._tf = Buffer()
         self._tf_listener = TransformListener(self._tf, node)
 
+    @property
+    def joint_names(self):
+        """The 7 arm joint names as seen in /joint_states.
+
+        'joint_1..7' on bench; 'arm_joint_1..7' on flatbot with the nightly
+        driver (which renders the URDF with arm_mount as root and prefixes
+        every joint). Determined from the first /joint_states message; returns
+        the bench default before any message arrives."""
+        return self._active_joints if self._active_joints is not None else list(JOINTS)
+
     # -- state streams -----------------------------------------------------
     def _js_cb(self, msg):
+        if self._active_joints is None:
+            if "arm_joint_1" in msg.name:
+                self._active_joints = ["arm_joint_%d" % i for i in range(1, 8)]
+                self._tip_frames = [
+                    "arm_robotiq_85_left_finger_tip_link",
+                    "arm_robotiq_85_right_finger_tip_link",
+                ]
+            elif "joint_1" in msg.name:
+                self._active_joints = list(JOINTS)
+            else:
+                return  # no recognisable arm joints yet — wait
         idx = {n: i for i, n in enumerate(msg.name)}
         try:
-            q = [float(msg.position[idx[n]]) for n in JOINTS]
+            q = [float(msg.position[idx[n]]) for n in self._active_joints]
             eff = (
-                [float(msg.effort[idx[n]]) for n in JOINTS]
+                [float(msg.effort[idx[n]]) for n in self._active_joints]
                 if len(msg.effort) == len(msg.name)
                 else None
             )
@@ -195,15 +230,15 @@ class PlannerClient:
         while time.monotonic() - t0 < timeout_s:
             try:
                 pts = []
-                for frame in FINGERTIP_FRAMES:
-                    tf = self._tf.lookup_transform("base_link", frame, Time())
+                for frame in self._tip_frames:
+                    tf = self._tf.lookup_transform(self._base_frame, frame, Time())
                     tr = tf.transform.translation
                     pts.append([tr.x, tr.y, tr.z])
                 return [sum(c) / len(pts) for c in zip(*pts)]
             except Exception:
                 rclpy.spin_once(self.node, timeout_sec=0.05)
         self._tip_frames_missing = True
-        print("[client] no %s in TF — contact heights unavailable" % (FINGERTIP_FRAMES[0],))
+        print("[client] no %s in TF — contact heights unavailable" % (self._tip_frames[0],))
         return None
 
     def planner_reachable(self, timeout_s=5.0):

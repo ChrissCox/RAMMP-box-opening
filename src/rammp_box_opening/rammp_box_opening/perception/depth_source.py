@@ -112,8 +112,9 @@ def camera_pose_at(g, offset_s=None):
     when = rt.Time.from_msg(g.color_stamp)
     if off:
         when = when + Duration(nanoseconds=int(round(off * 1e9)))
+    root = getattr(g, "_base_frame", "base_link")
     try:
-        tr = g.tf_buffer.lookup_transform("base_link", g.parent, when)
+        tr = g.tf_buffer.lookup_transform(root, g.parent, when)
     except Exception:
         return None
     q, t = tr.transform.rotation, tr.transform.translation
@@ -219,6 +220,8 @@ def top_face_from_depth(depth, k, rot_cam, trans_cam, table_z, model, roi=None):
     pts = pts_cam @ rot.T + np.asarray(trans_cam, dtype=float)
     z_base = pts[:, 2].reshape(gh, gw)
 
+    if table_z is None:
+        return None, "no table_z yet — run scene camera first to measure surface"
     expected_top = table_z + float(model.dims[2])
     band = (
         valid
@@ -410,6 +413,8 @@ def button_circle_refine(color_rgb, depth, k, rot_cam, trans_cam, center, button
 def top_residual_reject(z_top, table_z, model):
     """None when the measured top is commit-close to nominal, else the
     honest refusal reason. Pure, unit-testable."""
+    if table_z is None:
+        return None
     residual = float(z_top) - (float(table_z) + model.dims[2])
     if abs(residual) <= TOP_RESIDUAL_MAX_M:
         return None
@@ -449,19 +454,22 @@ class BoxTopWatcher:
     stands — so the fix is often ready the moment the arm parks (owner:
     detect during the flip, 2026-09-01)."""
 
-    def __init__(self, node, cfg, model, table_z, period_s=None):
+    def __init__(self, node, cfg, model, table_z, period_s=None, base_frame="base_link",
+                 camera_cfg_name=None):
         from rammp_box_opening.perception.d405 import D405Grabber
 
         if period_s is None:
             period_s = float(getattr(cfg, "detect_period_s", 0.15))
         self.cfg = cfg
         self.model = model
+        self._base_frame = base_frame
+        self._camera_cfg_name = camera_cfg_name
         # The SURVEYED table. Not fitted from the camera: passive stereo reads
         # a blank bench as a broad smear whose mode sits ~35 mm above the real
         # surface, and a table fitted from it moved the lid band off the lid
         # (field 2026-09-16: box right under the look, not found in 438
         # frames; replaying the 1 Sep capture, 39/94 hits fell to 7/94).
-        self.table_z = float(table_z)
+        self.table_z = float(table_z) if table_z is not None else None
         # Only sightings whose BUTTON CIRCLE was found may vote. The
         # plateau centroid finds the lid, not the button: on the bench
         # capture it sits a median 5.9 mm (max 15.4) from the circle and
@@ -476,7 +484,8 @@ class BoxTopWatcher:
         # (the circle is still required). This is what lets the wrist confirm
         # the box while the arm is still descending toward it.
         self.moving_ok = bool(getattr(cfg, "confirm_in_flight", False))
-        self.grab = D405Grabber(node, need_depth=True)
+        self.grab = D405Grabber(node, need_depth=True, cfg_name=self._camera_cfg_name)
+        self.grab._base_frame = self._base_frame
         self.window = FixWindow(cfg.min_hits, cfg.tol_m, cfg.window_s, cfg.fresh_s)
         self.coarse_window = FixWindow(
             COARSE_MIN_HITS, COARSE_TOL_M, COARSE_WINDOW_S, cfg.fresh_s

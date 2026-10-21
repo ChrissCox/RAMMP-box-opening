@@ -50,7 +50,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
-from rammp_box_opening.runtime.driver import REQUIRED_RMW
+from rammp_box_opening.constants import REQUIRED_RMW
 from rammp_box_opening.perception.scene_calib import SCENE_CALIB_FILE, load_scene_yaml
 from rammp_box_opening.runtime.strays import host_pids
 
@@ -58,6 +58,8 @@ ARGS = [
     ("tf", "true", "start robot_state_publisher for the arm (false: TF comes from elsewhere)"),
     ("camera", "false", "start a host D405 driver (default: sheppy's wrist_camera node runs it)"),
     ("owl", "true", "start the persistent OWL bbox detector (loads once)"),
+    ("bench_world", "", "world YAML to use (default: installed world_bench.yaml); "
+                        "pass world_flatbot.yaml for the wheelchair platform"),
 ]
 
 
@@ -102,6 +104,14 @@ def _nodes(context, *_args, **_kwargs):
             "on",
         )
 
+    from rammp_box_opening.tasks.cli_common import default_bench_yaml
+    from rammp_box_opening.worlds import WorldStore
+    bench_world_arg = LaunchConfiguration("bench_world").perform(context).strip()
+    _store = WorldStore(bench_world_arg or default_bench_yaml())
+    # camera config YAML names for the OWL nodes; empty string = use bench defaults
+    wrist_cam_cfg = _store.wrist_camera_config or ""
+    scene_cam_cfg = _store._bench.get("scene_camera_config") or ""
+
     nodes = []
     if flag("tf"):
         nodes.append(
@@ -114,7 +124,10 @@ def _nodes(context, *_args, **_kwargs):
     scene_calib = Path(
         FindPackageShare("rammp_box_opening").perform(context), "config", SCENE_CALIB_FILE
     )
-    if scene_calib.exists():
+    # On flatbot, sheppy's static_tf node (rammp-deployments manifest) already
+    # publishes all camera transforms from transforms/cameras.yaml — do not
+    # also spawn a static_transform_publisher here.
+    if scene_calib.exists() and not _store.external_static_tf:
         # the scene camera joins the arm's TF tree: base_link -> its link
         # frame, from scripts/calibrate_scene_camera.py. The driver hangs its
         # optical frames off that link itself.
@@ -137,18 +150,28 @@ def _nodes(context, *_args, **_kwargs):
         # persistent semantic gate: the OWL model loads ONCE here instead of
         # once per CLI run (field 2026-09-01: per-run loading made every
         # detect wait)
+        wrist_params = {}
+        if wrist_cam_cfg:
+            wrist_params["camera_config"] = wrist_cam_cfg
         nodes.append(
             Node(
                 package="rammp_box_opening",
                 executable="owl_detector",
                 name="owl_detector",
                 output="screen",
+                parameters=[wrist_params] if wrist_params else [],
             )
         )
-        if scene_calib.exists():
+        # The scene OWL starts whenever a scene camera is configured: a
+        # calibration YAML means the bench Gemini is set up; a scene_cam_cfg
+        # means the flatbot OAK-D is configured. The node only needs topics.
+        if scene_calib.exists() or scene_cam_cfg:
             # ... and a second instance watching the scene camera, which finds
             # the box before the arm moves. Each infers only inside its own
             # enable window, so the two never load the GPU together.
+            scene_params = {"camera": "scene"}
+            if scene_cam_cfg:
+                scene_params["camera_config"] = scene_cam_cfg
             nodes.append(
                 Node(
                     package="rammp_box_opening",
@@ -157,7 +180,7 @@ def _nodes(context, *_args, **_kwargs):
                     output="screen",
                     # its floor is the container config's owl_min_score_scene
                     # (lower than the wrist's: the box is small from a metre)
-                    parameters=[{"camera": "scene"}],
+                    parameters=[scene_params],
                 )
             )
     if flag("camera"):

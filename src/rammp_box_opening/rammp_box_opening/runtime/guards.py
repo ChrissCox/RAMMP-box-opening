@@ -11,7 +11,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from rammp_curobo.geometry import ang_diff
+from rammp_box_opening.geometry import ang_diff
 
 from rammp_box_opening.runtime.stamps import secs
 

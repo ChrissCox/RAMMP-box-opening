@@ -87,24 +87,33 @@ def stable_fix(samples, tol, n):
 
 class D405Grabber:
     """The newest colour frame (BGR), aligned depth (metres) and intrinsics
-    of the wrist D405, with what composing the camera's pose needs: a TF
-    buffer, the parent frame and the mount (config/camera_d405_wrist.yaml).
-    It only stores what arrives; callers spin their own node.
+    of the wrist camera, with what composing the camera's pose needs: a TF
+    buffer, the parent frame and the mount (config/camera_d405_wrist.yaml or
+    config/camera_oak_wrist.yaml).  It only stores what arrives; callers spin
+    their own node.
 
-    need_depth=False (the OWL node): colour and intrinsics only."""
+    need_depth=False (the OWL node): colour and intrinsics only.
+    cfg_name: override the config file (None = CAMERA_CONFIG default)."""
 
-    def __init__(self, node, need_depth=True):
+    def __init__(self, node, need_depth=True, cfg_name=None):
         from tf2_ros import Buffer, TransformListener
 
         self.node = node
-        cfg = camera_config()
+        cfg = camera_config(cfg_name or CAMERA_CONFIG)
         self.parent = cfg["parent_frame"]
         self.mount_xyz = np.asarray(cfg["mount_xyz"], dtype=float)
         self.mount_quat = list(cfg["mount_quat_xyzw"])
-        # the stamp lag against the arm (config/camera_d405_wrist.yaml);
-        # camera_pose_at looks the pose up at stamp + this
+        # the stamp lag against the arm; camera_pose_at looks the pose up at
+        # stamp + this
         self.stamp_offset_s = float(cfg.get("stamp_offset_s", 0.0) or 0.0)
-        ns = cfg["depth_topic"].rsplit("/depth/", 1)[0]
+        # Topic paths: explicit keys take precedence over namespace-derived
+        # defaults (OAK-D uses /rgb and /stereo instead of /color and
+        # /aligned_depth_to_color).
+        ns = cfg.get("depth_topic", "").rsplit("/depth/", 1)
+        _ns = ns[0] if len(ns) == 2 else None
+        self._color_topic = cfg.get("color_topic") or (_ns + "/color/image_raw" if _ns else None)
+        self._info_topic = cfg.get("color_info_topic") or (_ns + "/color/camera_info" if _ns else None)
+        self._depth_topic = cfg.get("aligned_depth_topic") or (_ns + "/aligned_depth_to_color/image_raw" if _ns else None)
         self.tf_buffer = Buffer()
         # spin_thread=False: the listener's own executor thread would spin
         # this node alongside the one that already spins it (the OWL node's
@@ -118,7 +127,6 @@ class D405Grabber:
         self.color = self.depth = self.info = None
         self.k = self.dist = None
         self.color_stamp = None
-        self._ns = ns
         self._subs = []
         self.resubscribes = 0
         self._subscribe()
@@ -127,20 +135,20 @@ class D405Grabber:
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import CameraInfo, Image
 
-        node, ns = self.node, self._ns
+        node = self.node
         self._subs = [
             node.create_subscription(
-                Image, ns + "/color/image_raw", self._color_cb, qos_profile_sensor_data
+                Image, self._color_topic, self._color_cb, qos_profile_sensor_data
             ),
             node.create_subscription(
-                CameraInfo, ns + "/color/camera_info", self._info_cb, qos_profile_sensor_data
+                CameraInfo, self._info_topic, self._info_cb, qos_profile_sensor_data
             ),
         ]
         if self.need_depth:
             self._subs.append(
                 node.create_subscription(
                     Image,
-                    ns + "/aligned_depth_to_color/image_raw",
+                    self._depth_topic,
                     self._depth_cb,
                     qos_profile_sensor_data,
                 )
@@ -182,9 +190,9 @@ class D405Grabber:
         """Which streams have not arrived yet (diagnosis)."""
         out = []
         if self.color is None:
-            out.append("color")
+            out.append("color (%s)" % self._color_topic)
         if self.need_depth and self.depth is None:
-            out.append("ALIGNED depth (align_depth.enable:=true?)")
+            out.append("depth (%s)" % self._depth_topic)
         if self.info is None:
-            out.append("camera_info")
+            out.append("camera_info (%s)" % self._info_topic)
         return out

@@ -160,7 +160,7 @@ class MissionFrames:
         self.doc = {
             "source": "mission",
             "container": container,
-            "table_z": float(table_z),
+            "table_z": float(table_z) if table_z is not None else float("nan"),
             "stage": "started",
             "truth_xyz": None,
             "truth_source": None,

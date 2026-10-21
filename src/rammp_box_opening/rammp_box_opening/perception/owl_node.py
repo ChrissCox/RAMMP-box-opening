@@ -56,6 +56,9 @@ class OwlDetector(Node):
         # the arm moves). One model per instance; each infers only inside
         # its own enable window, so two instances never load the GPU at once.
         self.camera = str(self.declare_parameter("camera", "wrist").value)
+        # camera_config: name of the camera YAML to use for the wrist instance
+        # (e.g. "camera_oak_wrist.yaml" on flatbot). Ignored for scene camera.
+        self._camera_cfg_name = str(self.declare_parameter("camera_config", "").value) or None
         bbox_topic, enable_topic = topics_for(self.camera)
         # the score floor; the container yaml's owl_min_score unless the
         # launch says otherwise. The scene instance runs lower: from a metre
@@ -113,13 +116,15 @@ class OwlDetector(Node):
         )
 
         if self.camera == "scene":
+            from rammp_box_opening.perception.d405 import camera_config
             from rammp_box_opening.perception.scene import SceneGrabber
 
-            self.grab = SceneGrabber(self, keep=1, need_depth=False)
+            _scfg = camera_config(self._camera_cfg_name) if self._camera_cfg_name else None
+            self.grab = SceneGrabber(self, keep=1, need_depth=False, scene_cfg=_scfg)
         else:
             from rammp_box_opening.perception.d405 import D405Grabber
 
-            self.grab = D405Grabber(self, need_depth=False)
+            self.grab = D405Grabber(self, need_depth=False, cfg_name=self._camera_cfg_name)
         self.pub = self.create_publisher(Float32MultiArray, bbox_topic, 1)
         self._last_stamp = None
         self._last_new_frame_t = time.monotonic()

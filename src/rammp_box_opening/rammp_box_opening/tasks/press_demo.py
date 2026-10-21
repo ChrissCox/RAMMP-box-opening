@@ -87,7 +87,7 @@ from rammp_box_opening.constants import (
     TRANSIT_SPEED,
     state_dir,
 )
-from rammp_curobo.geometry import ang_diff
+from rammp_box_opening.geometry import ang_diff
 from rammp_box_opening.models.container import (
     ContainerModel,
     ContainerPose,
@@ -751,6 +751,36 @@ def build_approach_leg(ctx, cfg):
 # stood well off the box.
 RECENTRE_TOL_M = 0.025
 RECENTRE_MAX = 2  # moves over the button before pressing from the last aim (detect.recentre_max_moves)
+
+
+def _arm_urdf_path(node, base_frame):
+    """Return a temp-file path to the arm's URDF, or None for the bench default.
+
+    On flatbot the nightly arm_state_publisher renders the URDF with arm_mount
+    as root (incorporating the adapter plate tilt) and publishes it latched on
+    /arm/robot_description. The FK chain must use THAT URDF so its root matches
+    the planning frame. On the bench the installed kinova_gen3.urdf is correct."""
+    if base_frame == "base_link":
+        return None
+    import tempfile
+    from std_msgs.msg import String
+
+    got = []
+    sub = node.create_subscription(String, "/arm/robot_description", got.append, 1)
+    t0 = time.monotonic()
+    while not got and time.monotonic() - t0 < 5.0:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    node.destroy_subscription(sub)
+    if not got:
+        node.get_logger().error(
+            "/arm/robot_description not received in 5 s — ArmChain will use the "
+            "bench URDF (base_link root). FK in arm_mount frame will be wrong."
+        )
+        return None
+    f = tempfile.NamedTemporaryFile(suffix=".urdf", delete=False, mode="w")
+    f.write(got[0].data)
+    f.close()
+    return f.name
 
 
 def tool_xy(ctx):
@@ -1713,13 +1743,13 @@ def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S):
         from rammp_box_opening.perception.d405 import camera_config
 
         parent = camera_config()["parent_frame"]
-        if not client.tf_ready("base_link", parent, timeout_s=2.0):
+        if not client.tf_ready(client._base_frame, parent, timeout_s=2.0):
             # bench 2026-09-25: box_opening stopped, no /tf at all; the run
             # flew to staging and then could not place one wrist frame
             # ("no camera pose for the frame", 0/60)
             return (
-                "no TF from base_link to %s — sheppy's `box_opening` node (the arm's TF, the scene camera's and "
-                "the OWL detectors) is not running: `sheppy up box-opening`. Nothing moved." % parent
+                "no TF from %s to %s — sheppy's `box_opening` node (the arm's TF, the scene camera's and "
+                "the OWL detectors) is not running: `sheppy up box-opening`. Nothing moved." % (client._base_frame, parent)
             )
     return None
 
@@ -1906,6 +1936,9 @@ def main():
     cli_common.refuse_unmeasured(model, args.execute, measuring=args.detect_only)
     node, client = cli_common.init_runtime(args.execute)
     worlds = WorldStore(bench)
+    client._base_frame = worlds.base_frame
+    from rammp_box_opening.runtime.approach import set_chain_root
+    set_chain_root(worlds.base_frame, urdf_path=_arm_urdf_path(node, worlds.base_frame))
     runner = Runner(client)
     cli_common.apply_speed_scale(runner, args)
     # The persistent owl_detector node owns the OWL model; there is no
@@ -1951,7 +1984,8 @@ def main():
             owl = OwlRung(pnode, cfg, watcher_holder)
             impls["owl"] = owl
     # the box found by geometry: the lid plateau above the surveyed table
-    watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z)
+    watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame,
+                            camera_cfg_name=worlds.wrist_camera_config)
     watcher_holder["watcher"] = watcher
     # The scene camera, when it has been calibrated to the arm
     # (scripts/calibrate_scene_camera.py): it finds the box before the arm
@@ -1970,6 +2004,7 @@ def main():
             locator = SceneLocator(
                 pnode, cfg, model, worlds.table_top_z, T_base_scene_link, spins=False,
                 tag_px=scene_tag_px(args.scene_calib or scene_calib_path()),
+                scene_cfg=worlds.scene_camera_cfg,
             )
             # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
             # and the readiness checks below are that long — by the time
@@ -2074,12 +2109,17 @@ def main():
                 print("[press_demo] scene camera: %s — searching with the wrist" % locator.last_why)
             if scene_fix is not None:
                 sp = scene_fix.pose
+                if worlds.table_top_z is None and not math.isnan(scene_fix.table_z_scene):
+                    worlds.table_top_z = scene_fix.table_z_scene
+                    watcher.table_z = scene_fix.table_z_scene
+                surveyed = watcher.table_z
                 print(
                     "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points "
-                    "(OWL %.2f; the scene reads the table at %.3f, surveyed %.3f; %.1f s to locate "
+                    "(OWL %.2f; the scene reads the table at %.3f, surveyed %s; %.1f s to locate "
                     "[%s], %.1f s since start) — flying to staging"
                     % (sp.xyz[0], sp.xyz[1], math.degrees(sp.yaw), scene_fix.n_points,
-                       scene_fix.score, scene_fix.table_z_scene, watcher.table_z,
+                       scene_fix.score, scene_fix.table_z_scene,
+                       ("%.3f" % surveyed) if surveyed is not None else "n/a",
                        time.monotonic() - t_scene,
                        " ".join("%s %.2f" % (k[:-2], v) for k, v in locator.last_timing.items()),
                        time.monotonic() - t_main)

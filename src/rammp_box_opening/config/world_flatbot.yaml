@@ -1,0 +1,39 @@
+# Flatbot collision world — arm_mount frame, 2026-10-20.
+#
+# arm_mount is gravity-aligned (+Z up). arm_base_link shares this origin but
+# is rotated 30° around Y (forward lean, new_adapter_plate_v3).
+#
+# There is NO static table obstacle. The working surface in front of the
+# wheelchair varies with the environment; SceneLocator measures it from the
+# scene OAK-D depth on every run (table_from_scene_points → SceneFix.table_z_scene).
+# The planner's dynamic collision world is populated from OAK-D RGBD streams
+# (depth_collision: true) — RAMMP-CuRobo must expose a depth-world interface
+# for this to be active; until then the planner runs without surface obstacles.
+#
+# TODO: Confirm the floor keepout clears the wheelchair seat (tape measure).
+# TODO: Implement depth-world push in RAMMP-CuRobo (depth_collision: true is
+#       set but the planner interface is not yet wired).
+#
+# Names are load-bearing:
+#   pedestal : arm adapter-plate block; cuRobo marks it no_pad and never
+#              drops it (NEVER_DROP in worlds.py).
+base_frame: arm_mount
+# In a gravity-aligned frame the table normal is purely +Z.
+table_normal_base: [0.0, 0.0, 1.0]
+# Camera config names — both cameras are OAK-D PoE on flatbot.
+wrist_camera_config: camera_oak_wrist.yaml
+scene_camera_config: camera_oak_scene.yaml
+# Signals the runtime to stream OAK-D depth frames into the planner's
+# collision world instead of using a static table cuboid.
+depth_collision: true
+# sheppy's static_tf node (rammp-deployments manifest) publishes all camera
+# and world TF — press_demo.launch.py must not also spawn a
+# static_transform_publisher for the scene camera.
+external_static_tf: true
+
+obstacles:
+  # Keep-out below the arm — prevents planning into the wheelchair seat and
+  # frame. 30 cm below arm_mount origin. ESTIMATED — verify with tape.
+  - name: floor
+    position: [0.0, 0.0, -0.33]
+    dims: [1.50, 1.50, 0.06]

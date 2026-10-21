@@ -20,6 +20,7 @@ HOME = [0.0, 0.262, 3.142, -2.269, 0.0, 0.960, 1.571]
 JOINTS = ["joint_%d" % i for i in range(1, 8)]
 
 NODE_NAMESPACE = "/rammp_curobo"  # the planner container's actions and service
+REQUIRED_RMW = "rmw_cyclonedds_cpp"  # driver and planner containers speak Cyclone
 # The kinova-gen3-ros2 driver (sheppy's `arm` node): trajectories and the gripper.
 EXECUTE_ACTION = "/execute_joint_trajectory"
 GRIPPER_SETPOINT_TOPIC = "/setpoint/gripper"

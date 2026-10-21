@@ -30,29 +30,47 @@ from rammp_box_opening.worlds import WorldStore
 STREAM_WINDOW_S = 3.0  # how long every camera and detector topic is listened to
 
 
-def camera_topics():
+def camera_topics(store=None):
     """(topic, required, fix) for every camera stream the mission reads:
-    required ones FAIL preflight when silent, the rest WARN. The wrist
-    namespace comes from the same config the mission's grabber uses."""
+    required ones FAIL preflight when silent, the rest WARN. Topic paths
+    come from the camera configs named in the world YAML (OAK-D on flatbot,
+    D405+Gemini on the bench)."""
     from rammp_box_opening.perception.d405 import camera_config
-    from rammp_box_opening.perception.scene import COLOR_INFO, COLOR_TOPIC, DEPTH_INFO, DEPTH_TOPIC
+    from rammp_box_opening.perception.scene import COLOR_INFO, COLOR_TOPIC, DEPTH_INFO, DEPTH_TOPIC, SCENE_NS
 
-    ns = camera_config()["depth_topic"].rsplit("/depth/", 1)[0]
-    wrist = "is sheppy's wrist_camera node up, and the D405 on USB (lsusb | grep 8086)?"
-    scene = "the mission will search with the wrist instead — is sheppy's scene_camera node up?"
+    # wrist camera topics from the config file the grabber uses
+    wcfg_name = (store.wrist_camera_config if store is not None else None)
+    wcfg = camera_config(wcfg_name) if wcfg_name else camera_config()
+    wrist_color = wcfg.get("color_topic")
+    wrist_info = wcfg.get("color_info_topic")
+    wrist_depth = wcfg.get("aligned_depth_topic")
+    if wrist_color is None:
+        # D405 fallback: derive from depth_topic namespace
+        _ns = wcfg.get("depth_topic", "").rsplit("/depth/", 1)
+        ns = _ns[0] if len(_ns) == 2 else "/wrist_camera"
+        wrist_color = ns + "/color/image_raw"
+        wrist_info = ns + "/color/camera_info"
+        wrist_depth = ns + "/aligned_depth_to_color/image_raw"
+
+    # scene camera topics from the scene config, or module defaults (Gemini)
+    scfg = (store.scene_camera_cfg if store is not None else None) or {}
+    sns = scfg.get("ns", SCENE_NS)
+    scene_color = sns + scfg.get("color_topic_suffix", "/color/image_raw")
+    scene_cinfo = sns + scfg.get("color_info_topic_suffix", "/color/camera_info")
+    scene_depth = sns + scfg.get("depth_topic_suffix", "/depth/image_raw")
+    scene_dinfo = sns + scfg.get("depth_info_topic_suffix", "/depth/camera_info")
+
+    wrist_fix = "is sheppy's wrist_camera node up and the camera powered?"
+    scene_fix = "the mission will search with the wrist instead — is sheppy's scene_camera node up?"
+    depth_fix = "the wrist camera must publish aligned depth (D405: align_depth.enable:=true; OAK-D: spatial alignment enabled)"
     return [
-        (ns + "/color/image_raw", True, wrist),
-        (ns + "/color/camera_info", True, wrist),
-        (
-            ns + "/aligned_depth_to_color/image_raw",
-            True,
-            "the wrist camera must launch with align_depth.enable:=true (sheppy manifest, "
-            "wrist_camera command) — without it every wrist fix fails",
-        ),
-        (COLOR_TOPIC, False, scene),
-        (COLOR_INFO, False, scene),
-        (DEPTH_TOPIC, False, scene),
-        (DEPTH_INFO, False, scene),
+        (wrist_color, True, wrist_fix),
+        (wrist_info, True, wrist_fix),
+        (wrist_depth, True, depth_fix),
+        (scene_color, False, scene_fix),
+        (scene_cinfo, False, scene_fix),
+        (scene_depth, False, scene_fix),
+        (scene_dinfo, False, scene_fix),
     ]
 
 
@@ -189,6 +207,7 @@ def main():
     #    container: a path that exists here is invisible there unless its
     #    directory is mounted at the same path.
     store = WorldStore(args.bench_world or cli_common.default_bench_yaml())
+    client._base_frame = store.base_frame
     _name, path = store.push_name("bench")
     ok, msg = client.set_world(path)
     if ok:
@@ -203,7 +222,7 @@ def main():
     # 5. TF for the finger tips (robot_state_publisher from the launch)
     tips = client.contact_xyz(timeout_s=3.0)
     if tips is not None:
-        print("PASS  TF base_link -> %s" % ", ".join(FINGERTIP_FRAMES))
+        print("PASS  TF %s -> %s" % (store.base_frame, ", ".join(client._tip_frames)))
     else:
         print(
             "FAIL  no TF for the finger tips — run press_demo.launch.py "
@@ -224,7 +243,7 @@ def main():
 
     # 7. the camera streams the mission reads, and the two OWL detectors
     #    (a mission used to discover a missing stream mid-run: 2026-09-22)
-    topics = camera_topics()
+    topics = camera_topics(store)
     counts, owl = _listen(node, topics)
     for _topic, level, text in stream_verdicts(topics, counts):
         print("%-4s  %s" % (level, text))

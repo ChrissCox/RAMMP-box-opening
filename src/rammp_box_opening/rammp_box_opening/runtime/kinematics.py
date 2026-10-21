@@ -79,10 +79,10 @@ def urdf_path():
 class ArmChain:
     """base_link -> tool_frame of the Gen3, from its URDF."""
 
-    def __init__(self, path=None, tip="end_effector_link", tool_from_tip_m=TOOL_FROM_EE_M):
-        root = ET.parse(path or urdf_path()).getroot()
+    def __init__(self, path=None, tip="end_effector_link", tool_from_tip_m=TOOL_FROM_EE_M, root="base_link"):
+        xml_root = ET.parse(path or urdf_path()).getroot()
         by_child = {}
-        for j in root.findall("joint"):
+        for j in xml_root.findall("joint"):
             o = j.find("origin")
             xyz = [float(v) for v in (o.get("xyz", "0 0 0") if o is not None else "0 0 0").split()]
             rpy = [float(v) for v in (o.get("rpy", "0 0 0") if o is not None else "0 0 0").split()]
@@ -94,9 +94,13 @@ class ArmChain:
             by_child[j.find("child").get("link")] = (
                 j.get("name"), j.get("type"), j.find("parent").get("link"), np.array(xyz), _rpy(*rpy), axis, (lo, hi),
             )
+        # The nightly arm URDF (flatbot) prefixes all link names with "arm_":
+        # e.g. "arm_end_effector_link" instead of "end_effector_link".
+        if tip not in by_child and ("arm_" + tip) in by_child:
+            tip = "arm_" + tip
         chain = []
         link = tip
-        while link != "base_link":
+        while link != root:
             name, typ, parent, t, R, axis, lim = by_child[link]
             chain.append((name, typ, t, R, axis, lim))
             link = parent

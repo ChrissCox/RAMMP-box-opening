@@ -12,7 +12,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
-from rammp_curobo.geometry import ang_diff
+from rammp_box_opening.geometry import ang_diff
 
 from rammp_box_opening.constants import (
     JOINT_VMAX,

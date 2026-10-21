@@ -12,7 +12,7 @@ import yaml
 
 from rammp_box_opening.primitives.look import SWEEP_RAD
 
-from rammp_curobo.geometry import euler_deg_to_quat_xyzw, yaw_about_world_z
+from rammp_box_opening.geometry import euler_deg_to_quat_xyzw, yaw_about_world_z
 
 from rammp_box_opening.constants import TRANSIT_SPEED
 
