@@ -51,11 +51,19 @@ LIFT_RAD = 0.8
 SWEEP_RAD = 0.6
 
 
+_WRIST_PITCH_LIMIT = 1.95  # cuRobo joint limit 2.09 minus 0.10 rad margin, with 0.04 slack
+
+
 def look_joints(rest, lift=LIFT_RAD):
-    """`rest` with the hand lifted and the tool turned to look down."""
+    """`rest` with the hand lifted and the tool turned to look down.
+
+    j6 is clamped inside the planner's joint-limit margin so the goal
+    always plans on flatbot, where HOME j6 is -0.683 (vs +0.960 on the
+    bench) and the unclamped formula would reach -3.054."""
     q = [float(v) for v in rest]
     q[ELBOW] += lift
-    q[WRIST_PITCH] += TILT_RAD - lift
+    q[WRIST_PITCH] = max(-_WRIST_PITCH_LIMIT, min(_WRIST_PITCH_LIMIT,
+                                                   q[WRIST_PITCH] + TILT_RAD - lift))
     return q
 
 

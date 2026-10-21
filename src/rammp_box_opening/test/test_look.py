@@ -19,28 +19,45 @@ def test_the_look_turns_the_wrist_down_and_lifts_the_hand_clear():
     distance, and the goal is refused (IK_FAIL, live planner 2026-09-15);
     past that, lift buys VIEW, which is what the first field run ran out of.
     The elbow opens to lift the hand and the wrist takes the same angle back,
-    so the camera still points straight down."""
-    from rammp_box_opening.primitives.look import LIFT_RAD
+    so the camera still points straight down.
+
+    On flatbot, HOME j6 is -0.683, so the formula would give j6 = -3.054
+    (outside [-2.09, 2.09]).  look_joints() clamps j6 to keep the goal
+    plannable; j4 still opens by the full LIFT_RAD."""
+    from rammp_box_opening.primitives.look import LIFT_RAD, _WRIST_PITCH_LIMIT
 
     q = look_joints(HOME)
     assert q[3] == pytest.approx(HOME[3] + LIFT_RAD)
-    assert q[5] == pytest.approx(HOME[5] - math.pi / 2 - LIFT_RAD)
-    # the tool's pitch is what the elbow and the wrist pitch add up to: the
-    # lift must leave it exactly where the bare tilt would have
-    assert q[3] + q[5] == pytest.approx(HOME[3] + HOME[5] - math.pi / 2)
+    # j6 may be clamped when the formula would exceed the planner's limit
+    unclamped = HOME[5] - math.pi / 2 - LIFT_RAD
+    assert q[5] == pytest.approx(max(-_WRIST_PITCH_LIMIT, unclamped))
     assert q[:3] == pytest.approx(HOME[:3])
     assert q[4] == pytest.approx(HOME[4])
     assert q[6] == pytest.approx(HOME[6])
 
 
+def test_look_joints_exact_when_within_limits():
+    """When the formula stays inside the joint-limit margin the result is
+    exact — the sum-of-joints invariant (tool pitch) is preserved."""
+    from rammp_box_opening.primitives.look import LIFT_RAD
+
+    # bench-style HOME: j6=0.960 → formula gives -1.411, within limits
+    bench_home = [0.067, -1.897, -3.137, -0.657, -0.211, 0.960, 1.725]
+    q = look_joints(bench_home)
+    assert q[3] == pytest.approx(bench_home[3] + LIFT_RAD)
+    assert q[5] == pytest.approx(bench_home[5] - math.pi / 2 - LIFT_RAD)
+    assert q[3] + q[5] == pytest.approx(bench_home[3] + bench_home[5] - math.pi / 2)
+
+
 def test_the_look_follows_whatever_rest_pose_it_is_given():
     # a chair's rest pose is not this bench's HOME; the look is relative
-    from rammp_box_opening.primitives.look import LIFT_RAD
+    from rammp_box_opening.primitives.look import LIFT_RAD, _WRIST_PITCH_LIMIT
 
     other = [0.2, 0.3, 3.0, -2.0, 0.1, 0.9, 1.5]
     q = look_joints(other)
     assert q[3] == pytest.approx(other[3] + LIFT_RAD)
-    assert q[5] == pytest.approx(other[5] - math.pi / 2 - LIFT_RAD)
+    unclamped = other[5] - math.pi / 2 - LIFT_RAD
+    assert q[5] == pytest.approx(max(-_WRIST_PITCH_LIMIT, unclamped))
     assert q[:3] == pytest.approx(other[:3])
     assert q[4] == pytest.approx(other[4])
 
