@@ -104,9 +104,14 @@ def _nodes(context, *_args, **_kwargs):
             "on",
         )
 
+    from ament_index_python.packages import get_package_share_directory
     from rammp_box_opening.tasks.cli_common import default_bench_yaml
     from rammp_box_opening.worlds import WorldStore
     bench_world_arg = LaunchConfiguration("bench_world").perform(context).strip()
+    if bench_world_arg and not os.path.isabs(bench_world_arg):
+        bench_world_arg = os.path.join(
+            get_package_share_directory("rammp_box_opening"), "config", bench_world_arg
+        )
     _store = WorldStore(bench_world_arg or default_bench_yaml())
     # camera config YAML names for the OWL nodes; empty string = use bench defaults
     wrist_cam_cfg = _store.wrist_camera_config or ""
@@ -206,10 +211,25 @@ def _nodes(context, *_args, **_kwargs):
 
 
 def generate_launch_description():
+    # torch links against JetPack's CUDA and the wheel-bundled cuSPARSELt;
+    # neither is on LD_LIBRARY_PATH by default, so the OWL node would crash
+    # on dlopen without this.
+    _site = os.path.join(
+        os.path.expanduser("~"),
+        "RAMMP-box-opening/install/rammp_box_opening/lib/python3.10/site-packages",
+    )
+    _torch_lib = os.path.join(_site, "torch", "lib")
+    _cuda_lib = "/usr/local/cuda-12.6/lib64"
+    _existing_ldpath = os.environ.get("LD_LIBRARY_PATH", "")
+    _ldpath = ":".join(p for p in [_torch_lib, _cuda_lib, _existing_ldpath] if p)
+
     return LaunchDescription(
         # the driver and planner containers speak Cyclone; so must every
         # node started here (Fast DDS discovers them, then loses the data)
-        [SetEnvironmentVariable("RMW_IMPLEMENTATION", REQUIRED_RMW)]
+        [
+            SetEnvironmentVariable("RMW_IMPLEMENTATION", REQUIRED_RMW),
+            SetEnvironmentVariable("LD_LIBRARY_PATH", _ldpath),
+        ]
         + [DeclareLaunchArgument(n, default_value=d, description=h) for n, d, h in ARGS]
         + [OpaqueFunction(function=_nodes)]
     )

@@ -43,7 +43,7 @@ NOT_AUTHORIZED = -8
 KNUCKLE_CLOSED_RAD = 0.8
 
 # Both containers of the arm module build on rammp-base, which selects Cyclone.
-REQUIRED_RMW = "rmw_cyclonedds_cpp"
+from rammp_box_opening.constants import REQUIRED_RMW as REQUIRED_RMW  # re-export
 
 
 def dilate(traj, speed):
