@@ -25,10 +25,17 @@ from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
 
-from rammp_arm_interfaces.action import ExecuteJointTrajectory
-from rammp_arm_interfaces.msg import GripperSetpoint
-from rammp_curobo_interfaces.action import PlanToJoints, PlanToPose
-from rammp_curobo_interfaces.srv import SetWorld
+# Interface packages are installed in the driver/planner containers and in
+# ros2_ws on the bench, but may not be available on a fresh flatbot host.
+# Wrap in try/except so that *importing* this module (launch file, CLI arg
+# parsing) does not fail — instantiating PlannerClient still requires them.
+try:
+    from rammp_arm_interfaces.action import ExecuteJointTrajectory
+    from rammp_arm_interfaces.msg import GripperSetpoint
+    from rammp_curobo_interfaces.action import PlanToJoints, PlanToPose
+    from rammp_curobo_interfaces.srv import SetWorld
+except ImportError:
+    ExecuteJointTrajectory = GripperSetpoint = PlanToJoints = PlanToPose = SetWorld = None
 
 from rammp_box_opening.constants import (
     EXECUTE_ACTION,

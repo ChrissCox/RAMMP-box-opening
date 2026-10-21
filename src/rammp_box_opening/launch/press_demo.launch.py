@@ -50,7 +50,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
-from rammp_box_opening.runtime.driver import REQUIRED_RMW
+from rammp_box_opening.constants import REQUIRED_RMW
 from rammp_box_opening.perception.scene_calib import SCENE_CALIB_FILE, load_scene_yaml
 from rammp_box_opening.runtime.strays import host_pids
 
