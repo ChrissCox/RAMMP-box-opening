@@ -94,6 +94,10 @@ class ArmChain:
             by_child[j.find("child").get("link")] = (
                 j.get("name"), j.get("type"), j.find("parent").get("link"), np.array(xyz), _rpy(*rpy), axis, (lo, hi),
             )
+        # The nightly arm URDF (flatbot) prefixes all link names with "arm_":
+        # e.g. "arm_end_effector_link" instead of "end_effector_link".
+        if tip not in by_child and ("arm_" + tip) in by_child:
+            tip = "arm_" + tip
         chain = []
         link = tip
         while link != root:

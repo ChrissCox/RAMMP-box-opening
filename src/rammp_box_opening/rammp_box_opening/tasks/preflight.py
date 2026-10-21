@@ -222,7 +222,7 @@ def main():
     # 5. TF for the finger tips (robot_state_publisher from the launch)
     tips = client.contact_xyz(timeout_s=3.0)
     if tips is not None:
-        print("PASS  TF %s -> %s" % (store.base_frame, ", ".join(FINGERTIP_FRAMES)))
+        print("PASS  TF %s -> %s" % (store.base_frame, ", ".join(client._tip_frames)))
     else:
         print(
             "FAIL  no TF for the finger tips — run press_demo.launch.py "

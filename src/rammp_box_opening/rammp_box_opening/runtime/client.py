@@ -98,6 +98,9 @@ class PlannerClient:
         # Set on first /joint_states message: 'joint_1..7' on bench,
         # 'arm_joint_1..7' on flatbot (nightly driver renders arm_mount URDF).
         self._active_joints = None
+        # Fingertip TF frame names — match the URDF's link prefix.
+        # Overridden to "arm_robotiq_*" on flatbot when joint prefix is detected.
+        self._tip_frames = list(FINGERTIP_FRAMES)
         self._gripper_pos = None
         self._gripper_target = None  # driver setpoint (0..1) re-sent while pending
         self.world_held = None  # path of the world the planner holds
@@ -139,6 +142,10 @@ class PlannerClient:
         if self._active_joints is None:
             if "arm_joint_1" in msg.name:
                 self._active_joints = ["arm_joint_%d" % i for i in range(1, 8)]
+                self._tip_frames = [
+                    "arm_robotiq_85_left_finger_tip_link",
+                    "arm_robotiq_85_right_finger_tip_link",
+                ]
             elif "joint_1" in msg.name:
                 self._active_joints = list(JOINTS)
             else:
@@ -223,7 +230,7 @@ class PlannerClient:
         while time.monotonic() - t0 < timeout_s:
             try:
                 pts = []
-                for frame in FINGERTIP_FRAMES:
+                for frame in self._tip_frames:
                     tf = self._tf.lookup_transform(self._base_frame, frame, Time())
                     tr = tf.transform.translation
                     pts.append([tr.x, tr.y, tr.z])
@@ -231,7 +238,7 @@ class PlannerClient:
             except Exception:
                 rclpy.spin_once(self.node, timeout_sec=0.05)
         self._tip_frames_missing = True
-        print("[client] no %s in TF — contact heights unavailable" % (FINGERTIP_FRAMES[0],))
+        print("[client] no %s in TF — contact heights unavailable" % (self._tip_frames[0],))
         return None
 
     def planner_reachable(self, timeout_s=5.0):
