@@ -16,11 +16,11 @@ def chain():
 
 
 def test_fk_matches_the_planner_at_home(chain):
-    # cuRobo's tool_frame at HOME (its own URDF, 2026-09-16 probe): the
-    # tool z axis level along world +x, the frame 0.577 m out, 0.434 up
+    # flatbot HOME (new_adapter_plate_v3, 2026-10-21): arm tilted 30° forward,
+    # tool z at 30° above horizontal, frame ~0.04 m out and 0.586 m up in arm_mount.
     R, t = chain.fk(HOME)
-    assert np.allclose(t, [0.5767, 0.0011, 0.4336], atol=2e-4), t
-    assert np.allclose(R[:, 2], [1.0, 0.0, 0.0], atol=2e-3)
+    assert np.allclose(t, [-0.03551, 0.04043, 0.58633], atol=2e-4), t
+    assert np.allclose(R[:, 2], [0.86353, 0.07361, 0.49889], atol=2e-3)
 
 
 def test_fk_matches_the_planner_at_a_press_staging(chain):
