@@ -28,11 +28,13 @@ def test_from_container_rotates_by_yaw():
 
 
 def test_attitude_quat_top_down_points_tool_down():
-    from rammp_curobo.geometry import tool_axis, xyzw_to_wxyz
+    import numpy as np
 
     q = attitude_quat([180.0, 0.0, 0.0], yaw=0.7)
-    ax = tool_axis(xyzw_to_wxyz(q))  # explicit order conversion
-    assert ax[2] == pytest.approx(-1.0, abs=1e-6)  # tool z straight down
+    x, y, z, w = q
+    # z-column of the rotation matrix (tool z axis in world frame)
+    tool_z = np.array([2*(x*z + y*w), 2*(y*z - x*w), 1 - 2*(x*x + y*y)])
+    assert tool_z[2] == pytest.approx(-1.0, abs=1e-6)  # tool z straight down
 
 
 def test_lid_place_is_a_table_height_pose():

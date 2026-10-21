@@ -827,6 +827,7 @@ class _Readiness:
         self.tf = tf
         self.others = list(others)
         self.planner_waits = []
+        self._base_frame = "arm_mount"
 
     def tf_ready(self, target, source, timeout_s=2.0):
         return self.tf

@@ -42,6 +42,7 @@ class FakeClient:
         self.live = list(Q0)
         self.efforts = True
         self.armed = True  # the client's motion latch (only --execute sets it)
+        self.joint_names = ["joint_%d" % i for i in range(1, 8)]
         self.gripper_sent = []  # every gripper command that went out
         self.executed = []  # (n_points, speed)
         self.exec_starts = []  # first waypoint of each executed trajectory

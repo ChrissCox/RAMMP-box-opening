@@ -127,8 +127,12 @@ TAG_MOVED_PX = 5.0
 
 def detect_tag(img):
     """The calibration tag's four corners (px, float) in a BGR image, or None."""
-    det = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(TAG_DICT), cv2.aruco.DetectorParameters())
-    corners, ids, _ = det.detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    dictionary = cv2.aruco.getPredefinedDictionary(TAG_DICT)
+    params = cv2.aruco.DetectorParameters_create() if hasattr(cv2.aruco, "DetectorParameters_create") else cv2.aruco.DetectorParameters()
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        corners, ids, _ = cv2.aruco.ArucoDetector(dictionary, params).detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    else:
+        corners, ids, _ = cv2.aruco.detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), dictionary, parameters=params)
     if ids is None or TAG_ID not in ids.ravel():
         return None
     return corners[list(ids.ravel()).index(TAG_ID)].reshape(4, 2).astype(np.float64)
