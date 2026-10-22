@@ -319,13 +319,17 @@ class Place:
             ctx, self.target_xyz[2], SETDOWN_OVERDRIVE_M, self.name
         )
         ctx.last_world = world
+        # guard arms at this fraction of the stroke — verified closure must
+        # use the same value so an early-trip check stays live when arm_after
+        # is ever lowered
+        _arm_after = 0.5
         guard = GuardSpec(
             touch_nm=m.touch_nm if self.touch_nm is None else float(self.touch_nm),
             trip="setdown",
             # contact is only possible at the stroke's very end — the
             # fast segment's dynamics must not trip the gentler set-down
             # threshold (lid released 110 mm up, field 2026-09-02)
-            arm_after=0.5,
+            arm_after=_arm_after,
         )
 
         def verify(v):
@@ -335,7 +339,7 @@ class Place:
                 and not in_band(v.gripper_pos, self.band)
             )
             if v.outcome == "touch":
-                if v.progress is not None and v.progress < 0.5:
+                if v.progress is not None and v.progress < _arm_after:
                     return False, (
                         "guard tripped at %.0f%% of the descent — struck "
                         "something on the way down, set-down NOT confirmed"

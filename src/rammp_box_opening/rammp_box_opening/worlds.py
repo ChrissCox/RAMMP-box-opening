@@ -221,7 +221,12 @@ class WorldStore:
         exactly +z when the bench file does not say."""
         n = self._bench.get("table_normal_base", [0.0, 0.0, 1.0])
         n = [float(v) for v in n]
-        s = sum(v * v for v in n) ** 0.5 or 1.0
+        s = sum(v * v for v in n) ** 0.5
+        if s < 1e-12:
+            raise ValueError(
+                "table_normal_base in bench config is a zero vector — "
+                "check world_bench.yaml"
+            )
         return [v / s for v in n]
 
     def push_name(
