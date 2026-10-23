@@ -42,23 +42,29 @@ def test_the_button_is_found_in_the_lens_frame_with_no_transform_at_all(pink):
     assert s.up_mm == pytest.approx(12.0, abs=3.0) and s.button_depth < s.lid_depth  # the knob up
 
 
-def test_the_depth_under_the_fingers_is_read_off_the_column_the_fingers_line_projects_to(pink):
+def test_the_depth_under_the_fingers_is_read_where_the_fingers_line_meets_the_surface(pink):
     from test_button_aim import BOX_H, BUTTON_XY, OAK_K, ROT_DOWN, _h0, render
 
-    # the camera's -y is image up, and (ROT_DOWN) base +x: the fingers' line
-    # LENS_FROM_FINGERS_M along base +x from the lens, through the button
+    # ROT_DOWN: the camera's +x is base -y, its +y base -x. A lens at
+    # (lx, ly) from the fingers' line, in the camera's axes, stands at
+    # fingers - ly * base_x... — here the fingers' line runs through the button
     h0 = _h0(pink)
-    for height in (0.24, 0.30, 0.40):
-        cam = np.r_[BUTTON_XY[0] - dp.LENS_FROM_FINGERS_M, BUTTON_XY[1], h0 + height]
-        _color, depth = render(cam, ROT_DOWN, [(BUTTON_XY, h0, 0.0)], h0 - BOX_H)
-        assert dp.depth_under_fingers(depth, OAK_K) == pytest.approx(height, abs=0.004)
-        # and the button itself is in view, near the top of the frame
-        s, why = dp.find_in_camera(*render(cam, ROT_DOWN, [(BUTTON_XY, h0, 0.0)], h0 - BOX_H), OAK_K, pink)
-        assert why is None, why
-        assert s.y == pytest.approx(-dp.LENS_FROM_FINGERS_M, abs=0.003) and s.lid_depth == pytest.approx(height, abs=0.004)
-    # nearer than the frame's edge row can see on that line: no reading
+    for lens_xy in ((0.0, 0.10), (0.0, 0.065), (0.02, 0.06)):
+        for height in (0.24, 0.30, 0.40):
+            off = ROT_DOWN @ np.r_[lens_xy, 0.0]  # the lens from the fingers' line, in base
+            cam = np.r_[BUTTON_XY[0] + off[0], BUTTON_XY[1] + off[1], h0 + height]
+            color, depth = render(cam, ROT_DOWN, [(BUTTON_XY, h0, 0.0)], h0 - BOX_H)
+            assert dp.depth_under_fingers(depth, OAK_K, lens_xy) == pytest.approx(height, abs=0.004)
+            # and the button itself is in view where the fingers' line meets it
+            s, why = dp.find_in_camera(color, depth, OAK_K, pink)
+            assert why is None, why
+            assert dp.under_fingers(s, lens_xy) == pytest.approx((0.0, 0.0), abs=0.003)
+            assert s.lid_depth == pytest.approx(height, abs=0.004)
+    # nearer than the frame's edge can see on that line: no reading
     flat = np.full((400, 640), 0.15)
-    assert dp.depth_under_fingers(flat, OAK_K) is None
+    assert dp.depth_under_fingers(flat, OAK_K, (0.0, 0.10)) is None
+    # on the lens's own axis it is the depth straight ahead
+    assert dp.depth_under_fingers(np.full((400, 640), 0.33), OAK_K, (0.0, 0.0)) == pytest.approx(0.33, abs=0.003)
 
 
 def test_the_lid_is_the_nearest_flat_surface():
@@ -101,7 +107,11 @@ class _Gravity:
         return [0.48, 0.0, 0.2, 0.0]
 
 
-def _sighting(x=0.0, y=-0.10, lid=0.27, up=0.4):
+LENS = (0.0, 0.065, -0.105)  # the lens from the tool frame, in the hand: 65 mm beside the fingers, 105 mm behind
+
+
+def _sighting(x=0.0, y=-LENS[1], lid=0.27, up=0.4):
+    """The button seen at (x, y) from the lens axis: by default under the fingers."""
     return dp.LensSighting(x=x, y=y, lid_depth=lid, button_depth=lid - up / 1000.0, up_mm=up, raw=None)
 
 
@@ -126,10 +136,10 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=0.24, push="touc
     events, legs = [], {}
     seq = list(looks)
 
-    def look(node, watcher, model, tag, runner=None):
+    def look(node, watcher, model, tag, runner=None, ctx=None):
         events.append("look:" + tag)
-        s = seq.pop(0)
-        return s
+        s, z, status = seq.pop(0)[:3]
+        return s, z, LENS, status
 
     monkeypatch.setattr(dp, "look", look)
 
@@ -197,13 +207,50 @@ def test_at_staging_the_hand_already_points_down_and_does_not_turn(ctx, monkeypa
     assert "depth:turn" not in events and arm.turns == [] and dp.exit_code(result) == 0
 
 
-def test_without_the_button_in_view_the_depth_under_the_fingers_bounds_the_stroke(ctx, monkeypatch, tmp_path):
-    cfg = load_press_demo(PINK)
-    looks = [(None, 0.31, "the button in none"), (None, None, "none")]
-    result, events, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.28)
-    goal = arm.turns[0][0]
-    assert goal[2] - arm.lines[0][2] == pytest.approx(0.31 + cfg.travel_m)
-    assert result.felt and not result.popped and dp.exit_code(result) == 1  # the knob not judged: not called open
+def test_without_the_button_in_view_it_does_not_press_blind(ctx, monkeypatch, tmp_path):
+    result, events, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, [(None, 0.31, "the button in none")])
+    assert result.free and "not pressing blind" in result.why and "depth:touch" not in events
+    assert arm.lines == [] and dp.exit_code(result) == 1
+
+
+def test_from_over_the_box_the_fingers_are_moved_over_the_button_the_camera_sees(ctx, monkeypatch, tmp_path):
+    """Flatbot 2026-10-22 20:04: TF's tilted aim put the press 45 mm off the
+    button's centre, on the lid's edge. Straight down, the camera sees the
+    button from its own axis, LENS[:2] beside the fingers: the hand moves by
+    the difference, and looks again."""
+    looks = [(_sighting(x=0.02, y=-LENS[1] + 0.03), 0.27, "2/2"), (_sighting(x=0.001), 0.27, "2/2"),
+             (_sighting(up=12.0), None, "2/2")]
+    result, events, arm, legs, start = _press(ctx, monkeypatch, tmp_path, looks)
+    assert dp.exit_code(result) == 0
+    assert events[:5] == ["depth:turn", "look:depth-look", "depth:centre", "look:depth-look", "depth:touch"]
+    goal, quat = arm.turns[0]
+    R = rp._rot(quat)
+    centre = np.asarray(goal) + R[:, 0] * 0.02 + R[:, 1] * 0.03  # along the hand's own x and y
+    assert arm.lines[0] == pytest.approx(list(centre))
+    assert legs["depth:centre"].guard.trip == "obstruction" and legs["depth:centre"].plan_free
+    # the stroke then goes straight down from over the button
+    assert arm.lines[1][:2] == pytest.approx(list(centre[:2]))
+
+
+def test_a_button_far_from_under_the_fingers_is_not_chased(ctx, monkeypatch, tmp_path):
+    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, [(_sighting(y=-LENS[1] + 0.12), 0.27, "2/2")])
+    assert result.free and "farther than a re-centre" in result.why and "depth:centre" not in events
+
+
+def test_a_move_that_does_not_bring_the_button_under_the_fingers_stops(ctx, monkeypatch, tmp_path):
+    looks = [(_sighting(x=0.03), 0.27, "2/2"), (_sighting(x=0.029), 0.27, "2/2")]
+    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks)
+    assert result.free and "did not bring it under" in result.why and "depth:touch" not in events
+
+
+def test_the_touch_reports_where_the_mount_in_tf_puts_the_fingertips(ctx, monkeypatch, tmp_path):
+    import json
+
+    looks = [(_sighting(lid=0.27), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
+    _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.15)
+    note = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl"))) if '"depth_touch"' in line][0]
+    assert note["fingertips_ahead_of_lens_mm"] == pytest.approx(120.0)
+    assert note["tf_says_mm"] == pytest.approx(1000 * (dp.DOWN_CONTACT_TOOL[2] - LENS[2]))
 
 
 def test_a_hand_that_cannot_point_down_there_stops_with_nothing_else_flown(ctx, monkeypatch, tmp_path):
@@ -211,9 +258,9 @@ def test_a_hand_that_cannot_point_down_there_stops_with_nothing_else_flown(ctx, 
     assert result.free and "no straight-down hand" in result.why and events == [] and dp.exit_code(result) == 1
 
 
-def test_no_depth_under_the_hand_presses_nothing(ctx, monkeypatch, tmp_path):
+def test_no_wrist_frame_at_all_presses_nothing(ctx, monkeypatch, tmp_path):
     result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, [(None, None, "no frame")])
-    assert result.free and "no depth" in result.why and "depth:touch" not in events
+    assert result.free and "not pressing blind" in result.why and "depth:touch" not in events
 
 
 def test_an_open_box_is_not_pressed(ctx, monkeypatch, tmp_path):
