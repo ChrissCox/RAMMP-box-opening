@@ -15,3 +15,11 @@ parent_frame: wrist_camera_color_optical_frame
 mount_xyz: [0, 0, 0]
 mount_quat_xyzw: [0, 0, 0, 1]
 stamp_offset_s: 0.0
+# The lens origin from tool_frame, in its axes (m) — measured, not TF: the
+# depth press centres on TF's mount only when TF agrees with this within
+# 5 mm sideways (tasks/depth_press.MOUNT_XY_TOL_M). Fitted from the
+# 2026-10-22 runs (rammp-deployments#128: [0, 0.065, 0.015] from
+# arm_end_effector_link, tool_frame 0.12 m past it); the hand-measured mount
+# deployed before it ([0, 0.10, -0.10]) put the 20:04 press on the lid's
+# edge. Re-measure after ANY bracket change.
+wrist_lens_in_hand_m: [0.0, 0.065, -0.105]

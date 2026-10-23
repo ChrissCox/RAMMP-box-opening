@@ -43,19 +43,33 @@ def fit_plane(points, tol_m=0.004, iters=300, max_points=40000, rng=None):
     rng = np.random.default_rng(0) if rng is None else rng
     if len(P) > max_points:
         P = P[rng.choice(len(P), max_points, replace=False)]
-    best_n, best_inl = 0, None
-    for _ in range(iters):
-        a, b, c = P[rng.choice(len(P), 3, replace=False)]
-        n = np.cross(b - a, c - a)
-        nn = np.linalg.norm(n)
-        if nn < 1e-12:
-            continue
-        n /= nn
-        inl = np.abs((P - a) @ n) < tol_m
-        cnt = int(inl.sum())
-        if cnt > best_n:
-            best_n, best_inl = cnt, inl
-    if best_inl is None or best_n < 3:
+    if iters < 1:
+        return None
+    # every hypothesis drawn first, in the order one loop would draw them (so
+    # the rng ends where it did), then scored a block at a time as a matrix
+    # product: a Python loop over (P - a) @ n was 150 us a hypothesis on the
+    # Jetson. The block keeps each len(P) x block temporary near 32 MB.
+    idx = np.array([rng.choice(len(P), 3, replace=False) for _ in range(iters)])
+    tri = P[idx]
+    a = tri[:, 0]
+    nrm = np.cross(tri[:, 1] - a, tri[:, 2] - a)
+    nn = np.linalg.norm(nrm, axis=1)
+    keep = nn >= 1e-12  # a degenerate triple scores -1: never picked
+    nrm[keep] /= nn[keep, None]
+    off = np.einsum("ij,ij->i", a, nrm)
+    counts = np.full(iters, -1, dtype=np.int64)
+    block = max(1, 4_000_000 // len(P))
+    for i in range(0, iters, block):
+        j = slice(i, i + block)
+        hit = np.abs(P @ nrm[j].T - off[j]) < tol_m
+        counts[j] = np.where(keep[j], hit.sum(axis=0), -1)
+    best = int(np.argmax(counts))  # ties go to the first best, as the loop's '>' did
+    best_n = int(counts[best])
+    if best_n < 3:
+        return None
+    best_inl = np.abs(P @ nrm[best] - off[best]) < tol_m
+    best_n = int(best_inl.sum())  # the fraction counts the mask the fit uses
+    if best_n < 3:
         return None
     Q = P[best_inl]
     c = Q.mean(axis=0)

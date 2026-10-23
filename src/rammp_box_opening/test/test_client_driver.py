@@ -10,6 +10,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from action_msgs.srv import CancelGoal
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from rammp_arm_interfaces.action import ExecuteJointTrajectory
@@ -64,7 +65,7 @@ class _GoalHandle:
         return _Future(self._wrapped)
 
     def cancel_goal_async(self):
-        return _Future(object())
+        return _Future(SimpleNamespace(return_code=0))  # ERROR_NONE: taken
 
 
 class _Driver:
@@ -124,7 +125,7 @@ class _RunningHandle:
     def cancel_goal_async(self):
         self.cancels += 1
         self._fut.settle()  # the driver settles the goal on a cancel
-        return _Future(object())
+        return _Future(SimpleNamespace(return_code=0))  # ERROR_NONE: taken
 
 
 class _FlyingDriver(_Driver):
@@ -353,6 +354,203 @@ def test_settled_joints_are_averaged_on_one_branch_across_the_wrap(monkeypatch):
     monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
     _eff, q = c.settled_efforts(duration_s=0.05, settle_s=0.0)
     assert abs(abs(q[2]) - math.pi) < 0.003
+
+
+# -- a stop is claimed only when the driver confirmed it (review 2026-10-22) --
+
+
+class _Pending:
+    """A future the scripted driver settles (or never does)."""
+
+    def __init__(self, result=None, done=False):
+        self._r, self._d = result, done
+
+    def done(self):
+        return self._d
+
+    def result(self):
+        return self._r if self._d else None
+
+    def settle(self, r=None):
+        if r is not None:
+            self._r = r
+        self._d = True
+
+
+def _ended(status, error_code=0):
+    return SimpleNamespace(status=status, result=ExecuteJointTrajectory.Result(error_code=error_code))
+
+
+class _ScriptedHandle:
+    """A flying goal whose cancel answer and result are scripted: `cancel`
+    is the CancelGoal response (None: it never comes), `ended` the result
+    the driver settles on the cancel (None: never)."""
+
+    accepted = True
+
+    def __init__(self, cancel, ended):
+        self._cancel = cancel
+        self._ended = ended
+        self.result_fut = _Pending()
+        self.cancels = 0
+
+    def get_result_async(self):
+        return self.result_fut
+
+    def cancel_goal_async(self):
+        self.cancels += 1
+        if self._ended is not None:
+            self.result_fut.settle(self._ended)
+        return _Pending(self._cancel, done=self._cancel is not None)
+
+
+class _ScriptedDriver(_Driver):
+    def __init__(self, handle):
+        super().__init__()
+        self.handle = handle
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        self.goals.append(goal)
+        return _Future(self.handle)
+
+
+class _TripGuard(_Guard):
+    def on_efforts(self, eff):
+        return eff is not None  # trips on the first reading
+
+
+def _cresp(code):
+    return CancelGoal.Response(return_code=code)
+
+
+def _no_waiting(monkeypatch):
+    # the confirmation waits (3 s cancel, 10 s result) shortened to a tick
+    real = client_mod.spin_until_done
+    monkeypatch.setattr(
+        client_mod, "spin_until_done", lambda node, fut, timeout_s, abort=None: real(node, fut, 0.01, abort)
+    )
+
+
+def _run(handle, **kw):
+    end = [v + 0.05 for v in LIVE]
+    return _client(_ScriptedDriver(handle)).execute(_traj(LIVE, end), 1.0, **kw)
+
+
+def test_a_trip_nobody_confirmed_stopping_is_a_failure_not_a_touch(monkeypatch):
+    """The driver neither answers the cancel nor ends the goal (it dies when
+    one cyclic exchange goes 3 s unanswered): reading a contact height off
+    that arm and pushing on top of it is how a box gets pressed through."""
+    _no_waiting(monkeypatch)
+    outcome, info = _run(_ScriptedHandle(None, None), guard=_TripGuard())
+    assert outcome == "failed" and "did not confirm" in info["message"]
+    assert info["torque_peak"] == 0.0
+
+
+def test_a_trip_whose_cancel_was_refused_and_stroke_completed_is_a_failure(monkeypatch):
+    _no_waiting(monkeypatch)
+    h = _ScriptedHandle(_cresp(CancelGoal.Response.ERROR_REJECTED), _ended(4, 0))  # SUCCESSFUL
+    outcome, info = _run(h, guard=_TripGuard())
+    assert outcome == "failed" and "did not confirm" in info["message"]
+
+
+@pytest.mark.parametrize(
+    "cancel, ended",
+    [
+        (_cresp(CancelGoal.Response.ERROR_NONE), _ended(5, -6)),  # taken, CANCELED
+        (None, _ended(5, -6)),  # the answer lost, but the goal reads CANCELED
+        (_cresp(CancelGoal.Response.ERROR_GOAL_TERMINATED), _ended(4, 0)),  # ended on its own just then
+    ],
+)
+def test_a_trip_the_driver_confirmed_stopping_is_a_touch(monkeypatch, cancel, ended):
+    _no_waiting(monkeypatch)
+    outcome, info = _run(_ScriptedHandle(cancel, ended), guard=_TripGuard())
+    assert outcome == "touch" and info["message"] == "torque guard trip"
+
+
+@pytest.mark.parametrize(
+    "cancel, ended",
+    [(None, None), (_cresp(CancelGoal.Response.ERROR_REJECTED), _ended(4, 0))],
+)
+def test_a_stop_when_nobody_confirmed_is_a_failure_not_a_stop(monkeypatch, cancel, ended):
+    _no_waiting(monkeypatch)
+    outcome, info = _run(_ScriptedHandle(cancel, ended), stop_when=lambda progress=None: True)
+    assert outcome == "failed" and "did not confirm" in info["message"]
+
+
+def test_a_guarded_stroke_is_cancelled_within_a_fifth_of_a_second_of_the_stream_stopping(monkeypatch):
+    """/joint_states stops as the stroke starts while the driver keeps
+    flying it: 0.5 s staleness plus a 1 s grace was 1.5 s blind, ~126 mm
+    of the depth touch's 84 mm/s stroke."""
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", lambda node, timeout_sec=0.0: time.sleep(0.005))
+    h = _ScriptedHandle(_cresp(CancelGoal.Response.ERROR_NONE), _ended(5, -6))
+    c = _client(_ScriptedDriver(h))
+    t0 = time.monotonic()
+    c._eff_at = t0  # the last message, now
+    outcome, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, guard=_Guard())
+    blind = time.monotonic() - t0
+    assert outcome == "failed" and "effort stream lost" in info["message"]
+    assert h.cancels == 1
+    assert blind < client_mod.PlannerClient.GUARD_STALE_S + 0.05 < 0.3
+
+
+
+def test_a_slow_stop_when_does_not_read_as_a_lost_stream(monkeypatch):
+    """An in-flight confirm runs the wrist's depth fix in stop_when on the
+    guarded stroke: its own time must not age the stream the guard judges."""
+    h = _ScriptedHandle(_cresp(CancelGoal.Response.ERROR_NONE), _ended(5, -6))
+    c = _client(_ScriptedDriver(h))
+    spins = {"n": 0}
+
+    def spin(node, timeout_sec=0.0):  # a /joint_states message per spin
+        spins["n"] += 1
+        c._eff_at = time.monotonic()
+        if spins["n"] == 3:
+            h.result_fut.settle(_ended(4, 0))
+
+    def slow(progress=None):
+        time.sleep(client_mod.PlannerClient.GUARD_STALE_S + 0.05)
+        return False
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    outcome, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, guard=_Guard(), stop_when=slow)
+    assert outcome == "arrived" and h.cancels == 0
+
+def _abort_client(handle):
+    from rammp_box_opening.runtime.abort import AbortFlag, sigint_handler
+
+    flag = AbortFlag()
+    c = _client(_ScriptedDriver(handle))
+    c._abort = flag
+    return c, flag, sigint_handler(flag)
+
+
+def test_a_ctrl_c_in_the_spin_that_delivers_the_result_is_not_swallowed(monkeypatch):
+    h = _ScriptedHandle(None, None)
+    c, flag, handler = _abort_client(h)
+
+    def spin(node, timeout_sec=0.0):
+        handler(2, None)  # Ctrl+C ...
+        h.result_fut.settle(_ended(4, 0))  # ... while the result callback runs
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    with pytest.raises(KeyboardInterrupt):
+        c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert flag.goal_in_flight is False and h.cancels == 0  # over already: nothing to cancel
+    with pytest.raises(KeyboardInterrupt):
+        c.gripper_send(0.8)  # what the runner does next never goes out
+    assert c._gripper_pub.sent == []
+
+
+def test_a_ctrl_c_while_the_goal_is_rejected_is_not_swallowed(monkeypatch):
+    class Rejected:
+        accepted = False
+
+    c, flag, handler = _abort_client(None)
+    c._execute.send_goal_async = lambda goal, feedback_callback=None: (handler(2, None), _Future(Rejected()))[1]
+    with pytest.raises(KeyboardInterrupt):
+        c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+
+
 
 
 def _live_stream(c, monkeypatch, fresh_after_settle=None, settle_s=0.15):

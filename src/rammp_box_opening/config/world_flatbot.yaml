@@ -7,13 +7,14 @@
 # wheelchair varies with the environment; SceneLocator measures it from the
 # scene OAK-D depth on every run, around the box it found (scene_source.table_around
 # → SceneFix.table_z_scene).
-# The planner's dynamic collision world is populated from OAK-D RGBD streams
-# (depth_collision: true) — RAMMP-CuRobo must expose a depth-world interface
-# for this to be active; until then the planner runs without surface obstacles.
+# The planner gets that table only from the scene fix: press_demo copies
+# SceneFix.table_z_scene/table_extent into WorldStore.table_top_z/table_extent,
+# and WorldStore._planning_bench adds a TABLE_THICKNESS_M slab under it, over
+# where it was seen. Until a scene fix, and in any CLI that never makes one
+# (home_arm, preflight, record_detection_set ...), the planner sees only the
+# floor keep-out below. There is no depth/voxel collision world.
 #
 # TODO: Confirm the floor keepout clears the wheelchair seat (tape measure).
-# TODO: Implement depth-world push in RAMMP-CuRobo (depth_collision: true is
-#       set but the planner interface is not yet wired).
 #
 # Names are load-bearing:
 #   pedestal : arm adapter-plate block; cuRobo marks it no_pad and never
@@ -24,9 +25,6 @@ table_normal_base: [0.0, 0.0, 1.0]
 # Camera config names — both cameras are OAK-D PoE on flatbot.
 wrist_camera_config: camera_oak_wrist.yaml
 scene_camera_config: camera_oak_scene.yaml
-# Signals the runtime to stream OAK-D depth frames into the planner's
-# collision world instead of using a static table cuboid.
-depth_collision: true
 # sheppy's static_tf node (rammp-deployments manifest) publishes all camera
 # and world TF — press_demo.launch.py must not also spawn a
 # static_transform_publisher for the scene camera.

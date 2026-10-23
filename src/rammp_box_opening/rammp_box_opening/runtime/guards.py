@@ -46,6 +46,7 @@ class TorqueGuard:
         self._recent = deque(maxlen=RECENT_SAMPLES)
         self._baseline_at = None  # (monotonic s, progress) the baseline in force was taken
         self._trip = None
+        self._recent_key = None  # the reading last kept in _recent
 
     def on_progress(self, progress):
         self._progress = float(progress)
@@ -64,7 +65,7 @@ class TorqueGuard:
             return False
         now = time.monotonic()
         eff = [float(v) for v in wrist_efforts]
-        self._recent.append((now, self._progress, eff))
+        self._remember(now, eff, eff)
         if self._baseline is None:
             self._baseline = eff
             self._baseline_at = (now, self._progress)
@@ -84,6 +85,15 @@ class TorqueGuard:
             self._trip = (now, devs.index(dev), dev, eff)
             return True
         return False
+
+    def _remember(self, now, eff, key):
+        # the client polls once per callback it spins (~1 kHz of execution
+        # feedback) and /joint_states arrives at ~46 Hz: the same message is
+        # handed in 10-20 times running, and kept each time it filled the
+        # run-up with copies of four to seven readings (field 2026-10-22)
+        if key != self._recent_key:
+            self._recent_key = key
+            self._recent.append((now, self._progress, eff))
 
     def trip_report(self):
         """What tripped the guard, for the run log — or None. `joint` indexes
@@ -138,6 +148,7 @@ class CompensatedGuard(TorqueGuard):
         self.down_n = None  # the latest reading of the pull at the fingertip (N, + down)
         self.peak_down_n = None
         self._why = None
+        self._g_key = self._g_last = None  # the joints gravity was last evaluated at, and its value
         if reference is not None:
             eff, q = reference
             self._baseline = [float(v) for v in eff]
@@ -153,8 +164,14 @@ class CompensatedGuard(TorqueGuard):
             return False
         now = time.monotonic()
         eff = [float(v) for v in wrist_efforts]
-        g = [float(v) for v in self._gravity(joints)]
-        self._recent.append((now, self._progress, eff))
+        key = tuple(float(v) for v in joints)
+        if key != self._g_key:
+            # gravity is a function of the joints alone: one model
+            # evaluation (0.7 ms on the Orin) per /joint_states message,
+            # not one per feedback callback the client spun
+            self._g_key, self._g_last = key, [float(v) for v in self._gravity(joints)]
+        g = self._g_last
+        self._remember(now, eff, (tuple(eff), key))
         if self._baseline is None or self._g0 is None:
             self._baseline, self._g0 = eff, g
             self._baseline_at = (now, self._progress)
