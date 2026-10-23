@@ -844,6 +844,82 @@ def test_the_aimer_hands_its_priors_to_every_aim(pink, monkeypatch):
     assert aimer.last_sighting.oblique
 
 
+def _full_frame_d2(h, w, u, v, r_max):
+    """The aim's masks as they were before _window_d2: the whole frame."""
+    yy, xx = np.mgrid[0:h, 0:w]
+    return 0, 0, (xx - u) ** 2 + (yy - v) ** 2
+
+
+def test_the_window_holds_every_pixel_a_mask_can_pass():
+    """_window_d2's window holds every pixel nearer than r_max — centres
+    off the frame, on its border and between pixels — and never leaves the
+    frame; its d2 is the full frame's over that window."""
+    from rammp_box_opening.perception.button_aim import _window_d2
+
+    h, w = OAK_HW
+    rng = np.random.default_rng(7)
+    cases = [(0.0, 0.0, 30.0), (w - 1.0, h - 1.0, 30.0), (319.5, 199.5, 80.0), (-20.0, 50.0, 25.0), (w + 10.5, h + 3.0, 40.0)]
+    cases += [(rng.uniform(-80, w + 80), rng.uniform(-80, h + 80), rng.uniform(1, 80)) for _ in range(300)]
+    for u, v, r_max in cases:
+        v0, u0, d2 = _window_d2(h, w, u, v, r_max)
+        _, _, full = _full_frame_d2(h, w, u, v, r_max)
+        assert 0 <= v0 and 0 <= u0 and v0 + d2.shape[0] <= h and u0 + d2.shape[1] <= w
+        inside = np.zeros((h, w), bool)
+        inside[v0 : v0 + d2.shape[0], u0 : u0 + d2.shape[1]] = True
+        assert not (~inside & (full < r_max**2)).any(), (u, v, r_max)
+        np.testing.assert_array_equal(d2, full[inside].reshape(d2.shape))
+
+
+def test_the_aim_windows_change_no_result(frame, model, pink, monkeypatch):
+    """circle_gates, disc_height and ring_height read only the window their
+    disc or annulus can reach, not the whole frame (5-9 ms a call on the
+    Jetson): every gate verdict and height is the full frame's, bit for bit
+    — at the centre, clipped by each border, off the frame, between pixels."""
+    from rammp_box_opening.perception import button_aim
+
+    h0 = _h0(pink)
+    cam = np.r_[BUTTON_XY, h0] + np.r_[0.01, -0.008, 0.13]
+    color, depth = render(cam, ROT_DOWN, [(BUTTON_XY, h0, 0.0)], h0 - BOX_H)
+    s, why = find_button(color, depth, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z, pink)
+    assert why is None, why
+    frames = [
+        (frame["depth"], frame["k"], frame["rot_cam"], frame["trans_cam"], TABLE_Z + model.dims[2], (461.5, 274.5, 41.0)),
+        (depth, OAK_K, ROT_DOWN, cam, h0, (s.uv[0], s.uv[1], s.r_px)),
+    ]
+    reached = 0
+    for d, k, rot, trans, lid_z, (bu, bv, br) in frames:
+        hh, ww = d.shape
+        circles = [
+            (bu, bv, br), (bu + 0.3, bv - 0.7, br * 0.9), (508.0, 200.0, 33.5), (319.5, 199.5, 80.0),
+            (3.0, bv, 40.0), (4.5, bv, br), (ww - 4.0, bv, 40.0), (ww - 5.5, bv, br),
+            (bu, 3.0, 40.0), (bu, 4.5, br), (bu, hh - 4.0, 40.0), (bu, hh - 5.5, br),
+            (3.0, 3.0, 50.0), (ww - 4.0, hh - 4.0, 50.0), (ww - 1.0, hh - 1.0, 30.0),
+            (-60.0, bv, 30.0), (ww + 60.0, bv, 30.0), (bu, -60.0, 30.0), (bu, hh + 60.0, 30.0),
+        ]
+        for u, v, r in circles:
+            got = (
+                button_aim.circle_gates(d, k, rot, trans, u, v, r, lid_z),
+                button_aim.disc_height(d, k, rot, trans, u, v, r),
+                button_aim.ring_height(d, k, rot, trans, u, v, r),
+            )
+            with monkeypatch.context() as mp:
+                mp.setattr(button_aim, "_window_d2", _full_frame_d2)
+                want = (
+                    button_aim.circle_gates(d, k, rot, trans, u, v, r, lid_z),
+                    button_aim.disc_height(d, k, rot, trans, u, v, r),
+                    button_aim.ring_height(d, k, rot, trans, u, v, r),
+                )
+            assert got[0] == want[0], (u, v, r)
+            np.testing.assert_equal(got[1:], want[1:])
+            if got[0] is None or ("border" not in got[0] and "centre" not in got[0]):
+                reached += 1  # the gates got as far as the masks
+            if u < -r or v < -r or u > ww + r or v > hh + r:
+                assert np.isnan(got[1]) and np.isnan(got[2])
+    assert reached >= 6
+
+
+
+
 # --- one frame per tick: colour, depth and pose of the same moment ----------
 
 
