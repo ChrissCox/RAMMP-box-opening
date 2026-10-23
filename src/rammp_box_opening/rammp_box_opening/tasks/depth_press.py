@@ -98,6 +98,12 @@ _LENS_DOWN = np.diag([1.0, -1.0, -1.0])
 # (AHEAD_TOL_M) and some depth noise.
 TOUCH_SLOW_M = AHEAD_TOL_M + 0.015
 TOUCH_SPEED = CONTACT_SPEED
+# A knob not yet up at the after-look (4.5 mm, then 8 mm on the next run's
+# aim, 16:02-16:03) is looked at again for this long before it is judged
+KNOB_RECHECK_S = 2.0
+# A box the press slid this little, still standing (its lid's depth within
+# LID_MOVED_M), is gripped where the camera sees it now; farther is a STOP
+SLIDE_OK_M = 0.015
 
 
 @dataclass
@@ -445,6 +451,9 @@ class DepthPress:
     felt: bool = False  # the torques felt the button bottom out
     popped: bool = False  # the camera sees the knob up after
     moved: bool = False  # the camera sees the box moved
+    shift_m: float = 0.0  # how far the wrist camera saw the button move (when it saw it again)
+    lid_dz_m: float = 0.0  # ... and the lid's depth change
+    knob_mm: float = float("nan")  # the knob above the lid at the after-look
     why: str = None  # why it stopped short, when it did
     lost: bool = False  # after a contact the wrist camera did not find the box again
     touch_xyz: tuple = None  # where the pads met the button (the arm's own kinematics)
@@ -655,7 +664,39 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
         d = np.asarray(R2, float) @ dh
         c = ctx.cpose
         ctx.cpose = ContainerPose(xyz=(float(c.xyz[0] + d[0]), float(c.xyz[1] + d[1]), float(c.xyz[2])), yaw=c.yaw)
-    return DepthPress(free=True, contact=True, felt=felt, popped=popped, moved=moved)
+    return DepthPress(free=True, contact=True, felt=felt, popped=popped, moved=moved, shift_m=float(shift),
+                      lid_dz_m=float(after.lid_depth - s.lid_depth), knob_mm=float(after.up_mm))
+
+
+def knob_up_after(node, ctx, watcher, runner, result, timeout_s=KNOB_RECHECK_S):
+    """A press felt to bottom out whose knob the after-look did not see up:
+    look again for `timeout_s` (it may still be rising, or the first look
+    read it low). Returns the DepthPress with `popped`/`knob_mm` from the
+    best look."""
+    if result.popped or not result.felt or result.lost or not result.free:
+        return result
+    t0 = time.monotonic()
+    best = result.knob_mm
+    while time.monotonic() - t0 < timeout_s:
+        again, _z, _lens, _status = look(node, watcher, ctx.model, "depth-after", runner, ctx, settled=True)
+        if again is not None and np.isfinite(again.up_mm):
+            best = again.up_mm if not np.isfinite(best) else max(best, again.up_mm)
+            if again.up_mm >= KNOB_UP_MM:
+                break
+    popped = bool(np.isfinite(best) and best >= KNOB_UP_MM)
+    print("[press_demo] AFTER, again: the knob %s" % ("UP %.0f mm — the box is open" % best if popped else
+                                                     "%.1f mm above the lid" % best if np.isfinite(best) else "not judged"))
+    return dataclasses.replace(result, popped=popped, knob_mm=float(best))
+
+
+def lid_ready(result):
+    """Whether the lid may be gripped after this depth press: the arm free
+    in the air where the touch began, the knob up, the box seen again by the
+    wrist camera, and not moved — or only slid (SLIDE_OK_M) and still
+    standing, in which case ctx.cpose already holds where it slid to."""
+    if not (result.free and result.popped) or result.lost or result.why is not None:
+        return False
+    return not result.moved or (result.shift_m <= SLIDE_OK_M and abs(result.lid_dz_m) <= LID_MOVED_M)
 
 
 def after_scene_check(ctx, runner, result, scene_fix, locator):

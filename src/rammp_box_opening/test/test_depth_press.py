@@ -974,3 +974,35 @@ def test_whatever_the_fast_stretch_meets_is_not_pushed(ctx, monkeypatch, tmp_pat
     assert "depth:approach" in events and "depth:touch" not in events and "press:push" not in events
     assert result.free and "not pushing" in result.why
 
+
+def test_a_knob_still_rising_is_looked_at_again(monkeypatch):
+    """16:02-16:03: the after-look read the knob 4.5 mm up, under
+    KNOB_UP_MM; the next run's aim saw it 8 mm up. A press felt to bottom
+    out is looked at again before it is judged not to have popped."""
+    import dataclasses
+
+    seen = iter([(_sighting(up=4.5), None, "2/2"), (_sighting(up=8.0), None, "2/2")])
+    monkeypatch.setattr(dp, "look", lambda *a, **k: (*next(seen)[:2], None, "2/2"))
+    felt = dp.DepthPress(free=True, contact=True, felt=True, popped=False, knob_mm=4.5)
+    again = dp.knob_up_after(None, SimpleNamespace(model=None), None, None, felt)
+    assert again.popped and again.knob_mm == pytest.approx(8.0)
+    # nothing to look at again: not felt, already popped, or the arm not free
+    for r in (dataclasses.replace(felt, felt=False), dataclasses.replace(felt, popped=True),
+              dataclasses.replace(felt, free=False)):
+        assert dp.knob_up_after(None, None, None, None, r) is r
+
+
+def test_the_lid_is_gripped_only_off_a_popped_box_standing_where_it_was_seen():
+    ok = dp.DepthPress(free=True, contact=True, felt=True, popped=True)
+    assert dp.lid_ready(ok)
+    # slid a little, still standing: gripped where it slid to (16:02: 6 mm)
+    assert dp.lid_ready(dp.DepthPress(free=True, contact=True, popped=True, moved=True, shift_m=0.006, lid_dz_m=-0.001))
+    for bad in (
+        dp.DepthPress(free=True, contact=True, popped=False),  # the knob is not up
+        dp.DepthPress(free=False, contact=True, popped=True),  # the arm holds
+        dp.DepthPress(free=True, contact=True, popped=True, lost=True),  # the wrist lost the box
+        dp.DepthPress(free=True, contact=True, popped=True, why="stopped short"),
+        dp.DepthPress(free=True, contact=True, popped=True, moved=True, shift_m=0.03),  # moved too far
+        dp.DepthPress(free=True, contact=True, popped=True, moved=True, shift_m=0.004, lid_dz_m=0.02),  # tipped
+    ):
+        assert not dp.lid_ready(bad), bad

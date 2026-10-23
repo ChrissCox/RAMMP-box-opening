@@ -602,6 +602,53 @@ def test_the_lid_comes_off_and_goes_down_in_one_motion(ctx):
     assert setdown.warp is None  # the group profile does the fast-then-slow
 
 
+def test_after_a_popped_depth_press_the_fingers_open_and_the_lid_comes_off(ctx, tmp_path, capsys):
+    """The depth press presses with the pads shut and used to end the run
+    there (2026-10-23: "test the full execute stack including pulling the
+    lid off"). Now the fingers open above the popped knob, and the tail
+    every press ends with flies from where the depth press's rise left the
+    arm: down around the knob, close, lift, carry, set down, home."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import GRIPPER_CMD_CLOSED, GRIPPER_CMD_OPEN
+    from rammp_box_opening.tasks import press_demo
+    from rammp_box_opening.tasks.depth_press import DepthPress
+
+    sent, held = [], {"pos": 0.0}
+
+    def gripper_cmd(position):
+        if position is None:  # a read: what the fingers hold
+            return True, held["pos"], False
+        sent.append(position)
+        held["pos"] = 0.42 if position == GRIPPER_CMD_CLOSED else float(position)  # closed on the knob
+        return True, held["pos"], position == GRIPPER_CMD_CLOSED
+
+    ctx.client.gripper_cmd = gripper_cmd
+    # grip:down arrives around the knob; the lift-carry-set-down execution
+    # ends on the table (the set-down's trip is its success)
+    ctx.client.exec_script = [("arrived", {}), ("touch", {"message": "torque guard trip", "progress": 0.95, "torque_peak": 4.1})]
+    result = DepthPress(free=True, contact=True, felt=True, popped=True, touch_xyz=(0.45, 0.0, 0.085))
+    code = press_demo.lid_off_after_depth_press(ctx, _demo_cfg(), make_runner(ctx.client, tmp_path), True, result)
+    out = capsys.readouterr().out
+    assert code == 0 and "LID PULLED" in out and "DONE — box open, lid placed, arm home" in out, out
+    assert sent[:2] == [GRIPPER_CMD_OPEN, GRIPPER_CMD_CLOSED]  # open above it first, then the grip
+    assert ctx.client.joint_targets[-1] == pytest.approx(press_demo.rest_joints(_demo_cfg()))  # and home
+
+
+def test_a_grip_refused_after_the_depth_press_goes_home_honestly(ctx, tmp_path, monkeypatch):
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.tasks import press_demo
+    from rammp_box_opening.tasks.depth_press import DepthPress
+
+    homes = []
+    monkeypatch.setattr(press_demo, "build_grip_and_place_legs", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("IK_FAIL")))
+    monkeypatch.setattr(press_demo, "try_home", lambda c, runner, execute, why: homes.append(why) or True)
+    result = DepthPress(free=True, contact=True, felt=True, popped=True)
+    code = press_demo.lid_off_after_depth_press(ctx, _demo_cfg(), make_runner(ctx.client, tmp_path), True, result)
+    assert code == 1 and ctx.client.executed == [] and "STOP before the grip" in homes[0]
+
+
 def test_contact_leg_speeds_come_from_config(ctx):
     """grip:down, lift and the set-down each read their own config knob.
 

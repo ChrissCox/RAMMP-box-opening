@@ -1,7 +1,8 @@
 """press_demo.main() end to end, every ROS / camera / planner edge faked (no
 rclpy.init, nothing talks to DDS or the arm): the lid drop spot is resolved
-only for a run that will grip and place the lid — never for the depth press,
-which ends at the press."""
+only for a run that will grip and place the lid — never for --press-only,
+the depth press's included, which ends at the press. A depth press without
+it takes the lid off after the press (2026-10-23)."""
 import json
 import sys
 from pathlib import Path
@@ -223,11 +224,40 @@ def test_the_depth_press_is_not_refused_over_a_lid_spot_it_never_uses(monkeypatc
         called.append(ctx.lid_drop)
         return result
 
-    code, _rows = run_main(monkeypatch, tmp_path, ["--execute", "--depth-press"], _approach(), SMALL, depth=depth)
+    code, _rows = run_main(monkeypatch, tmp_path, ["--execute", "--depth-press", "--press-only"], _approach(), SMALL,
+                           depth=depth)
     out = capsys.readouterr().out
     assert "no lid drop spot" not in out
     assert called == [None]  # pressed, no lid spot resolved for it
     assert code == exit_code(result) and code != 4
+
+
+def test_a_depth_press_that_takes_the_lid_off_needs_a_lid_spot_first(monkeypatch, tmp_path, capsys):
+    """Without --press-only the lid comes off after the depth press: where
+    it goes is resolved before anything presses, as for any press."""
+
+    def depth(*a, **k):
+        raise AssertionError("nothing presses without somewhere to put the lid")
+
+    code, _rows = run_main(monkeypatch, tmp_path, ["--execute", "--depth-press"], _approach(), SMALL, depth=depth)
+    assert code == 4 and "no lid drop spot" in capsys.readouterr().out
+
+
+def test_a_popped_depth_press_goes_on_to_take_the_lid_off(monkeypatch, tmp_path, capsys):
+    from rammp_box_opening.tasks import press_demo
+    from rammp_box_opening.tasks.depth_press import DepthPress
+
+    result = DepthPress(free=True, contact=True, felt=True, popped=True)
+    taken = []
+
+    def lid_off(ctx, cfg, runner, execute, res):
+        taken.append((ctx.lid_drop, res))
+        return 0
+
+    monkeypatch.setattr(press_demo, "lid_off_after_depth_press", lid_off)
+    code, _rows = run_main(monkeypatch, tmp_path, ["--execute", "--depth-press"], _approach(), ROOMY,
+                           depth=lambda *a, **k: result)
+    assert code == 0 and len(taken) == 1 and taken[0][0] is not None and taken[0][1] is result
 
 
 def test_a_depth_press_run_that_falls_through_to_grip_and_place_still_needs_a_lid_spot(

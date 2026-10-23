@@ -1751,6 +1751,45 @@ def build_grip_and_place_legs(ctx, cfg, start_joints=None):
     return [*grip, *place]
 
 
+def lid_off_after_depth_press(ctx, cfg, runner, execute, result):
+    """After a depth press that popped the knob (depth_press.lid_ready): the
+    fingers shut for the press open above it, then the tail every press
+    ends with — down around the knob, close, lift, carry to ctx.lid_drop,
+    set down, release, retreat, home (build_grip_and_place_legs), from
+    where the depth press's rise left the arm, the box where the pads met
+    its button (and where the wrist camera saw it slide to, when it slid).
+    Returns the process exit code: 0 only with the lid placed."""
+    from rammp_box_opening.tasks.depth_press import finish
+
+    if result.moved:
+        print("[press_demo] the press slid the box %.0f mm, still standing — gripping it where the wrist camera sees "
+              "it now" % (1000 * result.shift_m))
+    print("[press_demo] GRIP AND PLACE: the fingers open above the knob, then onto it, close, lift, carry and set "
+          "down as one motion")
+    live = list(ctx.client.joints())
+    try:
+        legs = build_grip_and_place_legs(ctx, cfg, start_joints=live)
+    except RuntimeError as e:
+        homed = try_home(ctx, runner, execute, "STOP before the grip — %s" % e)
+        return max(1, finish(ctx, result, homed))
+    opened = _gripper_leg(ctx, _state(live), "grip:open", GRIPPER_CMD_OPEN, _full_world(ctx))
+    res = runner.run([opened, *legs], execute=execute)
+    grip = [r for r in res if r.leg_name == "grip:close"]
+    if grip and grip[-1].ok:
+        print("[press_demo] LID PULLED — %s" % grip[-1].detail)
+    elif grip:
+        print("[press_demo] GRIP FAILED — %s: the fingers closed on air, so the knob did not pop or the grip missed "
+              "it" % grip[-1].detail)
+    if any(not r.ok for r in res):
+        return 1  # grip or set-down failed — arm holds
+    runner.finish()
+    frames = getattr(ctx, "mission_frames", None)
+    if frames is not None:
+        frames.note(stage="done", popped=True, touch_xyz=None if result.touch_xyz is None else list(result.touch_xyz))
+    print("[press_demo] DONE — box open, lid placed, arm home")
+    return 0
+
+
 def run_push(ctx, cfg, runner, args, touch, touch_leg=None, node=None, watcher=None, retries=1):
     """The push stage from the touch's measured contact, then the retreat
     and what follows; the grip phase is planned while the retreat flies.
@@ -2831,10 +2870,11 @@ def main():
             detect_s=round(time.monotonic() - t_detect, 2),
         )
 
-        # the depth press (tasks/depth_press) ends the run at the press and
-        # never handles the lid; a run that skips it still grips and places
+        # the depth press (tasks/depth_press) presses from here; with
+        # --press-only the run ends at the press, without it the lid comes
+        # off after it as after any press (lid_off_after_depth_press)
         depth_here = args.depth_press and at_staging and reach.pressed is None
-        if not args.press_only and not depth_here:
+        if not args.press_only:
             # the box lands wherever it lands: resolve the drop spot NOW,
             # before any container-directed motion — configured lid_place
             # when clear, slid away from the box when crowded, refusal
@@ -2889,6 +2929,10 @@ def main():
 
             result = depth_press.press_down_from_here(node, ctx, cfg, runner, watcher, depth_press.DOWN_CONTACT_TOOL)
             result = depth_press.after_scene_check(ctx, runner, result, scene_fix, locator)
+            if not args.press_only:
+                result = depth_press.knob_up_after(node, ctx, watcher, runner, result)
+                if depth_press.lid_ready(result):
+                    sys.exit(lid_off_after_depth_press(ctx, cfg, runner, args.execute, result))
             homed = result.free and try_home(ctx, runner, args.execute, depth_press.home_why(result) or "DEPTH PRESS done")
             sys.exit(depth_press.finish(ctx, result, homed))
         if at_staging and reach.pressed is not None:
