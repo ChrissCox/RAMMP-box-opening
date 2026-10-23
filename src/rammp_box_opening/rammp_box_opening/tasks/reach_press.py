@@ -675,13 +675,27 @@ def _home_after_contact(node, ctx, cfg, runner, watcher, scene_fix, locator, but
     return _go_home(ctx, cfg, runner, ""), popped, up_after
 
 
+# _predicted_drift samples every this many points plus the last: it is a
+# printed estimate, and evaluating the gravity model at every point (and the
+# start again for each) cost ~0.2 s at rest before the look leg (2026-10-22)
+DRIFT_SAMPLE_EVERY = 4
+
+
 def _predicted_drift(plan):
     """joint_4's gravity torque change along the slide and the stroke (Nm):
-    what a raw guard would have read as a strike."""
+    what a raw guard would have read as a strike. A display estimate only
+    (gravity_mismatch is the gate): sampled every DRIFT_SAMPLE_EVERY points
+    plus the last."""
     g = _wrist_gravity()
-    slide = max(abs(float(g(q)[0]) - float(g(plan.slide_pts[0])[0])) for q in plan.slide_pts)
-    stroke = max(abs(float(g(q)[0]) - float(g(plan.stroke_pts[0])[0])) for q in plan.stroke_pts)
-    return slide, stroke
+
+    def drift(pts):
+        if len(pts) == 0:
+            return 0.0
+        g0 = float(g(pts[0])[0])
+        idx = sorted(set(range(DRIFT_SAMPLE_EVERY, len(pts), DRIFT_SAMPLE_EVERY)) | {len(pts) - 1})
+        return max(abs(float(g(pts[i])[0]) - g0) for i in idx)
+
+    return drift(plan.slide_pts), drift(plan.stroke_pts)
 
 
 def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
