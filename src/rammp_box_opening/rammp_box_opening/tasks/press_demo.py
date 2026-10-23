@@ -2133,9 +2133,10 @@ def scene_detect_report(locator, duration_s=DETECT_REPORT_S):
             continue
         tops.append(fix.top_xyz)
         print(
-            "[press_demo]   SCENE: box at [%.3f, %.3f] yaw %.1f deg, lid top z %.3f, table %.3f%s, OWL %.2f, %d lid points"
+            "[press_demo]   SCENE: box at [%.3f, %.3f] yaw %.1f deg, lid top z %.3f, table %.3f%s, OWL %.2f, %d lid points%s"
             % (fix.pose.xyz[0], fix.pose.xyz[1], math.degrees(fix.pose.yaw), fix.top_xyz[2],
-               fix.table_z_scene, table_seen_over(fix.table_extent), fix.score, fix.n_points)
+               fix.table_z_scene, table_seen_over(fix.table_extent), fix.score, fix.n_points,
+               "; %s, finished from its lid's arc in view" % fix.partial if getattr(fix, "partial", "") else "")
         )
     if not tops:
         print("[press_demo] detect-only done: NO BOX — %s" % locator.last_why)
@@ -2518,10 +2519,12 @@ def main():
             adopt_scene_table(ctx, worlds, watcher, scene_fix)
             surveyed = watcher.table_z
             print(
-                "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points "
+                "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points%s "
                 "(OWL %.2f; the scene reads the table at %.3f%s, surveyed %s; %.1f s to locate "
                 "[%s], %.1f s since start) — flying to staging"
                 % (sp.xyz[0], sp.xyz[1], math.degrees(sp.yaw), scene_fix.n_points,
+                   " (%s, finished from its lid's arc in view)" % scene_fix.partial
+                   if getattr(scene_fix, "partial", "") else "",
                    scene_fix.score, scene_fix.table_z_scene, table_seen_over(scene_fix.table_extent),
                    ("%.3f" % surveyed) if surveyed is not None else "n/a",
                    time.monotonic() - t_scene,

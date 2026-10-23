@@ -52,6 +52,7 @@ class SceneFix:
     score: float  # the OWL score behind it
     table_z_scene: float  # the table height the scene depth itself shows, or nan
     table_extent: object = None  # (x0, x1, y0, y1) where it shows that table, when no survey says
+    partial: str = ""  # how the frame cut the box when it was finished from the part in view, else ""
 
 
 def robust_yaw(xy):
@@ -190,7 +191,7 @@ def table_around(pts_base, centre_xy, below_z, ring=TABLE_RING_M):
     return float(c[2] - (n[0] * (centre_xy[0] - c[0]) + n[1] * (centre_xy[1] - c[1])) / n[2])
 
 
-def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz):
+def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=False):
     """Coarse container pose from a camera level with the lid. It sees the
     box's side, never its top face, and the wall behind a round lid falls
     inside the pixel box too (flatbot 2026-10-22: 22 of 252 points, at lid
@@ -198,7 +199,12 @@ def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz):
     object in the box, its top checked against the table around it
     (`table_z` when surveyed), its centre half its width behind the face the
     camera sees. Returns (ContainerPose, top_xyz, n_points, table_z) or
-    (None, why, n_points, table_z or nan)."""
+    (None, why, n_points, table_z or nan).
+
+    `partial`: the frame cuts the box off at its side (a round container
+    only, scene_fix_from_boxes): what is in view is not centred on it and
+    is narrower than it, so the centre is the lid's circle through the arc
+    of its side in view (lid_circle) instead, and no width is asked."""
     x0, y0, x1, y1 = bbox
     inside = (uv[:, 0] >= x0) & (uv[:, 0] <= x1) & (uv[:, 1] >= y0) & (uv[:, 1] <= y1)
     if inside.sum() < MIN_LID_POINTS:
@@ -230,6 +236,12 @@ def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz):
     if abs(top_z - lid_z) > LID_BAND_M:
         return None, "its top is %+.0f mm from lid height (the table at %.3f + %.0f mm)" % (
             1000 * (top_z - lid_z), table_z, 1000 * model.dims[2]), n, table_z
+    if partial:
+        centre, why = lid_circle(near, top_z, model, cam)
+        if centre is None:
+            return None, why, n, table_z
+        pose = container_pose_from_top((centre[0], centre[1], top_z), 0.0, model, table_z)  # round: yaw unused
+        return pose, (centre[0], centre[1], top_z), n, float(table_z)
     lo, hi = np.percentile((obj[:, :2] - cam[:2]) @ across, [10, 90])
     width = float(hi - lo)
     need = MIN_FOOTPRINT_FRAC * min(float(model.dims[0]), float(model.dims[1]))
@@ -255,6 +267,7 @@ class SceneBoxFix:
     table_z: float = float("nan")  # the table the winner was measured against
     lift: str = ""  # "top" or "side": which view of it won
     clipped: tuple = ()  # (score, box, edges) of each candidate refused at the frame's edge
+    partial: tuple = ()  # the edges the frame cut the winner at, when it was finished from part of it
 
 
 # An OWL box this close to the frame's edge has its container running off
@@ -263,6 +276,57 @@ class SceneBoxFix:
 # image's edge was fixed 7 cm short of where the wrist camera then found it,
 # and the staging aimed past its button)
 FRAME_EDGE_PX = 3
+
+
+# ... unless the container is round and the frame cuts it at its side: then
+# the arc of the lid's side band in view is a circle of the lid's known
+# diameter, fitted with that radius (lid_circle). Flatbot 2026-10-23: the
+# canister half off the frame put 147 deg of its lid in view and the fit
+# put it 3 cm from where the wrist camera found it, the old lift 7 cm.
+PARTIAL_FIT_RMS_M = 0.015  # the lid's points this close to the circle, RMS
+PARTIAL_MIN_ARC_DEG = 60.0  # ... spread over at least this much of it
+PARTIAL_TRIM_M = 0.006  # points farther than this (or 2.5 MADs) off it are not the lid's
+
+
+def lid_circle(near, top_z, model, cam_xyz):
+    """The centre (x, y) of a round lid from the points of its side band a
+    level camera sees: the circle of the lid's radius through them, fitted
+    by Gauss-Newton from a start behind the band (from `cam_xyz`), points
+    far off it trimmed. Returns ((cx, cy), None) or (None, why)."""
+    r = 0.5 * float(model.lid_dims[0])
+    thick = float(model.lid_dims[2])
+    band = near[(near[:, 2] > top_z - thick) & (near[:, 2] <= top_z + 0.005)]
+    if len(band) < MIN_LID_POINTS:
+        return None, "only %d points on the lid's side in view (need %d)" % (len(band), MIN_LID_POINTS)
+    P = band[:, :2]
+    cam = np.asarray(cam_xyz, float)[:2]
+    m = P.mean(axis=0)
+    c = m + r * (m - cam) / np.linalg.norm(m - cam)
+    keep = np.ones(len(P), bool)
+    for _round in range(4):
+        for _it in range(30):
+            dv = P[keep] - c
+            dist = np.maximum(np.linalg.norm(dv, axis=1), 1e-9)
+            step = np.linalg.lstsq(-dv / dist[:, None], -(dist - r), rcond=None)[0]
+            c = c + step
+            if np.linalg.norm(step) < 1e-7:
+                break
+        res = np.linalg.norm(P - c, axis=1) - r
+        mad = 1.4826 * np.median(np.abs(res - np.median(res)))
+        keep = np.abs(res) < max(PARTIAL_TRIM_M, 2.5 * mad)
+    if keep.sum() < MIN_LID_POINTS:
+        return None, "only %d of the lid's side points lie on a %.0f mm circle" % (int(keep.sum()), 2000 * r)
+    rms = float(np.sqrt(np.mean(res[keep] ** 2)))
+    if rms > PARTIAL_FIT_RMS_M:
+        return None, "the lid's side is no %.0f mm circle (%.0f mm RMS off it)" % (2000 * r, 1000 * rms)
+    ang = np.sort(np.arctan2(P[keep, 1] - c[1], P[keep, 0] - c[0]))
+    gaps = np.diff(np.r_[ang, ang[0] + 2 * np.pi])
+    arc = 360.0 - float(np.degrees(gaps.max()))
+    if arc < PARTIAL_MIN_ARC_DEG:
+        return None, "only %.0f deg of the lid's circle in view (need %.0f)" % (arc, PARTIAL_MIN_ARC_DEG)
+    if np.dot(c - P[keep].mean(axis=0), P[keep].mean(axis=0) - cam) <= 0.0:
+        return None, "the lid's circle comes out on the camera's side of what it sees"
+    return (float(c[0]), float(c[1])), None
 
 
 def frame_edges(box, image_wh, edge_px=FRAME_EDGE_PX):
@@ -275,10 +339,19 @@ def frame_edges(box, image_wh, edge_px=FRAME_EDGE_PX):
     return tuple(e for e, hit in hits if hit)
 
 
-def off_frame_why(score, edges, R_base_color, frame="arm_mount"):
-    """What to tell the operator about a box the OWL found running off the
-    frame at `edges`: which way that is in `frame` (the image's own left and
-    right mean nothing on a camera hung upside down), and the way back."""
+def side_cut(edges, R_base_color):
+    """True when every edge in `edges` cuts the view across, not up or down:
+    its image direction is level in the base frame (a camera hung level, as
+    flatbot's scene OAK is, cuts a box at its left or right side)."""
+    R = np.asarray(R_base_color, float)
+    col = {"left": 0, "right": 0, "top": 1, "bottom": 1}
+    return all(abs(R[2, col[e]]) < 0.5 for e in edges)
+
+
+def off_frame_ways(edges, R_base_color):
+    """The base-frame axis ("+y", ...) each image edge in `edges` lies
+    toward: the image's own left and right mean nothing on a camera hung
+    upside down."""
     R = np.asarray(R_base_color, float)
     out = {"right": R[:, 0], "left": -R[:, 0], "bottom": R[:, 1], "top": -R[:, 1]}
     ways = []
@@ -286,6 +359,14 @@ def off_frame_why(score, edges, R_base_color, frame="arm_mount"):
         d = out[e]
         k = int(np.argmax(np.abs(d)))
         ways.append(("+" if d[k] > 0 else "-") + "xyz"[k])
+    return ways
+
+
+def off_frame_why(score, edges, R_base_color, frame="arm_mount"):
+    """What to tell the operator about a box the OWL found running off the
+    frame at `edges`: which way that is in `frame` (off_frame_ways), and the
+    way back."""
+    ways = off_frame_ways(edges, R_base_color)
     back = ", ".join(("-" if w[0] == "+" else "+") + w[1] for w in ways)
     return ("the OWL's box (%.2f) runs off the scene camera's frame toward %s %s: it sees part of the "
             "container, and a part is not where the box is — move the box toward %s until all of it is "
@@ -313,7 +394,8 @@ def sees_top_face(pts_base, uv, bbox, lid_z, cam_xyz):
     return cam[2] - float(lid_z) >= TOP_VIEW_MIN_SLOPE * d
 
 
-def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side_table_z=None, image_wh=None):
+def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side_table_z=None, image_wh=None,
+                         cam_R=None):
     """The OWL's candidates (score, [x0, y0, x1, y1]) best first: every
     candidate lifted to the lid slab (box_from_scene_points) when a table
     height is known (`table_z`) and the camera stands above the lid
@@ -327,22 +409,27 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
     container wins. What the live locate() does with every message, and
     what an offline replay of recorded frames computes the same way. With
     `image_wh` (the colour image's w, h), a candidate reaching the frame's
-    edge is refused before either lift (FRAME_EDGE_PX)."""
+    edge is refused before either lift (FRAME_EDGE_PX) — unless the model
+    is round and the frame cuts it at its side (`cam_R`, the camera's axes
+    in the base frame, says which image edges are), when the side lift
+    finishes it from the part in view (partial)."""
     tried = []
     clipped = []
-    if image_wh is not None:
-        inside = []
-        for score, box in boxes:
-            edges = frame_edges(box, image_wh)
-            if edges:
-                clipped.append((score, box, edges))
-                tried.append("it runs off the frame at its %s edge (OWL %.2f)" % (" and ".join(edges), score))
-            else:
-                inside.append((score, box))
-        boxes = inside
+    cands = []  # (score, box, the side edges a round box is finished across, or ())
+    for score, box in boxes:
+        edges = frame_edges(box, image_wh) if image_wh is not None else ()
+        if not edges:
+            cands.append((score, box, ()))
+        elif model.round and cam_R is not None and side_cut(edges, cam_R):
+            cands.append((score, box, edges))
+        else:
+            clipped.append((score, box, edges))
+            tried.append("it runs off the frame at its %s edge (OWL %.2f)" % (" and ".join(edges), score))
     if table_z is not None:
         lid_z = float(table_z) + float(model.dims[2])
-        for score, box in boxes:
+        for score, box, edges in cands:
+            if edges:
+                continue  # only the side lift finishes a box from part of it
             if cam_xyz is not None and not sees_top_face(pts_base, uv, box, lid_z, cam_xyz):
                 continue
             pose, top, n = box_from_scene_points(pts_base, uv, box, table_z, model)
@@ -350,11 +437,15 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
                 return SceneBoxFix(pose, top, n, box, tuple(tried), float(table_z), "top", tuple(clipped))
             tried.append("%s (OWL %.2f)" % (top, score))
     if cam_xyz is not None:
-        for score, box in boxes:
-            pose, top, n, tz = box_from_side_points(pts_base, uv, box, side_table_z, model, cam_xyz)
+        for score, box, edges in cands:
+            pose, top, n, tz = box_from_side_points(pts_base, uv, box, side_table_z, model, cam_xyz, partial=bool(edges))
             if pose is not None:
-                return SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side", tuple(clipped))
-            tried.append("from the side, %s (OWL %.2f)" % (top, score))
+                return SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side", tuple(clipped), edges)
+            if edges:
+                clipped.append((score, box, edges))
+                tried.append("from the side, cut off at the frame's %s edge, %s (OWL %.2f)" % (" and ".join(edges), top, score))
+            else:
+                tried.append("from the side, %s (OWL %.2f)" % (top, score))
     return SceneBoxFix(None, None, 0, None, tuple(tried), clipped=tuple(clipped))
 
 
@@ -524,7 +615,7 @@ class SceneLocator:
                 got = scene_fix_from_boxes(
                     [(c[4], c[:4]) for c in cands], pts_base, uv, top_table_z, self.model,
                     cam_xyz=T_base_color[:3, 3], side_table_z=self.table_z,
-                    image_wh=(self.grab.color.shape[1], self.grab.color.shape[0]),
+                    image_wh=(self.grab.color.shape[1], self.grab.color.shape[0]), cam_R=T_base_color[:3, :3],
                 )
                 tried.extend(got.tried)
                 for score, _box, edges in got.clipped:
@@ -555,7 +646,7 @@ class SceneLocator:
                     else "none of the OWL's %d candidate(s) is this container: %s" % (len(tried), "; ".join(tried[-3:]))
                 )
                 if off_frame is not None and heard and t_ready is not None and not self.grab.missing():
-                    self.last_why = "%s; %s" % (off_frame_why(*off_frame), self.last_why)
+                    self.last_why = "%s; %s" % (off_frame_why(*off_frame, frame=self.base_frame or "base_link"), self.last_why)
                 return None
             bbox, pose, top, n, pts_base, uv, got = found
             table_seen = (
@@ -571,7 +662,11 @@ class SceneLocator:
                 if assumed:
                     print("[scene] too few table points to measure its extent; planning the %.2f m ring "
                           "square around the box at the measured height" % (2 * TABLE_RING_M[1]))
+            partial = ""
+            if got.partial:
+                partial = "cut off by the frame toward %s %s" % (
+                    self.base_frame or "base_link", " and ".join(off_frame_ways(got.partial, T_base_color[:3, :3])))
             return SceneFix(pose=pose, top_xyz=top, n_points=n, score=float(bbox[4]), table_z_scene=table_seen,
-                            table_extent=extent)
+                            table_extent=extent, partial=partial)
         finally:
             self.owl.disable()

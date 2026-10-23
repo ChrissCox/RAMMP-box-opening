@@ -41,6 +41,10 @@ class ContainerModel:
     # keeps flipping"). Reach checked on the live planner: 20/20 positions
     # over the table, from HOME and from LOOK, straight descents everywhere.
     press_yaw_steer: bool = True
+    # True: the lid is a disc lid_dims[0] across (the Ankou canister): the
+    # scene camera may finish a box its frame cuts off from the arc of the
+    # lid's side it does see (perception/scene_source.lid_circle)
+    round: bool = False
 
     def press_quat(self, xyz):
         """The press/grip/place attitude at a base-frame point (xyzw)."""
@@ -61,6 +65,7 @@ class ContainerModel:
             hover_standoff=float(raw["hover_standoff"]),
             measure_me=bool(raw.get("measure_me", True)),
             press_yaw_steer=bool(raw.get("press_yaw_steer", True)),
+            round=bool(raw.get("round", False)),
         )
 
 

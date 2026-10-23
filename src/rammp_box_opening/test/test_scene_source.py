@@ -498,3 +498,76 @@ def test_the_recorded_flatbot_frame_still_finds_its_canister_inside_the_frame():
     boxes = [(float(b[4]), [float(v) for v in b[:4]]) for b in z["owl_boxes"]]
     got = scene_fix_from_boxes(boxes, pts, uv, None, ContainerModel.load(PINK), cam_xyz=T[:3, 3], image_wh=(640, 400))
     assert got.box == boxes[0][1] and not got.clipped
+
+
+# A level camera like SIDE_CAM: image +u along base -y, +v along -z (_project)
+SIDE_R = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+
+
+def _cut_side_scene(rng, cut_u):
+    """_side_scene's canister with the frame ending at column `cut_u`: what
+    lies past it is not in view."""
+    pts, uv, canister, _tall = _side_scene(rng)
+    keep = uv[:, 0] < cut_u
+    cuv = _project(canister)
+    model = ContainerModel.load(PINK)
+    cap = (canister[:, 2] > SIDE_TABLE + model.dims[2] - 0.025) & (cuv[:, 0] < cut_u)
+    x0, y0, x1, y1 = _pixel_box(cuv[cap])
+    return pts[keep], uv[keep], [x0, y0, cut_u - 1.0, y1], model
+
+
+def test_a_round_box_the_frame_cuts_at_its_side_is_finished_from_its_lid():
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    pts, uv, box, model = _cut_side_scene(np.random.default_rng(6), cut_u=350)  # the canister spans u ~318..378
+    got = scene_fix_from_boxes([(0.45, box)], pts, uv, None, model, cam_xyz=SIDE_CAM, image_wh=(350, 400), cam_R=SIDE_R)
+    assert got.pose is not None, got.tried
+    assert got.partial == ("right",) and not got.clipped
+    assert np.hypot(got.pose.xyz[0] - 0.70, got.pose.xyz[1] + 0.55) < 0.01
+    # the side lift without it: what is in view is not centred on the box
+    plain = scene_fix_from_boxes([(0.45, box)], pts, uv, None, model, cam_xyz=SIDE_CAM)
+    assert plain.pose is None or np.hypot(plain.pose.xyz[0] - 0.70, plain.pose.xyz[1] + 0.55) > 0.015
+
+
+def test_what_cannot_be_finished_from_part_of_it_is_still_refused():
+    from dataclasses import replace
+
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    pts, uv, box, model = _cut_side_scene(np.random.default_rng(6), cut_u=350)
+    kw = dict(cam_xyz=SIDE_CAM, image_wh=(350, 400))
+    # a square container: no circle to finish it with
+    square = scene_fix_from_boxes([(0.45, box)], pts, uv, None, replace(model, round=False), cam_R=SIDE_R, **kw)
+    assert square.pose is None and square.clipped and "runs off the frame at its right edge" in square.tried[0]
+    # cut at its top or bottom: the lid itself may be what is out of view
+    hung = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])  # image +u along base z
+    tall = scene_fix_from_boxes([(0.45, box)], pts, uv, None, model, cam_R=hung, **kw)
+    assert tall.pose is None and tall.clipped
+    # too little of the lid in view: no circle is fitted to a sliver
+    pts2, uv2, box2, _m = _cut_side_scene(np.random.default_rng(6), cut_u=326)
+    sliver = scene_fix_from_boxes([(0.45, box2)], pts2, uv2, None, model, cam_xyz=SIDE_CAM, image_wh=(326, 400), cam_R=SIDE_R)
+    assert sliver.pose is None and sliver.clipped and "cut off at the frame's right edge" in sliver.tried[0]
+
+
+def test_the_cut_flatbot_frame_puts_the_canister_where_the_wrist_found_it():
+    """Flatbot 2026-10-23 13:33: the canister half off the scene OAK's frame.
+    The run's side lift put it at [0.475, -0.276]; at staging the wrist
+    camera found its lid near [0.45, -0.21], through its own hand-measured
+    mount. Finished from its lid's arc, the scene puts it within 3 cm of
+    that: a regression pin, not a tape truth."""
+    from pathlib import Path
+
+    from rammp_box_opening.perception.scene import color_cloud
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    z = np.load(Path(__file__).parent / "data" / "scene_side_flatbot_cut_20261023.npz")
+    T = z["T_base_color"]
+    pc, uv = color_cloud(z["depth_mm"].astype(float) / 1000.0, z["kd"], z["k"], z["dist"], z["T_color_depth"], stride=2)
+    pts = pc @ T[:3, :3].T + T[:3, 3]
+    boxes = [(float(b[4]), [float(v) for v in b[:4]]) for b in z["owl_boxes"]]
+    got = scene_fix_from_boxes(boxes, pts, uv, None, ContainerModel.load(PINK), cam_xyz=T[:3, 3],
+                               image_wh=(640, 400), cam_R=T[:3, :3])
+    assert got.pose is not None, got.tried
+    assert got.partial == ("right",)
+    assert got.pose.xyz[0] == pytest.approx(0.446, abs=0.01) and got.pose.xyz[1] == pytest.approx(-0.236, abs=0.01)
+    assert np.hypot(got.pose.xyz[0] - 0.45, got.pose.xyz[1] + 0.21) < 0.03
