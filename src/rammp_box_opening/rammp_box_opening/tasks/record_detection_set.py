@@ -53,6 +53,16 @@ AT_HOME_RAD = 0.02  # this close to HOME is at HOME
 TRUTH_SUSPECT_M = 0.05
 
 
+def table_refusal(worlds):
+    """Why the recorder cannot run on this world, or None. Its hovers and
+    the lid's height come from a surveyed table; flatbot's table is measured
+    by the mission's scene fix, which the recorder does not take yet."""
+    if worlds.table_top_z is not None:
+        return None
+    return ("[record] needs a surveyed table (a bench world with a 'table' obstacle); "
+            "flatbot measures its table per run — not supported yet. Nothing moved.")
+
+
 def save_scene_frame(scene, folder, T_base_link):
     """One scene capture — everything the scene locator uses, raw: colour
     (BGR), the median depth of the kept frames, both intrinsics, the depth
@@ -88,8 +98,12 @@ def main():
     model = ContainerModel.load(cfg_path)
     cfg = load_press_demo(cfg_path)
     cli_common.refuse_unmeasured(model, args.execute)
-    node, client = cli_common.init_runtime(args.execute)
     worlds = WorldStore(bench)
+    why = table_refusal(worlds)
+    if why:
+        sys.exit(why)  # before rclpy: nothing started, nothing moved
+    node, client = cli_common.init_runtime(args.execute)
+    client._base_frame = worlds.base_frame
     runner = Runner(client)
     cli_common.apply_speed_scale(runner, args)
     table_z = worlds.table_top_z
@@ -103,7 +117,8 @@ def main():
     pexec.add_node(pnode)
     pthread = threading.Thread(target=pexec.spin, name="perception", daemon=True)
     pthread.start()
-    watcher = BoxTopWatcher(pnode, cfg, model, table_z)
+    watcher = BoxTopWatcher(pnode, cfg, model, table_z, base_frame=worlds.base_frame,
+                            camera_cfg_name=worlds.wrist_camera_config)
     scene = SceneGrabber(pnode, keep=5, need_depth=True)
     T_base_link = load_scene_calibration(args.scene_calib)
     ctx = Ctx(model=model, cpose=None, client=client, worlds=worlds, config_path=cfg_path)
