@@ -339,7 +339,9 @@ class GravityModel:
     kortex_transport.cpp fill_feedback: "~ +g(q) at free hold").
 
     A guard judged on what this does NOT explain feels the same push
-    wherever along a reach it comes (runtime/guards.CompensatedGuard)."""
+    wherever along a reach it comes (runtime/guards.CompensatedGuard).
+    The masses are lumped per arm link at construction (the gripper sits at
+    a fixed knuckle angle), so a call walks only the 7 arm joints."""
 
     def __init__(self, path=None, root="base_link", gripper_rad=GRIPPER_CLOSED_RAD):
         path = path or urdf_path()
@@ -390,7 +392,46 @@ class GravityModel:
         # tool_frame: TOOL_FROM_EE_M along the end-effector link's z, as ArmChain
         self._ee = next(child for child, jt in self._joints.items() if jt[0] == arm.chain[-1][0])
         self._tool = np.array(arm.tool_from_tip, float)
-        self.gripper_rad = float(gripper_rad)
+        self._gripper_rad = float(gripper_rad)
+        # lumped once: every massive link onto its CARRIER, the nearest link
+        # (itself or an ancestor) an arm joint moves; rigid on it from here on
+        arm_set = set(self.joint_names)
+        self._arm_links = [child_of[n] for n in self.joint_names]
+        T0, _axes = self._frames([0.0] * len(self.joint_names))  # q=0: every arm joint the identity
+
+        def carrier(link):
+            while link != root and self._joints[link][0] not in arm_set:
+                link = self._joints[link][2]
+            return link
+
+        self._seg = []  # per arm joint: (R, t) from the previous arm link (or the root) to it, unit axis
+        prev = root
+        for link in self._arm_links:
+            Tp = np.linalg.inv(T0[prev]) @ T0[link]
+            self._seg.append((Tp[:3, :3].copy(), Tp[:3, 3].copy(), self._joints[link][5]))
+            prev = link
+        lump = {}  # carrier -> (kg, first moment m * c in the carrier)
+        for link, (m, c) in self._mass.items():
+            if link not in T0:
+                continue
+            car = carrier(link)
+            if car == root:  # the base / mount: no arm joint carries it (as _below)
+                continue
+            Tc = np.linalg.inv(T0[car]) @ T0[link]
+            M, S = lump.get(car, (0.0, np.zeros(3)))
+            lump[car] = (M + m, S + m * (Tc[:3, :3] @ c + Tc[:3, 3]))
+        self._lump = [lump.get(link, (0.0, np.zeros(3))) for link in self._arm_links]
+        ee_car = carrier(self._ee)
+        self._ee_idx = self._arm_links.index(ee_car)
+        Te = np.linalg.inv(T0[ee_car]) @ T0[self._ee]
+        self._ee_in_car = (Te[:3, :3].copy(), Te[:3, 3].copy())
+        self._g = np.array([0.0, 0.0, -G_MPS2])
+
+    @property
+    def gripper_rad(self):
+        """The knuckle angle the gripper's links were lumped at: fixed, since
+        a later change would be silently ignored."""
+        return self._gripper_rad
 
     def _frames(self, q):
         qmap = dict(zip(self.joint_names, (float(v) for v in q)))
@@ -407,9 +448,9 @@ class GravityModel:
                     th = qmap[name]
                     axes[name] = (Tj[:3, 3].copy(), Tj[:3, :3] @ axis)
                 elif mimic is not None:
-                    th = mimic[1] * self.gripper_rad + mimic[2]  # the gripper's mimic joints follow its knuckle
+                    th = mimic[1] * self._gripper_rad + mimic[2]  # the gripper's mimic joints follow its knuckle
                 else:
-                    th = self.gripper_rad
+                    th = self._gripper_rad
                 J = np.eye(4)
                 J[:3, :3] = _axis_rot(axis, th)
                 Tj = Tj @ J
@@ -420,6 +461,33 @@ class GravityModel:
         """The torque each arm joint holds against gravity at q (Nm), in the
         sign the driver reports — joints `first` onward. `extra`: (kg,
         (x, y, z) in tool_frame) point masses the URDF does not carry."""
+        R, p = np.eye(3), np.zeros(3)
+        Rs, ps, zs, Ms, Ss = [], [], [], [], []
+        for (Rf, tf, a), th, (m, s) in zip(self._seg, q, self._lump):
+            p = p + R @ tf
+            R = R @ Rf
+            zs.append(R @ a)  # the joint's axis, before its own turn
+            ps.append(p)
+            R = R @ _axis_rot(a, float(th))
+            Rs.append(R)
+            Ms.append(m)
+            Ss.append(R @ s + m * p)  # the lump's first moment, in the world
+        if extra:  # into the end-effector link's carrier
+            Re, te = self._ee_in_car
+            k = self._ee_idx
+            for m, pt in extra:
+                Ms[k] += float(m)
+                Ss[k] = Ss[k] + float(m) * (Rs[k] @ (Re @ (np.asarray(pt, float) + self._tool) + te) + ps[k])
+        out, M, S = [], 0.0, np.zeros(3)
+        for i in range(len(self._seg) - 1, first - 1, -1):  # from the tip back: what joint i carries
+            M += Ms[i]
+            S = S + Ss[i]
+            out.append(-float(zs[i] @ np.cross(S - M * ps[i], self._g)))
+        return np.array(out[::-1])
+
+    def _holding_tree(self, q, extra=(), first=0):
+        """holding() by walking every link's frame: the reference the lumps
+        are pinned to (test/test_gravity_guard)."""
         T, axes = self._frames(q)
         g = np.array([0.0, 0.0, -G_MPS2])
         ee = T[self._ee]
