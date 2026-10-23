@@ -92,6 +92,13 @@ def _container_cuboid(model, cpose, name="container", top_z=None):
     }
 
 
+def planned_top_z(model, cpose):
+    """The container cuboid's top as the planner sees it in the full world:
+    its err-tall top plus the padding the planner adds to it. A start whose
+    collision spheres reach below this over the box is refused."""
+    return float(cpose.xyz[2]) + float(model.dims[2]) + ERR_TALL_M + PLANNER_PADDING_M
+
+
 def _lid_cuboid(model, lid_at):
     lx, ly, lz = model.lid_dims
     return {

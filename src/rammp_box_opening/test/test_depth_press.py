@@ -357,23 +357,43 @@ def test_a_push_the_torques_never_felt_bottom_out_is_not_a_press(ctx, monkeypatc
     assert not result.felt and not result.popped and dp.exit_code(result) == 1
 
 
+def test_a_box_the_bench_camera_sees_moved_is_moved_the_way_it_went(ctx, monkeypatch, tmp_path):
+    """The bench D405 is turned 180 deg about its lens axis: a button seen
+    12 mm further along the camera's x moved 12 mm along the hand's -x."""
+    from rammp_box_opening.models.container import from_container
+
+    bench = (0.0, 0.075, -0.125)
+    looks = [(_sighting(y=bench[1]), 0.27, "2/2"), (_sighting(x=0.012, y=bench[1], up=12.0), None, "2/2")]
+    result, _e, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, lens=bench, r_hc=RZ180, measured=bench,
+                                     touch_at=0.27 - (dp.DOWN_CONTACT_TOOL[2] - bench[2]))
+    assert result.moved
+    R = rp._rot(arm.turns[0][1])
+    want = np.r_[BUTTON[0], BUTTON[1]] - R[:2, 0] * 0.012  # along the hand's -x
+    assert from_container(ctx.cpose, ctx.model.button_offset)[:2] == pytest.approx(list(want))
+
+
 def test_a_box_the_press_moved_stops_the_run(ctx, monkeypatch, tmp_path):
     looks = [(_sighting(), 0.27, "2/2"), (_sighting(x=0.012, up=12.0), None, "2/2")]
     result, _e, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks)
     assert result.moved and dp.exit_code(result) == 1
 
 
-def test_the_reach_out_hands_over_to_the_depth_press_once_over_the_box(ctx, monkeypatch, tmp_path):
-    """After the slide in, the TF stroke is not flown: the depth press is."""
+ARRIVED = ("arrived", {"message": "ok", "progress": 1.0})
+
+
+def _depth_flow(ctx, monkeypatch, tmp_path, press, **kw):
+    """test_reach_press._flow with --depth-press: `press` stands in for
+    press_down_from_here (called with the reach's ctx). The fake chain's fk
+    stands at z 0.45 over the aimed button at 0.40."""
     from test_reach_press import _flow
 
     got = {}
 
-    def press(node, ctx_, cfg, runner, watcher, contact_tool):
+    def fake(node, ctx_, cfg, runner, watcher, contact_tool):
         got["contact"] = contact_tool
-        return dp.DepthPress(free=True, contact=True, felt=True, popped=True)
+        return press(ctx_)
 
-    monkeypatch.setattr(dp, "press_down_from_here", press)
+    monkeypatch.setattr(dp, "press_down_from_here", fake)
     real = rp.run_reach_press
 
     def with_flag(node, ctx_, cfg, runner, watcher, args, scene_fix, locator):
@@ -381,10 +401,43 @@ def test_the_reach_out_hands_over_to_the_depth_press_once_over_the_box(ctx, monk
                     scene_fix, locator)
 
     monkeypatch.setattr(rp, "run_reach_press", with_flag)
-    code, rec, _c, _h = _flow(ctx, monkeypatch, tmp_path)
+    kw.setdefault("touch", ARRIVED)  # no TF stroke flies: the 4th motion is the way up or home
+    code, rec, chain, home = _flow(ctx, monkeypatch, tmp_path, **kw)
+    return code, rec, chain, home, got
+
+
+def _popped(ctx_):
+    return dp.DepthPress(free=True, contact=True, felt=True, popped=True)
+
+
+def _lost(ctx_):
+    """Touched and pushed, then the wrist camera did not find the box again."""
+    return dp.DepthPress(free=False, contact=True, felt=True, lost=True, why="the wrist camera does not find it")
+
+
+def _measured(ctx_, z=0.30):
+    """The depth press as it leaves ctx: the box put where the fingertips met it."""
+    from rammp_box_opening.models.container import from_container
+
+    b = from_container(ctx_.cpose, ctx_.model.button_offset)
+    ctx_.cpose = rp.cpose_for_button((b[0], b[1], z), ctx_.cpose.yaw, ctx_.model.button_offset)
+    return dp.DepthPress(free=True, contact=True, felt=True, popped=True, touch_xyz=(b[0], b[1], z))
+
+
+def test_the_reach_out_hands_over_to_the_depth_press_once_over_the_box(ctx, monkeypatch, tmp_path):
+    """After the slide in, the TF stroke is not flown: the depth press is.
+    Standing within HOME_CLEAR_M of the box's padded top, the hand goes
+    straight up clear of it before home is planned — once."""
+    from rammp_box_opening.worlds import planned_top_z
+
+    code, rec, chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped)
     assert code == 0 and got["contact"] == rp.CONTACT_TOOL
-    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "home"]
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
     assert "press:down" not in rec.events
+    up = [xyz for xyz, _q in chain.lines][-1]
+    assert up[:2] == pytest.approx([0.5, -0.4]) and up[2] == pytest.approx(planned_top_z(ctx.model, ctx.cpose) + rp.HOME_CLEAR_M)
+    g = rec.legs["depth:clear"].guard
+    assert g.trip == "obstruction" and g.touch_nm == rp.DRAG_NM and g.hang is not None and rec.legs["depth:clear"].plan_free
 
 
 # ---- CENTRE on a mount that is known, in world xy ----------------------------------
@@ -467,3 +520,157 @@ def test_a_touch_far_from_where_the_mount_puts_the_fingertips_pushes_nothing(ctx
     looks = [(_sighting(lid=0.27), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
     result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.27 - (ahead_tf + 0.012))
     assert "press:push" in events and dp.exit_code(result) == 0
+
+
+def test_a_box_the_touch_put_lower_needs_no_line_up_before_home(ctx, monkeypatch, tmp_path):
+    """20:04: the touch found the lid 76 mm under TF's. With the box put
+    there, the hand at the stroke's start is clear of it and home plans."""
+    code, rec, _c, home, _g = _depth_flow(ctx, monkeypatch, tmp_path, _measured)
+    assert code == 0 and rec.events[-2:] == ["reach:slide-in", "home"]
+    from rammp_box_opening.models.container import from_container
+
+    assert from_container(home["cpose"], ctx.model.button_offset)[2] == pytest.approx(0.30)  # home planned around it
+
+
+def test_a_line_up_that_does_not_fly_falls_back_to_the_back_off_and_logs_each_refusal(ctx, monkeypatch, tmp_path):
+    import json
+
+    from test_reach_press import _Chain
+
+    real = _Chain.straight_line
+
+    def no_way_up(self, q0, xyz, quat):
+        if xyz[2] > 0.49:  # the line up (to 0.50; the look and the slide stand at ~0.47): a joint limit
+            self.lines.append((list(xyz), list(quat)))
+            return None, "joint_6 limit"
+        return real(self, q0, xyz, quat)
+
+    monkeypatch.setattr(_Chain, "straight_line", no_way_up)
+    code, rec, _c, _h, _g = _depth_flow(ctx, monkeypatch, tmp_path, _popped, home_refusals=2)
+    assert code == 1 and rec.events[-1] == "reach:back-off" and "depth:clear" not in rec.events
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    refused = [r for r in rows if r["leg"] == "home_refused"]
+    assert len(refused) == 2 and all("INVALID_START" in r["why"] for r in refused)
+
+
+def test_a_depth_press_whose_home_failed_never_exits_0(ctx, monkeypatch, tmp_path, capsys):
+    """The knob popped, but the arm did not get home: it holds over the box."""
+    monkeypatch.setattr(rp, "_go_home", lambda *a, **k: False)
+    code, _r, _c, _h, _g = _depth_flow(ctx, monkeypatch, tmp_path, _measured)
+    assert code == 1 and "did not get home" in capsys.readouterr().out
+
+
+def test_a_box_no_camera_finds_after_the_press_holds_the_arm(ctx, monkeypatch, tmp_path, capsys):
+    code, rec, _c, _h, _g = _depth_flow(ctx, monkeypatch, tmp_path, _lost, scene_after="none")
+    assert code == 1 and "home" not in rec.events and rec.events[-1] == "scene"
+    assert "neither camera" in capsys.readouterr().out
+
+
+def test_a_box_only_the_scene_camera_finds_after_the_press_goes_home_around_it(ctx, monkeypatch, tmp_path):
+    from rammp_box_opening.models.container import from_container
+
+    code, rec, _c, home, _g = _depth_flow(ctx, monkeypatch, tmp_path, _lost)
+    assert code == 1  # the knob was not judged
+    assert rec.events.count("scene") == 1 and rec.events[-1] == "home"
+    assert from_container(home["cpose"], ctx.model.button_offset) == pytest.approx([0.66, -0.57, 0.40])
+    # the scene camera saw it 50 mm away: home is planned around the box shifted by that
+    code, rec, _c, home, _g = _depth_flow(ctx, monkeypatch, tmp_path / "moved", _lost, scene_after="moved")
+    assert code == 1 and rec.events[-1] == "home"
+    assert from_container(home["cpose"], ctx.model.button_offset) == pytest.approx([0.71, -0.57, 0.40])
+
+
+def test_a_box_the_depth_press_moved_is_a_stop_before_the_arm_goes_home(ctx, monkeypatch, tmp_path, capsys):
+    def moved(ctx_):
+        return dp.DepthPress(free=True, contact=True, felt=True, popped=True, moved=True)
+
+    code, rec, _c, _h, _g = _depth_flow(ctx, monkeypatch, tmp_path, moved)
+    out = capsys.readouterr().out
+    assert code == 1 and rec.events[-1] == "home"
+    assert out.index("STOP: the press MOVED the box") < out.index("\nhome ")
+
+
+def test_the_mission_record_keeps_what_the_reach_and_the_depth_press_found(ctx, monkeypatch, tmp_path):
+    import json
+
+    from rammp_box_opening.detection_set import MissionFrames
+
+    ctx.mission_frames = MissionFrames(tmp_path / "missions", "ankou_pink.yaml", 0.2933, now=0)
+    code, _r, _c, _h, _g = _depth_flow(ctx, monkeypatch, tmp_path, _measured)
+    assert code == 0
+    ctx.mission_frames.frames.append(("scene_0", {"x": np.zeros(1)}))
+    doc = json.loads((ctx.mission_frames.close(exit_code=code) / "truth.json").read_text())
+    # the aim through TF is a fix, never trusted truth; the arm's own touch is kept beside it
+    assert doc["truth_source"] == "fix" and doc["truth_xyz"] == pytest.approx([0.66, -0.57, 0.40])
+    assert doc["stage"] == "pressed" and doc["popped"] is True and doc["touch_xyz"] == pytest.approx([0.66, -0.57, 0.30])
+    assert doc["table_z"] == pytest.approx(0.2933)
+
+
+# ---- what the depth press leaves behind ---------------------------------------
+
+def test_the_touch_puts_the_box_where_the_fingertips_met_it(ctx, monkeypatch, tmp_path):
+    """TF's lid at 0.40 (BUTTON 0.24 here); the fingertips met it 240 mm
+    down from 0.46, where the wrist camera saw the lid (so the touch passes
+    the mount check): every world after the touch holds the box there, and
+    the table is left as the scene camera measured it."""
+    from rammp_box_opening.models.container import from_container
+
+    ctx.model = ContainerModel.load(PINK)
+    ctx.cpose = rp.cpose_for_button(BUTTON, 0.3, ctx.model.button_offset)
+    ctx.worlds.table_top_z = 0.10
+    lid = 0.24 + (dp.DOWN_CONTACT_TOOL[2] - LENS[2])
+    looks = [(_sighting(lid=lid), lid, "2/2"), (_sighting(up=12.0), None, "2/2")]
+    result, _e, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.24)
+    assert result.popped and result.free
+    assert from_container(ctx.cpose, ctx.model.button_offset) == pytest.approx([BUTTON[0], BUTTON[1], 0.22])
+    assert ctx.cpose.yaw == 0.3 and result.touch_xyz == pytest.approx((BUTTON[0], BUTTON[1], 0.22))
+    assert ctx.worlds.table_top_z == 0.10
+    rise = [kw for kind, kw in ctx.worlds.pushes if kind == "full"][-1]  # the rise's world
+    assert from_container(rise["cpose"], ctx.model.button_offset)[2] == pytest.approx(0.22)
+    assert result.ref is not None  # the free-air reading the way home is guarded against
+
+
+def test_a_box_the_wrist_camera_loses_after_a_contact_holds_the_arm(ctx, monkeypatch, tmp_path):
+    looks = [(_sighting(), 0.27, "2/2"), (None, None, "the button in none")]
+    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks)
+    assert result.contact and result.felt and result.lost and not result.free
+    assert dp.exit_code(result) == 1 and events[-1] == "look:depth-after"
+
+
+def test_a_box_the_press_moved_is_moved_in_the_world_by_what_the_camera_saw(ctx, monkeypatch, tmp_path):
+    from rammp_box_opening.models.container import from_container
+
+    looks = [(_sighting(), 0.27, "2/2"), (_sighting(x=0.012, up=12.0), None, "2/2")]
+    result, _e, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, looks)
+    assert result.moved
+    R = rp._rot(arm.turns[0][1])
+    want = np.r_[BUTTON[0], BUTTON[1]] + R[:2, 0] * 0.012  # along the hand's own x
+    assert from_container(ctx.cpose, ctx.model.button_offset)[:2] == pytest.approx(list(want))
+
+
+def test_the_scene_camera_is_asked_only_when_the_wrist_lost_the_box(ctx, tmp_path):
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.models.container import ContainerPose
+
+    r = make_runner(ctx.client, tmp_path)
+    fix = SimpleNamespace(top_xyz=(0.6, -0.2, 0.4))
+    asked = []
+    loc = SimpleNamespace(locate=lambda s: asked.append(s) or SimpleNamespace(top_xyz=(0.6, -0.2, 0.4)))
+    seen = dp.DepthPress(free=True, contact=True, popped=True)
+    assert dp.after_scene_check(ctx, r, seen, fix, loc) is seen and asked == []
+    lost = dp.DepthPress(free=False, contact=True, lost=True, why="x")
+    assert dp.after_scene_check(ctx, r, lost, fix, None) is lost  # no scene camera: the arm holds
+    ctx.cpose = ContainerPose(xyz=(0.6, -0.2, 0.28), yaw=0.0)
+    out = dp.after_scene_check(ctx, r, lost, fix, loc)
+    assert out.free and not out.moved and len(asked) == 1 and ctx.cpose.xyz == (0.6, -0.2, 0.28)
+    tipped = SimpleNamespace(locate=lambda s: SimpleNamespace(top_xyz=(0.6, -0.2, 0.37)))
+    out = dp.after_scene_check(ctx, r, lost, fix, tipped)
+    assert out.free and out.moved
+
+
+def test_an_arm_that_did_not_get_home_is_never_a_success(ctx, capsys):
+    popped = dp.DepthPress(free=True, contact=True, felt=True, popped=True)
+    assert dp.finish(ctx, popped, True) == 0
+    assert dp.finish(ctx, popped, False) == 1 and "did not get home" in capsys.readouterr().out
+    held = dp.DepthPress(free=False, contact=True, why="the way up stopped")
+    assert dp.finish(ctx, held, False) == 1 and "did not get home" not in capsys.readouterr().out
