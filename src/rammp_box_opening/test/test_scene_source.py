@@ -172,3 +172,191 @@ def test_the_scene_fix_is_the_first_owl_box_whose_top_is_this_container():
     assert len(got.tried) == 1  # the table box, refused and said why
     none = scene_fix_from_boxes(boxes[:1], pts, uv, table_z, model)
     assert none.pose is None and none.tried
+
+
+def _table_low_wall_high(rng, n=3000, h=1000):
+    """A table filling the view's lower rows, a wall its upper ones."""
+    table = np.c_[rng.uniform(0.3, 0.9, n), rng.uniform(-0.4, 0.4, n), TABLE_Z + rng.normal(0, 0.003, n)]
+    wall = np.c_[1.2 + rng.normal(0, 0.003, n), rng.uniform(-0.4, 0.4, n), rng.uniform(0.0, 0.6, n)]
+    uv = np.c_[rng.uniform(0, 1000, 2 * n), np.r_[rng.uniform(0.65 * h, h, n), rng.uniform(0, 0.35 * h, n)]]
+    return np.vstack([table, wall]), uv
+
+
+def test_the_table_is_read_off_the_top_rows_of_a_camera_hung_upside_down():
+    """Flatbot's scene OAK hangs upside down: the table in front of it is in
+    the image's TOP rows, and its bottom rows are the wall behind the box."""
+    pts, uv = _table_low_wall_high(np.random.default_rng(1))
+    assert table_from_scene_points(pts, uv, image_h=1000) == pytest.approx(TABLE_Z, abs=0.004)
+    over = np.c_[uv[:, 0], 1000 - uv[:, 1]]  # the same view, the camera turned over
+    assert table_from_scene_points(pts, over, image_h=1000, upside_down=True) == pytest.approx(TABLE_Z, abs=0.004)
+    assert np.isnan(table_from_scene_points(pts, over, image_h=1000))  # the wall is not a table
+
+
+def test_which_way_up_the_scene_camera_hangs_is_read_off_its_pose():
+    from rammp_box_opening.perception.scene_source import image_upside_down
+
+    def pose(x, y, z):  # the colour optical frame's axes in the base frame
+        T = np.eye(4)
+        T[:3, 0], T[:3, 1], T[:3, 2] = x, y, z
+        return T
+
+    assert image_upside_down(pose((0, 1, 0), (0, 0, 1), (1, 0, 0))) is True  # flatbot's OAK, live TF 2026-10-22
+    assert image_upside_down(pose((0, -1, 0), (0, 0, -1), (1, 0, 0))) is False
+    assert image_upside_down(pose((0, 1, 0), (1, 0, 0), (0, 0, -1))) is None  # straight down: no up to speak of
+
+
+def test_a_robot_whose_tf_carries_the_scene_camera_is_placed_by_tf_not_the_calibration_file():
+    """Flatbot 2026-10-22: the installed camera_scene.yaml calibrates the
+    dojo bench's camera to base_link; flatbot's mount is on TF (sheppy's
+    static_tf). A fix through the wrong one would be flown to."""
+    from rammp_box_opening.perception.scene_source import SceneLocator
+
+    T_tf, T_cal = np.eye(4), np.eye(4)
+    T_tf[:3, 3], T_cal[:3, 3] = (0.2, -0.5, 0.4), (-0.07, 0.64, 0.35)
+    asked = []
+
+    class Grab:
+        link_frame = "scene_camera_color_optical_frame"
+
+        def lookup(self, parent, child):
+            asked.append((parent, child))
+            return T_tf
+
+        def link_to_color(self):
+            return np.eye(4)
+
+    loc = SceneLocator.__new__(SceneLocator)
+    loc.grab, loc.T_base_link, loc.base_frame = Grab(), None, "arm_mount"
+    assert np.allclose(loc.base_to_color(), T_tf) and asked == [("arm_mount", "scene_camera_color_optical_frame")]
+    asked.clear()
+    loc.T_base_link = T_cal  # a calibration file in force: TF is not asked
+    assert np.allclose(loc.base_to_color(), T_cal) and asked == []
+
+
+# A camera level with the lid, as flatbot's scene OAK sits: 0.2 m behind the
+# table's near edge, 0.1 m above the table, looking along +x.
+SIDE_CAM = np.array([0.2, -0.5, 0.40])
+SIDE_TABLE = 0.30
+PINK = "src/rammp_box_opening/config/containers/ankou_pink.yaml"
+
+
+def _project(pts, cam=SIDE_CAM, f=284.0, cx=320.0, cy=200.0):
+    """Pixels of base-frame points in a level camera at `cam` looking along +x."""
+    rel = pts - cam
+    return np.c_[cx + f * (-rel[:, 1]) / rel[:, 0], cy + f * (-rel[:, 2]) / rel[:, 0]]
+
+
+def _cylinder_front(centre, r, z0, z1, n, rng, cam=SIDE_CAM):
+    """The half of a standing cylinder's side the camera sees."""
+    face = np.arctan2(cam[1] - centre[1], cam[0] - centre[0])
+    a = face + rng.uniform(-1.3, 1.3, n)
+    return np.c_[centre[0] + r * np.cos(a), centre[1] + r * np.sin(a), rng.uniform(z0, z1, n)] + rng.normal(0, 0.002, (n, 3))
+
+
+def _side_scene(rng, box=(0.70, -0.55), r=0.0525, height=0.121):
+    """Table, the canister's visible side, the wall behind it, a taller thing
+    beside it and the streaks a level camera sees under the table."""
+    table = np.c_[rng.uniform(0.45, 1.2, 8000), rng.uniform(-0.95, -0.1, 8000), SIDE_TABLE + rng.normal(0, 0.003, 8000)]
+    table = table[np.hypot(table[:, 0] - box[0], table[:, 1] - box[1]) > r + 0.01]
+    canister = _cylinder_front(box, r, SIDE_TABLE, SIDE_TABLE + height, 1500, rng)
+    tall = _cylinder_front((0.70, -0.85), 0.05, SIDE_TABLE, SIDE_TABLE + 0.26, 1500, rng)
+    wall = np.c_[np.full(4000, 1.30), rng.uniform(-0.95, -0.1, 4000), rng.uniform(0.30, 0.90, 4000)]
+    under = np.c_[rng.uniform(0.45, 0.9, 4000), rng.uniform(-0.95, -0.1, 4000), rng.uniform(0.0, 0.28, 4000)]
+    pts = np.vstack([table, canister, tall, wall, under])
+    return pts, _project(pts), canister, tall
+
+
+def _pixel_box(uv_part, pad=(2, 6)):
+    """The OWL box around some points' pixels, padded the way a lid's box
+    takes in some wall above it."""
+    lo, hi = uv_part.min(axis=0), uv_part.max(axis=0)
+    return lo[0] - pad[0], lo[1] - pad[1], hi[0] + pad[0], hi[1] + pad[0]
+
+
+def test_the_table_around_a_box_is_its_commonest_height_not_what_is_under_it():
+    from rammp_box_opening.perception.scene_source import table_around
+
+    pts, _uv, _c, _t = _side_scene(np.random.default_rng(3))
+    assert table_around(pts, (0.70, -0.55), below_z=0.39) == pytest.approx(SIDE_TABLE, abs=0.004)
+    # a TF 3 deg off in pitch (the table rises away from the camera), and the
+    # table behind the box hidden by it: the visible ring is all in front, so
+    # its median sits low; the plane is read AT the box
+    tilted = pts[~((pts[:, 0] > 0.70) & (np.abs(pts[:, 2] - SIDE_TABLE) < 0.02))].copy()
+    tilted[:, 2] += 0.05 * (tilted[:, 0] - 0.70)
+    assert table_around(tilted, (0.70, -0.55), below_z=0.39) == pytest.approx(SIDE_TABLE, abs=0.004)
+
+
+def test_a_level_camera_finds_the_canister_from_its_side():
+    """Flatbot 2026-10-22: its scene OAK sits level with the lid and cannot
+    move. The pixel box takes in the wall behind the lid; the side lift
+    keeps the nearest object, finds the table around it, and puts the
+    centre half the canister's width behind the face it sees."""
+    from rammp_box_opening.perception.scene_source import box_from_side_points
+
+    model = ContainerModel.load(PINK)
+    pts, uv, canister, tall = _side_scene(np.random.default_rng(4))
+    cap = canister[:, 2] > SIDE_TABLE + model.dims[2] - 0.025
+    bbox = _pixel_box(_project(canister[cap]))
+    pose, top, n, table_z = box_from_side_points(pts, uv, bbox, None, model, SIDE_CAM)
+    assert pose is not None, top
+    assert np.hypot(pose.xyz[0] - 0.70, pose.xyz[1] + 0.55) < 0.012
+    assert table_z == pytest.approx(SIDE_TABLE, abs=0.004) and pose.xyz[2] == pytest.approx(table_z)
+    # the thing beside it is too tall to be it, whatever the OWL says
+    pose, why, _n, _tz = box_from_side_points(pts, uv, _pixel_box(_project(tall[tall[:, 2] > SIDE_TABLE + 0.23])), None, model, SIDE_CAM)
+    assert pose is None and "from lid height" in why
+    # and a canister twice as wide is another container
+    pts2, uv2, wide, _t = _side_scene(np.random.default_rng(5), r=0.11)
+    bbox = _pixel_box(_project(wide[wide[:, 2] > SIDE_TABLE + model.dims[2] - 0.025]))
+    pose, why, _n, _tz = box_from_side_points(pts2, uv2, bbox, None, model, SIDE_CAM)
+    assert pose is None and "another container" in why
+
+
+def test_flatbot_scene_frame_finds_the_pink_canister_from_the_side():
+    """The recorded flatbot frame (2026-10-22, camera level with the lid,
+    the canister in a blue holder, a black speaker beside it): the top-face
+    lift refuses the canister — the wall behind it falls in its box — and
+    the side lift finds it, refusing the speaker on height."""
+    from pathlib import Path
+
+    from rammp_box_opening.perception.scene import color_cloud
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    z = np.load(Path(__file__).parent / "data" / "scene_side_flatbot_20261022.npz")
+    T = z["T_base_color"]
+    pc, uv = color_cloud(z["depth_mm"].astype(float) / 1000.0, z["kd"], z["k"], z["dist"], z["T_color_depth"], stride=2)
+    pts = pc @ T[:3, :3].T + T[:3, 3]
+    model = ContainerModel.load(PINK)
+    boxes = [(float(b[4]), [float(v) for v in b[:4]]) for b in z["owl_boxes"]]
+    lid = boxes[0][1]
+    top_face, why, _n = box_from_scene_points(pts, uv, lid, 0.30, model)
+    assert top_face is None and "another container" in why
+    got = scene_fix_from_boxes(boxes, pts, uv, None, model, cam_xyz=T[:3, 3])
+    assert got.box == lid and not got.tried
+    # where this frame puts it under the hand-measured TF: a regression pin, not a tape truth
+    assert got.pose.xyz[0] == pytest.approx(0.675, abs=0.01) and got.pose.xyz[1] == pytest.approx(-0.578, abs=0.01)
+    assert got.table_z == pytest.approx(0.30, abs=0.01)
+    speaker = scene_fix_from_boxes(boxes[2:], pts, uv, None, model, cam_xyz=T[:3, 3])
+    assert speaker.pose is None and "from lid height" in speaker.tried[0]
+
+
+def test_the_table_is_measured_where_the_camera_saw_it():
+    from rammp_box_opening.perception.scene_source import table_extent
+
+    pts, _uv, _c, _t = _side_scene(np.random.default_rng(6))
+    ext = table_extent(pts, SIDE_TABLE, (0.70, -0.55))
+    assert ext is not None
+    x0, x1, y0, y1 = ext
+    assert 0.44 <= x0 <= 0.50 and 1.10 <= x1 <= 1.21  # the table spans x 0.45-1.2 in the scene
+    assert -0.96 <= y0 <= -0.90 and -0.20 <= y1 <= -0.10  # ... and only 0.6 m around the box is read
+    assert table_extent(pts, SIDE_TABLE + 0.2, (0.70, -0.55)) is None  # nothing at a height with no table
+
+
+def test_a_camera_that_sees_the_top_face_keeps_the_top_face_lift(model):
+    """Which view holds depends on how high the table stands against the
+    camera, so both are tried: the top-face lift first."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    pts, uv = _scene(model)
+    boxes = [(0.5, list(_bbox_around(pts, uv, (0.45, -0.12))))]
+    got = scene_fix_from_boxes(boxes, pts, uv, TABLE_Z, model, cam_xyz=np.array([0.0, 0.0, 0.6]))
+    assert got.pose is not None and got.lift == "top"

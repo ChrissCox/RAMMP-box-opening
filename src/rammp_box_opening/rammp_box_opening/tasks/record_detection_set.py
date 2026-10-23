@@ -197,7 +197,7 @@ def main():
         return truth
 
     try:
-        why = pd.readiness_refusal(client, args.execute)
+        why = pd.readiness_refusal(client, args.execute, camera_cfg_name=worlds.wrist_camera_config)
         if why:
             sys.exit("[record] not starting: %s" % why)
         live = client.joints()

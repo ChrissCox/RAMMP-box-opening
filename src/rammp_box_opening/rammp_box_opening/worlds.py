@@ -103,6 +103,7 @@ def _lid_cuboid(model, lid_at):
 
 PLACEMENT_BAND_X = (0.15, 0.75)  # where a container may sit (reach map)
 PLACEMENT_BAND_Y = (-0.50, 0.50)
+TABLE_THICKNESS_M = 0.06  # a measured table is written as a slab this thick under its top
 
 
 def _table_top_z(bench):
@@ -126,8 +127,8 @@ def bench_world(bench, unseen_model=None):
         top = _table_top_z(bench)
         if top is not None:
             h = unseen_model.dims[2] + ERR_TALL_M
-            x0, x1 = PLACEMENT_BAND_X
-            y0, y1 = PLACEMENT_BAND_Y
+            # where the table was seen, when it was measured (WorldStore)
+            x0, x1, y0, y1 = bench.get("placement_xy") or (*PLACEMENT_BAND_X, *PLACEMENT_BAND_Y)
             obstacles.append(
                 {
                     "name": "unseen_container_band",
@@ -212,6 +213,7 @@ class WorldStore:
         )
         self._dir.mkdir(parents=True, exist_ok=True)
         self._surface_z = None  # runtime-measured surface; overrides YAML when set
+        self._surface_xy = None  # (x0, x1, y0, y1): where the scene camera saw that surface
 
     @property
     def table_top_z(self):
@@ -227,6 +229,31 @@ class WorldStore:
     @table_top_z.setter
     def table_top_z(self, value):
         self._surface_z = float(value) if value is not None else None
+
+    @property
+    def table_extent(self):
+        """(x0, x1, y0, y1) where the scene camera saw the table, or None."""
+        return self._surface_xy
+
+    @table_extent.setter
+    def table_extent(self, value):
+        self._surface_xy = None if value is None else tuple(float(v) for v in value)
+
+    def _planning_bench(self):
+        """The bench YAML, plus the table the scene camera measured when the
+        YAML has none — flatbot's table changes with every place the chair
+        goes: a slab under the measured top over where it was seen, and that
+        area as the unseen container's band. Without it the planner plans as
+        if there were no table at all."""
+        if _table_top_z(self._bench) is not None or self._surface_z is None or self._surface_xy is None:
+            return self._bench
+        x0, x1, y0, y1 = self._surface_xy
+        table = {
+            "name": "table",
+            "position": [(x0 + x1) / 2, (y0 + y1) / 2, self._surface_z - TABLE_THICKNESS_M / 2],
+            "dims": [x1 - x0, y1 - y0, TABLE_THICKNESS_M],
+        }
+        return dict(self._bench, obstacles=list(self._bench["obstacles"]) + [table], placement_xy=[x0, x1, y0, y1])
 
     @property
     def base_frame(self):
@@ -274,12 +301,13 @@ class WorldStore:
         tag="",
         container_pad_xy=0.0,
     ):
+        bench = self._planning_bench()
         if kind == "bench":
-            world = bench_world(self._bench, unseen_model=model)
+            world = bench_world(bench, unseen_model=model)
             name = "bench" + (("_" + tag) if tag else "")
         elif kind == "full":
             world = full_world(
-                self._bench,
+                bench,
                 model,
                 cpose,
                 lid_at=lid_at,
@@ -288,7 +316,7 @@ class WorldStore:
             name = "full" + (("_" + tag) if tag else "")
         elif kind == "interaction":
             world = interaction_world(
-                self._bench, model, cpose, contact_z, depth_max, lid_at=lid_at
+                bench, model, cpose, contact_z, depth_max, lid_at=lid_at
             )
             name = "interaction" + (("_" + tag) if tag else "")
         else:

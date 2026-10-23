@@ -170,6 +170,10 @@ class SceneGrabber:
     def link_to_color(self):
         return self.lookup(self._link_frame, self._color_frame)
 
+    @property
+    def link_frame(self):
+        return self._link_frame
+
     def cloud_in_color_frame(self, depth=None, stride=1):
         """(points (N,3) in the colour optical frame, their colour pixels
         (N,2)) for the valid depth pixels. None until depth, intrinsics and
