@@ -64,7 +64,7 @@ class FakeClient:
     def efforts_present(self):
         return self.efforts
 
-    def settled_efforts(self, duration_s=0.3, settle_s=0.15, timeout_s=2.0):
+    def settled_efforts(self, duration_s=0.15, settle_s=0.15, timeout_s=2.0):
         return ([0.0] * 4, list(self.live)) if self.efforts else None
 
     def contact_xyz(self, timeout_s=0.25):
