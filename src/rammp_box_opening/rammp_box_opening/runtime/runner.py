@@ -12,10 +12,13 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
+import numpy as np
+
 from rammp_box_opening.geometry import ang_diff
 
 from rammp_box_opening.constants import (
     JOINT_VMAX,
+    START_GATE_RAD,
     RECOIL_ARC_RAD,
     RECOIL_SPEED,
     CONTACT_SPEED,
@@ -65,6 +68,10 @@ class LegResult:
     # can be read off the log instead of re-flown
     trip: dict = field(default=None, compare=False, repr=False)
     lookahead: object = field(default=None, compare=False, repr=False)
+    # the trajectory this execution actually sent (a merged group's one
+    # profile, a re-timed line): what `progress` is a fraction of, so the
+    # recoil reverses the path flown, in its own time base
+    flown_traj: object = field(default=None, compare=False, repr=False)
 
 
 
@@ -149,6 +156,72 @@ def _restore_execution_profile(leg):
         leg.retime(leg.traj)
 
 
+def _free_air_line(leg):
+    """A plan-free line flown on its own, slower than full speed, whose guard
+    (if any) judges an OBSTRUCTION against a free-air rest reference and is
+    armed from the first sample: nothing about it — no arming fraction, no
+    rebaseline, no contact-time expectation, no recoil — depends on the
+    trajectory's time base, so it may fly a re-timed profile instead of a
+    dilated one."""
+    g = leg.guard
+    return (
+        leg.plan_free
+        and leg.warp is None
+        and leg.guard_from is None
+        and leg.retime is None
+        and leg.contact_path_frac is None
+        and 0.0 < float(leg.speed) < 1.0
+        and (
+            g is None
+            or (
+                g.trip == "obstruction"
+                and g.reference is not None
+                and g.gravity is not None
+                and g.arm_after is None
+                and g.rebaseline_after is None
+            )
+        )
+    )
+
+
+def _path_speed_peak(traj):
+    pts = traj.points
+    best = 0.0
+    for a, b in zip(pts, pts[1:]):
+        dt = secs(b.time_from_start) - secs(a.time_from_start)
+        if dt > 0.0:
+            ds = math.sqrt(sum((x - y) ** 2 for x, y in zip(a.positions, b.positions)))
+            best = max(best, ds / dt)
+    return best
+
+
+def line_profile(leg, params, time_scale=1.0):
+    """The free-air line `leg` as a re-timed profile, or None to fly it as
+    before (dilated by its speed).
+
+    Dilating a full-speed profile by 1/speed scales its accelerations by
+    speed**2: at CONTACT_SPEED 0.15 the line eases in and out at 0.135 and
+    0.068 rad/s^2 and a 15 cm line is all ramp (4.55 s). Here the SAME
+    positions are re-timed with the accelerations scaled by speed (not
+    speed**2) and the cruise lowered until no sample's path speed exceeds
+    the dilated profile's peak: never faster than it flies today, only less
+    time spent getting up to speed and back down."""
+    from rammp_box_opening.runtime.driver import dilate
+
+    s = float(leg.speed)
+    ref = dilate(leg.traj, s * float(time_scale))
+    v_max = _path_speed_peak(ref)
+    p = replace(params, accel=params.accel * s, decel=params.decel * s, time_scale=float(time_scale))
+    cruise = s
+    for _ in range(6):
+        traj, _info = retime_group([leg.traj], [cruise], JOINT_VMAX, p)
+        peak = _path_speed_peak(traj)
+        if peak <= v_max * (1.0 + 1e-6):
+            return traj if secs(traj.points[-1].time_from_start) < secs(ref.points[-1].time_from_start) else None
+        cruise *= 0.98 * v_max / peak
+    return None
+
+
 class Runner:
     def __init__(self, client, log_dir=None, margin_rad=SANITY_MARGIN_RAD):
         self.client = client
@@ -210,8 +283,15 @@ class Runner:
                     pass
         for leg in legs:
             flies = "-"
+            line = (
+                line_profile(leg, self.retime, self.time_scale)
+                if leg.kind is Kind.MOTION and leg.traj is not None and _free_air_line(leg)
+                else None
+            )
             if id(leg) in flown:
                 flies = "%.2f" % flown[id(leg)]
+            elif line is not None:
+                flies = "%.2f" % secs(line.points[-1].time_from_start)
             elif leg.kind is Kind.MOTION and leg.traj is not None:
                 flies = "%.2f" % (
                     secs(leg.traj.points[-1].time_from_start) / (leg.speed * self.time_scale)
@@ -471,10 +551,14 @@ class Runner:
                     % (res.leg_name, res.outcome, res.detail)
                 )
                 return results
+            # the press semantics belong to the group's GUARDED member: a
+            # press merged as the tail of its approach still holds and
+            # recoils (group[0] is then the unguarded approach)
+            owner = next((g for g in group if g.guard is not None), lead)
             if (
-                lead.kind is Kind.MOTION
-                and lead.guard is not None
-                and lead.guard.trip == "press"
+                owner.kind is Kind.MOTION
+                and owner.guard is not None
+                and owner.guard.trip == "press"
                 and res.outcome in ("touch", "arrived")
             ):
                 # a good press leaves the arm on the button — whether the
@@ -482,16 +566,21 @@ class Runner:
                 # is planned: recoil along the stroke first. A FAILED leg is
                 # left holding where it struck — the operator needs to see
                 # that.
-                if lead.hold_s > 0.0:
-                    _hold(lead.hold_s)  # held on the button: the driver holds position, still pressing
+                if owner.hold_s > 0.0:
+                    _hold(owner.hold_s)  # held on the button: the driver holds position, still pressing
                 nxt = next(
                     (g for g in groups[gi + 1 :] if g[0].kind is Kind.MOTION), None
                 )
-                handled, next_chain = self._reflex_recoil(
-                    lead, res, nxt, next_chain, results
+                handled, moved, next_chain = self._reflex_recoil(
+                    owner, res, nxt, next_chain, results
                 )
-                if handled:
-                    after_touch = False  # nxt was planned from the recoil's end
+                if moved:
+                    # the recoil moved the arm: a next group its own hook did
+                    # not plan from the recoil's end was planned from where
+                    # the press stopped — sent as-is, the driver's first
+                    # waypoint would put the arm back down on the button,
+                    # unguarded. Replan it from live.
+                    after_touch = not handled
         # a pending gripper command deliberately OUTLIVES the run: the next
         # phase's planning is what it overlaps with (finish() collects it)
         return results
@@ -566,17 +655,25 @@ class Runner:
         flies, from the recoil's own end, so the arm is off the button
         before the planner is even asked.
 
-        Returns (next_group was planned from the recoil's end, next_chain).
+        A push is short (button_travel_m) and starts where the touch
+        stopped: reversing it alone ends on the touch's contact pose. The
+        leg's `recoil_via` (the touch's trajectory) carries the recoil on
+        back up the touch stroke until RECOIL_ARC_RAD is covered.
+
+        Returns (next_group was planned from the recoil's end, the arm
+        moved, next_chain).
         """
-        if leg.traj is None or res.progress is None:
-            return False, next_chain
+        flown = res.flown_traj if res.flown_traj is not None else leg.traj
+        if flown is None or res.progress is None:
+            return False, False, next_chain
         path = reverse_tail(
-            leg.traj, res.progress, self.client.joints(), RECOIL_ARC_RAD
+            flown, res.progress, self.client.joints(), RECOIL_ARC_RAD
         )
         if path is None:
-            return False, next_chain
+            return False, False, next_chain
+        path = self._recoil_on_up_the_touch(leg, path)
         traj, _info = retime_group(
-            [positions_to_traj(leg.traj.joint_names, path)],
+            [positions_to_traj(flown.joint_names, path)],
             [RECOIL_SPEED],
             JOINT_VMAX,
             replace(self.retime, time_scale=self.time_scale),
@@ -596,7 +693,7 @@ class Runner:
         why = self._refusal(reflex)
         if why:
             print("REFUSED recoil — %s" % why)
-            return False, next_chain
+            return False, False, next_chain
         hook = None
         if next_group is not None:
             def hook(_end=list(reflex.goal_joints)):
@@ -628,13 +725,49 @@ class Runner:
                 )
             )
         else:
-            # not fatal: the arm is somewhere along a path it just flew and
-            # the next leg replans from live, exactly as without a recoil
+            # not fatal: the arm is somewhere along a path it just flew; the
+            # next leg replans from live (run() forces it: the arm moved)
             print(
                 "  recoil did not complete (%s) — the next leg replans from live"
                 % (rres.detail or outcome)
             )
-        return (ok and planned), (next_chain + 2 if planned else next_chain + 1)
+        return (ok and planned), True, (next_chain + 2 if planned else next_chain + 1)
+
+    @staticmethod
+    def _recoil_on_up_the_touch(leg, path):
+        """`path` (the press's reversed tail) carried on back along the
+        touch stroke it continued (leg.recoil_via) until RECOIL_ARC_RAD of
+        joint arc is covered. Only when the touch's path passes within
+        START_GATE_RAD of where the reversed press ends, on the same
+        branch: anything else is not the stroke this press continued."""
+        via = leg.recoil_via
+        if via is None:
+            return path
+        path = np.asarray(path, float)
+        arc = float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum())
+        if arc >= RECOIL_ARC_RAD - 1e-3:
+            return path
+        ext = reverse_tail(via, 1.0, path[-1], RECOIL_ARC_RAD - arc)
+        if ext is None or len(ext) < 2 or float(np.linalg.norm(ext[0] - path[-1])) > 1e-6:
+            return path
+        if float(np.linalg.norm(ext[1] - ext[0])) > START_GATE_RAD:
+            return path
+        if len(ext) > 2 and np.linalg.norm(ext[2] - ext[0]) < np.linalg.norm(ext[2] - ext[1]):
+            # the touch's sample nearest the press's start lies just PAST it
+            # (further down the stroke): skip it, never a step back down
+            ext = np.vstack([ext[:1], ext[2:]])
+        # reverse_tail stops at the first SAMPLE past its arc: end exactly
+        # on the budget, however far apart the touch's samples are
+        left, out = RECOIL_ARC_RAD - arc, [ext[0]]
+        for a, b in zip(ext, ext[1:]):
+            d = float(np.linalg.norm(b - a))
+            if d >= left:
+                if left > 1e-9:
+                    out.append(a + (b - a) * (left / d))
+                break
+            out.append(b)
+            left -= d
+        return np.vstack([path, np.asarray(out)[1:]]) if len(out) > 1 else path
 
     def _replan_group(self, group, next_chain, start=None):
         """Re-plan each leg of the group from live state (or from `start`:
@@ -759,7 +892,10 @@ class Runner:
         else:
             traj = group[0].traj
             exec_speed = lead.speed * self.time_scale
-            if guard_spec is not None and lead.warp is None and lead.guard_from is not None:
+            flown = line_profile(lead, self.retime, self.time_scale) if _free_air_line(lead) else None
+            if flown is not None:
+                traj, exec_speed = flown, 1.0
+            elif guard_spec is not None and lead.warp is None and lead.guard_from is not None:
                 # A descent flown on its own gets the SAME rule as a merged
                 # tail above: baseline and arming where its straight line
                 # begins, plus a settle. Its guard used to arm at a fixed
@@ -840,6 +976,7 @@ class Runner:
             contact_xyz=contact,
             trip=guard.trip_report() if guard is not None else None,
             lookahead=info.get("while_running"),
+            flown_traj=traj,
         )
 
     @staticmethod
@@ -899,8 +1036,10 @@ class Runner:
             "kind": leg.kind.value,
             "world": leg.world,
             "speed": leg.speed,
-            **asdict(res),
+            # the trajectories are not log material (and asdict deep-copies them)
+            **asdict(replace(res, lookahead=None, flown_traj=None)),
         }
         row.pop("leg_name", None)
         row.pop("lookahead", None)
+        row.pop("flown_traj", None)
         self._append(row)

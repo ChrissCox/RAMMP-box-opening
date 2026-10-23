@@ -346,7 +346,12 @@ def test_the_reach_out_press_flies_in_presses_unloads_judges_and_only_then_goes_
         assert g.gravity is not None and g.hang == (_Gravity.K, reach_press.HANG_N), name
     assert L["reach:unload"].guard.touch_nm == ctx.model.touch_nm  # starts on the button: the backstop only
     assert L["reach:slide-out"].guard.touch_nm == reach_press.DRAG_NM
-    assert L["press:push"].guard.gravity is None  # the push's backstop, as straight down
+    # the push's backstop bounds the TOTAL off the free-air reading at the
+    # stroke's start, not what it adds to the touch's loaded first sample
+    gp = L["press:push"].guard
+    assert gp.trip == "press" and gp.touch_nm == ctx.model.touch_nm
+    assert gp.gravity is not None and gp.reference == AT_START
+    assert L["press:push"].recoil_via is L["press:down"].traj  # the recoil carries on up the touch
     # the push flown is the lid-clear depth, not button_travel_m (the fake fk stands at z 0.45)
     cfg = load_press_demo(PINK)
     depth = reach_press.reach_push_m(cfg, reach_press.REACH_TILTS_DEG[0])

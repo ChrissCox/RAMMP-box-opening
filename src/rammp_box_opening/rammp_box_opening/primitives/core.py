@@ -14,7 +14,6 @@ import time
 from dataclasses import dataclass
 
 from rammp_box_opening.constants import (
-    JOINT_ARC_PER_M,
     JOINT_VMAX,
     TCP_OFFSET_M,
     TIP_TO_TOOL_M,
@@ -616,37 +615,59 @@ def _push_guard_and_verify(m, cfg, depth_m=None):
     return guard, verify
 
 
+# The FK push is flown only when the arm's own kinematics put the live tool
+# within this much of where the fingertip TF says the contact was, plus the
+# push: farther means the chain and TF disagree (wrong root, wrong URDF) and
+# a line "button_travel_m below the contact" is not that — the planner, in
+# its own model, plans the push instead (press_push)
+PUSH_FK_SLACK_M = 0.005
+PUSH_MIN_M = 0.001  # a push shorter than this is not flown: the arm is already at its bound
+
+
 def press_push_from_touch(ctx, state, cfg, touch_leg, live, contact_xyz, world):
-    """The PUSH cut from the touch's own trajectory: its unexecuted
-    continuation past the stop is a validated path straight on through
-    the contact, so the push needs no planner call while the fingers sit
-    on the button (the planner round trip was ~0.5 s of pressing at
-    contact_nm, 2026-09-04). Re-timed like any motion at press_speed.
-    Returns (leg, state) or None when too little of the stroke remains —
-    the caller then plans it (press_push)."""
-    from rammp_box_opening.runtime.retime import (
-        RetimeParams,
-        forward_tail,
-        positions_to_traj,
-        retime_group,
-    )
+    """The PUSH as the arm's own straight line straight down from the live
+    stop to exactly button_travel_m below the MEASURED contact (fingertip
+    TF, via TIP_TO_TOOL_M), holding the live attitude: no planner call
+    while the fingers sit on the button (the planner round trip was ~0.5 s
+    of pressing at contact_nm, 2026-09-04). Re-timed at press_speed.
+
+    It used to be cut from what was left of the touch's own trajectory by a
+    bench joint-arc constant: that stopped wherever the touch stroke ended
+    (travel_m below the PREDICTED button, 3 mm past the push on the pink
+    canister) and the constant was 7-24 % short on flatbot, so a contact a
+    few mm low flew 7.5-11 mm and was still reported a full 12 mm push.
+
+    Returns (leg, state) or None — at or past its bound already, a line the
+    arm cannot fly, or a chain that disagrees with TF — and the caller then
+    plans it (press_push)."""
+    import numpy as np
+
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
+    from rammp_box_opening.runtime.retime import RetimeParams, positions_to_traj, retime_group
 
     m = ctx.model
-    if touch_leg.traj is None:
+    tool_at_contact = float(contact_xyz[2]) - TIP_TO_TOOL_M
+    bottom = tool_at_contact - cfg.button_travel_m
+    chain = approach._chain()
+    R, t = chain.fk(live)
+    left = float(t[2]) - bottom
+    if left < PUSH_MIN_M or left > cfg.button_travel_m + PUSH_FK_SLACK_M:
         return None
-    path = forward_tail(touch_leg.traj, live, cfg.button_travel_m * JOINT_ARC_PER_M)
-    if path is None:
+    quat = mat_to_quat_xyzw(np.asarray(R, float))
+    pts, _why = chain.straight_line(live, [float(t[0]), float(t[1]), bottom], quat)
+    if pts is None:
         return None
+    names = touch_leg.traj.joint_names if touch_leg is not None and touch_leg.traj is not None else ctx.client.joint_names
     traj, _ = retime_group(
-        [positions_to_traj(touch_leg.traj.joint_names, path)],
+        [positions_to_traj(names, pts)],
         [cfg.press_speed],
         JOINT_VMAX,
         RetimeParams(),
     )
-    tool_at_contact = float(contact_xyz[2]) - TIP_TO_TOOL_M
     guard, verify = _push_guard_and_verify(m, cfg)
     button = from_container(ctx.cpose, m.button_offset)
-    quat = m.press_quat(button)
+    press_quat = m.press_quat(button)
     xy = ctx.last_pose[0][:2] if ctx.last_pose else [button[0], button[1]]
     world_name, world_path = world
     leg = Leg(
@@ -658,13 +679,15 @@ def press_push_from_touch(ctx, state, cfg, touch_leg, live, contact_xyz, world):
         world=world_name,
         world_path=str(world_path),
         chain=state.chain,
-        # a replan (drift at execution) falls back to the planned push
-        target=("pose", [float(xy[0]), float(xy[1]), tool_at_contact - cfg.button_travel_m], quat, 0.0),
-        goal_joints=[float(v) for v in path[-1]],
+        target=("pose", [float(t[0]), float(t[1]), bottom], list(quat), 0.0),
+        goal_joints=[float(v) for v in pts[-1]],
         verify=verify,
+        plan_s=0.0,
+        # the arm's own line: a planner path is not it (runner never re-plans it)
+        plan_free=True,
     )
-    ctx.last_pose = ([float(xy[0]), float(xy[1]), tool_at_contact - cfg.button_travel_m], list(quat))
-    return leg, PlanState(joints=list(path[-1]), chain=state.chain + 1)
+    ctx.last_pose = ([float(xy[0]), float(xy[1]), bottom], list(press_quat))
+    return leg, PlanState(joints=[float(v) for v in pts[-1]], chain=state.chain + 1)
 
 
 class Home:
