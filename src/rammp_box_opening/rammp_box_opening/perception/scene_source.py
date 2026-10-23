@@ -62,16 +62,16 @@ def robust_yaw(xy):
     between 10 % and 90 %, so a 10-90 box hardly knows the angle at all."""
     xy = np.asarray(xy, float)
 
-    def area(theta):
-        c, s = np.cos(-theta), np.sin(-theta)
-        r = xy @ np.array([[c, -s], [s, c]]).T
-        lo, hi = np.percentile(r, [3, 97], axis=0)
-        return float(np.prod(hi - lo))
+    def best_of(th):
+        # every angle's rotation in one stacked matmul and its trimmed box
+        # in one percentile call (a Python loop of these was 16 ms)
+        c, s = np.cos(-th), np.sin(-th)
+        rot = np.stack([np.stack([c, -s], -1), np.stack([s, c], -1)], -2)
+        lo, hi = np.percentile(xy @ rot.transpose(0, 2, 1), [3, 97], axis=1)
+        return th[int(np.argmin(np.prod(hi - lo, axis=-1)))]
 
-    coarse = np.radians(np.arange(0.0, 90.0, 1.0))
-    best = coarse[int(np.argmin([area(t) for t in coarse]))]
-    fine = best + np.radians(np.arange(-1.0, 1.0, 0.1))
-    best = fine[int(np.argmin([area(t) for t in fine]))]
+    best = best_of(np.radians(np.arange(0.0, 90.0, 1.0)))
+    best = best_of(best + np.radians(np.arange(-1.0, 1.0, 0.1)))
     return float(best % (np.pi / 2))
 
 
