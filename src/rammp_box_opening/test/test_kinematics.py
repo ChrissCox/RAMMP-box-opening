@@ -314,3 +314,44 @@ def test_one_fold_solve_gives_the_four_solves_candidates(chain):
             assert np.allclose(pick_new, pick_old, atol=1e-6)
             checked += 1
     assert checked >= 10
+
+
+
+
+def test_the_same_reach_question_twice_is_walked_once(monkeypatch):
+    """The staging's reach proof and the planner client ask nearest_solution
+    the same thing back to back (2026-10-22): the second is answered from
+    the first — and only for the exact same inputs."""
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
+
+    arm = ArmChain()
+    q_goal = list(HOME)
+    q_goal[1] += 0.3
+    R, t = arm.fk(q_goal)
+    xyz, quat = [float(v) for v in t], [float(v) for v in mat_to_quat_xyzw(R)]
+    walks = []
+    real = arm.reach
+
+    def counted(*a, **k):
+        walks.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(arm, "reach", counted)
+    first = arm.nearest_solution(HOME, xyz, quat)
+    assert first is not None and len(walks) == 1
+    kept = float(first[0])
+    first[0] += 1.0  # the caller's copy: the memo keeps its own
+    again = arm.nearest_solution(tuple(HOME), np.array(xyz), quat)  # the same numbers, other types
+    assert len(walks) == 1 and again[0] == pytest.approx(kept)
+    nudged = list(HOME)
+    nudged[2] += 1e-6
+    assert arm.nearest_solution(nudged, xyz, quat) is not None  # another start: walked again
+    assert len(walks) == 2
+    # a new root (set_chain_root) is a new chain, with nothing remembered
+    for name in ("_ROOT", "_URDF_PATH", "_CHAIN", "_GRAVITY"):
+        monkeypatch.setattr(approach, name, getattr(approach, name))
+    monkeypatch.setattr(approach, "_CHAIN", arm)
+    approach.set_chain_root("base_link")
+    fresh = approach._chain()
+    assert fresh is not arm and fresh._nearest_memo is None
