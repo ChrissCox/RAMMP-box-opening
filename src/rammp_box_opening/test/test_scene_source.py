@@ -351,6 +351,22 @@ def test_the_table_is_measured_where_the_camera_saw_it():
     assert table_extent(pts, SIDE_TABLE + 0.2, (0.70, -0.55)) is None  # nothing at a height with no table
 
 
+def test_a_measured_table_height_always_comes_with_somewhere_to_plan_it():
+    """Review 2026-10-22: a height with too few points to measure its
+    extent reached the planner as no table at all. It falls back to the
+    ring square the height was read from, and says it assumed it."""
+    from rammp_box_opening.perception.scene_source import MIN_TABLE_POINTS, TABLE_RING_M, seen_table_extent, table_extent
+
+    pts, _uv, _c, _t = _side_scene(np.random.default_rng(6))
+    assert seen_table_extent(pts, SIDE_TABLE, (0.70, -0.55)) == (table_extent(pts, SIDE_TABLE, (0.70, -0.55)), False)
+    rng = np.random.default_rng(7)
+    a, d = rng.uniform(0, 2 * np.pi, MIN_TABLE_POINTS - 1), rng.uniform(*TABLE_RING_M, MIN_TABLE_POINTS - 1)
+    sparse = np.c_[0.70 + d * np.cos(a), -0.55 + d * np.sin(a), np.full(len(a), SIDE_TABLE)]
+    assert table_extent(sparse, SIDE_TABLE, (0.70, -0.55)) is None
+    ext, assumed = seen_table_extent(sparse, SIDE_TABLE, (0.70, -0.55))
+    assert assumed and ext == pytest.approx((0.40, 1.00, -0.85, -0.25))
+
+
 def test_a_camera_that_sees_the_top_face_keeps_the_top_face_lift(model):
     """Which view holds depends on how high the table stands against the
     camera, so both are tried: the top-face lift first."""
