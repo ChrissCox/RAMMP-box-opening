@@ -414,9 +414,17 @@ class LiftFree:
         self.touch_nm = float(touch_nm)
 
     def plan(self, ctx, state):
+        from rammp_box_opening.runtime import approach
         from rammp_box_opening.runtime.approach import _chain, line_trajectory
         from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
 
+        # "vertical" is the chain root's z: on flatbot base_link leans 30 deg
+        # from the gravity-aligned arm_mount the planner works in, and a lift
+        # solved there moved the fingers 40 mm sideways for 69 mm up
+        if approach._ROOT != ctx.worlds.base_frame:
+            raise RuntimeError(
+                "plan-free lift refused: chain root %s != planning frame %s" % (approach._ROOT, ctx.worlds.base_frame)
+            )
         chain = _chain()
         q0 = list(state.joints if state.joints is not None else ctx.client.joints())
         R, t = chain.fk(q0)
