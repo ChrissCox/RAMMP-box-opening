@@ -2448,7 +2448,10 @@ def main():
             detect_s=round(time.monotonic() - t_detect, 2),
         )
 
-        if not args.press_only:
+        # the depth press (tasks/depth_press) ends the run at the press and
+        # never handles the lid; a run that skips it still grips and places
+        depth_here = args.depth_press and at_staging and reach.pressed is None
+        if not args.press_only and not depth_here:
             # the box lands wherever it lands: resolve the drop spot NOW,
             # before any container-directed motion — configured lid_place
             # when clear, slid away from the box when crowded, refusal
@@ -2495,7 +2498,7 @@ def main():
             "[press_demo] PRESS target origin [%.3f, %.3f, %.3f] yaw %.1f deg"
             % (ctx.cpose.xyz[0], ctx.cpose.xyz[1], ctx.cpose.xyz[2], math.degrees(ctx.cpose.yaw))
         )
-        if args.depth_press and at_staging and reach.pressed is None:
+        if depth_here:
             # over the button at staging, the hand already straight down: how
             # far down from the wrist camera's depth, the press by the
             # torques (tasks/depth_press)
