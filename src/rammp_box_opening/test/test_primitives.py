@@ -1,3 +1,5 @@
+import pytest
+
 from rammp_box_opening.models.container import from_container
 from rammp_box_opening.primitives.core import Home, Lift, Place, PlanState, tcp_z
 from rammp_box_opening.runtime.legs import Kind, VerifyCtx
@@ -173,48 +175,98 @@ def test_press_push_is_bounded_from_the_measured_contact(ctx):
     assert not ok
 
 
-def test_press_push_is_cut_from_the_touch_stroke_when_enough_remains(ctx):
-    """No planner call while the fingers press: the push continues the
-    touch's own trajectory from the live stop, re-timed at press_speed,
-    with the same guard and verify as the planned push."""
-    import numpy as np
-    import pytest
-    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+PINK = "src/rammp_box_opening/config/containers/ankou_pink.yaml"
+FLATBOT_URDF = "src/rammp_box_opening/test/data/arm_flatbot_20261021.urdf"
+# where the pink canister's button stood under the press: flatbot (arm_mount,
+# run 2026-10-22 20:04's contact) and the bench (base_link)
+ARMS = {"flatbot": (FLATBOT_URDF, "arm_mount", [0.4824, -0.1572, 0.3313]),
+        "bench": (None, "base_link", [0.45, 0.0, 0.20])}
 
-    from rammp_box_opening.constants import JOINT_ARC_PER_M, TIP_TO_TOOL_M
-    from rammp_box_opening.models.container import load_press_demo
-    from rammp_box_opening.primitives.core import press_push_from_touch
+
+def _press_at(ctx, monkeypatch, arm, tool_contact_off_m, braked_m):
+    """The arm (a real URDF) stopped straight down over the button with the
+    tool `braked_m` below where the fingertip TF read the contact, which was
+    `tool_contact_off_m` from the arm's nominal contact height."""
+    from rammp_box_opening.constants import HOME, TIP_TO_TOOL_M
+    from rammp_box_opening.models.container import ContainerModel, attitude_quat
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.kinematics import ArmChain
     from rammp_box_opening.runtime.legs import Leg
 
-    c = ctx
-    cfg = load_press_demo(CFG)
-    # a touch stroke: joint_7 descends 0.5 rad over 60 samples
-    msg = JointTrajectory()
-    msg.joint_names = ["joint_%d" % i for i in range(1, 8)]
-    for k in range(60):
-        pt = JointTrajectoryPoint()
-        pt.positions = [0.0] * 6 + [0.5 * k / 59]
-        pt.velocities = [0.0] * 7
-        pt.accelerations = [0.0] * 7
-        pt.time_from_start.sec = 0
-        pt.time_from_start.nanosec = int((k + 1) * 0.02 * 1e9)
-        msg.points.append(pt)
-    touch = Leg(name="press:down", kind=Kind.MOTION, traj=msg, speed=1.0, guard=None,
-                world="interaction_button", chain=0, target=None, goal_joints=list(msg.points[-1].positions))
-    live = [0.0] * 6 + [0.5 * 30 / 59]  # the guard stopped at sample 30
-    tip = [0.45, -0.15, 0.1024]
-    c.last_pose = ([0.451, -0.151, 0.09], [0.0, 1.0, 0.0, 0.0])
-    out = press_push_from_touch(c, state(), cfg, touch, live, tip, ("interaction_button", "/tmp/w.yaml"))
+    path, root, (x, y, z) = ARMS[arm]
+    chain = ArmChain(path=path, root=root)
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    ctx.model = ContainerModel.load(PINK)
+    quat = attitude_quat([180.0, 0.0, 90.0], 0.0)
+    tool_at_contact = z + tool_contact_off_m
+    live = chain.nearest_solution(HOME, [x, y, tool_at_contact - braked_m], quat)
+    assert live is not None
+    ctx.client.live = [float(v) for v in live]
+    ctx.last_pose = ([x, y, tool_at_contact - 0.015], list(quat))
+    touch = Leg(name="press:down", kind=Kind.MOTION, traj=approach.line_trajectory(ctx.client.joint_names, [live, live]),
+                speed=0.35, guard=None, world="interaction_button", chain=0, target=None, goal_joints=list(live))
+    tip = [x, y, tool_at_contact + TIP_TO_TOOL_M]
+    return chain, touch, ctx.client.joints(), tip
+
+
+@pytest.mark.parametrize("arm", ["flatbot", "bench"])
+@pytest.mark.parametrize("contact_mm", [-3.7, 0.0, 6.2])  # the bench's logged contact spread
+@pytest.mark.parametrize("braked_mm", [0.0, 1.5])
+def test_the_push_is_button_travel_m_straight_down_from_the_measured_contact(ctx, monkeypatch, arm, contact_mm, braked_mm):
+    """The push is the arm's own straight line to exactly button_travel_m
+    below the MEASURED contact: wherever the contact came in the touch
+    stroke and however far the arm braked past it. Cut from the touch's own
+    continuation by a bench joint-arc constant it flew 7.5-11 mm on flatbot
+    and still reported a full 12 mm push."""
+    import numpy as np
+
+    from rammp_box_opening.constants import TIP_TO_TOOL_M
+    from rammp_box_opening.models.container import load_press_demo
+    from rammp_box_opening.primitives.core import press_push_from_touch
+
+    cfg = load_press_demo(PINK)
+    chain, touch, live, tip = _press_at(ctx, monkeypatch, arm, contact_mm / 1000.0, braked_mm / 1000.0)
+    out = press_push_from_touch(ctx, state(), cfg, touch, live, tip, ("interaction_button", "/tmp/w.yaml"))
     assert out is not None
     push, st = out
     q = np.asarray([p.positions for p in push.traj.points])
     assert np.allclose(q[0], live)  # starts at the live stop
-    arc = float(np.abs(np.diff(q[:, 6])).sum())
-    assert arc == pytest.approx(cfg.button_travel_m * JOINT_ARC_PER_M, rel=0.35)
-    assert push.name == "press:push" and push.guard.trip == "press" and push.speed == 1.0
-    assert push.target[1][2] == pytest.approx(tip[2] - TIP_TO_TOOL_M - cfg.button_travel_m)
+    bound = tip[2] - TIP_TO_TOOL_M - cfg.button_travel_m
+    xyz = np.asarray([chain.fk(v)[1] for v in q])
+    assert xyz[-1][2] == pytest.approx(bound, abs=5e-4)  # exactly the bound, from the contact
+    assert np.abs(xyz[:, :2] - xyz[0][:2]).max() < 5e-4  # straight down: the press does not slide
+    assert (np.diff(xyz[:, 2]) <= 1e-6).all()
+    assert push.name == "press:push" and push.guard.trip == "press" and push.speed == 1.0 and push.plan_free
+    assert push.guard.touch_nm == pytest.approx(ctx.model.touch_nm - cfg.contact_nm)
+    assert push.target[1][2] == pytest.approx(bound) and st.joints == pytest.approx(list(q[-1]))
     ok, d = push.verify(VerifyCtx(outcome="arrived"))
     assert ok and "full" in d
-    # stopped at the very end of the stroke: nothing to cut -> the caller plans
-    assert press_push_from_touch(c, state(), cfg, touch, list(msg.points[-1].positions), tip,
-                                 ("interaction_button", "/tmp/w.yaml")) is None
+
+
+def test_no_fk_push_when_the_arm_is_at_its_bound_or_far_from_the_contact(ctx, monkeypatch):
+    """At or past the bound there is nothing to fly; a live tool far above
+    the contact TF reads means the chain and TF disagree, and a line from it
+    would not be button_travel_m: the caller plans the push instead."""
+    from rammp_box_opening.models.container import load_press_demo
+    from rammp_box_opening.primitives.core import PUSH_FK_SLACK_M, press_push_from_touch
+
+    cfg = load_press_demo(PINK)
+    w = ("interaction_button", "/tmp/w.yaml")
+    _c, touch, live, tip = _press_at(ctx, monkeypatch, "flatbot", 0.0, cfg.button_travel_m + 0.0005)
+    assert press_push_from_touch(ctx, state(), cfg, touch, live, tip, w) is None
+    _c, touch, live, tip = _press_at(ctx, monkeypatch, "flatbot", 0.0, -(PUSH_FK_SLACK_M + 0.002))
+    assert press_push_from_touch(ctx, state(), cfg, touch, live, tip, w) is None
+
+
+def test_a_refused_push_line_falls_back_to_the_planned_push(ctx, monkeypatch):
+    from rammp_box_opening.constants import TIP_TO_TOOL_M
+    from rammp_box_opening.models.container import load_press_demo
+    from rammp_box_opening.tasks import press_demo
+
+    cfg = load_press_demo(PINK)
+    chain, touch, _live, tip = _press_at(ctx, monkeypatch, "flatbot", 0.0, 0.0)
+    monkeypatch.setattr(chain, "straight_line", lambda *a, **k: (None, "near a singularity"))
+    push = press_demo.build_push_legs(ctx, cfg, tip, touch_leg=touch)[0]
+    assert push.name == "press:push" and not push.plan_free  # planned (press_push)
+    assert push.target[1][2] == pytest.approx(tip[2] - TIP_TO_TOOL_M - cfg.button_travel_m)
+    assert push.recoil_via is touch.traj  # the recoil still carries on up the touch

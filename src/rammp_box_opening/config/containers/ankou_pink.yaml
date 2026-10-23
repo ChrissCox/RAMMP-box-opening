@@ -83,6 +83,9 @@ press:
                                   # in-contact baseline, i.e. the same ~7 Nm
                                   # total as before, but reaching it is the
                                   # exception, not how the press ends.
+                                  # The reach-out and depth presses bound
+                                  # the TOTAL instead: touch_nm off the
+                                  # free-air reading taken before the touch.
                                   # 7.0 -> 7.5 (2026-09-16): a press 6 mm off
                                   # centre met the 7.0 backstop at 5.6 Nm over
                                   # its baseline without popping the button;
@@ -225,11 +228,11 @@ press_demo:
                                   # touch stage may search before reporting
                                   # "no surface" — it must cover the camera's
                                   # run-to-run lid-height spread (+/-6 mm)
-                                  # AND leave the push's 4 mm of validated
-                                  # path below the real top: the push is cut
-                                  # from this stroke's own continuation, so
-                                  # no planner runs while the fingers press
-                                  # (2026-09-04). The touch stops at contact;
+                                  # — nothing more: the push is not cut from
+                                  # this stroke but flown as the arm's own
+                                  # straight line, button_travel_m below the
+                                  # MEASURED contact, so no planner runs while
+                                  # the fingers press. The touch stops at contact;
                                   # a deeper plan costs nothing.
                                   # Old note: press depth below the lid plane. This is
                                   # the HARD bound on how deep the stroke can

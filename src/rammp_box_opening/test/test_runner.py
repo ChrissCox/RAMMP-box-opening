@@ -816,7 +816,7 @@ def test_an_approach_and_its_guarded_descent_fly_as_one_goal(tmp_path):
     dynamics swing the wrist."""
     c = FakeClient()
     c.exec_script = [("touch", {"message": "torque guard trip", "progress": 0.8})]
-    g = GuardSpec(touch_nm=3.0, trip="press")
+    g = GuardSpec(touch_nm=3.0, trip="touch")  # a merged PRESS tail also recoils: a second goal
     legs = [
         leg("approach", Q0, Q1, chain=0, speed=0.75),
         leg("press:down", Q1, Q2, chain=0, speed=0.15, guard=g),
@@ -1041,3 +1041,137 @@ def test_a_replan_refreshes_where_the_descent_begins(tmp_path):
     c.exec_script = [("touch", {"message": "contact", "progress": 0.9})]
     runner(c, tmp_path).run([press], execute=True)
     assert press.guard_from is None and press.waypoint is None  # the fake plan carries no waypoint
+
+
+class _NoPlan:
+    success = False
+    message = "no plan"
+    trajectory = None
+
+
+def test_press_push_ran_its_bound_then_recoil_but_lookahead_failed_must_replan(tmp_path):
+    """The push arrives at its bound, the recoil flies back along it and the
+    retreat's re-plan hosted under the recoil FAILS. The retreat was
+    planned from the PUSH END; the arm stands at the recoil's end, under
+    DRIFT_REPLAN_RAD and the driver's start gate from it — sent as-is, the
+    driver's first waypoint puts the arm back down on the button, unguarded.
+    Any recoil that moved the arm replans what its hook did not."""
+    c = FakeClient()
+    push_end = [0.0, 0.03, 0.0, 0.03, 0.0, 0.0, 0.0]  # ~0.042 rad: a 10 mm push
+    hop = [0.0, -0.1, 0.0, -0.1, 0.0, 0.0, 0.0]
+    g = GuardSpec(touch_nm=4.0, trip="press")
+    push = leg("press:push", Q0, push_end, guard=g, world="interaction_button", chain=0)
+    push.verify = lambda v: (v.outcome in ("touch", "arrived"), "pressed")
+    retreat = leg("retreat", push_end, hop, chain=1, world="interaction_button")
+    c.exec_script = [("arrived", {"message": "ok", "progress": 1.0, "torque_peak": 1.2})]
+    c.plans = [_NoPlan()]  # the replan hosted under the recoil fails
+    res = runner(c, tmp_path).run([push, retreat], execute=True)
+    assert [x.leg_name for x in res] == ["press:push", "recoil", "retreat"]
+    # the recoil walked the push back to its start: the retreat flies from there
+    assert c.exec_starts[2] == pytest.approx(Q0, abs=1e-6)
+
+
+def test_a_press_trip_merged_as_a_groups_tail_still_holds_and_recoils(tmp_path, monkeypatch):
+    """can_merge lets a guarded leg END a group and _run_motion flies it with
+    the guarded member's guard — the hold and the recoil must follow that
+    same owner, not group[0] (the unguarded approach), and reverse the path
+    actually flown (the merged profile progress counts in)."""
+    from rammp_box_opening.runtime import runner as runner_mod
+    from rammp_box_opening.runtime.legs import merge_groups
+
+    held = []
+    monkeypatch.setattr(runner_mod, "_hold", lambda s: held.append(s))
+    c = FakeClient()
+    c.exec_script = [("touch", {"message": "torque guard trip", "progress": 0.8})]
+    g = GuardSpec(touch_nm=3.0, trip="press")
+    approach = leg("approach", Q0, Q1, chain=0, speed=0.75)
+    press = leg("press:push", Q1, Q2, chain=0, speed=0.15, guard=g)
+    press.hold_s = 0.3
+    assert len(merge_groups([approach, press])) == 1
+    res = runner(c, tmp_path).run([approach, press], execute=True)
+    assert held == [0.3]
+    assert [r.leg_name for r in res] == ["press:push", "recoil"]
+    assert res[0].flown_traj is not None and len(res[0].flown_traj.points) > 2  # the merged profile, not press.traj
+
+
+class _StopsWhereItTripped(FakeClient):
+    """Executions keep their trajectories; a 'touch' leaves the arm at the
+    scripted progress (in time) instead of at the goal."""
+
+    def __init__(self):
+        super().__init__()
+        self.trajs = []
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None):
+        from rammp_box_opening.runtime.stamps import secs
+
+        self.trajs.append(traj_)
+        outcome, info = super().execute(traj_, speed, guard=guard, while_running=while_running, stop_when=stop_when)
+        if outcome == "touch":
+            cut = secs(traj_.points[-1].time_from_start) * float(info["progress"])
+            pts = [p for p in traj_.points if secs(p.time_from_start) <= cut]
+            self.live = list(pts[-1].positions)
+        return outcome, info
+
+
+DIR = [0.0, 0.6, 0.0, 0.8, 0.0, 0.0, 0.0]  # unit length
+TOP = [0.0, 0.3, 0.0, 1.2, 0.0, 0.5, 0.0]
+
+
+def _down(a, n, step=0.002, offset=0.0):
+    """n joint samples `step` rad apart along DIR from `a`: a straight
+    joint-space stroke (a touch, and the push continuing it)."""
+    return [[x + d * step * k + (offset if j == 0 else 0.0) for j, (x, d) in enumerate(zip(a, DIR))] for k in range(n)]
+
+
+def _touch_and_push(progress, via_offset=0.0):
+    from rammp_box_opening.runtime import approach
+
+    names = ["joint_%d" % i for i in range(1, 8)]
+    stop = _down(TOP, 61)[-1]  # the touch stopped 0.12 rad down its 0.2 rad stroke
+    g = GuardSpec(touch_nm=7.0, trip="press")
+    push = leg("press:push", stop, _down(stop, 26)[-1], guard=g, world="interaction_button", speed=1.0)
+    push.traj = approach.line_trajectory(names, _down(stop, 26))  # 0.05 rad: ~12 mm
+    push.plan_free = True
+    push.recoil_via = approach.line_trajectory(names, _down(TOP, 101, offset=via_offset))
+    c = _StopsWhereItTripped()
+    c.live = list(stop)
+    c.exec_script = [("touch", {"message": "stop met", "progress": progress, "torque_peak": 7.2})]
+    return c, push, stop
+
+
+@pytest.mark.parametrize("progress", [1.0, 0.6445])
+def test_the_recoil_carries_on_back_up_the_touch_to_its_full_arc(tmp_path, progress):
+    """A push is 12 mm and starts where the touch stopped: reversed alone it
+    ends ON the touch's contact pose (run 20:04: 0.23 s back to where 6.1 Nm
+    was read). The recoil carries on up the touch stroke to RECOIL_ARC_RAD."""
+    import numpy as np
+
+    from rammp_box_opening.constants import RECOIL_ARC_RAD
+
+    c, push, stop = _touch_and_push(progress)
+    res = runner(c, tmp_path).run([push], execute=True)
+    assert [r.leg_name for r in res] == ["press:push", "recoil"]
+    q = np.asarray([p.positions for p in c.trajs[-1].points])
+    arc = float(np.linalg.norm(np.diff(q, axis=0), axis=1).sum())
+    assert arc == pytest.approx(RECOIL_ARC_RAD, abs=1e-6)
+    # it ends ON the touch stroke, above where the touch stopped
+    end = q[-1] - np.asarray(TOP)
+    along = float(np.dot(end, DIR))
+    assert np.linalg.norm(end - along * np.asarray(DIR)) < 1e-9
+    pushed = float(np.dot(q[0] - np.asarray(stop), DIR))
+    assert along == pytest.approx(0.12 + pushed - RECOIL_ARC_RAD, abs=1e-6) and along < 0.12
+    # ... never a step back down on the way
+    s = (q - np.asarray(TOP)) @ np.asarray(DIR)
+    assert (np.diff(s) <= 1e-12).all()
+
+
+def test_the_recoil_does_not_extend_along_a_stroke_this_push_did_not_continue(tmp_path):
+    import numpy as np
+
+    from rammp_box_opening.constants import START_GATE_RAD
+
+    c, push, stop = _touch_and_push(1.0, via_offset=2 * START_GATE_RAD)
+    runner(c, tmp_path).run([push], execute=True)
+    q = np.asarray([p.positions for p in c.trajs[-1].points])
+    assert q[-1] == pytest.approx(stop, abs=1e-6)  # the push reversed, nothing more

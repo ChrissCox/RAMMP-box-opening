@@ -545,7 +545,8 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
     if not stroke:
         return DepthPress(free=True, why="the stroke down is not a straight line the arm can fly (%s)" % (why or "no length"))
     print("[press_demo] TOUCH: straight down, at most %.0f mm, until the torques feel it" % (1000 * reach))
-    touched = runner.run([touch_leg(ctx, cfg, stroke, quat, over)], execute=True)
+    touch = touch_leg(ctx, cfg, stroke, quat, over)
+    touched = runner.run([touch], execute=True)
     if touched[-1].outcome == "touch":
         ctx.contact_pad = CONTACT_SHIFT_PAD_M
     if any(not r.ok for r in touched):
@@ -580,9 +581,15 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
     if not pts:
         return DepthPress(free=_rise(ctx, runner, quat, top_z, over), contact=True,
                           why="the push is not a straight line the arm can fly (%s)" % (why or "no length"))
-    guard, verify = _push_guard_and_verify(m, cfg)
+    # the backstop judged against the free-air reading over the box, not the
+    # push's first sample: that is already loaded by whatever the touch
+    # overshot (run 20:04: 5.8 Nm), and the push then rode to 13.5 Nm off
+    # free air against touch_nm 10
+    _g, verify = _push_guard_and_verify(m, cfg)
+    guard = GuardSpec(touch_nm=float(m.touch_nm), trip="press", gravity=rp._wrist_gravity(), reference=over)
     push = rp.line_leg(ctx, "press:push", pts, quat, cfg.press_speed, guard, _full_world(ctx), verify)
     push.hold_s = float(cfg.push_hold_s)
+    push.recoil_via = touch.traj  # the recoil carries on back up the touch
     res = runner.run([push], execute=True)  # held, then the runner's recoil lets go
     pushed = res[0]  # the recoil, when there was one, comes after it
     felt = pushed.ok and pushed.outcome == "touch"

@@ -74,6 +74,11 @@ class Leg:
     # a latch may need a moment held down (2026-09-23: a push that met its
     # stop and let go at once left the box shut)
     hold_s: float = 0.0
+    # MOTION legs with a "press" guard: the TOUCH's trajectory this push
+    # continues. The push alone is button_travel_m long; the reflex recoil
+    # reverses it and then carries on back up this stroke until it has
+    # covered RECOIL_ARC_RAD (runner._reflex_recoil)
+    recoil_via: object = field(default=None, compare=False, repr=False)
     # MOTION legs only: polled while the leg flies; the first True cancels it
     # and the leg reads as 'stopped' — a SEARCH, which exists to find
     # something rather than to arrive (the look and the sweep).

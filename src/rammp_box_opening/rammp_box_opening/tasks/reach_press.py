@@ -889,7 +889,8 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     stroke, why = _line_from(ctx, plan2.stroke_pts, plan2.bottom_xyz, plan2.quat)
     if not stroke:
         return stop_after_back_out("the stroke down is not a straight line the arm can fly (%s) — nothing was pressed" % (why or "no length"))
-    touched = runner.run([touch_leg(ctx, cfg, stroke, plan2.quat, world, at_start)], execute=True)
+    touch = touch_leg(ctx, cfg, stroke, plan2.quat, world, at_start)
+    touched = runner.run([touch], execute=True)
     if touched[-1].outcome == "touch":
         # contact happened: from here every world pads the box for a shove
         ctx.contact_pad = CONTACT_SHIFT_PAD_M
@@ -915,9 +916,14 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         down, why = _line(ctx, [float(t[0]), float(t[1]), float(t[2]) - depth], plan2.quat)
         if not down:
             return stop_after_back_out("the push is not a straight line the arm can fly (%s) — nothing was pressed" % (why or "no length"))
-        guard, verify = _push_guard_and_verify(m, cfg, depth_m=depth)
+        # the backstop judged against the free-air reading at the stroke's
+        # start: the push's first sample already carries the touch's
+        # overshoot, and a backstop riding on it is no bound on the total
+        _g, verify = _push_guard_and_verify(m, cfg, depth_m=depth)
+        guard = GuardSpec(touch_nm=float(m.touch_nm), trip="press", gravity=_wrist_gravity(), reference=at_start)
         push = line_leg(ctx, "press:push", down, plan2.quat, cfg.press_speed, guard, world, verify)
         push.hold_s = float(cfg.push_hold_s)
+        push.recoil_via = touch.traj  # the recoil carries on back up the touch
         res = runner.run([push], execute=True)  # held, then the runner's recoil reverses it
         if any(not r.ok for r in res):
             return stop_after_back_out("the push failed (%s)" % res[-1].detail)
