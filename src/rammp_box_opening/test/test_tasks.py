@@ -508,10 +508,31 @@ def test_the_lid_side_snaps_to_the_base_axis_nearest_the_preferred_one(ctx):
     xyz, side = press_demo.box_relative_lid_drop(m, box, -0.027, [0.45, -0.25, -0.027])
     assert side == (0.0, -1.0)
     assert xyz[0] == pytest.approx(0.5625) and xyz[1] == pytest.approx(-0.0247 - need)
-    # every candidate lies on a base axis through the box, preferred side first
+    # the base-axis spots through the box first, preferred side first; the
+    # diagonals only after every axis spot (2026-10-23)
     spots = press_demo.lid_drop_candidates(m, box, -0.027, [0.45, -0.25, -0.027])
-    assert [d for _xyz, d in spots][0] == (0.0, -1.0)
-    assert all(d in ((0.0, -1.0), (0.0, 1.0), (1.0, 0.0), (-1.0, 0.0)) for _xyz, d in spots)
+    dirs = [d for _xyz, d in spots]
+    assert dirs[0] == (0.0, -1.0)
+    axis = [d in ((0.0, -1.0), (0.0, 1.0), (1.0, 0.0), (-1.0, 0.0)) for d in dirs]
+    assert axis == sorted(axis, reverse=True)
+
+
+def test_a_box_at_the_edge_of_the_seen_table_gets_a_diagonal_drop_spot():
+    """Flatbot 2026-10-23 16:31: the box at [0.39, -0.20] on the edge of the
+    table the scene camera saw, the set-down zone x 0.43-0.63, y -0.63 to
+    -0.23: every axis spot fell outside it ("no lid drop spot ... move the
+    box"). A diagonal one, LID_DIAG_EXTRA_M farther out, fits."""
+    from rammp_box_opening.models.container import ContainerModel, ContainerPose
+    from rammp_box_opening.tasks import press_demo
+
+    m = ContainerModel.load("src/rammp_box_opening/config/containers/ankou_pink.yaml")
+    box = ContainerPose(xyz=(0.391, -0.196, 0.184), yaw=0.0)
+    zone = (0.43, 0.63, -0.63, -0.23)
+    (xyz, d), = press_demo.lid_drop_candidates(m, box, 0.184, zone=zone)
+    assert d[0] > 0 and d[1] < 0  # toward +x, -y: into the seen table
+    assert math.hypot(xyz[0] - 0.391, xyz[1] + 0.196) == pytest.approx(
+        press_demo.lid_place_min_clear(m) + press_demo.LID_DIAG_EXTRA_M)
+    assert zone[0] <= xyz[0] <= zone[1] and zone[2] <= xyz[1] <= zone[3]
 
 
 class _RefusesPlacesAt:

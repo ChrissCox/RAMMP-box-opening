@@ -14,7 +14,7 @@ PKG = Path(__file__).resolve().parents[1]
 PINK = str(PKG / "config/containers/ankou_pink.yaml")
 BENCH = str(PKG / "config/world_bench.yaml")
 BOX_XY = (0.45, -0.10)
-SMALL = (BOX_XY[0] - 0.25, BOX_XY[0] + 0.25, BOX_XY[1] - 0.25, BOX_XY[1] + 0.25)  # no lid spot fits
+SMALL = (BOX_XY[0] - 0.22, BOX_XY[0] + 0.22, BOX_XY[1] - 0.22, BOX_XY[1] + 0.22)  # no lid spot fits, diagonals included
 ROOMY = (BOX_XY[0] - 0.6, BOX_XY[0] + 0.6, BOX_XY[1] - 0.6, BOX_XY[1] + 0.6)
 
 

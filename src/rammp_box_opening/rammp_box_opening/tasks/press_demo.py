@@ -1571,6 +1571,9 @@ def drop_zone(m, worlds):
     return (ext[0] + inset, ext[1] - inset, ext[2] + inset, ext[3] - inset)
 
 
+LID_DIAG_EXTRA_M = 0.03  # a diagonal drop spot this much farther out than an axis one (lid_drop_candidates)
+
+
 def lid_place_min_clear(m):
     """Smallest planar container-origin-to-lid_place distance that leaves
     the place hover IK-solvable: both footprint half-diagonals plus
@@ -1587,14 +1590,21 @@ def lid_drop_candidates(m, cpose, table_z, prefer_xy=None, zone=None):
     set-down zone (`zone`: drop_zone's (x0, x1, y0, y1); the bench's when
     None).
 
-    Only the four base-axis directions are offered. The planner holds the
+    The four base-axis directions are offered first. The planner holds the
     (padded) container as a cuboid aligned to the BASE axes whatever the
     box's yaw, so a spot on a diagonal sits ~20 mm nearer that cuboid's
     corner than a spot at the same distance on an axis — and the carry pose
     above one 27 deg off the -y axis had no IK in any attitude, while the
     four axis spots around the same box all planned (field 2026-09-17).
     The configured lid_place (`prefer_xy`) picks which axis side is tried
-    first: the one nearest its direction from the box."""
+    first: the one nearest its direction from the box.
+
+    The four diagonals come after them, LID_DIAG_EXTRA_M farther out (past
+    that corner): a box at the edge of the table the scene camera saw has
+    no axis spot inside it (flatbot 2026-10-23: the box at [0.39, -0.20],
+    the zone x 0.43-0.63, y -0.63 to -0.23 — every axis spot out, a
+    diagonal in). One that does not plan falls through to the next
+    (build_place_legs), and the place is planned before the grip."""
     need = lid_place_min_clear(m)
     bx, by = float(cpose.xyz[0]), float(cpose.xyz[1])
     dirs = []
@@ -1611,6 +1621,11 @@ def lid_drop_candidates(m, cpose, table_z, prefer_xy=None, zone=None):
         x, y = bx + ux * need, by + uy * need
         if x0 <= x <= x1 and y0 <= y <= y1:
             out.append(([x, y, float(table_z)], (ux, uy)))
+    diag = (need + LID_DIAG_EXTRA_M) / math.sqrt(2.0)
+    for ux, uy in ((1.0, -1.0), (1.0, 1.0), (-1.0, -1.0), (-1.0, 1.0)):
+        x, y = bx + ux * diag, by + uy * diag
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            out.append(([x, y, float(table_z)], (ux / math.sqrt(2.0), uy / math.sqrt(2.0))))
     return out
 
 
