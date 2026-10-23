@@ -9,6 +9,7 @@ quaternion math the mount composition needs.
 """
 
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import yaml
@@ -70,6 +71,23 @@ def mat_to_quat_xyzw(m):
     return q / np.linalg.norm(q)
 
 
+# frame_snapshot's depth_stamp for a grabber that keeps none (a test's fake):
+# the pairing check has nothing to judge. A real grabber's None means no
+# depth yet, and the frame waits.
+MISSING = object()
+
+
+def frame_snapshot(g):
+    """g.snapshot() when the grabber has one; otherwise the same namespace
+    read from its attributes (depth_stamp MISSING when it keeps none)."""
+    snap = getattr(g, "snapshot", None)
+    if snap is not None:
+        return snap()
+    return SimpleNamespace(color=g.color, color_stamp=g.color_stamp, depth=g.depth,
+                           depth_stamp=getattr(g, "depth_stamp", MISSING),
+                           k=g.k, dist=getattr(g, "dist", None))
+
+
 def stable_fix(samples, tol, n):
     """Median position once the newest `n` sightings agree pairwise within
     `tol` metres, else None. `samples` = [(position, t), ...], newest last.
@@ -128,9 +146,12 @@ class D405Grabber:
         # re-subscribing did nothing). Whoever spins the node feeds TF.
         self.tf_listener = TransformListener(self.tf_buffer, node, spin_thread=False)
         self.need_depth = bool(need_depth)
-        self.color = self.depth = self.info = None
+        # each image is stored with its own stamp as ONE tuple, so a reader on
+        # another thread never sees a frame with another frame's stamp, and
+        # a depth is never paired with a colour it was not shot with
+        self._color = self._depth = (None, None)
+        self.info = None
         self.k = self.dist = None
-        self.color_stamp = None
         self._subs = []
         self.resubscribes = 0
         self._subscribe()
@@ -172,17 +193,42 @@ class D405Grabber:
     def _color_cb(self, msg):
         if msg.encoding in ("rgb8", "bgr8"):
             a = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-            self.color = a[:, :, ::-1].copy() if msg.encoding == "rgb8" else a.copy()
-            self.color_stamp = msg.header.stamp
+            arr = a[:, :, ::-1].copy() if msg.encoding == "rgb8" else a.copy()
+            self._color = (arr, msg.header.stamp)
 
     def _depth_cb(self, msg):
         if msg.encoding == "16UC1":
-            self.depth = (
+            arr = (
                 np.frombuffer(msg.data, dtype=np.uint16)
                 .reshape(msg.height, msg.width)
                 .astype(np.float32)
                 / 1000.0
             )
+            self._depth = (arr, msg.header.stamp)
+
+    @property
+    def color(self):
+        return self._color[0]
+
+    @property
+    def color_stamp(self):
+        return self._color[1]
+
+    @property
+    def depth(self):
+        return self._depth[0]
+
+    @property
+    def depth_stamp(self):
+        return self._depth[1]
+
+    def snapshot(self):
+        """The newest colour and depth, each with its own stamp, and the
+        intrinsics — each read ONCE, so the pixels, the stamp the pose is
+        looked up at and the dedup key all belong to the same frames."""
+        (color, color_stamp), (depth, depth_stamp) = self._color, self._depth
+        return SimpleNamespace(color=color, color_stamp=color_stamp, depth=depth,
+                               depth_stamp=depth_stamp, k=self.k, dist=self.dist)
 
     def _info_cb(self, msg):
         k = np.array(msg.k).reshape(3, 3)

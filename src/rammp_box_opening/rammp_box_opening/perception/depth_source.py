@@ -32,6 +32,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from rammp_box_opening.models.container import ContainerPose
+from rammp_box_opening.perception.d405 import MISSING, frame_snapshot
 
 # Height band around the EXPECTED container top (table + dims.z, which
 # is itself derived from live tag fixes 2026-08-25). Generous banding let
@@ -88,16 +89,59 @@ STRIDE = 4
 # early on STILL frames, not from letting moving ones vote.
 STILL_TRANS_M = 0.004
 STILL_ROT_RAD = 0.02
+# a depth votes only with the colour frame it was shot with: stamps this
+# close. Half the wrist OAK's ~80 ms frame interval (run logs 2026-10-22);
+# the aim's runner note logs pair_dt_ms so the field can tighten it.
+PAIR_TOL_S = 0.04
 
 
-def camera_pose_at(g, offset_s=None):
+def _stamp_s(stamp):
+    return stamp.sec + stamp.nanosec * 1e-9
+
+
+def depth_paired(snap, last_depth_key):
+    """(ok, why): whether the snapshot's depth belongs to its colour frame —
+    a new depth (not the one last processed: a frozen depth stream must not
+    vote again with every new colour) stamped within PAIR_TOL_S of the
+    colour. A grabber that keeps no depth stamp (d405.MISSING) passes.
+    Callers refuse WITHOUT consuming the colour frame: its depth may simply
+    not have landed yet, and the next poll tries it again."""
+    if snap.depth_stamp is MISSING:
+        return True, None
+    if snap.depth_stamp is None:
+        return False, "no depth stamp yet"
+    if depth_key(snap) == last_depth_key:
+        return False, "depth not new"
+    dt = _stamp_s(snap.depth_stamp) - _stamp_s(snap.color_stamp)
+    if abs(dt) > PAIR_TOL_S:
+        return False, "depth not paired with colour (dt %.0f ms)" % (1000 * dt)
+    return True, None
+
+
+def depth_key(snap):
+    """The snapshot's depth stamp as (sec, nanosec), or None without one."""
+    st = snap.depth_stamp
+    return None if st is MISSING or st is None else (st.sec, st.nanosec)
+
+
+def pair_dt_ms(snap):
+    """The snapshot's depth stamp minus its colour stamp (ms), or None."""
+    if snap.depth_stamp is MISSING or snap.depth_stamp is None or snap.color_stamp is None:
+        return None
+    return 1000.0 * (_stamp_s(snap.depth_stamp) - _stamp_s(snap.color_stamp))
+
+
+def camera_pose_at(g, offset_s=None, stamp=None):
     """base_link <- camera AT THE FRAME'S STAMP: the TF of the grabber's
     parent frame composed with its mount (config/camera_d405_wrist.yaml).
 
     `offset_s` shifts the stamp by the camera's measured timestamp lag
     (the grabber's stamp_offset_s when None; perception/lag.py measures it),
     so a frame shot while the arm moved is placed where the arm was when
-    the shutter fired, not where the stamp says.
+    the shutter fired, not where the stamp says. `stamp` is the frame's
+    stamp (g.color_stamp when None): a caller that snapshotted the frame
+    passes its stamp, so the pose is the one of the pixels it judges even
+    when a newer frame lands meanwhile.
 
     No latest-TF fallback: upstream documents that fallback as safe only
     while parked, and the watcher runs during motion — at continuous frame
@@ -109,7 +153,7 @@ def camera_pose_at(g, offset_s=None):
     from rammp_box_opening.perception.d405 import quat_to_mat
 
     off = getattr(g, "stamp_offset_s", 0.0) if offset_s is None else float(offset_s)
-    when = rt.Time.from_msg(g.color_stamp)
+    when = rt.Time.from_msg(stamp if stamp is not None else g.color_stamp)
     if off:
         when = when + Duration(nanoseconds=int(round(off * 1e9)))
     root = getattr(g, "_base_frame", "base_link")
@@ -503,6 +547,7 @@ class BoxTopWatcher:
         self.last_aim = None  # the last close-up aim's press point (press_demo.aim_button_at_staging)
         self.last_aim_capture = None  # ... and the folder its frame was saved in
         self._last_stamp = None
+        self._last_depth_stamp = None  # the depth that last voted (depth_paired)
         self._last_cam = None  # previous frame's camera pose (still filter)
         # detection runs only inside a detect window (wait_for_fix and the
         # detect-only report set it); the idle 20 Hz tick otherwise costs a
@@ -550,23 +595,29 @@ class BoxTopWatcher:
 
     def _tick_locked(self):
         g = self.grab
-        if g.depth is None or g.k is None or g.color_stamp is None:
+        f = frame_snapshot(g)  # one read: the pixels, stamp and pose of one frame
+        if f.depth is None or f.k is None or f.color_stamp is None:
             return
-        stamp = (g.color_stamp.sec, g.color_stamp.nanosec)
+        stamp = (f.color_stamp.sec, f.color_stamp.nanosec)
         if stamp == self._last_stamp:
             return
+        paired, why = depth_paired(f, self._last_depth_stamp)
+        if not paired:
+            self.last_reject = why  # not consumed: tried again once its depth lands
+            return
         self._last_stamp = stamp
+        self._last_depth_stamp = depth_key(f)
         self.frames += 1
-        cam = camera_pose_at(g)
+        cam = camera_pose_at(g, stamp=f.color_stamp)
         if cam is None:
             return
         rot_cam, trans_cam = cam
         still = camera_is_still(self._last_cam, cam)
         self._last_cam = cam
-        self._apply_pending_roi(still, g.color_stamp.sec + g.color_stamp.nanosec * 1e-9)
+        self._apply_pending_roi(still, _stamp_s(f.color_stamp))
         table_z = self.table_z
         fix, why = top_face_from_depth(
-            g.depth, g.k, rot_cam, trans_cam, table_z, self.model, roi=self.roi
+            f.depth, f.k, rot_cam, trans_cam, table_z, self.model, roi=self.roi
         )
         if fix is None:
             self.last_reject = why
@@ -585,9 +636,9 @@ class BoxTopWatcher:
         # the circle is the press's aim, and only a still frame can be trusted
         # to place it — a moving frame votes coarse, on the plateau centroid
         circle = None if not still else button_circle_refine(
-            g.color,
-            g.depth,
-            g.k,
+            f.color,
+            f.depth,
+            f.k,
             rot_cam,
             trans_cam,
             fix.center,
