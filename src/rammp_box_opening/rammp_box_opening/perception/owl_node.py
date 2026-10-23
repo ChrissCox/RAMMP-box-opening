@@ -143,7 +143,7 @@ class OwlDetector(Node):
         # the mission's container (owl_source.announce_container): its
         # prompts and floor replace this node's own the moment it is run
         self.create_subscription(String, CONTAINER_TOPIC, self._on_container, latched)
-        self.create_timer(period, self._tick)
+        self._timer = self.create_timer(period, self._tick)
 
     def _on_container(self, msg):
         from rammp_box_opening.models.container import load_press_demo
@@ -164,7 +164,15 @@ class OwlDetector(Node):
         )
 
     def _on_enable(self, msg):
+        rising = bool(msg.data) and not self.enabled
         self._enabled_until = (time.monotonic() + ENABLE_MAX_S) if msg.data else 0.0
+        if rising:
+            # infer the newest frame NOW, not at the next tick: waiting
+            # cost every locate 0-0.5 s before its 0.65 s inference. The
+            # reset leaves the timer overdue when the inference returns,
+            # so the next one follows back to back as it always did.
+            self._timer.reset()
+            self._tick()
 
     @property
     def enabled(self):
