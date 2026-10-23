@@ -446,6 +446,7 @@ def _watcher(model, require_circle=True):
 
     w._lock = threading.Lock()
     w._last_stamp = None
+    w._last_depth_stamp = None
     w._last_cam = None
     w._still_since = None
     w._pending_roi = None
@@ -520,7 +521,7 @@ def _tick_at(w, t_cam, boxes, monkeypatch, n):
     from rammp_box_opening.perception import depth_source as ds
 
     w.grab.frame(boxes, t_cam, n)
-    monkeypatch.setattr(ds, "camera_pose_at", lambda g: (ROT_DOWN, t_cam))
+    monkeypatch.setattr(ds, "camera_pose_at", lambda g, offset_s=None, stamp=None: (ROT_DOWN, t_cam))
     w._tick()
 
 
@@ -605,3 +606,76 @@ def test_with_the_lag_measured_moving_frames_may_confirm_the_box(model, monkeypa
     got = w.fix(now=time.monotonic())
     assert got is not None
     assert abs(got[0][0] - 0.45) < 0.01 and abs(got[0][1] + 0.15) < 0.01
+
+
+# --- a depth votes only with the colour frame it was shot with --------------
+
+
+class _PairedGrab(_Grab):
+    """_Grab with a depth stamp: frame() stamps both streams, colour_only()
+    advances the colour while the depth stream stalls."""
+
+    def __init__(self):
+        super().__init__()
+        self.depth_stamp = None
+
+    def frame(self, boxes, t_cam, n):
+        super().frame(boxes, t_cam, n)
+        self.depth_stamp = self.color_stamp
+
+    def colour_only(self, n):
+        self.color_stamp = type("S", (), {"sec": n, "nanosec": 0})()
+
+
+def test_a_paired_depth_still_commits_the_precise_fix(model, monkeypatch):
+    w = _watcher(model, require_circle=False)
+    w.grab = _PairedGrab()
+    box = [(0.45, -0.15, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)]
+    for n in range(4):
+        _tick_at(w, T_CAM, box, monkeypatch, n + 1)
+    assert w.frames == 4 and w.fix(now=time.monotonic()) is not None
+
+
+def test_a_frozen_depth_adds_nothing_to_either_window(model, monkeypatch):
+    """The depth stream stalls while colour keeps arriving: each new colour
+    stamp used to re-vote the same old depth, and three agreeing votes of
+    one frame made a fix of a moment long gone."""
+    from rammp_box_opening.perception import depth_source as ds
+
+    w = _watcher(model, require_circle=False)
+    w.grab = _PairedGrab()
+    box = [(0.45, -0.15, TABLE_Z + model.dims[2], model.dims[0], model.dims[1], 0.0)]
+    _tick_at(w, T_CAM, box, monkeypatch, 1)
+    n_fine, n_coarse = len(w.window.samples), len(w.coarse_window.samples)
+    assert n_coarse == 1
+    monkeypatch.setattr(ds, "camera_pose_at", lambda g, offset_s=None, stamp=None: (ROT_DOWN, T_CAM))
+    for n in range(2, 8):
+        w.grab.colour_only(n)
+        w._tick()
+    assert (len(w.window.samples), len(w.coarse_window.samples)) == (n_fine, n_coarse)
+    assert w.frames == 1 and w.last_reject == "depth not new"
+    assert w.fix(now=time.monotonic()) is None
+
+
+def test_the_pose_is_looked_up_at_the_stamp_given_not_the_grabbers_newest():
+    from types import SimpleNamespace
+
+    from builtin_interfaces.msg import Time
+
+    from rammp_box_opening.perception.depth_source import camera_pose_at
+
+    asked = []
+
+    class Buffer:
+        def lookup_transform(self, root, parent, when):
+            asked.append(when.nanoseconds)
+            return SimpleNamespace(transform=SimpleNamespace(
+                rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+                translation=SimpleNamespace(x=0.0, y=0.0, z=0.0)))
+
+    g = SimpleNamespace(tf_buffer=Buffer(), parent="tool", mount_xyz=[0.0, 0.0, 0.0], mount_quat=[0.0, 0.0, 0.0, 1.0],
+                        stamp_offset_s=0.0, color_stamp=Time(sec=5, nanosec=0))
+    assert camera_pose_at(g) is not None
+    camera_pose_at(g, stamp=Time(sec=9, nanosec=500))
+    camera_pose_at(g, offset_s=-0.2, stamp=Time(sec=9, nanosec=500))
+    assert asked == [5_000_000_000, 9_000_000_500, 8_800_000_500]
