@@ -98,14 +98,15 @@ def test_home_arm_steps_toward_home_until_the_planner_can_plan_it(monkeypatch, c
     fb = ArmChain(root="arm_mount", path=FLATBOT_URDF)
     z = [fb.fk(q)[1][2] for q in pts]
     assert min(z) == pytest.approx(z[0]) and z[-1] - z[0] == pytest.approx(0.119, abs=0.002)
-    # HOME is planned from the step's END, in the guarded bench world
+    # HOME is planned from the step's END, once per step in the bare world:
+    # world_flatbot.yaml has no table, so no band to guard
     assert ctx.client.joint_starts[-1] == pytest.approx(list(step.goal_joints))
-    assert legs[1].world == "bench"
+    assert legs[1].world == "bench_bare" and len(ctx.client.joint_starts) == 3
     out = capsys.readouterr().out
     assert "arm_joint_4" not in out and "joint_4 is 0.047 rad from its limit" in out
     assert "a plan-free step 48% of the way to HOME first (the largest joint 0.254 rad, the tool +119 mm up" in out
-    # the refused tries say nothing: only the step that plans is reported
-    assert "CAUTION" not in out
+    # the no-table caution once, up front; the refused tries say nothing
+    assert out.count("CAUTION") == 1 and "CAUTION: no table is known" in out
 
 
 def test_a_joint_just_outside_the_margin_plans_from_the_start_first(monkeypatch):
