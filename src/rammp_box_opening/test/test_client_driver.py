@@ -353,3 +353,58 @@ def test_settled_joints_are_averaged_on_one_branch_across_the_wrap(monkeypatch):
     monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
     _eff, q = c.settled_efforts(duration_s=0.05, settle_s=0.0)
     assert abs(abs(q[2]) - math.pi) < 0.003
+
+
+def _live_stream(c, monkeypatch, fresh_after_settle=None, settle_s=0.15):
+    """A /joint_states message every ~20 ms (49 Hz live); with
+    `fresh_after_settle` the stream freezes after that many fresh messages
+    past the settle. Returns the count of fresh messages delivered after it."""
+    t0 = time.monotonic()
+    seen = {"after": 0}
+
+    def spin(node, timeout_sec=0.0):
+        time.sleep(0.02)
+        late = time.monotonic() - t0 >= settle_s
+        if late and fresh_after_settle is not None and seen["after"] >= fresh_after_settle:
+            return  # frozen: _eff_at stops moving, then goes stale
+        c._eff = [0.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.4]
+        c._eff_at = time.monotonic()
+        if late:
+            seen["after"] += 1
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    return seen
+
+
+def test_settled_efforts_default_read_holds_the_arm_about_0_3_s(monkeypatch):
+    """Review 2026-10-22: the default 0.15 s settle + 0.30 s mean held the
+    arm ~0.47 s per read, ~9 reads a depth run. 0.15 s + 0.15 s (~7
+    messages at 49 Hz) is the whole read."""
+    c = _client()
+    seen = _live_stream(c, monkeypatch)
+    t0 = time.monotonic()
+    got = c.settled_efforts()
+    elapsed = time.monotonic() - t0
+    assert got is not None
+    eff, q = got
+    assert eff == pytest.approx([0.1, 0.2, 0.3, 0.4]) and q == pytest.approx(LIVE)
+    assert 0.30 <= elapsed < 0.40
+    assert seen["after"] >= 3
+
+
+def test_settled_efforts_still_refuse_fewer_than_three_fresh_readings(monkeypatch):
+    """Two fresh messages after the settle, then a frozen stream: no
+    reference, at the default window as at any other."""
+    c = _client()
+    _live_stream(c, monkeypatch, fresh_after_settle=2)
+    t0 = time.monotonic()
+    assert c.settled_efforts(timeout_s=0.8) is None
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_settled_efforts_defaults_keep_the_settle():
+    import inspect
+
+    params = inspect.signature(client_mod.PlannerClient.settled_efforts).parameters
+    assert params["settle_s"].default == 0.15
+    assert params["duration_s"].default == 0.15
