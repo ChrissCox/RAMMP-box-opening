@@ -630,6 +630,82 @@ def _prune_captures(tag):
         pass
 
 
+# RE-STAGE: at staging with no button in view, the lid the wrist DOES see
+# (lid_in_view) brings the arm over it, the way centre_over_button moves
+# over an aimed button. Flatbot 2026-10-23: the scene camera's fix was 7 cm
+# off, half the lid lay at the wrist frame's edge and the button outside
+# its depth image, and the run stopped there.
+RESTAGE_MAX_M = 0.10  # a lid farther than this from where staging aimed is not a re-staging
+RESTAGE_MIN_M = 0.01  # nearer than this, where the arm stands is not what hides the button
+RESTAGE_TRIES = 2
+
+
+def wrist_lid(watcher):
+    """lid_in_view on the wrist camera's newest frame, at that frame's own
+    pose: ((x, y, z), info) or (None, why)."""
+    from rammp_box_opening.perception.button_aim import lid_in_view
+    from rammp_box_opening.perception.d405 import frame_snapshot
+    from rammp_box_opening.perception.depth_source import camera_pose_at
+
+    g = getattr(watcher, "grab", None)
+    if g is None:
+        return None, "no wrist camera"
+    f = frame_snapshot(g)
+    if f.depth is None or f.k is None or f.color_stamp is None:
+        return None, "no wrist frame"
+    cam = camera_pose_at(g, stamp=f.color_stamp)
+    if cam is None:
+        return None, "no camera pose for the wrist frame"
+    return lid_in_view(f.depth, f.k, cam[0], cam[1], watcher.model)
+
+
+def restage_on_lid(node, ctx, cfg, runner, watcher, execute, yaw, why):
+    """From staging with no button in view (`why`): put the box where the
+    wrist camera sees its lid (wrist_lid), fly to staging over it (planned,
+    collision-checked, in a world holding the box there) and aim again — at
+    most RESTAGE_TRIES moves of at most RESTAGE_MAX_M each. Returns
+    (got, status, moves, seen) as aim_button_at_staging, plus how many moves
+    flew and the aim's `out`. ctx.cpose is left where the last move aimed."""
+    for moves in range(RESTAGE_TRIES):
+        lid, info = wrist_lid(watcher)
+        if lid is None:
+            return None, "%s; no lid in the wrist frame to stage over (%s)" % (why, info), moves, {}
+        c = ctx.cpose
+        off = math.hypot(lid[0] - c.xyz[0], lid[1] - c.xyz[1])
+        runner.note("restage_lid", lid_xy=[round(v, 4) for v in lid[:2]], off_mm=round(1000 * off, 1),
+                    lid_frac=round(info["frac"], 2), cut=info["cut"], move=moves + 1)
+        if off > RESTAGE_MAX_M:
+            return None, "%s; the lid in view is %.0f mm from where staging aimed — more than a re-staging (%.0f mm)" % (
+                why, 1000 * off, 1000 * RESTAGE_MAX_M), moves, {}
+        if off < RESTAGE_MIN_M:
+            return None, "%s; the lid is under the staging (%.0f mm off) — moving would not show the button" % (
+                why, 1000 * off), moves, {}
+        print("[press_demo] RE-STAGE: no button in view, but the wrist sees the lid%s %.0f mm from where staging aimed "
+              "— moving over it" % (" (cut by the frame)" if info["cut"] else "", 1000 * off))
+        ctx.cpose = ContainerPose(xyz=(float(lid[0]), float(lid[1]), float(c.xyz[2])), yaw=c.yaw)
+        try:
+            leg = build_approach_leg(ctx, cfg)
+        except RuntimeError as e:
+            ctx.cpose = c
+            return None, "%s; the move over the lid was refused (%s)" % (why, e), moves, {}
+        leg.name = "approach:restage"
+        res = runner.run([leg], execute=execute)
+        bad = [r for r in res if not r.ok]
+        if bad and all(r.outcome == "refused" for r in bad):
+            ctx.cpose = c  # nothing was sent: the arm still stands where c was staged
+            return None, "%s; the move over the lid was refused" % why, moves, {}
+        if bad:
+            # out and failed in flight: no press, and no automatic motion after a fault
+            print("[press_demo] STOP: the move over the lid failed (%s) — not pressing; arm holds" % bad[-1].detail)
+            sys.exit(1)
+        seen = {}
+        got, status = aim_button_at_staging(node, watcher, yaw, runner=runner, out=seen)
+        if got is not None:
+            return got, status, moves + 1, seen
+        why = status
+    return None, "%s (after %d moves over the lid)" % (why, RESTAGE_TRIES), RESTAGE_TRIES, {}
+
+
 def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix, lookahead=True):
     """The arm straight to staging above the scene camera's box, the descent
     pre-planned on the way, then the wrist's precise fix.
@@ -690,6 +766,14 @@ def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix, loo
         preplanned = runner.lookahead_result
         seen = {}
         got, status = aim_button_at_staging(node, watcher, scene_fix.pose.yaw, runner=runner, out=seen)
+        if got is None and execute:
+            # the scene camera brings the arm near the box; the wrist may
+            # still see only part of the lid: move over what it sees
+            got, status, moves, seen_again = restage_on_lid(
+                node, ctx, cfg, runner, watcher, execute, scene_fix.pose.yaw, status)
+            if moves:
+                preplanned = None  # planned for the staging the arm has left
+                seen = seen_again or seen
         return SceneApproach(got=got, preplanned=preplanned, status=status, button_up_mm=seen.get("button_up_mm"),
                              cfg=cfg)
 

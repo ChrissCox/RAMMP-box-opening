@@ -1113,3 +1113,52 @@ def test_the_first_frames_lookback_honours_the_stamp_offset(aimer_env):
     aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
     _paired_frames(aimer, g, 1)
     assert [c[0] for c in calls] == [None, pytest.approx(0.03 - button_aim.FIRST_LOOKBACK_S)]
+
+
+# lid_in_view: a camera straight down (its x along base +y, y along +x, as
+# flatbot's wrist OAK at staging), 0.30 m above the lid
+DOWN = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
+LID_K = np.array([[398.0, 0.0, 320.0], [0.0, 398.0, 200.0], [0.0, 0.0, 1.0]])
+
+
+def _table_and_lid(model, lid_xy, cam=(0.45, -0.25, 0.71), table_z=0.27):
+    """The depth a straight-down camera at `cam` reads: the table, and a
+    round lid model.dims[2] above it at `lid_xy`."""
+    vv, uu = np.mgrid[0:400, 0:640]
+    lid_z = table_z + model.dims[2]
+    d_lid = cam[2] - lid_z
+    ray = np.stack([(uu - 320.0) / 398.0, (vv - 200.0) / 398.0, np.ones_like(uu, float)], -1)
+    at_lid = (ray * d_lid) @ DOWN.T + np.array(cam)
+    on = np.hypot(at_lid[..., 0] - lid_xy[0], at_lid[..., 1] - lid_xy[1]) < model.lid_dims[0] / 2
+    return np.where(on, d_lid, cam[2] - table_z), np.array(cam)
+
+
+def test_the_lid_in_view_is_the_patch_a_box_height_above_the_table():
+    from rammp_box_opening.perception.button_aim import lid_in_view
+
+    m = ContainerModel.load(PINK)
+    depth, cam = _table_and_lid(m, (0.47, -0.22))
+    lid, info = lid_in_view(depth, LID_K, DOWN, cam, m)
+    assert lid[0] == pytest.approx(0.47, abs=0.003) and lid[1] == pytest.approx(-0.22, abs=0.003)
+    assert not info["cut"] and info["frac"] == pytest.approx(1.0, abs=0.1)
+    # judged against the table in view: a camera TF puts 5 cm too high finds the same lid
+    lid2, _info = lid_in_view(depth, LID_K, DOWN, cam + [0.0, 0.0, 0.05], m)
+    assert lid2[:2] == pytest.approx(lid[:2], abs=1e-6)
+    bare, why = lid_in_view(np.full((400, 640), 0.44), LID_K, DOWN, cam, m)
+    assert bare is None and "nothing stands" in why
+
+
+def test_the_cut_lid_at_staging_is_found_where_the_box_was():
+    """Flatbot 2026-10-23 13:33: staging over the scene camera's fix
+    [0.475, -0.276]; the wrist frame shows half the lid at its edge. Its lid
+    is found 7 cm from that fix, cut by the frame, where the wrist camera's
+    own ring said the box was."""
+    from rammp_box_opening.perception.button_aim import lid_in_view
+
+    z = np.load(Path(__file__).parent / "data" / "wrist_staging_cut_20261023.npz")
+    lid, info = lid_in_view(z["depth_mm"].astype(float) / 1000.0, z["k"], z["rot_cam"], z["trans_cam"],
+                            ContainerModel.load(PINK))
+    assert lid is not None, info
+    assert info["cut"] and 0.15 < info["frac"] < 0.6
+    assert lid[0] == pytest.approx(0.460, abs=0.01) and lid[1] == pytest.approx(-0.204, abs=0.01)
+    assert 0.06 < np.hypot(lid[0] - 0.475, lid[1] + 0.276) < 0.10  # a re-staging, not a search

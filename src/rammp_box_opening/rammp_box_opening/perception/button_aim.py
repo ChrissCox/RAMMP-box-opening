@@ -582,6 +582,60 @@ def agreeing_median(points, tol=AGREE_M, n=MIN_HITS):
     return tuple(float(v) for v in np.median(last, axis=0))
 
 
+# lid_in_view: the lid is the surface standing the container's height above
+# the table the frame sees most of, judged against THAT table so the wrist
+# mount's height in TF (5 cm off on flatbot, 2026-10-23) cannot move it
+LID_VIEW_BAND_M = 0.035  # the patch this close to table + dims.z
+LID_VIEW_MIN_FRAC = 0.15  # of the lid's area at its depth: less is not a lid to stage over
+LID_VIEW_MAX_FRAC = 2.5  # ... and more is some other raised surface
+
+
+def lid_in_view(depth, k, rot, trans, model, stride=2):
+    """Where the container's lid is in a wrist frame, by depth alone: the
+    largest patch standing model.dims[2] above the table this frame sees
+    most of, its centroid in the planning frame. For bringing the arm over
+    a lid the aim could not find the button on: a lid the frame cuts off is
+    placed by the part in view, biased toward the frame's middle — the aim
+    from over it then sees it whole. Returns ((x, y, z), info) — info:
+    frac (of the lid's area), cut (it reaches the depth image's edge),
+    table_z — or (None, why)."""
+    import cv2
+
+    d = np.asarray(depth, float)[::stride, ::stride]
+    h, w = d.shape
+    vv, uu = np.mgrid[0:h, 0:w]
+    ok = np.isfinite(d) & (d > 0.05)
+    if ok.sum() < 200:
+        return None, "too little depth in the wrist frame"
+    K = np.asarray(k, float)
+    x = (uu * stride - K[0, 2]) / K[0, 0] * d
+    y = (vv * stride - K[1, 2]) / K[1, 1] * d
+    P = np.stack([x, y, d], -1) @ np.asarray(rot, float).T + np.asarray(trans, float)
+    z = P[..., 2]
+    zs = z[ok]
+    hist, edges = np.histogram(zs, bins=np.arange(zs.min(), zs.max() + 0.01, 0.005))
+    table_z = float(0.5 * (edges[hist.argmax()] + edges[hist.argmax() + 1]))
+    lid_z = table_z + float(model.dims[2])
+    mask = (ok & (np.abs(z - lid_z) <= LID_VIEW_BAND_M)).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask)
+    if n < 2:
+        return None, "nothing stands the container's height above the table in view (the table at %.3f)" % table_z
+    comp = lab == 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+    dl = float(np.median(d[comp]))
+    area = float(model.lid_dims[0]) * float(model.lid_dims[1]) * (math.pi / 4.0 if model.round else 1.0)
+    frac = float(comp.sum()) / (area * (K[0, 0] / dl) * (K[1, 1] / dl) / stride ** 2)
+    if frac < LID_VIEW_MIN_FRAC:
+        return None, "only %.0f%% of a lid at lid height in view" % (100 * frac)
+    if frac > LID_VIEW_MAX_FRAC:
+        return None, "the surface at lid height is %.1fx the lid — not this container" % frac
+    edge = ~cv2.erode(ok.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    edge |= np.pad(np.zeros((h - 2, w - 2), bool), 1, constant_values=True)
+    cut = bool((comp & cv2.dilate(edge.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)).any())
+    xyz = P[comp].mean(axis=0)
+    return (float(xyz[0]), float(xyz[1]), float(np.median(z[comp]))), {"frac": frac, "cut": cut, "table_z": table_z}
+
+
 class ButtonAimer:
     """Frames from a D405Grabber, still ones only, until MIN_HITS agree.
     lid_z and prior_xy go to find_button (see there)."""
