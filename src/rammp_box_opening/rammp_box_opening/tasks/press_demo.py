@@ -1844,6 +1844,23 @@ def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S, camera_cfg
     return None
 
 
+def depth_press_refusal(depth_press, cfg, scene, cfg_path=None):
+    """Why --depth-press must not start with this container, or None. Checked
+    before the runtime comes up, so before anything is actuated.
+
+    With detect.confirm_in_flight the scene approach carries the TF-height
+    guarded descent in its own goal (approach_from_scene); once that touches,
+    reach.pressed is set, the depth press is skipped and the press that runs
+    is TF's — the very stroke --depth-press exists to replace."""
+    if depth_press and scene and getattr(cfg, "confirm_in_flight", False):
+        return (
+            "--depth-press with detect.confirm_in_flight: the approach would carry the TF-height descent and "
+            "press before the depth press could run. Set detect.confirm_in_flight: false in %s, or drop "
+            "--depth-press. Nothing moved." % (cfg_path or "the container yaml")
+        )
+    return None
+
+
 def try_home(ctx, runner, execute, why):
     """Recovery home that cannot crash the exit path: a refused home plan
     leaves the arm holding with an honest line (2026-08-25 review). Goes
@@ -2074,6 +2091,9 @@ def main():
     # empty close read 0.793 when it was measured, 0.636 since 2026-09-25)
     cfg = replace(cfg, grip_band=tuple(round(v, 3) for v in fingers.scaled_band(cfg.grip_band)))
     cli_common.refuse_unmeasured(model, args.execute, measuring=args.detect_only)
+    why = depth_press_refusal(args.depth_press, cfg, scene=not args.no_scene, cfg_path=cfg_path)
+    if why:
+        sys.exit("[press_demo] not starting: %s" % why)
     node, client = cli_common.init_runtime(args.execute)
     worlds = WorldStore(bench)
     client._base_frame = worlds.base_frame
