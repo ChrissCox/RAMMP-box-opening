@@ -119,25 +119,41 @@ def circle_gates(depth, k, rot_cam, trans_cam, u, v, r, lid_z):
     # refuse to press it shut (tasks.press_demo.refuse_open_box)
     if p[2] - lid_z < -TOP_RESIDUAL_MAX_M or p[2] - lid_z > KNOB_MAX_UP_M:
         return "centre %.0f mm from lid height" % (1000 * (p[2] - lid_z))
-    yy, xx = np.mgrid[0:h, 0:w]
-    d2 = (xx - u) ** 2 + (yy - v) ** 2
-    disc = depth[d2 < (0.8 * r) ** 2]
+    v0, u0, d2 = _window_d2(h, w, u, v, ANNULUS[1] * r)
+    win = depth[v0 : v0 + d2.shape[0], u0 : u0 + d2.shape[1]]
+    disc = win[d2 < (0.8 * r) ** 2]
     disc = disc[(disc > DEPTH_MIN_M) & (disc < DEPTH_MAX_M) & np.isfinite(disc)]
     if disc.size < 20 or float(np.std(disc)) > DISC_STD_MAX_M:
         return "disc not flat (%d px, std %.1f mm)" % (disc.size, 1000 * float(np.std(disc)) if disc.size else 0.0)
     ring = (d2 > (ANNULUS[0] * r) ** 2) & (d2 < (ANNULUS[1] * r) ** 2)
-    rd = depth[ring]
+    rd = win[ring]
     ok = (rd > DEPTH_MIN_M) & (rd < DEPTH_MAX_M) & np.isfinite(rd)
     if ok.sum() < 30:
         return "no depth around the circle"
     # heights of the ring's points, in base z (the camera looks down; each
     # pixel's own depth is lifted)
     rv, ru = np.nonzero(ring)
-    ring_pts = _lift(depth, kk, rot_cam, trans_cam, ru[ok], rv[ok])
+    ring_pts = _lift(depth, kk, rot_cam, trans_cam, ru[ok] + u0, rv[ok] + v0)
     frac = float(np.mean(np.abs(ring_pts[:, 2] - lid_z) < ANNULUS_TOL_M))
     if frac < ANNULUS_MIN_FRAC:
         return "ring around it is not lid (%.0f%% at lid height) — a corner?" % (100 * frac)
     return None
+
+
+def _window_d2(h, w, u, v, r_max):
+    """(v0, u0, d2): the squared pixel distance from (u, v) over the image's
+    window that holds every pixel nearer than r_max — outside it no
+    strict d2 < r_max ** 2 test can hold, so masks over it are the
+    full-frame masks, in the same row-major order. A centre off the frame
+    gets an empty window (this numpy's mgrid refuses a stop below its
+    start)."""
+    m = int(math.ceil(r_max)) + 1
+    v0 = min(h, max(0, int(math.floor(v)) - m))
+    u0 = min(w, max(0, int(math.floor(u)) - m))
+    v1 = max(v0, min(h, int(math.ceil(v)) + m + 1))
+    u1 = max(u0, min(w, int(math.ceil(u)) + m + 1))
+    yy, xx = np.mgrid[v0:v1, u0:u1]
+    return v0, u0, (xx - u) ** 2 + (yy - v) ** 2
 
 
 def _lift(depth, k, rot_cam, trans_cam, us, vs):
@@ -154,27 +170,28 @@ def disc_height(depth, k, rot_cam, trans_cam, u, v, r):
     at the centre is noisy by 2-3 mm at 25 cm; the disc is what the closed
     pads meet."""
     h, w = depth.shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    disc = (xx - u) ** 2 + (yy - v) ** 2 < r ** 2
-    disc &= (depth > DEPTH_MIN_M) & (depth < DEPTH_MAX_M) & np.isfinite(depth)
+    v0, u0, d2 = _window_d2(h, w, u, v, r)
+    win = depth[v0 : v0 + d2.shape[0], u0 : u0 + d2.shape[1]]
+    disc = d2 < r ** 2
+    disc &= (win > DEPTH_MIN_M) & (win < DEPTH_MAX_M) & np.isfinite(win)
     vs, us = np.nonzero(disc)
     if len(us) < 50:
         return float("nan")
-    return float(np.median(_lift(depth, k, rot_cam, trans_cam, us, vs)[:, 2]))
+    return float(np.median(_lift(depth, k, rot_cam, trans_cam, us + u0, vs + v0)[:, 2]))
 
 
 def ring_height(depth, k, rot_cam, trans_cam, u, v, r):
     """The base-frame height of the LID around the button: the median over
     the annulus the gates judge (ANNULUS), or nan."""
     h, w = depth.shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    d2 = (xx - u) ** 2 + (yy - v) ** 2
+    v0, u0, d2 = _window_d2(h, w, u, v, ANNULUS[1] * r)
+    win = depth[v0 : v0 + d2.shape[0], u0 : u0 + d2.shape[1]]
     ring = (d2 > (ANNULUS[0] * r) ** 2) & (d2 < (ANNULUS[1] * r) ** 2)
-    ring &= (depth > DEPTH_MIN_M) & (depth < DEPTH_MAX_M) & np.isfinite(depth)
+    ring &= (win > DEPTH_MIN_M) & (win < DEPTH_MAX_M) & np.isfinite(win)
     vs, us = np.nonzero(ring)
     if len(us) < 30:
         return float("nan")
-    return float(np.median(_lift(depth, k, rot_cam, trans_cam, us, vs)[:, 2]))
+    return float(np.median(_lift(depth, k, rot_cam, trans_cam, us + u0, vs + v0)[:, 2]))
 
 
 def view_tilt_deg(rot_cam):
