@@ -232,14 +232,25 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="
                 arm.trace.append(lg.name)
                 legs[lg.name] = lg
             name = legs_[-1].name
-            if name == "depth:touch" and touch_at is not None:
+            top = list(ctx.client.live)
+            # the stroke flies fast, then slowly (depth:approach, depth:touch):
+            # `touch_at` is down from where the stroke began, and a lid higher
+            # than the fast stretch reaches is met on it
+            if name == "depth:approach":
+                self.stroke_top = top
+            stroke_top = getattr(self, "stroke_top", None) or top
+            meets = touch_at is not None and (
+                name == "depth:touch"
+                or (name == "depth:approach" and stroke_top[2] - legs_[-1].traj.points[-1].positions[2] >= touch_at))
+            if meets:
                 ctx.client.exec_script = [("touch", {"message": "torque guard trip", "progress": 0.7, "torque_peak": 3.2})]
             if name == "press:push":
                 ctx.client.exec_script = [(push, {"message": "x", "progress": 0.6 if push == "touch" else 1.0, "torque_peak": 7.4})]
-            top = list(ctx.client.live)
             out = super().run(legs_, execute, lookahead)
-            if name == "depth:touch" and touch_at is not None:
-                ctx.client.live = [top[0], top[1], top[2] - touch_at] + top[3:]  # stopped on the lid
+            if meets:
+                ctx.client.live = [stroke_top[0], stroke_top[1], stroke_top[2] - touch_at] + stroke_top[3:]  # stopped on the lid
+            if name == "depth:touch" or meets:
+                self.stroke_top = None
             return out
 
     runner = R(ctx.client, log_dir=tmp_path)
@@ -254,7 +265,8 @@ def test_over_the_box_it_turns_down_measures_the_depth_and_presses_by_feel(ctx, 
     result, events, arm, legs, start = _press(ctx, monkeypatch, tmp_path, looks)
     assert dp.exit_code(result) == 0 and result.free and result.felt and result.popped
     assert events == [
-        "depth:turn", "look:depth-look", "depth:touch", "press:push", "depth:unload", "depth:rise", "look:depth-after",
+        "depth:turn", "look:depth-look", "depth:approach", "depth:touch", "press:push", "depth:unload", "depth:rise",
+        "look:depth-after",
     ]
     # TURN: straight down, about the fingertip — it stays where it was over the button
     (goal, quat), = arm.turns
@@ -263,14 +275,19 @@ def test_over_the_box_it_turns_down_measures_the_depth_and_presses_by_feel(ctx, 
     Rd = rp._rot(quat)
     assert Rd[2, 2] == pytest.approx(-1.0)
     assert np.asarray(goal) + Rd @ np.asarray(dp.DOWN_CONTACT_TOOL) == pytest.approx(tip)
-    # TOUCH: straight down, no farther than the depth the camera measured plus travel_m
+    # TOUCH: straight down, fast to TOUCH_SLOW_M short of where the depth and
+    # TF's mount put the lid (2026-10-23: all of it at press_speed met the lid
+    # at 12.4 Nm), then slowly, no farther than the depth plus travel_m
     cfg = load_press_demo(PINK)
-    stroke = arm.lines[0]
+    fast, stroke = arm.lines[0], arm.lines[1]
+    ahead_tf = dp.DOWN_CONTACT_TOOL[2] - LENS[2]
+    assert fast[:2] == pytest.approx(list(goal[:2])) and goal[2] - fast[2] == pytest.approx(0.27 - ahead_tf - dp.TOUCH_SLOW_M)
     assert stroke[:2] == pytest.approx(list(goal[:2])) and goal[2] - stroke[2] == pytest.approx(0.27 + cfg.travel_m)
     g = legs["depth:touch"].guard
     assert g.trip == "touch" and g.gravity is not None and g.reference is not None
+    assert legs["depth:approach"].guard.trip == "touch" and legs["depth:approach"].guard.reference is g.reference
     # PUSH: button_travel_m from where the torques felt the lid, backstopped
-    assert arm.lines[1][2] == pytest.approx(goal[2] - TOUCH_AT - cfg.button_travel_m) and legs["press:push"].guard.trip == "press"
+    assert arm.lines[2][2] == pytest.approx(goal[2] - TOUCH_AT - cfg.button_travel_m) and legs["press:push"].guard.trip == "press"
     # ... its backstop the TOTAL off the free-air reading over the box (touch_nm), not touch_nm - contact_nm on
     # top of a first sample the touch's overshoot already loaded; the recoil carries on back up the touch
     gp = legs["press:push"].guard
@@ -284,8 +301,9 @@ def test_over_the_box_it_turns_down_measures_the_depth_and_presses_by_feel(ctx, 
 def test_only_the_lines_up_or_in_place_fly_faster_and_every_guard_is_as_before(ctx, monkeypatch, tmp_path):
     """Run 20:04 flew the turn (3.3 mm of tool travel) in 7.43 s and the rise
     in 5.56 s at CONTACT_SPEED. The turn pivots about the fingertip and the
-    rise starts after the at-rest check: FREE_LINE_SPEED. Off the button,
-    and the touch and the push, as before."""
+    rise starts after the at-rest check: FREE_LINE_SPEED. Off the button and
+    the push, as before; the touch flies at press_speed to TOUCH_SLOW_M short
+    of the lid and at TOUCH_SPEED onto it (2026-10-23: 12.4 Nm at 0.35)."""
     from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED
 
     cfg = load_press_demo(PINK)
@@ -294,8 +312,9 @@ def test_only_the_lines_up_or_in_place_fly_faster_and_every_guard_is_as_before(c
     assert dp.exit_code(result) == 0 and "depth:centre" in events
     speeds = {name: lg.speed for name, lg in legs.items()}
     assert speeds == {
-        "depth:turn": FREE_LINE_SPEED, "depth:centre": FREE_LINE_SPEED, "depth:touch": cfg.press_speed,
-        "press:push": cfg.press_speed, "depth:unload": CONTACT_SPEED, "depth:rise": FREE_LINE_SPEED,
+        "depth:turn": FREE_LINE_SPEED, "depth:centre": FREE_LINE_SPEED, "depth:approach": cfg.press_speed,
+        "depth:touch": dp.TOUCH_SPEED, "press:push": cfg.press_speed, "depth:unload": CONTACT_SPEED,
+        "depth:rise": FREE_LINE_SPEED,
     }
     assert dp.CENTRE_SPEED == FREE_LINE_SPEED and CONTACT_SPEED < FREE_LINE_SPEED < cfg.press_speed
     over_box, down = arm.reads[0], arm.reads[1]  # 'over the box', then 'pointing down' after the turn
@@ -418,7 +437,7 @@ def test_from_over_the_box_the_fingers_are_moved_over_the_button_the_camera_sees
              (_sighting(up=12.0), None, "2/2")]
     result, events, arm, legs, start = _press(ctx, monkeypatch, tmp_path, looks)
     assert dp.exit_code(result) == 0
-    assert events[:5] == ["depth:turn", "look:depth-look", "depth:centre", "look:depth-look", "depth:touch"]
+    assert events[:6] == ["depth:turn", "look:depth-look", "depth:centre", "look:depth-look", "depth:approach", "depth:touch"]
     # the re-look follows a move with no at-rest read: it waits for still frames
     assert [t for t in arm.trace if t.startswith("look:")][:2] == ["look:depth-look (settled)", "look:depth-look"]
     assert "look:depth-after (settled)" in arm.trace
@@ -592,7 +611,7 @@ def test_a_mount_in_tf_within_5_mm_of_the_measured_lens_centres(ctx, monkeypatch
     looks = [seen, seen, seen.after]
     result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, lens=tf)
     assert dp.exit_code(result) == 0
-    assert events[:5] == ["depth:turn", "look:depth-look", "depth:centre", "look:depth-look", "depth:touch"]
+    assert events[:6] == ["depth:turn", "look:depth-look", "depth:centre", "look:depth-look", "depth:approach", "depth:touch"]
 
 
 def test_a_turn_short_of_straight_down_centres_the_vertical_stroke_not_the_tool_axis(ctx, monkeypatch, tmp_path):
@@ -942,3 +961,16 @@ def test_a_look_straight_after_an_at_rest_read_takes_frames_at_once(monkeypatch)
         took = _time.monotonic() - t0
         assert s is not None and status == "2/2 frames", (settled, status)
         assert (took < dp.LOOK_SETTLE_S) if settled else (took >= dp.LOOK_SETTLE_S), (settled, took)
+
+
+def test_whatever_the_fast_stretch_meets_is_not_pushed(ctx, monkeypatch, tmp_path):
+    """The fast stretch is a guarded touch too, and ends TOUCH_SLOW_M short
+    of the lid — more than AHEAD_TOL_M, so every contact the press accepts
+    is met slowly. Something met on the fast stretch stands too far above
+    the lid: the slow stretch is not flown, nothing is pushed."""
+    assert dp.TOUCH_SLOW_M > dp.AHEAD_TOL_M
+    looks = [(_sighting(), 0.27, "2/2"), (_sighting(up=12.0), 0.255, "2/2")]
+    result, events, arm, legs, start = _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.08)
+    assert "depth:approach" in events and "depth:touch" not in events and "press:push" not in events
+    assert result.free and "not pushing" in result.why
+

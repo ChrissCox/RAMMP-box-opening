@@ -90,6 +90,15 @@ AHEAD_TOL_M = 0.020
 # straight down. Nothing in it is a mount or a transform.
 _LENS_DOWN = np.diag([1.0, -1.0, -1.0])
 
+# TOUCH: the stroke flies at press_speed to TOUCH_SLOW_M above where the
+# camera's depth and TF's mount put the lid, then at TOUCH_SPEED onto it.
+# Flatbot 2026-10-23 16:02: all 112 mm at 0.35 met the lid moving — the
+# 3 Nm touch tripped at 12.4 Nm in one sample, the push began 9 Nm loaded,
+# and the box slid 6 mm. The slow stretch is the mount's own allowance
+# (AHEAD_TOL_M) and some depth noise.
+TOUCH_SLOW_M = AHEAD_TOL_M + 0.015
+TOUCH_SPEED = CONTACT_SPEED
+
 
 @dataclass
 class LensSighting:
@@ -377,19 +386,22 @@ def walk_in_down(ctx, start_xyz, quat):
     return None, None, "; ".join(whys)
 
 
-def touch_leg(ctx, cfg, pts, quat, reference):
+def touch_leg(ctx, cfg, pts, quat, reference, name="depth:touch", speed=None, arrive_ok=False):
     """The stroke down, guarded at contact_nm on the compensated torques
-    against the free-air `reference`: every trip is the first contact."""
+    against the free-air `reference`: every trip is the first contact.
+    `arrive_ok`: the stroke's fast first stretch, which is meant to arrive
+    (TOUCH_SLOW_M short of the lid) and touches only a lid higher than
+    expected."""
     guard = GuardSpec(touch_nm=cfg.contact_nm, trip="touch", gravity=rp._wrist_gravity(), reference=reference)
 
     def verify(v):
         if v.outcome == "touch":
             return True, "contact%s" % ("" if v.torque_peak is None else " at %.1f Nm" % v.torque_peak)
         if v.outcome == "arrived":
-            return False, "no contact all the way to the measured depth"
+            return (True, "arrived above the lid") if arrive_ok else (False, "no contact all the way to the measured depth")
         return False, "touch %s" % v.outcome
 
-    return rp.line_leg(ctx, "depth:touch", pts, quat, cfg.press_speed, guard, _full_world(ctx), verify)
+    return rp.line_leg(ctx, name, pts, quat, cfg.press_speed if speed is None else speed, guard, _full_world(ctx), verify)
 
 
 def _rise(ctx, runner, quat, top_z, ref):
@@ -541,12 +553,28 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
                                       1000 * depth, "n/a" if z_under is None else "%.0f mm" % (1000 * z_under)))
 
     reach = float(depth) + float(cfg.travel_m)
-    stroke, why = _hand_line(ctx, 0.0, 0.0, -reach, quat)
-    if not stroke:
-        return DepthPress(free=True, why="the stroke down is not a straight line the arm can fly (%s)" % (why or "no length"))
-    print("[press_demo] TOUCH: straight down, at most %.0f mm, until the torques feel it" % (1000 * reach))
-    touch = touch_leg(ctx, cfg, stroke, quat, over)
-    touched = runner.run([touch], execute=True)
+    # fast to TOUCH_SLOW_M short of where the depth and TF's mount put the lid
+    fast_m = max(0.0, float(depth) - (float(DOWN_CONTACT_TOOL[2]) - float(lens[2])) - TOUCH_SLOW_M)
+    touched = []
+    if fast_m > 0.0:
+        fast, why = _hand_line(ctx, 0.0, 0.0, -fast_m, quat)
+        if not fast:
+            return DepthPress(free=True, why="the stroke down is not a straight line the arm can fly (%s)" % (why or "no length"))
+        print("[press_demo] TOUCH: straight down, %.0f mm fast, then slowly, at most %.0f mm in all, until the torques "
+              "feel it" % (1000 * fast_m, 1000 * reach))
+        touch = touch_leg(ctx, cfg, fast, quat, over, name="depth:approach", arrive_ok=True)
+        touched = runner.run([touch], execute=True)
+        if any(not r.ok for r in touched):
+            return DepthPress(free=_rise(ctx, runner, quat, top_z, over), why=touched[-1].detail)
+    else:
+        print("[press_demo] TOUCH: straight down, slowly, at most %.0f mm, until the torques feel it" % (1000 * reach))
+    if not touched or touched[-1].outcome != "touch":
+        stroke, why = _hand_line(ctx, 0.0, 0.0, -(reach - fast_m), quat)
+        if not stroke:
+            return DepthPress(free=_rise(ctx, runner, quat, top_z, over),
+                              why="the stroke down is not a straight line the arm can fly (%s)" % (why or "no length"))
+        touch = touch_leg(ctx, cfg, stroke, quat, over, speed=TOUCH_SPEED)  # the leg that meets the lid, for the recoil
+        touched = runner.run([touch], execute=True)
     if touched[-1].outcome == "touch":
         ctx.contact_pad = CONTACT_SHIFT_PAD_M
     if any(not r.ok for r in touched):
