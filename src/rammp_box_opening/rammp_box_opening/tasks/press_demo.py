@@ -2100,73 +2100,74 @@ def main():
     import threading
 
     pthread = threading.Thread(target=pexec.spin, name="perception", daemon=True)
+    ctx = None  # the finally below runs even if startup fails before Ctx
     pthread.start()
-    # the owl_detector nodes were started by the launch with no container
-    # of their own: tell them which one this run is for, so their prompts
-    # and floor are this container's
-    from rammp_box_opening.perception.owl_source import announce_container
-
-    announce_container(pnode, cfg_path)
-
-    impls = {}
-    owl = None
-    watcher_holder = {}
-    if cfg.detect_source == "vlm":
-        from rammp_box_opening.perception.vlm_source import fetch_box_roi
-
-        impls["claude"] = fetch_box_roi  # bounded at call time, below
-        if "owl" in cfg.vlm_backends:
-            from rammp_box_opening.perception.owl_source import OwlRung
-
-            # listener starts NOW, not at detect time: the node sees the
-            # box as the arm settles and its bbox gates the depth watcher,
-            # so the fix is usually ready within a few still frames
-            owl = OwlRung(pnode, cfg, watcher_holder)
-            impls["owl"] = owl
-    # the box found by geometry: the lid plateau above the surveyed table
-    watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame,
-                            camera_cfg_name=worlds.wrist_camera_config)
-    watcher_holder["watcher"] = watcher
-    # The scene camera finds the box before the arm moves — the only thing
-    # that does, unless --no-scene. It is placed by its calibration
-    # (scripts/calibrate_scene_camera.py), or by TF where the robot's TF
-    # carries its mount: flatbot's static_tf, whose camera is not the one
-    # the installed camera_scene.yaml calibrates.
-    from rammp_box_opening.perception.scene import load_scene_calibration, scene_calib_path
-
-    scene_by_tf = worlds.external_static_tf
-    locator = None
-    if not args.no_scene:
-        T_base_scene_link = None if scene_by_tf else load_scene_calibration(args.scene_calib)
-        if scene_by_tf or T_base_scene_link is not None:
-            from rammp_box_opening.perception.scene_source import SceneLocator
-            from rammp_box_opening.perception.scene_calib import scene_tag_px
-
-            locator = SceneLocator(
-                pnode, cfg, model, worlds.table_top_z, T_base_scene_link, spins=False,
-                tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
-                scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
-            )
-            # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
-            # and the readiness checks below are that long — by the time
-            # locate() asks, the box is already on the topic
-            locator.owl.enable()
-    # camera on from here to exit
-    ctx = Ctx(
-        model=model,
-        cpose=None,
-        client=client,
-        worlds=worlds,
-        config_path=cfg_path,
-    )
-
-    ctx.press_cfg = cfg  # recovery homes go to the mission's rest pose
-    if args.execute and not args.detect_only:
-        # every run keeps what its cameras saw and, when the press lands,
-        # where the button really was: a detection set that grows with the
-        # bench's own runs (detection_set.MissionFrames; written at the end)
-        ctx.mission_frames = MissionFrames(state_dir() / "detection_sets" / MISSIONS_SET, Path(cfg_path).name, worlds.table_top_z)
     try:
+        # the owl_detector nodes were started by the launch with no container
+        # of their own: tell them which one this run is for, so their prompts
+        # and floor are this container's
+        from rammp_box_opening.perception.owl_source import announce_container
+
+        announce_container(pnode, cfg_path)
+
+        impls = {}
+        owl = None
+        watcher_holder = {}
+        if cfg.detect_source == "vlm":
+            from rammp_box_opening.perception.vlm_source import fetch_box_roi
+
+            impls["claude"] = fetch_box_roi  # bounded at call time, below
+            if "owl" in cfg.vlm_backends:
+                from rammp_box_opening.perception.owl_source import OwlRung
+
+                # listener starts NOW, not at detect time: the node sees the
+                # box as the arm settles and its bbox gates the depth watcher,
+                # so the fix is usually ready within a few still frames
+                owl = OwlRung(pnode, cfg, watcher_holder)
+                impls["owl"] = owl
+        # the box found by geometry: the lid plateau above the surveyed table
+        watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame,
+                                camera_cfg_name=worlds.wrist_camera_config)
+        watcher_holder["watcher"] = watcher
+        # The scene camera finds the box before the arm moves — the only thing
+        # that does, unless --no-scene. It is placed by its calibration
+        # (scripts/calibrate_scene_camera.py), or by TF where the robot's TF
+        # carries its mount: flatbot's static_tf, whose camera is not the one
+        # the installed camera_scene.yaml calibrates.
+        from rammp_box_opening.perception.scene import load_scene_calibration, scene_calib_path
+
+        scene_by_tf = worlds.external_static_tf
+        locator = None
+        if not args.no_scene:
+            T_base_scene_link = None if scene_by_tf else load_scene_calibration(args.scene_calib)
+            if scene_by_tf or T_base_scene_link is not None:
+                from rammp_box_opening.perception.scene_source import SceneLocator
+                from rammp_box_opening.perception.scene_calib import scene_tag_px
+
+                locator = SceneLocator(
+                    pnode, cfg, model, worlds.table_top_z, T_base_scene_link, spins=False,
+                    tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
+                    scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
+                )
+                # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
+                # and the readiness checks below are that long — by the time
+                # locate() asks, the box is already on the topic
+                locator.owl.enable()
+        # camera on from here to exit
+        ctx = Ctx(
+            model=model,
+            cpose=None,
+            client=client,
+            worlds=worlds,
+            config_path=cfg_path,
+        )
+
+        ctx.press_cfg = cfg  # recovery homes go to the mission's rest pose
+        if args.execute and not args.detect_only:
+            # every run keeps what its cameras saw and, when the press lands,
+            # where the button really was: a detection set that grows with the
+            # bench's own runs (detection_set.MissionFrames; written at the end)
+            ctx.mission_frames = MissionFrames(state_dir() / "detection_sets" / MISSIONS_SET, Path(cfg_path).name, worlds.table_top_z)
         why = readiness_refusal(client, args.execute, camera_cfg_name=worlds.wrist_camera_config)
         if why:
             sys.exit("[press_demo] not starting: %s" % why)
@@ -2617,7 +2618,7 @@ def main():
         except Exception:
             pass
         # the run is over and the arm stopped: now its frames are written
-        keep_mission_frames(ctx.mission_frames, ending)
+        keep_mission_frames(getattr(ctx, "mission_frames", None), ending)
 
 
 if __name__ == "__main__":
