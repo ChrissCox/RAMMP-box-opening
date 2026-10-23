@@ -84,6 +84,7 @@ class _Arm:
 
     def __init__(self, refuse_turn=False):
         self.lines, self.turns, self.refuse_turn = [], [], refuse_turn
+        self.trace = []  # legs, looks and at-rest reads, in order (_press)
 
     def fk(self, q):
         return np.asarray(quat_to_mat(*q[3:7]), float), np.asarray(q[:3], float)
@@ -115,11 +116,13 @@ def _sighting(x=0.0, y=-LENS[1], lid=0.27, up=0.4):
     return dp.LensSighting(x=x, y=y, lid_depth=lid, button_depth=lid - up / 1000.0, up_mm=up, raw=None)
 
 
-def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=0.24, push="touch", refuse_turn=False):
+def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=0.24, push="touch", refuse_turn=False, here=None,
+           turned=None):
     """press_down_from_here with the hand `tilt` deg over BUTTON (at the
     reach-out's stroke start, 6 cm above TF's lid at 0.40), the wrist camera
     scripted by `looks` and the fingertips meeting the lid `touch_at` down
-    the stroke. Returns (DepthPress, events, arm, legs, start tool pose)."""
+    the stroke. Every at-rest read is a distinct reading, ("rest", n, where)
+    in arm.trace. Returns (DepthPress, events, arm, legs, start tool pose)."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.runner import Runner
 
@@ -132,12 +135,22 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=0.24, push="touc
     quat = rp.reach_quat(ctx.model, BUTTON[:2], tilt)
     start = rp.tool_for_contact((BUTTON[0], BUTTON[1], 0.46), quat)  # TF's stroke start: 6 cm over its lid at 0.40
     ctx.client.live = list(start) + list(quat)
-    ctx.client.settled_efforts = lambda *a, **k: ([0.0] * 4, list(ctx.client.live))
     events, legs = [], {}
     seq = list(looks)
+    arm.reads = []
 
-    def look(node, watcher, model, tag, runner=None, ctx=None):
+    def settled(*a, **k):
+        got = ([0.001 * (len(arm.reads) + 1), 0.0, 0.0, 0.0], list(ctx.client.live))
+        arm.reads.append(got)
+        return got
+
+    ctx.client.settled_efforts = settled
+    real_settled = rp._settled
+    monkeypatch.setattr(rp, "_settled", lambda ctx_, where: (arm.trace.append("rest:" + where), real_settled(ctx_, where))[1])
+
+    def look(node, watcher, model, tag, runner=None, ctx=None, settled=False):
         events.append("look:" + tag)
+        arm.trace.append("look:%s%s" % (tag, " (settled)" if settled else ""))
         s, z, status = seq.pop(0)[:3]
         return s, z, LENS, status
 
@@ -147,6 +160,7 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=0.24, push="touc
         def run(self, legs_, execute, lookahead=None):
             for lg in legs_:
                 events.append(lg.name)
+                arm.trace.append(lg.name)
                 legs[lg.name] = lg
             name = legs_[-1].name
             if name == "depth:touch" and touch_at is not None:
@@ -161,7 +175,7 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=0.24, push="touc
 
     runner = R(ctx.client, log_dir=tmp_path)
     contact = rp.CONTACT_TOOL if tilt else dp.DOWN_CONTACT_TOOL
-    result = dp.press_down_from_here(None, ctx, cfg, runner, SimpleNamespace(), contact)
+    result = dp.press_down_from_here(None, ctx, cfg, runner, SimpleNamespace(), contact, here=here, turned=turned)
     return result, events, arm, legs, start
 
 
@@ -189,6 +203,74 @@ def test_over_the_box_it_turns_down_measures_the_depth_and_presses_by_feel(ctx, 
     assert arm.lines[1][2] == pytest.approx(goal[2] - 0.24 - cfg.button_travel_m) and legs["press:push"].guard.trip == "press"
     # RISE: back to where the touch began, judged for a pull at the fingertip
     assert arm.lines[-1][2] == pytest.approx(goal[2]) and legs["depth:rise"].guard.hang is not None
+
+
+def test_only_the_lines_up_or_in_place_fly_faster_and_every_guard_is_as_before(ctx, monkeypatch, tmp_path):
+    """Run 20:04 flew the turn (3.3 mm of tool travel) in 7.43 s and the rise
+    in 5.56 s at CONTACT_SPEED. The turn pivots about the fingertip and the
+    rise starts after the at-rest check: FREE_LINE_SPEED. Off the button,
+    and the touch and the push, as before."""
+    from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED
+
+    cfg = load_press_demo(PINK)
+    looks = [(_sighting(x=0.02), 0.27, "2/2"), (_sighting(), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
+    result, events, arm, legs, _s = _press(ctx, monkeypatch, tmp_path, looks)
+    assert dp.exit_code(result) == 0 and "depth:centre" in events
+    speeds = {name: lg.speed for name, lg in legs.items()}
+    assert speeds == {
+        "depth:turn": FREE_LINE_SPEED, "depth:centre": FREE_LINE_SPEED, "depth:touch": cfg.press_speed,
+        "press:push": cfg.press_speed, "depth:unload": CONTACT_SPEED, "depth:rise": FREE_LINE_SPEED,
+    }
+    assert dp.CENTRE_SPEED == FREE_LINE_SPEED and CONTACT_SPEED < FREE_LINE_SPEED < cfg.press_speed
+    over_box, down = arm.reads[0], arm.reads[1]  # 'over the box', then 'pointing down' after the turn
+    turn, rise, unload = legs["depth:turn"].guard, legs["depth:rise"].guard, legs["depth:unload"].guard
+    assert (turn.touch_nm, turn.trip, turn.reference, turn.hang) == (rp.DRAG_NM, "obstruction", over_box, None)
+    assert turn.gravity is not None
+    for g in (rise, unload):
+        assert (g.touch_nm, g.trip, g.reference) == (ctx.model.touch_nm, "obstruction", down)
+        assert g.hang[1] == rp.HANG_N and g.gravity is not None
+    assert legs["depth:touch"].guard.touch_nm == cfg.contact_nm and legs["depth:touch"].guard.reference == down
+
+
+def test_one_at_rest_read_where_the_arm_stands_and_a_fresh_one_after_a_turn(ctx, monkeypatch, tmp_path):
+    """Each at-rest read holds the arm 0.45 s. The turn moved: its own read
+    pointing down is the touch's reference."""
+    looks = [(_sighting(), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
+    _r, _e, arm, legs, _s = _press(ctx, monkeypatch, tmp_path, looks)
+    assert arm.trace[:4] == ["rest:over the box", "depth:turn", "rest:over the button, pointing down",
+                             "look:depth-look (settled)"]
+    assert legs["depth:touch"].guard.reference == arm.reads[1]
+
+
+def test_at_staging_one_at_rest_read_before_the_look(ctx, monkeypatch, tmp_path):
+    looks = [(_sighting(), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
+    result, _e, arm, legs, _s = _press(ctx, monkeypatch, tmp_path, looks, tilt=0)
+    assert dp.exit_code(result) == 0
+    assert arm.trace[:2] == ["rest:over the box", "look:depth-look (settled)"]  # no second read: the turn did not move
+    assert legs["depth:touch"].guard.reference == arm.reads[0]
+
+
+def test_the_callers_read_is_the_reference_when_nothing_moved_since(ctx, monkeypatch, tmp_path):
+    """The reach-out read the stroke's start a moment before: the same
+    reading at the same joints, not read again."""
+    here = ([0.5, 0.0, 0.0, 0.0], None)
+    looks = [(_sighting(), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
+    _r, _e, arm, legs, _s = _press(ctx, monkeypatch, tmp_path, looks, here=here)
+    assert arm.trace[:2] == ["depth:turn", "rest:over the button, pointing down"]
+    assert legs["depth:turn"].guard.reference == here
+
+
+def test_a_hand_that_slid_in_turning_is_not_turned_again(ctx, monkeypatch, tmp_path):
+    """The reach-out's walk in landed 2 deg short of straight down: turning
+    to exactly down from there is the wrist's singular case. No turn, and
+    the caller's read is the reference."""
+    here = ([0.5, 0.0, 0.0, 0.0], None)
+    short = dp.down_quat(ContainerModel.load(PINK), BUTTON[:2], 2.0)
+    looks = [(_sighting(), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
+    result, events, arm, legs, _s = _press(ctx, monkeypatch, tmp_path, looks, here=here, turned=short)
+    assert dp.exit_code(result) == 0 and arm.turns == [] and "depth:turn" not in events
+    assert arm.trace[0] == "look:depth-look (settled)" and not any(t.startswith("rest:over") for t in arm.trace)
+    assert legs["depth:touch"].guard.reference == here and legs["depth:touch"].target[2] == pytest.approx(short)
 
 
 def test_the_touch_measures_how_far_in_front_of_the_lens_the_fingertips_are(ctx, monkeypatch, tmp_path):
@@ -223,6 +305,9 @@ def test_from_over_the_box_the_fingers_are_moved_over_the_button_the_camera_sees
     result, events, arm, legs, start = _press(ctx, monkeypatch, tmp_path, looks)
     assert dp.exit_code(result) == 0
     assert events[:5] == ["depth:turn", "look:depth-look", "depth:centre", "look:depth-look", "depth:touch"]
+    # the re-look follows a move with no at-rest read: it waits for still frames
+    assert [t for t in arm.trace if t.startswith("look:")][:2] == ["look:depth-look (settled)", "look:depth-look"]
+    assert "look:depth-after (settled)" in arm.trace
     goal, quat = arm.turns[0]
     R = rp._rot(quat)
     centre = np.asarray(goal) + R[:, 0] * 0.02 + R[:, 1] * 0.03  # along the hand's own x and y
@@ -298,7 +383,7 @@ def test_the_reach_out_hands_over_to_the_depth_press_once_over_the_box(ctx, monk
 
     got = {}
 
-    def press(node, ctx_, cfg, runner, watcher, contact_tool):
+    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None):
         got["contact"] = contact_tool
         return dp.DepthPress(free=True, contact=True, felt=True, popped=True)
 
@@ -314,3 +399,139 @@ def test_the_reach_out_hands_over_to_the_depth_press_once_over_the_box(ctx, monk
     assert code == 0 and got["contact"] == rp.CONTACT_TOOL
     assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "home"]
     assert "press:down" not in rec.events
+
+
+def test_the_reach_out_slides_in_turning_down_in_one_leg(ctx, monkeypatch, tmp_path):
+    """Run 20:04: the slide in (4.56 s), two at-rest reads and the turn
+    (7.43 s) — one walk does both, as slow and as guarded as the slide."""
+    import test_reach_press as trp
+
+    from rammp_box_opening.constants import CONTACT_SPEED
+
+    got = {}
+
+    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None):
+        got.update(here=here, turned=turned)
+        return dp.DepthPress(free=True, contact=True, felt=True, popped=True)
+
+    monkeypatch.setattr(dp, "press_down_from_here", press)
+    walks = []
+
+    def walk(self, q0, xyz, quat, step_m=None, step_rad=None, max_step_rad=None):
+        walks.append((list(xyz), list(quat), step_m, step_rad, max_step_rad))
+        return [list(q0), [v + 0.01 for v in q0]], None
+
+    monkeypatch.setattr(trp._Chain, "walk", walk, raising=False)
+    real = rp.run_reach_press
+    monkeypatch.setattr(rp, "run_reach_press", lambda n, c, cfg, r, w, a, f, l: real(
+        n, c, cfg, r, w, SimpleNamespace(execute=True, press_only=True, depth_press=True), f, l))
+    code, rec, chain, _h = trp._flow(ctx, monkeypatch, tmp_path)
+    assert code == 0 and rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "home"]
+    leg = rec.legs["reach:slide-in"]
+    (goal, down, step_m, step_rad, jump), = walks
+    assert leg.speed == CONTACT_SPEED and leg.guard.reference == trp.AT_LOOK2 and leg.guard.touch_nm == rp.DRAG_NM
+    assert leg.target[2] == pytest.approx(down) and got["turned"] == pytest.approx(down)
+    assert (step_m, step_rad, jump) == (dp.TURN_STEP_M, dp.TURN_STEP_RAD, dp.TURN_MAX_JUMP_RAD)
+    assert rp._rot(down)[2, 2] == pytest.approx(-1.0)  # exactly down, the first of TURN_SHORT_DEG
+    # the pads end where the tilted fingertip would have ended the slide
+    quat = rp.reach_quat(ctx.model, trp.BUTTON[:2], rp.REACH_TILTS_DEG[0])
+    start = rp.tool_for_contact((trp.BUTTON[0], trp.BUTTON[1], trp.BUTTON[2] + rp.REACH_START_M), quat)
+    tip = np.asarray(start) + rp._rot(quat) @ np.asarray(rp.CONTACT_TOOL)
+    assert np.asarray(goal) + rp._rot(down) @ np.asarray(dp.DOWN_CONTACT_TOOL) == pytest.approx(tip)
+    # one at-rest read after it, handed over: the depth press reads nothing again
+    assert got["here"] == trp.AT_START and rec.reads == 4
+    # the slide is solved by plan_reach and reach_from_here, to prove it flies, and not again from the
+    # live joints; the stroke, which the depth press never flies, only by plan_reach
+    assert sum(xyz == pytest.approx(start) for xyz, _q in chain.lines) == 2
+    bottom = rp.tool_for_contact((trp.BUTTON[0], trp.BUTTON[1], trp.BUTTON[2] - load_press_demo(PINK).travel_m), quat)
+    assert sum(xyz == pytest.approx(bottom) for xyz, _q in chain.lines) == 1
+
+
+def test_where_no_walk_turns_down_on_the_way_it_slides_then_turns(ctx, monkeypatch, tmp_path):
+    import test_reach_press as trp
+
+    got = {}
+
+    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None):
+        got.update(here=here, turned=turned)
+        return dp.DepthPress(free=True, contact=True, felt=True, popped=True)
+
+    monkeypatch.setattr(dp, "press_down_from_here", press)
+    tried = []
+    monkeypatch.setattr(trp._Chain, "walk", lambda self, q0, xyz, quat, **k: (tried.append(quat), (None, "a joint limit"))[1],
+                        raising=False)
+    real = rp.run_reach_press
+    monkeypatch.setattr(rp, "run_reach_press", lambda n, c, cfg, r, w, a, f, l: real(
+        n, c, cfg, r, w, SimpleNamespace(execute=True, press_only=True, depth_press=True), f, l))
+    code, rec, _c, _h = trp._flow(ctx, monkeypatch, tmp_path)
+    assert code == 0 and len(tried) == len(dp.TURN_SHORT_DEG)
+    quat = rp.reach_quat(ctx.model, trp.BUTTON[:2], rp.REACH_TILTS_DEG[0])
+    assert rec.legs["reach:slide-in"].target[2] == pytest.approx(quat)  # the tilted slide: the depth press turns
+    assert got["turned"] is None and got["here"] == trp.AT_START
+
+
+def test_the_walk_in_on_flatbot_turns_down_over_the_button_no_lower_than_the_slide(ctx, monkeypatch):
+    """Flatbot's URDF, run 20:04's aimed button at 35 deg (the walk
+    modelled before it was flown: 31 points, the fingertip within 0.6 mm of
+    the slide's height)."""
+    from rammp_box_opening.constants import HOME
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.kinematics import ArmChain
+
+    chain = ArmChain(path="src/rammp_box_opening/test/data/arm_flatbot_20261021.urdf", root="arm_mount")
+    model = ContainerModel.load(PINK)
+    ctx.model = model
+    button, tilt = (0.4833, -0.1575, 0.4044), 35
+    quat, start, _bottom, look = rp.reach_geometry(model, button, tilt, 0.015)
+    q_look = chain.nearest_solution(HOME, look, quat)
+    assert q_look is not None
+    ctx.client.live = [float(v) for v in q_look]
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    pts, down, why = dp.walk_in_down(ctx, start, quat)
+    assert why is None, why
+    tip = np.asarray(start) + rp._rot(quat) @ np.asarray(rp.CONTACT_TOOL)  # the slid-in fingertip
+    R, t = chain.fk(pts[-1])
+    R = np.asarray(R, float)
+    lean = np.degrees(np.arccos(np.clip(-R[2, 2], -1.0, 1.0)))
+    assert lean < 1.0 + max(dp.TURN_SHORT_DEG)
+    assert np.linalg.norm(np.asarray(t) + R @ np.asarray(dp.DOWN_CONTACT_TOOL) - tip) < 0.001
+    lowest = []
+    for q in pts:
+        Rq, tq = chain.fk(q)
+        Rq = np.asarray(Rq, float)
+        lowest.append(min(float((np.asarray(tq) + Rq @ np.asarray(p))[2]) for p in (rp.CONTACT_TOOL, dp.DOWN_CONTACT_TOOL)))
+    assert min(lowest) >= tip[2] - 0.001  # never nearer the lid than the slide
+    assert max(float(np.abs(np.asarray(b) - np.asarray(a)).max()) for a, b in zip(pts, pts[1:])) <= dp.TURN_MAX_JUMP_RAD
+
+
+def test_a_look_straight_after_an_at_rest_read_takes_frames_at_once(monkeypatch):
+    """look() waits LOOK_SETTLE_S for still frames; after an at-rest read
+    the arm has been still 0.45 s already. Either way a frame shot before
+    `after` never counts."""
+    import time as _time
+
+    from rammp_box_opening.tasks import press_demo
+
+    monkeypatch.setattr(dp, "LOOK_SETTLE_S", 0.5)
+    monkeypatch.setattr(press_demo, "save_aim_frame", lambda *a, **k: None)
+    clock = {"ns": 1000}
+    grab = SimpleNamespace(color=np.zeros((4, 4, 3)), depth=np.zeros((4, 4)), k=np.eye(3),
+                           color_stamp=SimpleNamespace(sec=0, nanosec=1000))  # shot before the look began
+    node = SimpleNamespace(get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=clock["ns"])))
+
+    def spin(_node):
+        clock["ns"] += 10
+        if clock["ns"] % 1000 == 0:  # a new frame now and then, stamped now
+            grab.color_stamp = SimpleNamespace(sec=0, nanosec=clock["ns"])
+
+    monkeypatch.setattr(press_demo, "_spin_detect", spin)
+    # the stale frame sees the button elsewhere: counted, it would not agree
+    monkeypatch.setattr(dp, "find_in_camera", lambda c, d, k, m, dist=None: (
+        _sighting(x=0.05 if grab.color_stamp.nanosec == 1000 else 0.0), None))
+    for settled in (True, False):
+        clock["ns"], grab.color_stamp = 1000, SimpleNamespace(sec=0, nanosec=1000)
+        t0 = _time.monotonic()
+        s, _z, _lens, status = dp.look(node, SimpleNamespace(grab=grab), None, "t", settled=settled)
+        took = _time.monotonic() - t0
+        assert s is not None and status == "2/2 frames", (settled, status)
+        assert (took < dp.LOOK_SETTLE_S) if settled else (took >= dp.LOOK_SETTLE_S), (settled, took)

@@ -45,6 +45,13 @@ TRANSIT_SPEED = 1.0
 # one of them commits (runtime/legs.py stop_when).
 SEARCH_SPEED = 0.35
 CONTACT_SPEED = 0.15
+# A drag-guarded straight line in free air that moves up or away from
+# anything it could touch, flown only after an at-rest check (or in place,
+# pivoting about the fingertip): the reach-out's rise, slide out and back
+# off, the depth press's turn, rise and centring. Every line toward the lid,
+# or loaded, stays at CONTACT_SPEED. Run 2026-10-22 20:04 flew its turn, rise
+# and back off at 0.15: 18 s of a 45 s press.
+FREE_LINE_SPEED = 0.3
 DRIFT_REPLAN_RAD = 0.04  # < START_GATE_RAD: replan before the gate would refuse
 # The driver commands a trajectory's first waypoint at once, wherever the arm
 # is; runtime/driver.py refuses a goal whose start is farther than this from

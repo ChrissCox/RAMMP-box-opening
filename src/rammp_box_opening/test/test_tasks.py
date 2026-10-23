@@ -1712,6 +1712,62 @@ def test_a_dry_run_says_it_would_recentre_and_moves_nothing(ctx, tmp_path, monke
     assert "would move 40 mm" in capsys.readouterr().out
 
 
+def test_before_the_depth_press_staging_does_not_recentre_through_the_wrist_mount(ctx, tmp_path, monkeypatch):
+    """--depth-press centres the fingers itself from straight down, by the
+    wrist camera's own frame (tasks/depth_press CENTRE); the staging aim's
+    recentre goes through the wrist mount's TF, wrong on flatbot (83-85 mm
+    off the scene camera's box, 2026-10-22). Nothing moves for it — but the
+    box is still put where the aim saw it, for every world from here."""
+    first = ((0.450, 0.000, 0.085), 0.0)
+    press_demo, r, watcher, state = _centring_env(ctx, tmp_path, monkeypatch, tool_xys=[(0.45, 0.08)], aims=[])
+    got, moves, off = press_demo.centre_for_press(None, ctx, _demo_cfg(), r, watcher, True, first, depth_press=True)
+    assert (got, moves, state["n"]) == (first, 0, 0) and ctx.client.executed == []
+    assert ctx.cpose == watcher.to_container_pose(first) and off == pytest.approx(0.08)
+
+
+def test_before_the_depth_press_an_aim_beyond_its_reach_gets_one_planned_move(ctx, tmp_path, monkeypatch):
+    from rammp_box_opening.tasks.depth_press import CENTRE_MAX_M
+
+    a = [((0.450, 0.0, 0.085), 0.0), ((0.452, 0.0, 0.085), 0.0), ((0.454, 0.0, 0.085), 0.0)]
+    press_demo, r, watcher, state = _centring_env(
+        ctx, tmp_path, monkeypatch, tool_xys=[(0.45, CENTRE_MAX_M + 0.05), (0.45, 0.04), (0.45, 0.04)], aims=a[1:]
+    )
+    got, moves, off = press_demo.centre_for_press(None, ctx, _demo_cfg(), r, watcher, True, a[0], depth_press=True)
+    assert moves == 1 and state["n"] == 1 and got == a[1] and len(ctx.client.executed) == 1
+    assert ctx.cpose == watcher.to_container_pose(a[1])
+
+
+def test_without_the_depth_press_staging_recentres_as_before(ctx, tmp_path, monkeypatch):
+    first, second = ((0.450, 0.000, 0.085), 0.0), ((0.451, 0.001, 0.085), 0.0)
+    press_demo, r, watcher, state = _centring_env(
+        ctx, tmp_path, monkeypatch, tool_xys=[(0.45, 0.08), (0.451, 0.0015)], aims=[second]
+    )
+    got, moves, off = press_demo.centre_for_press(None, ctx, _demo_cfg(), r, watcher, True, first)
+    assert (got, moves) == (second, 1) and len(ctx.client.executed) == 1
+
+
+def test_the_depth_press_plans_no_descent_on_the_way_to_staging(ctx, tmp_path, monkeypatch):
+    """It flies its own touch: the approach's lookahead was a cuRobo plan
+    (and GPU) for a descent never flown."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.models.container import ContainerPose
+
+    press_demo = _search_env(monkeypatch)
+    cfg = load_press_demo(CFG)
+    monkeypatch.setattr(press_demo, "aim_button_at_staging", lambda *a, **k: (FIX, "3/3 frames"))
+    fix = _SceneFix((0.45, 0.0, -0.027), 0.0, (0.45, 0.0, 0.085))
+    r = make_runner(ctx.client, tmp_path)
+    assert press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix).preplanned is not None
+    reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix, lookahead=False)
+    assert reach.got == FIX and reach.preplanned is None
+    watcher = _Watcher()
+    watcher.to_container_pose = lambda got: ContainerPose(xyz=(got[0][0], got[0][1], -0.027), yaw=got[1])
+    _got, at_staging, preplanned, _pf = press_demo.stage_over_search_fix(None, ctx, _demo_cfg(), r, watcher, True, FIX,
+                                                                          depth_press=True)
+    assert at_staging and preplanned is None
+
+
 def _descent_leg():
     """A press descent as the planner client builds it: a planned segment
     from staging to the waypoint 60 mm above the target, at rest there,
