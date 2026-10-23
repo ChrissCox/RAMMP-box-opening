@@ -143,8 +143,6 @@ class FakeStore:
         self.pushes = []  # (kind, kwargs) — world-shape assertions
         self.table_extent = None  # the surveyed bench: no measured table
         self.table_top_z = -0.027  # world_bench.yaml's surveyed table top
-
-
         self.base_frame = "base_link"  # the bench's planning frame (WorldStore.base_frame)
 
     def push_name(self, kind, **kw):
