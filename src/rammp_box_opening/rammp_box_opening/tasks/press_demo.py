@@ -1271,8 +1271,8 @@ def build_push_legs(ctx, cfg, contact_xyz, touch_leg=None, push=True):
     live = list(ctx.client.joints())
     st = _state(live)
     world = ctx.last_world or _full_world(ctx)
-    # cut from the touch's own stroke when enough of it remains (no planner
-    # call while the fingers press the button); planned otherwise
+    # the arm's own straight line down from the stop (no planner call while
+    # the fingers press the button); planned when that line is refused
     legs = []
     if push:
         made = (
@@ -1282,6 +1282,8 @@ def build_push_legs(ctx, cfg, contact_xyz, touch_leg=None, push=True):
         )
         push_leg, st = made if made is not None else press_push(ctx, st, cfg, contact_xyz, world)
         push_leg.hold_s = float(cfg.push_hold_s)
+        # the recoil reverses the push, then carries on back up the touch
+        push_leg.recoil_via = touch_leg.traj if touch_leg is not None else None
         legs.append(push_leg)
     retreat_legs, st = Retreat(
         cfg.grip_hop_m + cfg.button_travel_m, speed=TRANSIT_SPEED, lazy=True
@@ -1311,8 +1313,9 @@ def _grip_open_after_retreat(ctx, st):
     the knob pops 15 mm — at the hop they are 35 mm above it."""
     world = ctx.last_world or _full_world(ctx)
     # rides the retreat: sent the moment the retreat starts flying, which
-    # is after the recoil has already lifted the pads 29 mm clear of the
-    # popped knob — the fingers open while the arm rises (2026-09-04)
+    # is after the recoil has already lifted the pads ~22 mm (RECOIL_ARC_RAD:
+    # back out of the push and on up the touch stroke) — the fingers open
+    # while the arm rises (2026-09-04)
     return _gripper_leg(
         ctx,
         st,

@@ -271,6 +271,12 @@ def test_over_the_box_it_turns_down_measures_the_depth_and_presses_by_feel(ctx, 
     assert g.trip == "touch" and g.gravity is not None and g.reference is not None
     # PUSH: button_travel_m from where the torques felt the lid, backstopped
     assert arm.lines[1][2] == pytest.approx(goal[2] - TOUCH_AT - cfg.button_travel_m) and legs["press:push"].guard.trip == "press"
+    # ... its backstop the TOTAL off the free-air reading over the box (touch_nm), not touch_nm - contact_nm on
+    # top of a first sample the touch's overshoot already loaded; the recoil carries on back up the touch
+    gp = legs["press:push"].guard
+    assert gp.touch_nm == pytest.approx(ctx.model.touch_nm) and gp.gravity is not None
+    assert gp.reference is g.reference and gp.reference is not None
+    assert legs["press:push"].recoil_via is legs["depth:touch"].traj
     # RISE: back to where the touch began, judged for a pull at the fingertip
     assert arm.lines[-1][2] == pytest.approx(goal[2]) and legs["depth:rise"].guard.hang is not None
 
@@ -343,6 +349,42 @@ def test_a_hand_that_slid_in_turning_is_not_turned_again(ctx, monkeypatch, tmp_p
     assert dp.exit_code(result) == 0 and arm.turns == [] and "depth:turn" not in events and "depth:centre" in events
     assert arm.trace[0] == "look:depth-look (settled)" and not any(t.startswith("rest:over") for t in arm.trace)
     assert legs["depth:touch"].guard.reference == here and legs["depth:touch"].target[2] == pytest.approx(short)
+
+
+def test_the_push_backstop_is_a_ceiling_off_free_air_not_on_top_of_the_touch_overshoot(ctx, monkeypatch, tmp_path):
+    """Run 2026-10-22 20:04 replayed (joint_4, the trip reports): over the box
+    it read 8.211 Nm in free air; the 0.35 touch overshot to 6.1 off that, so
+    the push's first sample (2.738) was already 5.5 Nm in. The raw backstop
+    (touch_nm - contact_nm = 7 Nm over THAT) rode to -4.972: 13.2 Nm off free
+    air against touch_nm 10, on the lid's edge. Judged off the free-air
+    reading the push trips at the first sample past touch_nm."""
+    from dataclasses import replace
+
+    from rammp_box_opening.runtime.guards import CompensatedGuard, TorqueGuard
+
+    looks = [(_sighting(), 0.27, "2/2"), (_sighting(up=12.0), 0.255, "2/2")]
+    _r, _e, _a, legs, _s = _press(ctx, monkeypatch, tmp_path, looks)
+    cfg = load_press_demo(PINK)
+    free_air = [8.211, -0.419, 0.926, -0.254]
+    push = [[2.738, -0.857, 0.754, -0.41], [-2.857, -1.583, 2.064, -0.421], [-3.72, -1.562, 2.129, -0.439],
+            [-4.204, -1.577, 2.297, -0.415], [-4.972, -1.727, 2.288, -0.428]]
+    q = [0.0] * 7
+
+    def first_trip(guard):
+        guard.on_progress(0.01)
+        for i, eff in enumerate(push):
+            if guard.on_efforts(eff, q) if isinstance(guard, CompensatedGuard) else guard.on_efforts(eff):
+                return i, free_air[0] - eff[0]
+        return None, None
+
+    spec = replace(legs["press:push"].guard, reference=(free_air, q))
+    now = CompensatedGuard(spec.touch_nm, spec.gravity, reference=spec.reference)
+    was = TorqueGuard(ctx.model.touch_nm - cfg.contact_nm)
+    i_now, total_now = first_trip(now)
+    i_was, total_was = first_trip(was)
+    assert (i_was, round(total_was, 1)) == (4, 13.2)  # what the run did
+    assert i_now == 1 and total_now < total_was  # the first sample the stream had past 10 Nm (11.1)
+    assert all(free_air[0] - e[0] <= ctx.model.touch_nm for e in push[:i_now])
 
 
 def test_the_touch_measures_how_far_in_front_of_the_lens_the_fingertips_are(ctx, monkeypatch, tmp_path):
