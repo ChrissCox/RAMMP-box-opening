@@ -61,6 +61,17 @@ LOOK_S = 2.0  # still frames are gathered this long at each look
 LOOK_SETTLE_S = 0.3  # ... after the arm stopped
 LOOK_HITS = 2  # sightings that agree within LOOK_AGREE_M make a look
 LOOK_AGREE_M = 0.003
+# A look that knows where the button must be (look's `expect`: after a
+# centring move, the hand moved level by what the camera asked; after the
+# press, back where the last look stood) takes no circle farther than this
+# from there, nor a lid this much nearer or farther. Flatbot 2026-10-23 17:30:
+# the look after a 21 mm move took a circle on the cabinet 288 mm away and
+# 99 mm deeper in the frames Hough missed the button in, two of them agreed,
+# and the run stopped "the camera's axes in TF are wrong?" with the button
+# right under the fingers. A box the press slid farther than this is lost to
+# the wrist camera, and the scene camera is asked (after_scene_check).
+LOOK_EXPECT_M = 0.03
+LOOK_EXPECT_DEPTH_M = 0.03
 LENS_AHEAD_MAX_M = 0.25  # the fingertips are at most this far in front of the lens
 # CENTRE: from over the box the fingers are put over the button the wrist
 # camera sees — TF's aim from the tilted look landed the press 45 mm off its
@@ -135,26 +146,39 @@ def lid_depth_guesses(depth, n=4):
     return out[:n]
 
 
-def find_in_camera(color, depth, k, model, dist=None):
+def find_in_camera(color, depth, k, model, dist=None, expect=None):
     """The button in one frame from a camera looking straight down along the
     tool, in that camera's own frame: (LensSighting, None) or (None, why).
-    find_button's straight-down aim, handed the lens itself as its world."""
+    find_button's straight-down aim, handed the lens itself as its world.
+    `expect`: (x, y, lid depth) where the button must be, in the same frame —
+    the lid looked for at that depth only, and no circle farther than
+    LOOK_EXPECT_M from there or LOOK_EXPECT_DEPTH_M off its lid depth."""
     from rammp_box_opening.perception.button_aim import find_button
 
     if color is None or depth is None or k is None:
         return None, "no frame"
     whys = []
-    for d0 in lid_depth_guesses(depth):
-        s, why = find_button(color, depth, k, _LENS_DOWN, (0.0, 0.0, 0.0), -d0 - float(model.dims[2]), model, dist=dist)
+    guesses, prior, reach = lid_depth_guesses(depth), None, None
+    if expect is not None:
+        # find_button's world is the lens turned down (_LENS_DOWN): its y is the camera's -y
+        guesses, prior, reach = [float(expect[2])], (float(expect[0]), -float(expect[1])), LOOK_EXPECT_M
+    for d0 in guesses:
+        s, why = find_button(color, depth, k, _LENS_DOWN, (0.0, 0.0, 0.0), -d0 - float(model.dims[2]), model, dist=dist,
+                             prior_xy=prior, prior_max_m=reach)
         if s is None:
             whys.append("at %.0f mm: %s" % (1000 * d0, why))
             continue
         up = float(s.above_lid_m)
         top = -float(s.xyz[2])
-        return LensSighting(
+        seen = LensSighting(
             x=float(s.xyz[0]), y=-float(s.xyz[1]), lid_depth=top + up if np.isfinite(up) else top,
             button_depth=top, up_mm=1000.0 * up, raw=s,
-        ), None
+        )
+        if expect is not None and abs(seen.lid_depth - float(expect[2])) > LOOK_EXPECT_DEPTH_M:
+            whys.append("at %.0f mm: its lid %.0f mm below the lens, not the %.0f it must be" % (
+                1000 * d0, 1000 * seen.lid_depth, 1000 * float(expect[2])))
+            continue
+        return seen, None
     return None, "; ".join(whys) if whys else "no flat surface in depth"
 
 
@@ -237,14 +261,14 @@ def _stamp_ns(stamp):
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
 
-def look(node, watcher, model, tag, runner=None, ctx=None, settled=False):
+def look(node, watcher, model, tag, runner=None, ctx=None, settled=False, expect=None):
     """Still frames after the arm stopped, until LOOK_HITS agree within
     LOOK_AGREE_M. Returns (LensSighting or None, depth under the fingers or
     None, the lens in the hand (lens_in_hand's pair) or None, status) —
     the median of the agreeing sightings. Without `ctx` there is no offset,
     and no depth under the fingers. `settled`: an at-rest read (rp._settled,
     0.45 s still) came just before, so frames count from now, without
-    LOOK_SETTLE_S more."""
+    LOOK_SETTLE_S more. `expect`: where the button must be (find_in_camera)."""
     from rammp_box_opening.tasks.press_demo import _spin_detect, save_aim_frame
 
     g = watcher.grab
@@ -268,7 +292,7 @@ def look(node, watcher, model, tag, runner=None, ctx=None, settled=False):
         z = None if lens is None else depth_under_fingers(g.depth, g.k, lens[0], lens[1])
         if z is not None:
             under.append(z)
-        s, why = find_in_camera(g.color, g.depth, g.k, model, dist=getattr(g, "dist", None))
+        s, why = find_in_camera(g.color, g.depth, g.k, model, dist=getattr(g, "dist", None), expect=expect)
         if s is None:
             continue
         seen.append(s)
@@ -306,6 +330,21 @@ def _in_hand(s, lens, R_hand_cam=None):
     r = np.eye(3) if R_hand_cam is None else np.asarray(R_hand_cam, float)
     b = r @ np.array([float(s.x), float(s.y), float(s.button_depth)])
     return np.array([float(lens[0]) + b[0], float(lens[1]) + b[1], (float(lens[2]) if len(lens) > 2 else 0.0) + b[2]])
+
+
+def expect_after_move(s, lens, R_hand_cam, R, d_world):
+    """Where the camera must see the button of sighting `s` once the hand has
+    moved by `d_world` holding its attitude `R` (the hand's axes in the
+    world): (x, y, lid depth) in the camera's own frame, for look(expect=)."""
+    r = np.eye(3) if R_hand_cam is None else np.asarray(R_hand_cam, float)
+    b = _in_hand(s, lens, r) - np.asarray(R, float).T @ np.asarray(d_world, float)
+    c = r.T @ (b - np.asarray(lens, float)[:3])
+    return float(c[0]), float(c[1]), float(c[2]) + float(s.lid_depth) - float(s.button_depth)
+
+
+def where_seen(s):
+    """look(expect=) for a look from where `s` was seen: (x, y, lid depth)."""
+    return float(s.x), float(s.y), float(s.lid_depth)
 
 
 def under_fingers(s, lens, R_hand_cam=None):
@@ -477,6 +516,7 @@ class DepthPress:
     lost: bool = False  # after a contact the wrist camera did not find the box again
     touch_xyz: tuple = None  # where the pads met the button (the arm's own kinematics)
     ref: object = None  # the free-air (efforts, joints) reading the press was judged against
+    seen_at: tuple = None  # where the after-look saw the button (where_seen), for a look again from there
 
 
 def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=None, turned=None):
@@ -555,7 +595,7 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
                 1000 * miss, moves))
         print("[press_demo] CENTRE: the button %.0f mm from under the fingers (world x %+.0f, y %+.0f mm) — moving over it"
               % (1000 * miss, 1000 * off[0], 1000 * off[1]))
-        _R, t = approach._chain().fk(ctx.client.joints())
+        R_move, t = approach._chain().fk(ctx.client.joints())
         pts, why = rp._line(ctx, [float(t[0]) + off[0], float(t[1]) + off[1], float(t[2])], quat)  # level
         if pts is None:
             return DepthPress(free=True, why="the move over the button is not a straight line the arm can fly (%s)" % why)
@@ -565,7 +605,8 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
             if any(not r.ok for r in res):
                 return DepthPress(free=False, why="the move over the button met something — the arm holds")
         moves += 1
-        s, z_under, lens2, status = look(node, watcher, m, "depth-look", runner, ctx)
+        expect = expect_after_move(s, lens, r_hc, R_move, (off[0], off[1], 0.0))
+        s, z_under, lens2, status = look(node, watcher, m, "depth-look", runner, ctx, expect=expect)
         lens, r_hc = lens2 or (lens, r_hc)
         if s is None:
             return DepthPress(free=True, why="the wrist camera lost the button after moving over it (%s)" % status)
@@ -659,7 +700,8 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
     if not _rise(ctx, runner, quat, top_z, over):
         return DepthPress(free=False, contact=True, felt=felt, why="the way up stopped")
 
-    after, _z, _lens, status = look(node, watcher, m, "depth-after", runner, ctx, settled=True)  # after _rise's read
+    # after _rise's read, back where the last look stood
+    after, _z, _lens, status = look(node, watcher, m, "depth-after", runner, ctx, settled=True, expect=where_seen(s))
     popped = after is not None and np.isfinite(after.up_mm) and after.up_mm >= KNOB_UP_MM
     if after is None:
         # the reach-out's AFTER rule: a box no camera finds after a contact
@@ -684,7 +726,8 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
         c = ctx.cpose
         ctx.cpose = ContainerPose(xyz=(float(c.xyz[0] + d[0]), float(c.xyz[1] + d[1]), float(c.xyz[2])), yaw=c.yaw)
     return DepthPress(free=True, contact=True, felt=felt, popped=popped, moved=moved, shift_m=float(shift),
-                      lid_dz_m=float(after.lid_depth - s.lid_depth), knob_mm=float(after.up_mm))
+                      lid_dz_m=float(after.lid_depth - s.lid_depth), knob_mm=float(after.up_mm),
+                      seen_at=where_seen(after))
 
 
 def knob_up_after(node, ctx, watcher, runner, result, timeout_s=KNOB_RECHECK_S):
@@ -697,7 +740,8 @@ def knob_up_after(node, ctx, watcher, runner, result, timeout_s=KNOB_RECHECK_S):
     t0 = time.monotonic()
     best = result.knob_mm
     while time.monotonic() - t0 < timeout_s:
-        again, _z, _lens, _status = look(node, watcher, ctx.model, "depth-after", runner, ctx, settled=True)
+        again, _z, _lens, _status = look(node, watcher, ctx.model, "depth-after", runner, ctx, settled=True,
+                                         expect=result.seen_at)
         if again is not None and np.isfinite(again.up_mm):
             best = again.up_mm if not np.isfinite(best) else max(best, again.up_mm)
             if again.up_mm >= KNOB_UP_MM:

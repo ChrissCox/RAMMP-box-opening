@@ -237,7 +237,8 @@ def view_tilt_deg(rot_cam):
     return math.degrees(math.acos(max(-1.0, min(1.0, -float(np.asarray(rot_cam, float)[2, 2])))))
 
 
-def find_button(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=None, lid_z=None, prior_xy=None):
+def find_button(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=None, lid_z=None, prior_xy=None,
+                prior_max_m=None):
     """The button in one still frame: (ButtonSighting, None) or (None, why).
     The sighting's xyz is the PRESS POINT: the seam circle's centre.
 
@@ -251,7 +252,8 @@ def find_button(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=No
     `prior_xy`: where the button is expected in base xy. Only the oblique
     path uses lid_z: the top-down staging aim's lid is at table_z + dims.z
     whatever lid_z says. Both use prior_xy: from straight down a circle
-    farther than DOWN_PRIOR_MAX_M from it is not the button. A camera axis more than
+    farther than DOWN_PRIOR_MAX_M (or `prior_max_m`, a caller that knows
+    the place better) from it is not the button. A camera axis more than
     OBLIQUE_MIN_DEG off straight down goes to find_button_oblique with the
     same arguments."""
     if rot_cam is not None and view_tilt_deg(rot_cam) > OBLIQUE_MIN_DEG:
@@ -279,6 +281,7 @@ def find_button(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=No
     if circles is None:
         return None, "no circle of %.0f-%.0f px radius in the frame" % (r_lo, r_hi)
     whys = []
+    prior_max = DOWN_PRIOR_MAX_M if prior_max_m is None else float(prior_max_m)
     for u, v, r in circles[0][:8]:  # Hough's own order: strongest first
         why = circle_gates(depth, kk, rot_cam, trans_cam, float(u), float(v), float(r), lid_z)
         if why is not None:
@@ -296,8 +299,8 @@ def find_button(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=No
         p = np.asarray(rot_cam, float) @ pc + np.asarray(trans_cam, float)
         if prior_xy is not None:
             miss = math.hypot(p[0] - float(prior_xy[0]), p[1] - float(prior_xy[1]))
-            if miss > DOWN_PRIOR_MAX_M:
-                whys.append("circle %.0f mm from where the box is (max %.0f)" % (1000 * miss, 1000 * DOWN_PRIOR_MAX_M))
+            if miss > prior_max:
+                whys.append("circle %.0f mm from where the box is (max %.0f)" % (1000 * miss, 1000 * prior_max))
                 continue
         z_disc = disc_height(depth, kk, rot_cam, trans_cam, float(u), float(v), float(r))
         z_top = z_disc if np.isfinite(z_disc) else float(p[2])

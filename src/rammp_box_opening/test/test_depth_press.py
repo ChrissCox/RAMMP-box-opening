@@ -42,6 +42,34 @@ def test_the_button_is_found_in_the_lens_frame_with_no_transform_at_all(pink):
     assert s.up_mm == pytest.approx(12.0, abs=3.0) and s.button_depth < s.lid_depth  # the knob up
 
 
+def test_a_look_that_knows_where_the_button_must_be_takes_no_circle_anywhere_else(pink):
+    """Flatbot 2026-10-23 17:30: after a 21 mm centring move the look took a
+    circle on the cabinet 288 mm away and 99 mm deeper, in the frames Hough
+    missed the button in. Told where the button must be, the finder takes
+    nothing else — and still finds the button there."""
+    from test_button_aim import BOX_H, BUTTON_XY, OAK_K, ROT_DOWN, _h0, render
+
+    h0 = _h0(pink)
+    b = np.r_[BUTTON_XY, h0]
+    cam = b + np.r_[0.0, 0.0, 0.26]
+    want = ROT_DOWN.T @ (b - cam)
+    here = (want[0], want[1], 0.26)
+    decoy = (BUTTON_XY[0] + 0.06, BUTTON_XY[1] - 0.12)  # another round lid's button, 10 cm lower, 13 cm off
+    # only the decoy in view, as in the frames Hough missed the button in
+    color, depth = render(cam, ROT_DOWN, [(decoy, h0 - 0.10, 0.0)], h0 - BOX_H)
+    s, why = dp.find_in_camera(color, depth, OAK_K, pink)
+    assert why is None and s.lid_depth == pytest.approx(0.36, abs=0.005)  # what the look used to take
+    s, why = dp.find_in_camera(color, depth, OAK_K, pink, expect=here)
+    assert s is None and why
+    # both in view: the button, where it must be
+    color, depth = render(cam, ROT_DOWN, [(BUTTON_XY, h0, 0.0), (decoy, h0 - 0.10, 0.0)], h0 - BOX_H)
+    s, why = dp.find_in_camera(color, depth, OAK_K, pink, expect=(want[0] + 0.01, want[1] - 0.01, 0.265))
+    assert why is None and (s.x, s.y) == pytest.approx((want[0], want[1]), abs=0.002)
+    # ... and nothing on a lid at another depth, even right where the button should be
+    s, why = dp.find_in_camera(color, depth, OAK_K, pink, expect=(want[0], want[1], 0.26 + 2 * dp.LOOK_EXPECT_DEPTH_M))
+    assert s is None
+
+
 def test_the_depth_under_the_fingers_is_read_where_the_fingers_line_meets_the_surface(pink):
     from test_button_aim import BOX_H, BUTTON_XY, OAK_K, ROT_DOWN, _h0, render
 
@@ -216,9 +244,12 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="
     real_settled = rp._settled
     monkeypatch.setattr(rp, "_settled", lambda ctx_, where: (arm.trace.append("rest:" + where), real_settled(ctx_, where))[1])
 
-    def look(node, watcher, model, tag, runner=None, ctx=None, settled=False):
+    arm.expects = []  # each look's `expect`, in order
+
+    def look(node, watcher, model, tag, runner=None, ctx=None, settled=False, expect=None):
         events.append("look:" + tag)
         arm.trace.append("look:%s%s" % (tag, " (settled)" if settled else ""))
+        arm.expects.append(expect)
         item = seq.pop(0)
         s, z, status = item(ctx) if callable(item) else item[:3]
         return s, z, (list(lens), np.asarray(r_hc, float)), status
@@ -448,6 +479,30 @@ def test_from_over_the_box_the_fingers_are_moved_over_the_button_the_camera_sees
     assert legs["depth:centre"].guard.trip == "obstruction" and legs["depth:centre"].plan_free
     # the stroke then goes straight down from over the button
     assert arm.lines[1][:2] == pytest.approx(list(centre[:2]))
+
+
+def test_each_look_after_a_move_or_the_press_is_told_where_the_button_must_be(ctx, monkeypatch, tmp_path):
+    """The centring move goes level by what the camera asked, the hand's
+    attitude held: the look after it is told where that button, unmoved,
+    must be seen from there (2026-10-23 17:30 took a cabinet's circle). The
+    after-look stands where the last look did: told where it saw it."""
+    seen = _seen(hand_off=(0.02, 0.03))
+    got = []
+
+    def again(ctx_):
+        out = seen(ctx_)
+        got.append(out[0])
+        return out
+
+    looks = [seen, again, seen.after]
+    result, events, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, looks)
+    assert dp.exit_code(result) == 0
+    assert [e for e in events if e.startswith("look:")] == ["look:depth-look", "look:depth-look", "look:depth-after"]
+    first, after_move, after_press = arm.expects
+    assert first is None  # nothing is known before the first look
+    assert after_move == pytest.approx((got[0].x, got[0].y, got[0].lid_depth), abs=1e-6)
+    assert after_press == pytest.approx(dp.where_seen(got[0]), abs=1e-9)
+    assert result.seen_at is not None  # ... and a look again after it, where the after-look saw it
 
 
 def test_a_button_far_from_under_the_fingers_is_not_chased(ctx, monkeypatch, tmp_path):
@@ -952,7 +1007,7 @@ def test_a_look_straight_after_an_at_rest_read_takes_frames_at_once(monkeypatch)
 
     monkeypatch.setattr(press_demo, "_spin_detect", spin)
     # the stale frame sees the button elsewhere: counted, it would not agree
-    monkeypatch.setattr(dp, "find_in_camera", lambda c, d, k, m, dist=None: (
+    monkeypatch.setattr(dp, "find_in_camera", lambda c, d, k, m, dist=None, expect=None: (
         _sighting(x=0.05 if grab.color_stamp.nanosec == 1000 else 0.0), None))
     for settled in (True, False):
         clock["ns"], grab.color_stamp = 1000, SimpleNamespace(sec=0, nanosec=1000)
@@ -982,10 +1037,12 @@ def test_a_knob_still_rising_is_looked_at_again(monkeypatch):
     import dataclasses
 
     seen = iter([(_sighting(up=4.5), None, "2/2"), (_sighting(up=8.0), None, "2/2")])
-    monkeypatch.setattr(dp, "look", lambda *a, **k: (*next(seen)[:2], None, "2/2"))
-    felt = dp.DepthPress(free=True, contact=True, felt=True, popped=False, knob_mm=4.5)
+    expects = []
+    monkeypatch.setattr(dp, "look", lambda *a, **k: (expects.append(k.get("expect")), (*next(seen)[:2], None, "2/2"))[1])
+    felt = dp.DepthPress(free=True, contact=True, felt=True, popped=False, knob_mm=4.5, seen_at=(0.0, -0.065, 0.27))
     again = dp.knob_up_after(None, SimpleNamespace(model=None), None, None, felt)
     assert again.popped and again.knob_mm == pytest.approx(8.0)
+    assert expects and set(expects) == {(0.0, -0.065, 0.27)}  # looked for where the after-look saw it
     # nothing to look at again: not felt, already popped, or the arm not free
     for r in (dataclasses.replace(felt, felt=False), dataclasses.replace(felt, popped=True),
               dataclasses.replace(felt, free=False)):
