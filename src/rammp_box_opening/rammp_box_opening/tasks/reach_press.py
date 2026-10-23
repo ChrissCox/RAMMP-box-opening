@@ -622,7 +622,17 @@ def _after_check(node, ctx, runner, watcher, scene_fix, locator, button, lid_bef
     from rammp_box_opening.tasks.press_demo import SCENE_LOCATE_S, knob_is_up
 
     m = ctx.model
-    again, status, up_after = _aim(node, watcher, yaw, button[2], button[:2], runner, "reach-after")
+    if locator is not None:
+        # the first scene bbox takes ~1.2 s (tick + inference): let it come
+        # while the wrist re-aims (no OWL, no GPU, the arm still at the look
+        # pose); locate() enables again (idempotent) and disables in its finally
+        locator.owl.enable()
+    try:
+        again, status, up_after = _aim(node, watcher, yaw, button[2], button[:2], runner, "reach-after")
+    except BaseException:
+        if locator is not None:
+            locator.owl.disable()  # never leave the latched enable on
+        raise
     moved = None if again is None else judge_box_moved(button, again[0])
     lid_after = None if again is None else _lid_z(again[0][2], up_after)
     lifted = None if lid_before is None or lid_after is None else lid_after - lid_before

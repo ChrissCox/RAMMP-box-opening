@@ -67,6 +67,41 @@ def test_the_depth_under_the_fingers_is_read_where_the_fingers_line_meets_the_su
     assert dp.depth_under_fingers(np.full((400, 640), 0.33), OAK_K, (0.0, 0.0)) == pytest.approx(0.33, abs=0.003)
 
 
+def test_a_camera_turned_in_the_hand_reads_under_the_fingers_through_its_own_axes(pink):
+    """The bench D405 sits 180 deg about its lens axis: the sighting, in the
+    camera's axes, is turned into the hand's before the lens offset is added,
+    and the fingers' line is projected through the camera's axes."""
+    from test_button_aim import BOX_H, BUTTON_XY, OAK_K, ROT_DOWN, _h0, render
+
+    h0 = _h0(pink)
+    for lens_xy in ((0.0, 0.075), (0.02, 0.06)):
+        for height in (0.24, 0.30):
+            off = ROT_DOWN @ np.r_[lens_xy, 0.0]  # the hand's axes are ROT_DOWN's, the camera turned in it
+            cam = np.r_[BUTTON_XY[0] + off[0], BUTTON_XY[1] + off[1], h0 + height]
+            color, depth = render(cam, ROT_DOWN @ RZ180, [(BUTTON_XY, h0, 0.0)], h0 - BOX_H)
+            assert dp.depth_under_fingers(depth, OAK_K, lens_xy, RZ180) == pytest.approx(height, abs=0.004)
+            s, why = dp.find_in_camera(color, depth, OAK_K, pink)
+            assert why is None, why
+            assert dp.under_fingers(s, lens_xy, RZ180) == pytest.approx((0.0, 0.0), abs=0.003)
+            # the camera's axes dropped: twice the lens offset, the wrong way
+            assert np.hypot(*dp.under_fingers(s, lens_xy)) == pytest.approx(2 * np.hypot(*lens_xy), abs=0.004)
+
+
+def test_the_lens_in_the_hand_keeps_the_cameras_axes(ctx, monkeypatch):
+    from rammp_box_opening.perception import depth_source
+    from rammp_box_opening.runtime import approach
+
+    arm = _Arm()
+    monkeypatch.setattr(approach, "_chain", lambda: arm)
+    quat = rp.reach_quat(ContainerModel.load(PINK), BUTTON[:2], 0)
+    ctx.client.live = [0.5, -0.1, 0.6] + list(quat)
+    R, t = arm.fk(ctx.client.live)
+    monkeypatch.setattr(depth_source, "camera_pose_at",
+                        lambda g: (R @ RZ180, t + R @ np.r_[0.0, 0.075, -0.125]))
+    lens, r_hc = dp.lens_in_hand(ctx, None)
+    assert lens == pytest.approx([0.0, 0.075, -0.125]) and r_hc == pytest.approx(RZ180)
+
+
 def test_the_lid_is_the_nearest_flat_surface():
     depth = np.full((400, 640), 0.42)  # the table
     depth[150:250, 240:400] = 0.31  # the lid, nearer
@@ -82,8 +117,9 @@ class _Arm:
     """A chain whose joints ARE the tool pose — position then quaternion — so
     every line and turn flies and fk follows the arm."""
 
-    def __init__(self, refuse_turn=False):
+    def __init__(self, refuse_turn=False, refuse_first=0):
         self.lines, self.turns, self.refuse_turn = [], [], refuse_turn
+        self.refuse_first = refuse_first  # the first this many turn attempts (exactly down, 2 deg short ...) refused
 
     def fk(self, q):
         return np.asarray(quat_to_mat(*q[3:7]), float), np.asarray(q[:3], float)
@@ -95,6 +131,9 @@ class _Arm:
     def walk(self, q0, xyz, quat, step_m=None, step_rad=None, max_step_rad=None):
         if self.refuse_turn:
             return None, "a joint limit 40% of the way"
+        if self.refuse_first > 0:
+            self.refuse_first -= 1
+            return None, "a 0.26 rad jump in the last step"
         self.turns.append((list(xyz), list(quat)))
         return [list(q0), [float(v) for v in xyz] + [float(v) for v in quat]], None
 
@@ -108,6 +147,11 @@ class _Gravity:
 
 
 LENS = (0.0, 0.065, -0.105)  # the lens from the tool frame, in the hand: 65 mm beside the fingers, 105 mm behind
+EYE = np.eye(3)
+RZ180 = np.diag([-1.0, -1.0, 1.0])  # the bench D405: 180 deg about its lens axis
+# where TF's lens puts the fingertips in front of it with LENS (116 mm): the lid
+# 270 mm below the lens is met 154 mm down
+TOUCH_AT = 0.27 - (dp.DOWN_CONTACT_TOOL[2] - LENS[2])
 
 
 def _sighting(x=0.0, y=-LENS[1], lid=0.27, up=0.4):
@@ -115,18 +159,43 @@ def _sighting(x=0.0, y=-LENS[1], lid=0.27, up=0.4):
     return dp.LensSighting(x=x, y=y, lid_depth=lid, button_depth=lid - up / 1000.0, up_mm=up, raw=None)
 
 
-def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=0.24, push="touch", refuse_turn=False):
+def _seen(hand_off=(0.0, 0.0), depth=0.27, lens=LENS, r_hc=EYE, up=0.4):
+    """A look that sees one fixed button wherever the fake arm stands: its
+    lid `hand_off` from the fingers' line, in the hand's axes, `depth` below
+    the lens along the tool, from the hand at the first look. The sighting is in
+    the camera's own axes (r_hc: the camera's axes in the hand's)."""
+    world = {}
+
+    def at(ctx, up=up):
+        q = ctx.client.joints()
+        R, t = np.asarray(quat_to_mat(*q[3:7]), float), np.asarray(q[:3], float)
+        if "b" not in world:
+            world["b"] = t + R @ np.r_[hand_off[0], hand_off[1], lens[2] + depth]
+        c = np.asarray(r_hc).T @ (R.T @ (world["b"] - t) - np.asarray(lens))
+        s = dp.LensSighting(x=float(c[0]), y=float(c[1]), lid_depth=float(c[2]),
+                            button_depth=float(c[2]) - up / 1000.0, up_mm=up, raw=None)
+        return s, None, "2/2"
+
+    at.world = world
+    at.after = lambda ctx: at(ctx, up=12.0)  # the same button, the knob up
+    return at
+
+
+def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="touch", refuse_turn=False,
+           lens=LENS, r_hc=EYE, measured=LENS, refuse_first=0):
     """press_down_from_here with the hand `tilt` deg over BUTTON (at the
     reach-out's stroke start, 6 cm above TF's lid at 0.40), the wrist camera
-    scripted by `looks` and the fingertips meeting the lid `touch_at` down
-    the stroke. Returns (DepthPress, events, arm, legs, start tool pose)."""
+    scripted by `looks` (a (sighting, z, status) or a _seen) with TF's lens
+    at `lens`, turned `r_hc`, against the `measured` one in the camera
+    config, and the fingertips meeting the lid `touch_at` down the stroke.
+    Returns (DepthPress, events, arm, legs, start tool pose)."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.runner import Runner
 
     cfg = load_press_demo(PINK)
     ctx.model = ContainerModel.load(PINK)
     ctx.press_cfg = cfg
-    arm = _Arm(refuse_turn)
+    arm = _Arm(refuse_turn, refuse_first)
     monkeypatch.setattr(approach, "_chain", lambda: arm)
     monkeypatch.setattr(approach, "_gravity", lambda: _Gravity())
     quat = rp.reach_quat(ctx.model, BUTTON[:2], tilt)
@@ -138,8 +207,9 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=0.24, push="touc
 
     def look(node, watcher, model, tag, runner=None, ctx=None):
         events.append("look:" + tag)
-        s, z, status = seq.pop(0)[:3]
-        return s, z, LENS, status
+        item = seq.pop(0)
+        s, z, status = item(ctx) if callable(item) else item[:3]
+        return s, z, (list(lens), np.asarray(r_hc, float)), status
 
     monkeypatch.setattr(dp, "look", look)
 
@@ -161,7 +231,8 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=0.24, push="touc
 
     runner = R(ctx.client, log_dir=tmp_path)
     contact = rp.CONTACT_TOOL if tilt else dp.DOWN_CONTACT_TOOL
-    result = dp.press_down_from_here(None, ctx, cfg, runner, SimpleNamespace(), contact)
+    watcher = SimpleNamespace(grab=SimpleNamespace(wrist_lens_in_hand_m=None if measured is None else list(measured)))
+    result = dp.press_down_from_here(None, ctx, cfg, runner, watcher, contact)
     return result, events, arm, legs, start
 
 
@@ -186,7 +257,7 @@ def test_over_the_box_it_turns_down_measures_the_depth_and_presses_by_feel(ctx, 
     g = legs["depth:touch"].guard
     assert g.trip == "touch" and g.gravity is not None and g.reference is not None
     # PUSH: button_travel_m from where the torques felt the lid, backstopped
-    assert arm.lines[1][2] == pytest.approx(goal[2] - 0.24 - cfg.button_travel_m) and legs["press:push"].guard.trip == "press"
+    assert arm.lines[1][2] == pytest.approx(goal[2] - TOUCH_AT - cfg.button_travel_m) and legs["press:push"].guard.trip == "press"
     # RISE: back to where the touch began, judged for a pull at the fingertip
     assert arm.lines[-1][2] == pytest.approx(goal[2]) and legs["depth:rise"].guard.hang is not None
 
@@ -195,9 +266,9 @@ def test_the_touch_measures_how_far_in_front_of_the_lens_the_fingertips_are(ctx,
     import json
 
     looks = [(_sighting(lid=0.27), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
-    result, _e, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.24)
+    result, _e, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.155)
     note = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl"))) if '"depth_touch"' in line][0]
-    assert note["down_mm"] == pytest.approx(240.0) and note["fingertips_ahead_of_lens_mm"] == pytest.approx(30.0)
+    assert note["down_mm"] == pytest.approx(155.0) and note["fingertips_ahead_of_lens_mm"] == pytest.approx(115.0)
     assert result.popped
 
 
@@ -354,6 +425,88 @@ def test_the_reach_out_hands_over_to_the_depth_press_once_over_the_box(ctx, monk
     assert g.trip == "obstruction" and g.touch_nm == rp.DRAG_NM and g.hang is not None and rec.legs["depth:clear"].plan_free
 
 
+# ---- CENTRE on a mount that is known, in world xy ----------------------------------
+
+def test_a_mount_in_tf_that_disagrees_with_the_measured_lens_is_not_centred_on(ctx, monkeypatch, tmp_path):
+    """Flatbot 2026-10-22 20:04: TF's hand-measured mount put the lens 100 mm
+    beside the fingers, the truth ~65. CENTRE on it 'converges' with the
+    press 35 mm off, on the lid's edge — it stops with nothing pressed."""
+    tf_dev = (0.0, 0.100, -0.22)
+    result, events, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, [_seen((0.0, 0.0))], lens=tf_dev)
+    assert result.free and "mount" in result.why and "+100" in result.why and "+65" in result.why
+    assert events == ["depth:turn", "look:depth-look"] and arm.lines == [] and dp.exit_code(result) == 1
+
+
+def test_no_measured_lens_in_the_camera_config_is_not_centred_on(ctx, monkeypatch, tmp_path):
+    result, events, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, [_seen((0.02, 0.0))], measured=None)
+    assert result.free and "wrist_lens_in_hand_m" in result.why
+    assert events == ["depth:turn", "look:depth-look"] and arm.lines == []
+
+
+def test_a_mount_in_tf_within_5_mm_of_the_measured_lens_centres(ctx, monkeypatch, tmp_path):
+    tf = (0.002, LENS[1] + 0.003, LENS[2] + 0.01)
+    seen = _seen((0.02, 0.03), lens=tf)
+    looks = [seen, seen, seen.after]
+    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, lens=tf)
+    assert dp.exit_code(result) == 0
+    assert events[:5] == ["depth:turn", "look:depth-look", "depth:centre", "look:depth-look", "depth:touch"]
+
+
+def test_a_turn_short_of_straight_down_centres_the_vertical_stroke_not_the_tool_axis(ctx, monkeypatch, tmp_path):
+    """Exactly down sits on the wrist's singularity, the turn stops 5 deg
+    short. The button on the tool axis 277 mm below the lens is 14 mm off the
+    fingertip's vertical: CENTRE moves it under the vertical stroke, level."""
+    seen = _seen((0.0, 0.0), depth=0.277)
+    looks = [seen, seen, seen.after]
+    result, events, arm, legs, _s = _press(ctx, monkeypatch, tmp_path, looks, refuse_first=2,
+                                           touch_at=0.277 - (dp.DOWN_CONTACT_TOOL[2] - LENS[2]))
+    goal, quat = arm.turns[0]
+    R = rp._rot(quat)
+    assert np.degrees(np.arccos(-R[2, 2])) == pytest.approx(5.0, abs=0.01)
+    assert dp.exit_code(result) == 0 and "depth:centre" in events
+    b = seen.world["b"]
+    tip = np.asarray(arm.lines[0]) + R @ np.asarray(dp.DOWN_CONTACT_TOOL)
+    assert np.hypot(*(tip[:2] - b[:2])) <= dp.CENTRE_TOL_M
+    assert np.hypot(*(np.asarray(goal[:2]) - arm.lines[0][:2])) == pytest.approx(0.014, abs=0.001)
+    # level: every waypoint of the centring move at the height it began
+    for p in legs["depth:centre"].traj.points:
+        assert p.positions[2] == pytest.approx(goal[2], abs=0.001)
+    # and the stroke goes straight down from there
+    assert arm.lines[1][:2] == pytest.approx(arm.lines[0][:2])
+
+
+def test_the_bench_cameras_turn_in_the_hand_is_kept_when_centring(ctx, monkeypatch, tmp_path):
+    """The bench D405, 180 deg about its lens axis: with the button under the
+    fingers there is no move; 30 mm off in the hand's +y, the move goes 30 mm
+    toward it — not 100 mm away."""
+    bench = (0.0, 0.075, -0.125)
+    seen = _seen((0.0, 0.0), lens=bench, r_hc=RZ180)
+    looks = [seen, seen.after]
+    result, events, arm, _l, start = _press(ctx, monkeypatch, tmp_path, looks, tilt=0, lens=bench, r_hc=RZ180,
+                                            measured=bench, touch_at=0.27 - (dp.DOWN_CONTACT_TOOL[2] - bench[2]))
+    assert dp.exit_code(result) == 0 and "depth:centre" not in events
+    seen = _seen((0.0, 0.03), lens=bench, r_hc=RZ180)
+    looks = [seen, seen, seen.after]
+    result, events, arm, _l, start = _press(ctx, monkeypatch, tmp_path, looks, tilt=0, lens=bench, r_hc=RZ180,
+                                            measured=bench, touch_at=0.27 - (dp.DOWN_CONTACT_TOOL[2] - bench[2]))
+    assert dp.exit_code(result) == 0 and "depth:centre" in events
+    R = rp._rot(rp.reach_quat(ctx.model, BUTTON[:2], 0))
+    want = np.asarray(start[:3]) + R @ np.r_[0.0, 0.03, 0.0]
+    assert arm.lines[0][:2] == pytest.approx(list(want[:2]), abs=0.001)
+
+
+def test_a_touch_far_from_where_the_mount_puts_the_fingertips_pushes_nothing(ctx, monkeypatch, tmp_path):
+    ahead_tf = dp.DOWN_CONTACT_TOOL[2] - LENS[2]
+    looks = [(_sighting(lid=0.27), 0.27, "2/2")]
+    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.27 - (ahead_tf - 0.05))
+    assert result.free and result.contact and "not pushing" in result.why and "press:push" not in events
+    assert events[-2:] == ["depth:unload", "depth:rise"]
+    # 12 mm (#128's mount against the 20:04 touch): pushed
+    looks = [(_sighting(lid=0.27), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
+    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.27 - (ahead_tf + 0.012))
+    assert "press:push" in events and dp.exit_code(result) == 0
+
+
 def test_a_box_the_touch_put_lower_needs_no_line_up_before_home(ctx, monkeypatch, tmp_path):
     """20:04: the touch found the lid 76 mm under TF's. With the box put
     there, the hand at the stroke's start is clear of it and home plans."""
@@ -441,14 +594,16 @@ def test_the_mission_record_keeps_what_the_reach_and_the_depth_press_found(ctx, 
 
 def test_the_touch_puts_the_box_where_the_fingertips_met_it(ctx, monkeypatch, tmp_path):
     """TF's lid at 0.40 (BUTTON 0.24 here); the fingertips met it 240 mm
-    down from 0.46: every world after the touch holds the box there, and
+    down from 0.46, where the wrist camera saw the lid (so the touch passes
+    the mount check): every world after the touch holds the box there, and
     the table is left as the scene camera measured it."""
     from rammp_box_opening.models.container import from_container
 
     ctx.model = ContainerModel.load(PINK)
     ctx.cpose = rp.cpose_for_button(BUTTON, 0.3, ctx.model.button_offset)
     ctx.worlds.table_top_z = 0.10
-    looks = [(_sighting(), 0.27, "2/2"), (_sighting(up=12.0), None, "2/2")]
+    lid = 0.24 + (dp.DOWN_CONTACT_TOOL[2] - LENS[2])
+    looks = [(_sighting(lid=lid), lid, "2/2"), (_sighting(up=12.0), None, "2/2")]
     result, _e, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, touch_at=0.24)
     assert result.popped and result.free
     assert from_container(ctx.cpose, ctx.model.button_offset) == pytest.approx([BUTTON[0], BUTTON[1], 0.22])

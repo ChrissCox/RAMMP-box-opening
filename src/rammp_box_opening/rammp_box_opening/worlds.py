@@ -221,6 +221,7 @@ class WorldStore:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._surface_z = None  # runtime-measured surface; overrides YAML when set
         self._surface_xy = None  # (x0, x1, y0, y1): where the scene camera saw that surface
+        self._warned_unplanned = False  # the "height but no extent" line, said once
 
     @property
     def table_top_z(self):
@@ -252,7 +253,13 @@ class WorldStore:
         goes: a slab under the measured top over where it was seen, and that
         area as the unseen container's band. Without it the planner plans as
         if there were no table at all."""
-        if _table_top_z(self._bench) is not None or self._surface_z is None or self._surface_xy is None:
+        if _table_top_z(self._bench) is not None or self._surface_z is None:
+            return self._bench
+        if self._surface_xy is None:
+            # not raised: a raise mid-mission would strand the arm
+            if not self._warned_unplanned:
+                self._warned_unplanned = True
+                print("[worlds] table height %.3f measured but no extent: the planner has NO table" % self._surface_z)
             return self._bench
         x0, x1, y0, y1 = self._surface_xy
         table = {

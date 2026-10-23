@@ -127,6 +127,7 @@ class ArmChain:
         self._segs = segs
         self._tail = (Racc, tacc)
         self._I3 = np.eye(3)
+        self._nearest_memo = None  # (inputs, answer) of the last nearest_solution
 
     def _fk_axes(self, q):
         """fk()'s (R, t), plus each moving joint's world axis z_k and origin p_k."""
@@ -249,20 +250,30 @@ class ArmChain:
 
         Measured from HOME to staging over boxes across the table (2026-09-25):
         the planner's own pick took 2.4-4.7 s and turned the wrist 3.2-3.6
-        rad; the walk from HOME 2.4-2.5 s; the folded wrist 1.6 s."""
+        rad; the walk from HOME 2.4-2.5 s; the folded wrist 1.6 s.
+
+        The last answer is kept for the exact same inputs: the staging's
+        reach proof (press_demo.staging_out_of_reach) and the planner client
+        ask the same question back to back, ~0.29 s of IK each (2026-10-22)."""
         from rammp_box_opening.runtime.branches import joint_time
 
-        start = np.array(q_start, float)
-        cands = []
-        for seed in [start, *[np.array(s, float) for s in seeds]]:
-            if cands:
-                break  # the seeds are only for when the walk from where the arm is found nothing
-            q = self.reach(seed, xyz, quat_xyzw)
-            if q is not None:
-                cands = self.equivalents(start, q)
-        if not cands:
-            return None
-        return min(cands, key=lambda q: joint_time(start, q))
+        key = (
+            tuple(float(v) for v in q_start), tuple(float(v) for v in xyz), tuple(float(v) for v in quat_xyzw),
+            tuple(tuple(float(v) for v in s) for s in seeds),
+        )
+        if self._nearest_memo is None or self._nearest_memo[0] != key:
+            start = np.array(q_start, float)
+            cands = []
+            for seed in [start, *[np.array(s, float) for s in seeds]]:
+                if cands:
+                    break  # the seeds are only for when the walk from where the arm is found nothing
+                q = self.reach(seed, xyz, quat_xyzw)
+                if q is not None:
+                    cands = self.equivalents(start, q)
+            best = min(cands, key=lambda q: joint_time(start, q)) if cands else None
+            self._nearest_memo = (key, best)
+        best = self._nearest_memo[1]
+        return None if best is None else np.array(best, float)  # a copy: the caller may change it
 
     def equivalents(self, q_start, q):
         """Every way this arm can hold tool_frame where `q` holds it, written
@@ -270,22 +281,29 @@ class ArmChain:
         the other way (joint_5 and joint_7 a half turn round, joint_6
         mirrored, re-solved to the same tool pose), each continuous joint
         taken the short way round from q_start (branches.nearest_branch) —
-        those inside every limit."""
+        those inside every limit. The fold is solved once and its whole-turn
+        copies on joint_5 and joint_7 added: FK repeats every 2*pi on those
+        continuous joints, so the -pi seeds converge to the same solve shifted
+        by a turn, and near the planner's +/-6 rad bound nearest_branch leaves
+        them raw, so each copy is still kept."""
         from rammp_box_opening.runtime.branches import (
             CONTINUOUS_JOINTS, PLANNER_CONTINUOUS_LIMIT_RAD, nearest_branch,
         )
 
         R, t = self.fk(q)
         out = [np.array(q, float)]
-        for d5 in (math.pi, -math.pi):
-            for d7 in (math.pi, -math.pi):
-                flip = np.array(q, float)
-                flip[4] += d5
-                flip[5] = -flip[5]
-                flip[6] += d7
-                qf = self.solve_pose(flip, t, R)
-                if qf is not None:
-                    out.append(qf)
+        flip = np.array(q, float)
+        flip[4] += math.pi
+        flip[5] = -flip[5]
+        flip[6] += math.pi
+        qf = self.solve_pose(flip, t, R)
+        if qf is not None:
+            for s5 in (0.0, -2.0 * math.pi):
+                for s7 in (0.0, -2.0 * math.pi):
+                    c = np.array(qf, float)
+                    c[4] += s5
+                    c[6] += s7
+                    out.append(c)
         out = [np.array(nearest_branch(c, q_start), float) for c in out]
         return [
             c for c in out

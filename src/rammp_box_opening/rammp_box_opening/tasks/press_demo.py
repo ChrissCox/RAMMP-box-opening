@@ -414,7 +414,8 @@ class SceneApproach:
     """What the reach from the scene fix came back with."""
 
     def __init__(self, got=None, preplanned=None, pressed=None, press_leg=None, in_flight=False, status="", button_up_mm=None,
-                 failed=False, reach_out=False):
+                 failed=False, reach_out=False, cfg=None):
+        self.cfg = cfg  # the press config the approach flew (its staging may be lowered), or None
         self.failed = failed  # the approach's own motion failed (the runner said why)
         self.reach_out = reach_out  # no straight-down staging reaches the box: the reach-out press's case
         self.button_up_mm = button_up_mm  # the aim's button-above-its-lid reading (refuse_open_box)
@@ -638,22 +639,38 @@ def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix):
     IN_FLIGHT_TOL_M. Otherwise the approach stops at staging and the wrist
     confirms from 12 cm at rest.
 
-    When no straight-down staging reaches the box, nothing moves here and
+    When cfg.staging_m is above the arm's straight-down reach, a lower
+    staging is tried, down to the clearance floor load_press_demo allows
+    (staging_for_reach); when none reaches the box, nothing moves here and
     `reach_out` hands the press to tasks/reach_press.
 
     Returns a SceneApproach; `got` is None when the approach failed or the
-    wrist saw nothing, `status` says which — the caller then stops."""
+    wrist saw nothing, `status` says which — the caller then stops. Its
+    `cfg` is the one flown: main presses with it."""
     ctx.cpose = scene_fix.pose
     watcher.roi = None  # the scene bbox never applied to the wrist frame
+    live = ctx.client.joints()  # one read: the reach proof and the plan start from the same joints
+    asked = cfg
+    cfg = staging_for_reach(ctx, cfg, runner, live)
+    if cfg is None:
+        floor = staging_floor(ctx.model)
+        return SceneApproach(
+            failed=True, reach_out=True, cfg=asked,
+            status="no straight-down staging reaches the box (the arm's kinematics: none %.3f-%.3f m above "
+            "the button)" % (asked.staging_m, min(floor, asked.staging_m)),
+        )
     try:
-        approach = [build_approach_leg(ctx, cfg)]
+        approach = [build_approach_leg(ctx, cfg, start_joints=live)]
     except RuntimeError as e:
-        # a box out of straight-down reach (flatbot 2026-10-22) — and ONLY
-        # that: a late set_world, a start in collision or an unlucky plan
-        # raise here too, and they are a STOP, not a different press
-        if "IK_FAIL" in str(e) and staging_out_of_reach(ctx, cfg):
-            return SceneApproach(failed=True, reach_out=True, status="no straight-down staging reaches the box (%s)" % e)
-        return SceneApproach(failed=True, status="the approach to staging was refused (%s)" % e)
+        # the kinematics found this staging, so a refusal is a late
+        # set_world, a start in collision or an unlucky plan: a STOP — but a
+        # lowered staging the planner refuses (IK_FAIL) is where the asked
+        # staging_m already proved out of reach: the reach-out press's case
+        if "IK_FAIL" in str(e) and cfg is not asked:
+            return SceneApproach(failed=True, reach_out=True, cfg=asked,
+                                 status="no straight-down staging reaches the box: the lowered %.3f m was refused (%s)"
+                                 % (cfg.staging_m, e))
+        return SceneApproach(failed=True, cfg=cfg, status="the approach to staging was refused (%s)" % e)
     if not cfg.confirm_in_flight:
         # No OWL and no plateau detector on this path: the scene camera
         # said which thing is the box; at staging the button's circle
@@ -664,11 +681,12 @@ def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix):
             lookahead=lambda q: build_press_legs(ctx, cfg, start_joints=q),
         )
         if any(not r.ok for r in res):
-            return SceneApproach(failed=True, status="the approach to staging failed")
+            return SceneApproach(failed=True, cfg=cfg, status="the approach to staging failed")
         preplanned = runner.lookahead_result
         seen = {}
         got, status = aim_button_at_staging(node, watcher, scene_fix.pose.yaw, runner=runner, out=seen)
-        return SceneApproach(got=got, preplanned=preplanned, status=status, button_up_mm=seen.get("button_up_mm"))
+        return SceneApproach(got=got, preplanned=preplanned, status=status, button_up_mm=seen.get("button_up_mm"),
+                             cfg=cfg)
 
     # ONE goal: approach chained into the descent, the wrist watching on the way
     press = build_press_legs(ctx, cfg, start_joints=approach[-1].goal_joints)
@@ -694,16 +712,16 @@ def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix):
     finally:
         watcher.active = False
     if any(not r.ok for r in res):
-        return SceneApproach(in_flight=True, failed=True, status="the approach to staging failed")
+        return SceneApproach(in_flight=True, failed=True, cfg=cfg, status="the approach to staging failed")
     outcome = res[-1].outcome
     if outcome == "touch":
         # the descent flew and found the surface: pressed, no stop anywhere
         got = state["got"] if state["got"] is not None else watcher.fix()
         if got is None:
             # main stops: the wrist aims every press, and none confirmed this one
-            return SceneApproach(failed=True, pressed=res, press_leg=press[0], in_flight=True,
+            return SceneApproach(failed=True, pressed=res, press_leg=press[0], in_flight=True, cfg=cfg,
                                  status="the arm touched on the scene camera's pose alone — the wrist never confirmed it")
-        return SceneApproach(got=got, pressed=res, press_leg=press[0], in_flight=True)
+        return SceneApproach(got=got, pressed=res, press_leg=press[0], in_flight=True, cfg=cfg)
     # stopped at the junction: confirm at rest, as the two-goal path does
     print(
         "[press_demo] stopped above the box: %s"
@@ -711,7 +729,7 @@ def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix):
            else "the wrist had not confirmed the box by the junction — looking from here")
     )
     got = state["got"] if state["got"] is not None else wait_for_fix(node, watcher, cfg, timeout_s=STAGING_FIX_S)
-    return SceneApproach(got=got, preplanned=None, in_flight=True)
+    return SceneApproach(got=got, preplanned=None, in_flight=True, cfg=cfg)
 
 
 def search_for_box(node, ctx, cfg, runner, watcher, execute, accept_coarse=False):
@@ -792,14 +810,16 @@ def build_home_leg(ctx, start_joints, joints=None):
 REACH_SEED_J1_RAD = (-2.4, -1.2, 0.0, 1.2, 2.4)
 
 
-def staging_out_of_reach(ctx, cfg):
+def staging_out_of_reach(ctx, cfg, live=None):
     """True only when the arm's own kinematics finds NO pose inside every
     limit for the straight-down staging build_approach_leg asks for (the
-    same button, attitude and height) — walked from the live joints and
-    look_joints(HOME), and solved from seeds spread over the arm's
-    branches: the planner's IK_FAIL also covers a goal in collision on a
-    box well inside reach. Flatbot 2026-10-22: at 0.80-0.89 m nothing
-    solves; at 0.45 m it does. A kinematics problem proves nothing."""
+    same button, attitude and height) — walked from the live joints (`live`,
+    read here when not given) and look_joints(HOME), and solved from seeds
+    spread over the arm's branches: the planner's IK_FAIL also covers a goal
+    in collision on a box well inside reach. Flatbot 2026-10-22, its table
+    at 0.293 in arm_mount: 0.12 above the button solves nowhere, 0.10 (the
+    clearance floor) out to about 0.52 m and no further (the boxes that
+    night stood 0.59-0.60 m out). A kinematics problem proves nothing."""
     from rammp_box_opening.perception.d405 import quat_to_mat
     from rammp_box_opening.primitives.look import look_joints
     from rammp_box_opening.runtime.approach import _chain
@@ -811,7 +831,7 @@ def staging_out_of_reach(ctx, cfg):
     quat = m.press_quat(button)
     try:
         chain = _chain()
-        live = planner_branch(ctx.client.joints())
+        live = planner_branch(ctx.client.joints() if live is None else live)
         if chain.nearest_solution(live, staging, quat, seeds=(look_joints(HOME),)) is not None:
             return False
         R = quat_to_mat(*quat)
@@ -829,17 +849,59 @@ def staging_out_of_reach(ctx, cfg):
         return False
 
 
-def build_approach_leg(ctx, cfg):
-    """Staging directly above the detected button, in the full world. The
-    fingers are already closing: main() dispatched press:close before the
-    look, and the Runner joins it before the guarded stroke."""
+STAGING_STEP_M = 0.005  # the lower stagings tried when cfg.staging_m is out of reach
+
+
+def staging_floor(model):
+    """The lowest staging the full world still plans: the clearance floor
+    load_press_demo enforces (dims.z - button_offset.z + 0.10)."""
+    return round(float(model.dims[2]) - float(model.button_offset[2]) + 0.10, 4)
+
+
+def staging_for_reach(ctx, cfg, runner=None, live=None):
+    """`cfg` when its staging is in straight-down reach (staging_out_of_reach);
+    else `cfg` with the highest STAGING_STEP_M-lower staging that is, one
+    step lower still for margin off the reach ceiling (the recentre moves
+    at staging height), never below staging_floor; None when even the floor
+    is out of reach — the reach-out press's case. Tables vary: flatbot's at
+    0.293 put the pink canister's 0.12 staging above the ceiling everywhere,
+    the 0.10 floor solving out to about 0.52 m. The floor is proved before
+    the steps between, so a box out of reach costs two proofs, not a proof
+    per step (~0.6 s each when nothing solves, flatbot 2026-10-22)."""
+    if not staging_out_of_reach(ctx, cfg, live=live):
+        return cfg
+    floor = staging_floor(ctx.model)
+    if cfg.staging_m <= floor or staging_out_of_reach(ctx, replace(cfg, staging_m=floor), live=live):
+        return None
+    h = floor
+    for k in range(1, int(round((cfg.staging_m - floor) / STAGING_STEP_M)) + 1):
+        step = round(cfg.staging_m - k * STAGING_STEP_M, 4)
+        if step <= floor:
+            break
+        if not staging_out_of_reach(ctx, replace(cfg, staging_m=step), live=live):
+            h = round(max(floor, step - STAGING_STEP_M), 4)
+            break
+    print(
+        "[press_demo] staging %.3f m above the button is out of straight-down reach: staging at %.3f m"
+        % (cfg.staging_m, h)
+    )
+    if runner is not None:
+        runner.note("staging_lowered", staging_m=h, asked_m=round(cfg.staging_m, 4), floor_m=floor)
+    return replace(cfg, staging_m=h)
+
+
+def build_approach_leg(ctx, cfg, start_joints=None):
+    """Staging directly above the detected button, in the full world, from
+    `start_joints` (the live joints when not given). The fingers are already
+    closing: main() dispatched press:close before the look, and the Runner
+    joins it before the guarded stroke."""
     m = ctx.model
     button = from_container(ctx.cpose, m.button_offset)
     quat = m.press_quat(button)  # the same attitude the press holds
     staging = [button[0], button[1], button[2] + cfg.staging_m]
     leg, _ = _plan_motion(
         ctx,
-        _state(ctx.client.joints()),
+        _state(ctx.client.joints() if start_joints is None else start_joints),
         "approach:staging",
         ("pose", staging, quat),
         _full_world(ctx),
@@ -898,16 +960,36 @@ def centre_over_button(node, ctx, cfg, runner, watcher, execute, got):
             print("[press_demo] (dry run) would move %.0f mm over the button and aim again" % (1000 * off))
             break
         print("[press_demo] CENTRE: the button is %.0f mm from under the tool — moving over it" % (1000 * off))
-        leg = build_approach_leg(ctx, cfg)
+        try:
+            leg = build_approach_leg(ctx, cfg)
+        except RuntimeError as e:
+            # a refused plan sends nothing: the arm still stands at staging
+            print("[press_demo] CENTRE: the move over the button was refused (%s) — pressing from the last aim" % e)
+            break
         leg.name = "approach:recentre"
         res = runner.run([leg], execute=execute)
-        if any(not r.ok for r in res):
-            break  # the arm holds where the refused move left it; the last aim stands
+        bad = [r for r in res if not r.ok]
+        if bad and all(r.outcome == "refused" for r in bad):
+            break  # nothing was sent: the arm is still at staging; the last aim stands
+        if bad:
+            # the move went out and failed in flight (an aborted goal, a
+            # following error): the arm holds where it stopped — no press
+            # after a motion fault, and no automatic motion either
+            print("[press_demo] STOP: the move over the button failed (%s) — not pressing; arm holds" % bad[-1].detail)
+            sys.exit(1)
         moves += 1
-        again, status = aim_button_at_staging(node, watcher, got[1], runner=runner)
+        seen = {}
+        again, status = aim_button_at_staging(node, watcher, got[1], runner=runner, out=seen)
         if again is None:
             print("[press_demo] CENTRE: lost the button after the move (%s) — pressing from the last aim" % status)
             break
+        # the aim from straight over the button is the best look at the knob
+        # the run gets: an open box it shows stops the run like the first aim's
+        open_already = refuse_open_box(seen.get("button_up_mm"))
+        if open_already is not None:
+            runner.note("open_box", button_above_lid_mm=round(seen["button_up_mm"], 1))
+            try_home(ctx, runner, execute, "STOP: " + open_already)
+            sys.exit(1)
         got = again
         ctx.cpose = watcher.to_container_pose(got)
         off = _off_button(ctx, cfg)
@@ -937,8 +1019,13 @@ def stage_over_search_fix(node, ctx, cfg, runner, watcher, execute, got, coarse=
     the lid. It may bring the arm here; it may not aim a press, so an aim
     that sees nothing stops the run."""
     ctx.cpose = planned_for = watcher.to_container_pose(got)
+    try:
+        approach = build_approach_leg(ctx, cfg)
+    except RuntimeError as e:
+        try_home(ctx, runner, execute, "STOP: the move to staging over the search's fix was refused — %s" % e)
+        sys.exit(1)
     res = runner.run(
-        [build_approach_leg(ctx, cfg)],
+        [approach],
         execute=execute,
         # the descent, planned while the arm flies there (as from the scene
         # camera's fix): at staging it is re-fitted to the aim, no plan
@@ -1176,12 +1263,15 @@ def build_push_legs(ctx, cfg, contact_xyz, touch_leg=None, push=True):
     return legs
 
 
-def build_home_from_hop(ctx, cfg):
+def build_home_from_hop(ctx, cfg, start_joints=None):
     """Home from the hop, where press-only ends up: the fingers stand 5 cm
     over the lid, inside the band the blind home world blocks, so rise out
     of the corridor first (in the button's own world), then home in the
-    full world — one execution."""
-    _world, rise, st = _rise_over_button(ctx, cfg, _state(ctx.client.joints()), "retreat:rise")
+    full world — one execution. start_joints: the post-press retreat's
+    end, when built as a lookahead while that retreat flies (run_push) —
+    both plans were made with the arm standing at the hop."""
+    q = ctx.client.joints() if start_joints is None else list(start_joints)
+    _world, rise, st = _rise_over_button(ctx, cfg, _state(q), "retreat:rise")
     home, _ = _plan_motion(ctx, st, "home", ("joints", list(rest_joints(cfg))), _full_world(ctx), TRANSIT_SPEED)
     return [rise, home]
 
@@ -1551,8 +1641,9 @@ def run_push(ctx, cfg, runner, args, touch, touch_leg=None, node=None, watcher=N
         execute=args.execute,
         # the WHOLE tail is planned here, under the retreat: grip, carry
         # and place as one chain, so the lift flows into the carry and the
-        # set-down without a stop (build_grip_and_place_legs)
-        lookahead=None
+        # set-down without a stop (build_grip_and_place_legs); press-only's
+        # tail is the rise and home from the hop (fly_home_from_hop)
+        lookahead=(lambda q: build_home_from_hop(ctx, cfg, start_joints=q))
         if args.press_only
         else (lambda q: build_grip_and_place_legs(ctx, cfg, start_joints=q)),
     )
@@ -1576,7 +1667,12 @@ def run_push(ctx, cfg, runner, args, touch, touch_leg=None, node=None, watcher=N
                 "[press_demo] NOT POPPED — the knob reads %.1f mm above the lid after the push; "
                 "pressing once more" % up_mm
             )
-            return _press_again(ctx, cfg, runner, args, node, watcher, retries - 1)
+            try:
+                return _press_again(ctx, cfg, runner, args, node, watcher, retries - 1)
+            except RuntimeError as e:
+                # its re-plan refused: the arm stands at the hop over the box
+                try_home(ctx, runner, args.execute, "STOP before pressing again — %s" % e)
+                sys.exit(1)
         else:
             try_home(
                 ctx, runner, args.execute,
@@ -1684,12 +1780,18 @@ def _rise_over_button(ctx, cfg, st, name):
 
 
 def build_restage_legs(ctx, cfg):
-    """From the hop, fingers open over a knob that did not pop: close them
-    and rise back to staging height above the button (_rise_over_button)."""
+    """From the hop, fingers open over a knob that did not pop: rise back
+    to staging height above the button (_rise_over_button) and close them
+    on the way up — the close rides the rise (it used to stand still at the
+    hop for the whole close first). Up and away from a flush button, the
+    closing fingers touch nothing; the Runner joins the close before the
+    guarded press descends."""
     st = _state(ctx.client.joints())
-    world, rise, _st = _rise_over_button(ctx, cfg, st, "retreat:restage")
-    close = _gripper_leg(ctx, st, "press:close", GRIPPER_CMD_CLOSED, world)
-    return [close, rise]
+    world, rise, st = _rise_over_button(ctx, cfg, st, "retreat:restage")
+    close = _gripper_leg(
+        ctx, st, "press:close", GRIPPER_CMD_CLOSED, world, defer_join=True, send_with_previous_motion=True
+    )
+    return [rise, close]
 
 
 def _press_again(ctx, cfg, runner, args, node, watcher, retries):
@@ -1699,10 +1801,17 @@ def _press_again(ctx, cfg, runner, args, node, watcher, retries):
     except RuntimeError as e:
         try_home(ctx, runner, args.execute, "STOP before pressing again — %s" % e)
         sys.exit(1)
-    res = runner.run(legs, execute=args.execute)
+    # the descent is planned while the rise flies, from its end
+    res = runner.run(legs, execute=args.execute, lookahead=lambda q: build_press_legs(ctx, cfg, start_joints=q))
     if any(not r.ok for r in res):
         sys.exit(1)
-    legs = build_press_legs(ctx, cfg)
+    try:
+        legs = runner.lookahead_result or build_press_legs(ctx, cfg)
+    except RuntimeError as e:
+        try_home(ctx, runner, args.execute, "STOP before pressing again — %s" % e)
+        sys.exit(1)
+    fly_free_air_fast(legs[0], cfg)  # as the first press: free air fast, the line at contact speed
+    ctx.last_pose = (list(legs[-1].target[1]), list(legs[-1].target[2]))
     res = runner.run(legs, execute=args.execute)
     if any(not r.ok for r in res):
         sys.exit(1)
@@ -1851,6 +1960,20 @@ def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S, camera_cfg
                 "the OWL detectors) is not running: `sheppy up box-opening`. Nothing moved." % (client._base_frame, parent)
             )
     return None
+
+
+def fly_home_from_hop(ctx, cfg, runner, execute):
+    """Press-only's last motion: home from the hop (build_home_from_hop),
+    planned under the retreat (run_push's lookahead) or, when that failed,
+    from here. A refused plan goes through try_home — never a traceback with
+    the arm left 5 cm over the open box. Returns True when home flew."""
+    try:
+        legs = runner.lookahead_result or build_home_from_hop(ctx, cfg)
+    except RuntimeError as e:
+        try_home(ctx, runner, execute, "STOP after the press — home from the hop refused (%s)" % e)
+        return False
+    res = runner.run(legs, execute=execute)
+    return all(r.ok for r in res)
 
 
 def depth_press_refusal(depth_press, cfg, scene, cfg_path=None):
@@ -2205,8 +2328,9 @@ def main():
                     tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
                     scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
                 )
-                # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
-                # and the readiness checks below are that long — by the time
+                # enable its OWL NOW: the first bbox takes ~0.7 s (the node
+                # infers on the enable edge: one inference, no tick wait) and
+                # the readiness checks below are about that long — by the time
                 # locate() asks, the box is already on the topic
                 locator.owl.enable()
         # camera on from here to exit
@@ -2349,6 +2473,11 @@ def main():
 
                 print("[press_demo] straight down is out of reach: %s" % reach.status)
                 sys.exit(run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator))
+            # the staging the approach flew (lowered when staging_m was out
+            # of reach): the stroke, the recentre, the retreat and recovery's
+            # rise over the button all go by it from here
+            cfg = reach.cfg or cfg
+            ctx.press_cfg = cfg
             got, preplanned, planned_for = reach.got, reach.preplanned, scene_fix.pose
             at_staging = got is not None
             open_already = refuse_open_box(reach.button_up_mm)
@@ -2571,7 +2700,13 @@ def main():
                 # alone — the one pre-planned during the approach when the aim
                 # agrees with the scene's fix, re-FITTED to the aim when it
                 # moved the target a little, re-planned only otherwise
-                press_legs, how = descent_from_staging(ctx, cfg, planned_for, preplanned)
+                try:
+                    press_legs, how = descent_from_staging(ctx, cfg, planned_for, preplanned)
+                except RuntimeError as e:
+                    # a refused press plan: nothing has touched the box —
+                    # rise over it and go home, never a traceback over the lid
+                    try_home(ctx, runner, args.execute, "STOP before the press — %s" % e)
+                    sys.exit(1)
                 runner.note("press_plan", from_staging=True, preplanned=press_legs is preplanned, how=how)
                 print("[press_demo] PRESS from staging — %s" % how)
             else:
@@ -2584,11 +2719,15 @@ def main():
                 # planned in its OWN world, so the lateral run happens where
                 # the container is visible.
                 runner.note("press_plan", chained=True)
-                approach = build_approach_leg(ctx, cfg)
-                press_legs = [
-                    approach,
-                    *build_press_legs(ctx, cfg, start_joints=approach.goal_joints),
-                ]
+                try:
+                    approach = build_approach_leg(ctx, cfg)
+                    press_legs = [
+                        approach,
+                        *build_press_legs(ctx, cfg, start_joints=approach.goal_joints),
+                    ]
+                except RuntimeError as e:
+                    try_home(ctx, runner, args.execute, "STOP before the press — %s" % e)
+                    sys.exit(1)
             touch_leg = press_legs[-1]
             # what follows the touch (the push's xy, the retreat) is relative
             # to the pose this stroke is ACTUALLY aimed at — a re-fitted or
@@ -2617,8 +2756,7 @@ def main():
         if args.press_only:
             if args.execute:
                 # the pop is confirmed (or pressed again) at the hop; home from there
-                res = runner.run(build_home_from_hop(ctx, cfg), execute=args.execute)
-                if any(not r.ok for r in res):
+                if not fly_home_from_hop(ctx, cfg, runner, args.execute):
                     sys.exit(1)
             runner.finish()
             sys.exit(0)
