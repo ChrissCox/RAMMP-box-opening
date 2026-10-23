@@ -101,6 +101,8 @@ class ArmChain:
         chain = []
         link = tip
         while link != root:
+            if link not in by_child:  # walked off the top: this URDF has no `root`
+                raise RuntimeError("URDF %s has no chain from %s to root %s" % (path or urdf_path(), tip, root))
             name, typ, parent, t, R, axis, lim = by_child[link]
             chain.append((name, typ, t, R, axis, lim))
             link = parent
@@ -108,23 +110,57 @@ class ArmChain:
         self.joint_names = [c[0] for c in self.chain if c[1] in ("revolute", "continuous")]
         self.limits = [c[5] for c in self.chain if c[1] in ("revolute", "continuous")]
         self.tool_from_tip = np.array([0.0, 0.0, float(tool_from_tip_m)])
+        # fk() is the IK's inner loop (every 2 mm of a plan-free line, with
+        # the arm standing still), so its constants are built once: each
+        # moving joint's fixed origin, with any fixed joints before it folded
+        # in, its unit axis's K and K@K, and the fixed tail to the tip.
+        segs, Racc, tacc = [], np.eye(3), np.zeros(3)
+        for _name, typ, t, R, axis, _lim in self.chain:
+            tacc = tacc + Racc @ t
+            Racc = Racc @ R
+            if typ in ("revolute", "continuous"):
+                a = np.asarray(axis, float)
+                a = a / np.linalg.norm(a)
+                K = np.array([[0.0, -a[2], a[1]], [a[2], 0.0, -a[0]], [-a[1], a[0], 0.0]])
+                segs.append((Racc, tacc, a, K, K @ K))
+                Racc, tacc = np.eye(3), np.zeros(3)
+        self._segs = segs
+        self._tail = (Racc, tacc)
+        self._I3 = np.eye(3)
+
+    def _fk_axes(self, q):
+        """fk()'s (R, t), plus each moving joint's world axis z_k and origin p_k."""
+        R = self._I3
+        p = np.zeros(3)
+        zs, ps = [], []
+        for k, (Rf, tf, a, K, KK) in enumerate(self._segs):
+            th = q[k]  # indexed, not zipped: a short q raises, as it always did
+            p = p + R @ tf
+            R = R @ Rf
+            zs.append(R @ a)
+            ps.append(p)
+            R = R @ (self._I3 + math.sin(th) * K + (1.0 - math.cos(th)) * KK)
+        Rt, tt = self._tail
+        p = p + R @ tt
+        R = R @ Rt
+        return R, p + R @ self.tool_from_tip, zs, ps
 
     def fk(self, q):
         """(R, t) of tool_frame in base_link for the 7 joint values."""
-        T = np.eye(4)
-        k = 0
-        for _name, typ, t, R, axis, _lim in self.chain:
-            A = np.eye(4)
-            A[:3, :3] = R
-            A[:3, 3] = t
-            T = T @ A
-            if typ in ("revolute", "continuous"):
-                J = np.eye(4)
-                J[:3, :3] = _axis_rot(axis, q[k])
-                k += 1
-                T = T @ J
-        Rt = T[:3, :3]
-        return Rt, T[:3, 3] + Rt @ self.tool_from_tip
+        R, t, _zs, _ps = self._fk_axes(q)
+        return R, t
+
+    def _fk_jac(self, q):
+        """fk()'s (R, t) and the geometric Jacobian, from one pass: column k
+        is (z_k x (t - p_k), z_k) — d(tool position)/dq_k and the angular
+        velocity, both in the root frame, the derivative solve_pose's error
+        (xyz - t, rotvec(R_goal R^T)) is taken in."""
+        R, t, zs, ps = self._fk_axes(q)
+        Z = np.array(zs)
+        J = np.empty((6, len(zs)))
+        J[:3] = np.cross(Z, t - np.array(ps)).T
+        J[3:] = Z.T
+        return R, t, J
 
     def within_limits(self, q, margin=LIMIT_MARGIN_RAD):
         for v, (lo, hi) in zip(q, self.limits):
@@ -135,26 +171,19 @@ class ArmChain:
         return True
 
     def _jacobian(self, q, eps=1e-6):
-        R0, t0 = self.fk(q)
-        J = np.zeros((6, len(q)))
-        for i in range(len(q)):
-            dq = list(q)
-            dq[i] += eps
-            R1, t1 = self.fk(dq)
-            J[:3, i] = (t1 - t0) / eps
-            J[3:, i] = rotvec(R1 @ R0.T) / eps
-        return J
+        """The analytic Jacobian (eps is unused: it was a finite difference,
+        8 FK passes where this is one)."""
+        return self._fk_jac(q)[2]
 
     def solve_pose(self, q_seed, xyz, R_goal, damping=0.01):
         """Joints near q_seed putting tool_frame at (xyz, R_goal), or None."""
         q = np.array(q_seed, float)
         xyz = np.asarray(xyz, float)
         for _ in range(MAX_ITERS):
-            R, t = self.fk(q)
+            R, t, J = self._fk_jac(q)
             err = np.r_[xyz - t, rotvec(R_goal @ R.T)]
             if np.linalg.norm(err[:3]) < CONVERGE_M and np.linalg.norm(err[3:]) < CONVERGE_RAD:
                 return q
-            J = self._jacobian(q)
             JJt = J @ J.T + (damping ** 2) * np.eye(6)
             q = q + J.T @ np.linalg.solve(JJt, err)
         R, t = self.fk(q)
