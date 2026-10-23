@@ -450,3 +450,51 @@ def test_the_top_face_is_seen_only_from_above_the_lid():
         pts, uv = lid_at(x, y)
         assert sees_top_face(pts, uv, bbox, lid_z, bench_cam), (x, y)
     assert sees_top_face(pts, uv, (500, 500, 510, 510), lid_z, (0.0, 0.0, lid_z))  # nothing in the box: its lift says why
+
+
+def test_a_box_the_frame_cuts_off_is_refused_not_lifted():
+    """Flatbot 2026-10-23: the canister half off the scene image's edge was
+    fixed from the half it saw, 7 cm short of where the wrist camera then
+    found it, and the staging aimed past its button. A candidate reaching
+    the frame's edge is now refused before either lift."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    model = ContainerModel.load(PINK)
+    pts, uv, canister, _tall = _side_scene(np.random.default_rng(4))
+    cap = canister[:, 2] > SIDE_TABLE + model.dims[2] - 0.025
+    box = list(_pixel_box(_project(canister[cap])))
+    inside = scene_fix_from_boxes([(0.4, box)], pts, uv, None, model, cam_xyz=SIDE_CAM, image_wh=(640, 400))
+    assert inside.pose is not None and not inside.clipped
+    w = int(np.ceil(box[2])) + 1  # the same box, with the frame ending at its right side
+    cut = scene_fix_from_boxes([(0.4, box)], pts, uv, None, model, cam_xyz=SIDE_CAM, image_wh=(w, 400))
+    assert cut.pose is None
+    assert cut.clipped == ((0.4, box, ("right",)),)
+    assert cut.tried == ("it runs off the frame at its right edge (OWL 0.40)",)
+
+
+def test_the_way_off_the_frame_is_said_in_the_planning_frame():
+    """Flatbot's scene OAK hangs upside down looking along +x: the image's
+    right is arm_mount +y, which is what the operator can act on."""
+    from rammp_box_opening.perception.scene_source import frame_edges, off_frame_why
+
+    assert frame_edges([2, 50, 300, 120], (640, 400)) == ("left",)
+    assert frame_edges([100, 50, 638, 399], (640, 400)) == ("right", "bottom")
+    assert frame_edges([10, 10, 600, 380], (640, 400)) == ()
+    flatbot = np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])  # columns: image +u, +v, view
+    why = off_frame_why(0.45, ("right",), flatbot)
+    assert "toward arm_mount +y" in why and "move the box toward -y" in why
+
+
+def test_the_recorded_flatbot_frame_still_finds_its_canister_inside_the_frame():
+    from pathlib import Path
+
+    from rammp_box_opening.perception.scene import color_cloud
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    z = np.load(Path(__file__).parent / "data" / "scene_side_flatbot_20261022.npz")
+    T = z["T_base_color"]
+    pc, uv = color_cloud(z["depth_mm"].astype(float) / 1000.0, z["kd"], z["k"], z["dist"], z["T_color_depth"], stride=2)
+    pts = pc @ T[:3, :3].T + T[:3, 3]
+    boxes = [(float(b[4]), [float(v) for v in b[:4]]) for b in z["owl_boxes"]]
+    got = scene_fix_from_boxes(boxes, pts, uv, None, ContainerModel.load(PINK), cam_xyz=T[:3, 3], image_wh=(640, 400))
+    assert got.box == boxes[0][1] and not got.clipped

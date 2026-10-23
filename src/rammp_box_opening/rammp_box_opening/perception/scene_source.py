@@ -254,6 +254,42 @@ class SceneBoxFix:
     tried: tuple  # why each refused candidate was refused, in order
     table_z: float = float("nan")  # the table the winner was measured against
     lift: str = ""  # "top" or "side": which view of it won
+    clipped: tuple = ()  # (score, box, edges) of each candidate refused at the frame's edge
+
+
+# An OWL box this close to the frame's edge has its container running off
+# the frame: the camera sees a part of it, and a lift of a part puts the box
+# off by up to half of it (flatbot 2026-10-23: the canister cut by the scene
+# image's edge was fixed 7 cm short of where the wrist camera then found it,
+# and the staging aimed past its button)
+FRAME_EDGE_PX = 3
+
+
+def frame_edges(box, image_wh, edge_px=FRAME_EDGE_PX):
+    """The edges ("left", "top", "right", "bottom") of a w x h image that
+    the pixel box [x0, y0, x1, y1] reaches."""
+    w, h = image_wh
+    x0, y0, x1, y1 = (float(v) for v in box[:4])
+    hits = (("left", x0 <= edge_px), ("top", y0 <= edge_px),
+            ("right", x1 >= w - 1 - edge_px), ("bottom", y1 >= h - 1 - edge_px))
+    return tuple(e for e, hit in hits if hit)
+
+
+def off_frame_why(score, edges, R_base_color, frame="arm_mount"):
+    """What to tell the operator about a box the OWL found running off the
+    frame at `edges`: which way that is in `frame` (the image's own left and
+    right mean nothing on a camera hung upside down), and the way back."""
+    R = np.asarray(R_base_color, float)
+    out = {"right": R[:, 0], "left": -R[:, 0], "bottom": R[:, 1], "top": -R[:, 1]}
+    ways = []
+    for e in edges:
+        d = out[e]
+        k = int(np.argmax(np.abs(d)))
+        ways.append(("+" if d[k] > 0 else "-") + "xyz"[k])
+    back = ", ".join(("-" if w[0] == "+" else "+") + w[1] for w in ways)
+    return ("the OWL's box (%.2f) runs off the scene camera's frame toward %s %s: it sees part of the "
+            "container, and a part is not where the box is — move the box toward %s until all of it is "
+            "in the camera's view" % (score, frame, " and ".join(ways), back))
 
 
 # The top face is seen only from above it. A camera that stands less than
@@ -277,7 +313,7 @@ def sees_top_face(pts_base, uv, bbox, lid_z, cam_xyz):
     return cam[2] - float(lid_z) >= TOP_VIEW_MIN_SLOPE * d
 
 
-def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side_table_z=None):
+def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side_table_z=None, image_wh=None):
     """The OWL's candidates (score, [x0, y0, x1, y1]) best first: every
     candidate lifted to the lid slab (box_from_scene_points) when a table
     height is known (`table_z`) and the camera stands above the lid
@@ -289,8 +325,21 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
     far a container runs along the view, so a tray the top-face lift just
     refused would pass it ahead of the real box. The first that is this
     container wins. What the live locate() does with every message, and
-    what an offline replay of recorded frames computes the same way."""
+    what an offline replay of recorded frames computes the same way. With
+    `image_wh` (the colour image's w, h), a candidate reaching the frame's
+    edge is refused before either lift (FRAME_EDGE_PX)."""
     tried = []
+    clipped = []
+    if image_wh is not None:
+        inside = []
+        for score, box in boxes:
+            edges = frame_edges(box, image_wh)
+            if edges:
+                clipped.append((score, box, edges))
+                tried.append("it runs off the frame at its %s edge (OWL %.2f)" % (" and ".join(edges), score))
+            else:
+                inside.append((score, box))
+        boxes = inside
     if table_z is not None:
         lid_z = float(table_z) + float(model.dims[2])
         for score, box in boxes:
@@ -298,15 +347,15 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
                 continue
             pose, top, n = box_from_scene_points(pts_base, uv, box, table_z, model)
             if pose is not None:
-                return SceneBoxFix(pose, top, n, box, tuple(tried), float(table_z), "top")
+                return SceneBoxFix(pose, top, n, box, tuple(tried), float(table_z), "top", tuple(clipped))
             tried.append("%s (OWL %.2f)" % (top, score))
     if cam_xyz is not None:
         for score, box in boxes:
             pose, top, n, tz = box_from_side_points(pts_base, uv, box, side_table_z, model, cam_xyz)
             if pose is not None:
-                return SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side")
+                return SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side", tuple(clipped))
             tried.append("from the side, %s (OWL %.2f)" % (top, score))
-    return SceneBoxFix(None, None, 0, None, tuple(tried))
+    return SceneBoxFix(None, None, 0, None, tuple(tried), clipped=tuple(clipped))
 
 
 def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6, upside_down=False):
@@ -410,6 +459,7 @@ class SceneLocator:
             heard = False  # any message at all from the scene instance
             t_ready = None
             tried = []  # (why) per candidate refused, for the log
+            off_frame = None  # (score, edges, R_base_color) of the best candidate cut by the frame's edge
             last_msg = None
             found = None
             while time.monotonic() - t0 < timeout_s:
@@ -474,8 +524,12 @@ class SceneLocator:
                 got = scene_fix_from_boxes(
                     [(c[4], c[:4]) for c in cands], pts_base, uv, top_table_z, self.model,
                     cam_xyz=T_base_color[:3, 3], side_table_z=self.table_z,
+                    image_wh=(self.grab.color.shape[1], self.grab.color.shape[0]),
                 )
                 tried.extend(got.tried)
+                for score, _box, edges in got.clipped:
+                    if off_frame is None or score > off_frame[0]:
+                        off_frame = (score, edges, T_base_color[:3, :3])
                 if got.pose is not None:
                     cand = next(c for c in cands if c[:4] == got.box)
                     found = (cand, got.pose, got.top, got.n, pts_base, uv, got)
@@ -500,6 +554,8 @@ class SceneLocator:
                     if not tried
                     else "none of the OWL's %d candidate(s) is this container: %s" % (len(tried), "; ".join(tried[-3:]))
                 )
+                if off_frame is not None and heard and t_ready is not None and not self.grab.missing():
+                    self.last_why = "%s; %s" % (off_frame_why(*off_frame), self.last_why)
                 return None
             bbox, pose, top, n, pts_base, uv, got = found
             table_seen = (
