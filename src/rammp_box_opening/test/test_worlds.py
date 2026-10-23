@@ -251,6 +251,17 @@ def test_a_measured_table_is_planned_around_wherever_it_stands(tmp_path):
     assert band["position"][2] - band["dims"][2] / 2 == pytest.approx(0.30)
 
 
+def test_the_flatbot_world_file_carries_only_keys_worldstore_reads():
+    """world_flatbot.yaml once set depth_collision: true, which nothing read,
+    under a comment claiming OAK depth streamed into the planner's collision
+    world. Its table comes only from the scene fix (above)."""
+    with open(FLATBOT) as f:
+        w = yaml.safe_load(f)
+    assert set(w) <= {"base_frame", "table_normal_base", "wrist_camera_config",
+                      "scene_camera_config", "external_static_tf", "obstacles"}
+    assert "table" not in {o["name"] for o in w["obstacles"]}
+
+
 def test_a_surveyed_table_is_not_doubled_by_a_measured_one(tmp_path):
     m, cp = _model_pose()
     store = WorldStore(BENCH, out_dir=tmp_path)

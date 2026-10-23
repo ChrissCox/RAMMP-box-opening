@@ -166,3 +166,68 @@ def test_a_chain_rooted_off_the_planning_frame_is_refused(monkeypatch):
     approach.set_chain_root("base_link", None)
     with pytest.raises(RuntimeError, match="chain root base_link != planning frame arm_mount"):
         next(ClearMarginFree(HOME).steps(ctx, PlanState(joints=STUCK, chain=0)))
+
+
+# The field trip, 2026-10-23 12:23 (run-20261023-122340): the wrist joints'
+# efforts from rest through the first 9% of the step, where the old guard
+# struck at 4.28 Nm on arm_joint_4. (progress, efforts of arm_joint_4..7)
+TRIP_RUN_UP = [
+    (0.0003, [4.611, -0.397, 0.611, -0.609]),
+    (0.0755, [6.044, -0.363, 1.436, -0.533]),
+    (0.0811, [6.702, -0.357, 1.851, -0.515]),
+    (0.0862, [7.876, -0.429, 2.460, -0.445]),
+    (0.0918, [8.889, -0.434, 3.204, -0.379]),
+]
+
+
+def _step_replay(monkeypatch, push_from=None, push_nm=0.0):
+    """The step's guard fed the field run-up, then the arm carrying its own
+    weight (the gravity model's, plus the run-up's last offsets from it) to
+    the end — and from `push_from` on, `push_nm` more on arm_joint_4."""
+    from rammp_box_opening.runtime.guards import CompensatedGuard, TorqueGuard
+    from rammp_box_opening.runtime.stamps import secs
+
+    ctx = _flatbot_ctx(monkeypatch, STUCK, client=LivePlanner())
+    step = home_arm.build_legs(ctx)[0]
+    spec = step.guard
+    assert spec.gravity is not None
+    assert spec.arm_after == spec.rebaseline_after == core.CLEAR_MARGIN_SETTLE
+    pts = step.traj.points
+    total = secs(pts[-1].time_from_start)
+    ts = np.array([secs(p.time_from_start) / total for p in pts])
+    qs = np.array([p.positions for p in pts])
+
+    def joints(f):
+        return [float(np.interp(f, ts, qs[:, j])) for j in range(7)]
+
+    hold = approach._gravity().wrist_holding
+    offset = np.array(TRIP_RUN_UP[-1][1]) - hold(joints(TRIP_RUN_UP[-1][0]))
+    feed = list(TRIP_RUN_UP)
+    for f in np.linspace(0.1, 1.0, 91):
+        e = np.array(hold(joints(f))) + offset
+        if push_from is not None and f >= push_from:
+            e[0] += push_nm
+        feed.append((float(f), [float(v) for v in e]))
+    guards = {
+        "step": CompensatedGuard(spec.touch_nm, spec.gravity, rebaseline_after=spec.rebaseline_after,
+                                 arm_after=spec.arm_after),
+        "from rest": TorqueGuard(spec.touch_nm),  # the guard the field run had
+    }
+    trips = {}
+    for name, g in guards.items():
+        for f, e in feed:
+            g.on_progress(f)
+            if g.on_efforts(e, joints(f)) if name == "step" else g.on_efforts(e):
+                trips[name] = f
+                break
+    return trips
+
+
+def test_the_weight_coming_back_onto_the_joints_is_not_a_strike(monkeypatch):
+    trips = _step_replay(monkeypatch)
+    assert trips == {"from rest": pytest.approx(0.0918)}  # the field's false trip, and only it
+
+
+def test_a_push_once_the_step_is_under_way_still_trips(monkeypatch):
+    trips = _step_replay(monkeypatch, push_from=0.5, push_nm=5.0)
+    assert trips["step"] == pytest.approx(0.5, abs=0.011)
