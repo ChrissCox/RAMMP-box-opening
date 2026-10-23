@@ -905,6 +905,52 @@ def test_the_tf_gate_asks_for_the_worlds_wrist_camera_frame():
     assert asked == ["end_effector_link"]  # the D405 default, unchanged
 
 
+def test_depth_press_with_confirm_in_flight_is_refused_before_any_motion():
+    """With detect.confirm_in_flight the scene approach flies the TF-height
+    descent in its own goal; once that touches, --depth-press was skipped
+    silently and the TF press ran. The combination stops the run before the
+    runtime comes up."""
+    import inspect
+    from types import SimpleNamespace
+
+    from rammp_box_opening.tasks import press_demo
+
+    why = press_demo.depth_press_refusal(True, SimpleNamespace(confirm_in_flight=True), scene=True, cfg_path="x.yaml")
+    assert why is not None and "confirm_in_flight" in why and "Nothing moved" in why and "x.yaml" in why
+    src = inspect.getsource(press_demo.main)
+    assert src.index("depth_press_refusal(") < src.index("init_runtime(") < src.index("home_first(")
+
+
+def test_depth_press_without_confirm_in_flight_is_not_refused():
+    from types import SimpleNamespace
+
+    from rammp_box_opening.tasks import press_demo
+
+    assert press_demo.depth_press_refusal(True, SimpleNamespace(confirm_in_flight=False), scene=True) is None
+    # the shipped containers stay runnable under --depth-press
+    for name in ("ankou_pink.yaml", "oxo_pop.yaml", "oxo_pop_small.yaml"):
+        cfg = load_press_demo("src/rammp_box_opening/config/containers/" + name)
+        assert press_demo.depth_press_refusal(True, cfg, scene=True) is None, name
+
+
+def test_confirm_in_flight_without_depth_press_is_not_refused():
+    from types import SimpleNamespace
+
+    from rammp_box_opening.tasks import press_demo
+
+    assert press_demo.depth_press_refusal(False, SimpleNamespace(confirm_in_flight=True), scene=True) is None
+
+
+def test_no_scene_depth_press_is_not_refused():
+    """--no-scene never flies approach_from_scene: the wrist search stages,
+    and the depth press runs from there whatever confirm_in_flight says."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.tasks import press_demo
+
+    assert press_demo.depth_press_refusal(True, SimpleNamespace(confirm_in_flight=True), scene=False) is None
+
+
 class _SceneFix:
     def __init__(self, xyz, yaw, top):
         from rammp_box_opening.models.container import ContainerPose
