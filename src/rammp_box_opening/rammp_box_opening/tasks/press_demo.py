@@ -1766,6 +1766,14 @@ def build_grip_and_place_legs(ctx, cfg, start_joints=None):
     return [*grip, *place]
 
 
+# After a depth press the lid's height is the touch's own: where the pads met
+# the button, flush with the lid, to about a millimetre. The camera's was good
+# to 2-3 mm, and 2 mm then grazed the lid (bench 2026-09-01: grip_clear_m 5
+# mm). The Ankou's popped knob stood only 4.5-8 mm (2026-10-23): 5 mm left the
+# pads ~3 mm of it. The grip:down is guarded either way.
+DEPTH_GRIP_CLEAR_M = 0.003
+
+
 def lid_off_after_depth_press(ctx, cfg, runner, execute, result):
     """After a depth press that popped the knob (depth_press.lid_ready): the
     fingers shut for the press open above it, then the tail every press
@@ -1779,6 +1787,18 @@ def lid_off_after_depth_press(ctx, cfg, runner, execute, result):
     if result.moved:
         print("[press_demo] the press slid the box %.0f mm, still standing — gripping it where the wrist camera sees "
               "it now" % (1000 * result.shift_m))
+    if result.touch_xyz is not None:
+        # the box stands where the pads measured it: grip its knob low, and set
+        # the lid down on the table it stands on when that is lower than the
+        # scene camera's (its table swung 0.180-0.200 m over 2026-10-23, and a
+        # set-down that arrives above the table stops, holding the lid)
+        cfg = replace(cfg, grip_clear_m=min(float(cfg.grip_clear_m), DEPTH_GRIP_CLEAR_M))
+        base_z = float(ctx.cpose.xyz[2])
+        d = ctx.lid_drop
+        if d is not None and base_z < float(d.xyz[2]):
+            print("[press_demo] the lid goes down on the table the touch measured: %.3f, not the scene's %.3f" % (
+                base_z, float(d.xyz[2])))
+            ctx.lid_drop = ContainerPose(xyz=(float(d.xyz[0]), float(d.xyz[1]), base_z), yaw=d.yaw)
     print("[press_demo] GRIP AND PLACE: the fingers open above the knob, then onto it, close, lift, carry and set "
           "down as one motion")
     live = list(ctx.client.joints())

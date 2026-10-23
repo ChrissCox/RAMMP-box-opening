@@ -656,6 +656,33 @@ def test_after_a_popped_depth_press_the_fingers_open_and_the_lid_comes_off(ctx, 
     assert ctx.client.joint_targets[-1] == pytest.approx(press_demo.rest_joints(_demo_cfg()))  # and home
 
 
+def test_after_a_depth_press_the_lid_is_gripped_low_and_set_down_on_the_measured_table(ctx, tmp_path, monkeypatch):
+    """The touch measured where the box stands: the knob is gripped
+    DEPTH_GRIP_CLEAR_M above the lid (the Ankou's popped knob stood 4.5-8
+    mm), and the lid goes down on the table the box stands on when that is
+    lower than the scene camera's (a set-down above the table stops)."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.models.container import ContainerPose
+    from rammp_box_opening.tasks import press_demo
+    from rammp_box_opening.tasks.depth_press import DepthPress
+
+    built = []
+    monkeypatch.setattr(press_demo, "build_grip_and_place_legs", lambda c, cfg, start_joints=None: built.append(cfg) or [])
+    ctx.cpose = ContainerPose(xyz=(0.39, -0.197, 0.182), yaw=0.0)  # the base the pads measured
+    ctx.lid_drop = ContainerPose(xyz=(0.552, -0.359, 0.195), yaw=0.0)  # on the scene camera's table
+    result = DepthPress(free=True, contact=True, felt=True, popped=True, touch_xyz=(0.39, -0.197, 0.303))
+    press_demo.lid_off_after_depth_press(ctx, _demo_cfg(), make_runner(ctx.client, tmp_path), True, result)
+    assert built[0].grip_clear_m == pytest.approx(press_demo.DEPTH_GRIP_CLEAR_M)
+    assert ctx.lid_drop.xyz == pytest.approx((0.552, -0.359, 0.182))
+    # no touch measured: the configured grip and the scene's table, as before
+    built.clear()
+    ctx.lid_drop = ContainerPose(xyz=(0.552, -0.359, 0.195), yaw=0.0)
+    press_demo.lid_off_after_depth_press(ctx, _demo_cfg(), make_runner(ctx.client, tmp_path), True,
+                                         DepthPress(free=True, contact=True, felt=True, popped=True))
+    assert built[0].grip_clear_m == pytest.approx(_demo_cfg().grip_clear_m) and ctx.lid_drop.xyz[2] == pytest.approx(0.195)
+
+
 def test_a_grip_refused_after_the_depth_press_goes_home_honestly(ctx, tmp_path, monkeypatch):
     from conftest import runner as make_runner
 
