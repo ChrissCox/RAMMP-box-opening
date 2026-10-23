@@ -237,7 +237,13 @@ def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=Fa
         return None, "its top is %+.0f mm from lid height (the table at %.3f + %.0f mm)" % (
             1000 * (top_z - lid_z), table_z, 1000 * model.dims[2]), n, table_z
     if partial:
-        centre, why = lid_circle(near, top_z, model, cam)
+        # the lid's points from one lid diameter around what the box shows, at its height
+        d = float(model.lid_dims[0])
+        seed = near[:, :2].mean(axis=0)
+        reach = np.linalg.norm(pts_base - cam, axis=1) <= np.percentile(rng, 5) + 2 * half + SIDE_DEPTH_SLACK_M
+        around = reach & (np.hypot(pts_base[:, 0] - seed[0], pts_base[:, 1] - seed[1]) <= d + PARTIAL_REACH_M)
+        band = pts_base[around & (pts_base[:, 2] > top_z - float(model.lid_dims[2])) & (pts_base[:, 2] <= top_z + 0.005)]
+        centre, why = lid_circle(band, model, cam)
         if centre is None:
             return None, why, n, table_z
         pose = container_pose_from_top((centre[0], centre[1], top_z), 0.0, model, table_z)  # round: yaw unused
@@ -283,49 +289,68 @@ FRAME_EDGE_PX = 3
 # diameter, fitted with that radius (lid_circle). Flatbot 2026-10-23: the
 # canister half off the frame put 147 deg of its lid in view and the fit
 # put it 3 cm from where the wrist camera found it, the old lift 7 cm.
-PARTIAL_FIT_RMS_M = 0.015  # the lid's points this close to the circle, RMS
-PARTIAL_MIN_ARC_DEG = 60.0  # ... spread over at least this much of it
-PARTIAL_TRIM_M = 0.006  # points farther than this (or 2.5 MADs) off it are not the lid's
+PARTIAL_INLIER_M = 0.006  # a lid point this close to the circle is on it (the side OAK's noise at 0.3 m)
+PARTIAL_MIN_ARC_DEG = 60.0  # the points on it spread over at least this much of it
+# A tight OWL box on a cut lid holds a short arc, and a circle of known
+# radius slides along a short arc: live 2026-10-23 the same canister fixed
+# at [0.497, -0.285] in most frames and [0.445, -0.235] in the rest, where
+# it stood. So the lid's points are taken from one lid diameter around what
+# the box shows (PARTIAL_REACH_M), the circle is found by RANSAC, and a
+# rival circle this far from the best that holds nearly as many points is
+# no fix at all.
+PARTIAL_REACH_M = 0.02  # beyond one lid diameter from the box's own near points
+PARTIAL_RIVAL_M = 0.035
+PARTIAL_RIVAL_FRAC = 0.85
+PARTIAL_RANSAC_ITERS = 400
 
 
-def lid_circle(near, top_z, model, cam_xyz):
+def lid_circle(band, model, cam_xyz):
     """The centre (x, y) of a round lid from the points of its side band a
-    level camera sees: the circle of the lid's radius through them, fitted
-    by Gauss-Newton from a start behind the band (from `cam_xyz`), points
-    far off it trimmed. Returns ((cx, cy), None) or (None, why)."""
+    level camera sees (`band`, base frame): the circle of the lid's radius
+    through the most of them (RANSAC over point pairs, the centre behind the
+    pair as the camera sees it), refined on those. Returns ((cx, cy), None)
+    or (None, why)."""
     r = 0.5 * float(model.lid_dims[0])
-    thick = float(model.lid_dims[2])
-    band = near[(near[:, 2] > top_z - thick) & (near[:, 2] <= top_z + 0.005)]
     if len(band) < MIN_LID_POINTS:
         return None, "only %d points on the lid's side in view (need %d)" % (len(band), MIN_LID_POINTS)
-    P = band[:, :2]
+    P = np.asarray(band, float)[:, :2]
     cam = np.asarray(cam_xyz, float)[:2]
-    m = P.mean(axis=0)
-    c = m + r * (m - cam) / np.linalg.norm(m - cam)
-    keep = np.ones(len(P), bool)
-    for _round in range(4):
-        for _it in range(30):
-            dv = P[keep] - c
-            dist = np.maximum(np.linalg.norm(dv, axis=1), 1e-9)
-            step = np.linalg.lstsq(-dv / dist[:, None], -(dist - r), rcond=None)[0]
-            c = c + step
-            if np.linalg.norm(step) < 1e-7:
-                break
-        res = np.linalg.norm(P - c, axis=1) - r
-        mad = 1.4826 * np.median(np.abs(res - np.median(res)))
-        keep = np.abs(res) < max(PARTIAL_TRIM_M, 2.5 * mad)
-    if keep.sum() < MIN_LID_POINTS:
-        return None, "only %d of the lid's side points lie on a %.0f mm circle" % (int(keep.sum()), 2000 * r)
-    rms = float(np.sqrt(np.mean(res[keep] ** 2)))
-    if rms > PARTIAL_FIT_RMS_M:
-        return None, "the lid's side is no %.0f mm circle (%.0f mm RMS off it)" % (2000 * r, 1000 * rms)
-    ang = np.sort(np.arctan2(P[keep, 1] - c[1], P[keep, 0] - c[0]))
-    gaps = np.diff(np.r_[ang, ang[0] + 2 * np.pi])
-    arc = 360.0 - float(np.degrees(gaps.max()))
+    rng = np.random.default_rng(0)  # the same frame, the same fix
+    cands = []
+    for _ in range(PARTIAL_RANSAC_ITERS):
+        i, j = rng.choice(len(P), 2, replace=False)
+        m, chord = 0.5 * (P[i] + P[j]), P[j] - P[i]
+        dist = float(np.linalg.norm(chord))
+        if dist < 0.01 or dist >= 2 * r:
+            continue
+        normal = np.array([-chord[1], chord[0]]) / dist
+        h = float(np.sqrt(r * r - 0.25 * dist * dist))
+        for c in (m + h * normal, m - h * normal):
+            if np.dot(c - m, m - cam) > 0.0:  # behind the pair, from the camera
+                on = np.abs(np.linalg.norm(P - c, axis=1) - r) < PARTIAL_INLIER_M
+                cands.append((int(on.sum()), c))
+    if not cands:
+        return None, "no %.0f mm circle through the lid's side in view" % (2000 * r)
+    cands.sort(key=lambda kc: -kc[0])
+    best_n, c = cands[0][0], cands[0][1].copy()
+    rival = next((k for k, cc in cands if np.linalg.norm(cc - c) > PARTIAL_RIVAL_M), 0)
+    if rival >= PARTIAL_RIVAL_FRAC * best_n:
+        return None, "the lid's arc in view fits two places %.0f+ mm apart" % (1000 * PARTIAL_RIVAL_M)
+    on = np.abs(np.linalg.norm(P - c, axis=1) - r) < PARTIAL_INLIER_M
+    for _it in range(30):
+        dv = P[on] - c
+        dist = np.maximum(np.linalg.norm(dv, axis=1), 1e-9)
+        step = np.linalg.lstsq(-dv / dist[:, None], -(dist - r), rcond=None)[0]
+        c = c + step
+        if np.linalg.norm(step) < 1e-7:
+            break
+    on = np.abs(np.linalg.norm(P - c, axis=1) - r) < PARTIAL_INLIER_M
+    if on.sum() < MIN_LID_POINTS:
+        return None, "only %d of the lid's side points lie on a %.0f mm circle" % (int(on.sum()), 2000 * r)
+    ang = np.sort(np.arctan2(P[on, 1] - c[1], P[on, 0] - c[0]))
+    arc = 360.0 - float(np.degrees(np.diff(np.r_[ang, ang[0] + 2 * np.pi]).max()))
     if arc < PARTIAL_MIN_ARC_DEG:
         return None, "only %.0f deg of the lid's circle in view (need %.0f)" % (arc, PARTIAL_MIN_ARC_DEG)
-    if np.dot(c - P[keep].mean(axis=0), P[keep].mean(axis=0) - cam) <= 0.0:
-        return None, "the lid's circle comes out on the camera's side of what it sees"
     return (float(c[0]), float(c[1])), None
 
 

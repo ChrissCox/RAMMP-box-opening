@@ -571,3 +571,49 @@ def test_the_cut_flatbot_frame_puts_the_canister_where_the_wrist_found_it():
     assert got.partial == ("right",)
     assert got.pose.xyz[0] == pytest.approx(0.446, abs=0.01) and got.pose.xyz[1] == pytest.approx(-0.236, abs=0.01)
     assert np.hypot(got.pose.xyz[0] - 0.45, got.pose.xyz[1] + 0.21) < 0.03
+
+
+def test_however_tight_the_owl_box_on_a_cut_lid_the_fix_does_not_slide():
+    """Live 2026-10-23 14:40: the same canister, standing still, fixed at
+    [0.497, -0.285] in most frames and [0.445, -0.235] in the rest. The OWL
+    box on a cut lid is tight, the arc in it short, and a circle of known
+    radius slides along a short arc; both press runs staged 7 cm off. Over
+    boxes from a sliver to the whole canister, a fix is where the canister
+    stood or none."""
+    from pathlib import Path
+
+    from rammp_box_opening.perception.scene import color_cloud
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    z = np.load(Path(__file__).parent / "data" / "scene_side_flatbot_cut_20261023.npz")
+    T = z["T_base_color"]
+    pc, uv = color_cloud(z["depth_mm"].astype(float) / 1000.0, z["kd"], z["k"], z["dist"], z["T_color_depth"], stride=2)
+    pts = pc @ T[:3, :3].T + T[:3, 3]
+    model = ContainerModel.load(PINK)
+    fixed = []
+    for x0 in (440, 500, 560, 600):
+        for y0, y1 in ((20, 180), (40, 160), (100, 185), (120, 240)):
+            got = scene_fix_from_boxes([(0.43, [x0, y0, 639, y1])], pts, uv, None, model, cam_xyz=T[:3, 3],
+                                       image_wh=(640, 400), cam_R=T[:3, :3])
+            if got.pose is not None:
+                fixed.append(got.pose.xyz[:2])
+    assert len(fixed) >= 8
+    off = [np.hypot(x - 0.445, y + 0.24) for x, y in fixed]
+    assert max(off) < 0.03, off
+
+
+def test_a_short_arc_is_no_circle():
+    """Thirty degrees of a lid's side: the circle through it could stand
+    anywhere along it, so no fix is made of it."""
+    from rammp_box_opening.perception.scene_source import lid_circle
+
+    model = ContainerModel.load(PINK)
+    r = model.lid_dims[0] / 2
+    a = np.linspace(np.pi - 0.26, np.pi + 0.26, 200)  # facing a camera on -x
+    band = np.c_[0.5 + r * np.cos(a), r * np.sin(a), np.full(200, 0.38)] + np.random.default_rng(1).normal(0, 0.002, (200, 3))
+    centre, why = lid_circle(band, model, (0.0, 0.0, 0.38))
+    assert centre is None and ("two places" in why or "deg of the lid's circle" in why)
+    wide = np.linspace(np.pi - 1.2, np.pi + 1.2, 200)
+    band = np.c_[0.5 + r * np.cos(wide), r * np.sin(wide), np.full(200, 0.38)] + np.random.default_rng(1).normal(0, 0.002, (200, 3))
+    centre, why = lid_circle(band, model, (0.0, 0.0, 0.38))
+    assert centre is not None and np.hypot(centre[0] - 0.5, centre[1]) < 0.003
