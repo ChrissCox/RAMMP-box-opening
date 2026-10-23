@@ -69,6 +69,13 @@ OBLIQUE_RADIUS_WINDOW = (0.85, 1.2)  # of OBLIQUE_BUTTON_PX; a lid off its prior
 OBLIQUE_MAX_CIRCLES = 8
 LID_PRIOR_TOL_M = 0.035  # the measured lid within this of its prior height
 PRIOR_MAX_M = 0.15  # a circle farther than this from prior_xy is not the button
+# ... and from straight down, where a circle's place is read straight off the
+# frame: farther than this from where the box is, it is not this box's
+# button. Flatbot 2026-10-23 15:09: a 47 mm circle on a cabinet's side, 28 cm
+# from the box, aimed the press and the centring flew 31 cm to it. The
+# allowance: the wrist mount's TF, 3.5 cm off sideways until
+# rammp-deployments#128, and the scene camera's own few centimetres.
+DOWN_PRIOR_MAX_M = 0.07
 DISC_MIN_FILL = 0.5  # of the disc's rectified cells with valid depth
 ANNULUS_MIN_FILL = 0.3  # of the annulus' cells; a popped knob hides its far side
 KNOB_NOISE_M = 0.0025  # disc and ring medians closer than this are one height
@@ -216,8 +223,9 @@ def find_button(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=No
 
     `lid_z`: the lid top's expected base z (default table_z + dims.z) and
     `prior_xy`: where the button is expected in base xy. Only the oblique
-    path uses either: the top-down staging aim is the one it was, its lid at
-    table_z + dims.z whatever lid_z says. A camera axis more than
+    path uses lid_z: the top-down staging aim's lid is at table_z + dims.z
+    whatever lid_z says. Both use prior_xy: from straight down a circle
+    farther than DOWN_PRIOR_MAX_M from it is not the button. A camera axis more than
     OBLIQUE_MIN_DEG off straight down goes to find_button_oblique with the
     same arguments."""
     if rot_cam is not None and view_tilt_deg(rot_cam) > OBLIQUE_MIN_DEG:
@@ -261,6 +269,11 @@ def find_button(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=No
             uu, vv = cv2.undistortPoints(np.array([[[uu, vv]]], np.float64), kk, np.asarray(dist, float), P=kk)[0, 0]
         pc = np.array([(uu - kk[0, 2]) / kk[0, 0] * zc, (vv - kk[1, 2]) / kk[1, 1] * zc, zc])
         p = np.asarray(rot_cam, float) @ pc + np.asarray(trans_cam, float)
+        if prior_xy is not None:
+            miss = math.hypot(p[0] - float(prior_xy[0]), p[1] - float(prior_xy[1]))
+            if miss > DOWN_PRIOR_MAX_M:
+                whys.append("circle %.0f mm from where the box is (max %.0f)" % (1000 * miss, 1000 * DOWN_PRIOR_MAX_M))
+                continue
         z_disc = disc_height(depth, kk, rot_cam, trans_cam, float(u), float(v), float(r))
         z_top = z_disc if np.isfinite(z_disc) else float(p[2])
         z_ring = ring_height(depth, kk, rot_cam, trans_cam, float(u), float(v), float(r))

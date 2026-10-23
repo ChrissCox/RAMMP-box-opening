@@ -1212,7 +1212,8 @@ def test_the_scene_approach_moves_over_a_lid_the_wrist_sees_and_aims_from_there(
     aimed = ((0.452, 0.07, 0.085), 0.0)
     aims = iter([(None, "no button"), (aimed, "3/3 still frames found the button circle")])
     monkeypatch.setattr(press_demo, "aim_button_at_staging", lambda *a, **k: next(aims))
-    monkeypatch.setattr(press_demo, "wrist_lid", lambda w: ((0.452, 0.07, 0.085), {"frac": 0.3, "cut": True, "table_z": -0.027}))
+    monkeypatch.setattr(press_demo, "wrist_lid", lambda w: ((0.452, 0.07, 0.085),
+                                                            {"frac": 0.3, "cut": True, "table_z": -0.027, "view_xy": (0.52, 0.07)}))
     reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
     assert reach.got == aimed and not reach.failed
     assert reach.preplanned is None
@@ -2307,66 +2308,92 @@ def test_the_arm_recentres_over_the_button_before_it_presses(ctx, tmp_path, monk
 
 def _restage_env(ctx, tmp_path, monkeypatch, lids, aims):
     """press_demo with the wrist's lid sightings and aims scripted: lids[i]
-    is what the i-th wrist_lid returns (an xy, or None), aims[i] the i-th
-    aim after a move (None: no button)."""
+    is what the i-th wrist_lid returns ((lid xy, where the camera looks), or
+    None), aims[i] the i-th aim after a move (None: no button)."""
     from conftest import runner as make_runner
 
     from rammp_box_opening.models.container import ContainerPose
 
     press_demo = _search_env(monkeypatch)
-    state = {"lid": 0, "aim": 0}
+    state = {"lid": 0, "aim": 0, "priors": []}
 
     def lid(watcher):
-        xy = lids[min(state["lid"], len(lids) - 1)]
+        got = lids[min(state["lid"], len(lids) - 1)]
         state["lid"] += 1
-        if xy is None:
+        if got is None:
             return None, "nothing stands the container's height above the table in view"
-        return (xy[0], xy[1], 0.39), {"frac": 0.24, "cut": True, "table_z": 0.27}
+        (x, y), view = got
+        return (x, y, 0.39), {"frac": 0.2, "cut": True, "table_z": 0.27, "view_xy": view}
 
     def aim(node, watcher, yaw, **kw):
+        state["priors"].append(kw.get("prior_xy"))
         got = aims[min(state["aim"], len(aims) - 1)]
         state["aim"] += 1
         return got, "3/3 still frames found the button circle" if got else "0/9 still frames found the button circle"
 
     monkeypatch.setattr(press_demo, "wrist_lid", lid)
     monkeypatch.setattr(press_demo, "aim_button_at_staging", aim)
-    ctx.cpose = ContainerPose(xyz=(0.475, -0.276, 0.27), yaw=0.0)  # the scene camera's fix, 13:33
+    ctx.cpose = ContainerPose(xyz=(0.395, -0.193, 0.198), yaw=0.0)  # the scene camera's fix, 15:09
     return press_demo, make_runner(ctx.client, tmp_path), _Watcher(), state
 
 
-def test_no_button_at_staging_but_the_lid_in_view_moves_the_arm_over_it(ctx, tmp_path, monkeypatch, capsys):
-    """Flatbot 2026-10-23 13:33: the scene camera's fix was 7 cm off; at
-    staging the wrist saw half the lid at its frame's edge and no button,
-    and the run stopped. It now moves over the lid it sees (planned, in a
-    world holding the box there) and aims again from there."""
-    aimed = ((0.459, -0.205, 0.39), 0.0)
-    press_demo, r, watcher, state = _restage_env(ctx, tmp_path, monkeypatch, lids=[(0.460, -0.204)], aims=[aimed])
+def test_no_button_at_staging_moves_the_camera_over_the_lid_it_sees(ctx, tmp_path, monkeypatch, capsys):
+    """Flatbot 2026-10-23: at staging the tool stands over the button and
+    the wrist camera ~10 cm beside it, so the lid sits at the frame's edge
+    and a few centimetres off hide the button. The camera is moved over the
+    lid it sees — the lid's place less where the camera looks, both through
+    one camera pose, so the wrist mount's error in TF cancels (moving the
+    tool over the lid's TF place went 6 cm the wrong way, 15:09) — and the
+    button is then looked for on that lid. The world's box stays the scene
+    camera's."""
+    from rammp_box_opening.runtime.approach import _chain
+
+    aimed = ((0.463, -0.209, 0.32), 0.0)
+    lid, view = (0.463, -0.209), (0.554, -0.218)  # the 15:09 frame, through its pose
+    press_demo, r, watcher, state = _restage_env(ctx, tmp_path, monkeypatch, lids=[(lid, view)], aims=[aimed])
+    tool = _chain().fk(ctx.client.joints())[1]
     got, status, moves, _seen = press_demo.restage_on_lid(None, ctx, _demo_cfg(), r, watcher, True, 0.0,
                                                            "0/39 still frames found the button circle")
-    assert got == aimed and moves == 1 and state["aim"] == 1
-    assert ctx.cpose.xyz[:2] == pytest.approx((0.460, -0.204))  # the world the move was planned in
-    assert len(ctx.client.executed) == 1
-    assert "RE-STAGE" in capsys.readouterr().out
+    assert got == aimed and moves == 1 and len(ctx.client.executed) == 1
+    # the tool moved by the camera's move: -91, +9 mm, at its own height
+    assert ctx.last_pose[0] == pytest.approx([tool[0] - 0.091, tool[1] + 0.009, tool[2]], abs=1e-6)
+    assert state["priors"] == [lid]  # the button looked for on the lid it saw
+    assert ctx.cpose.xyz[:2] == pytest.approx((0.395, -0.193))
+    assert "moving the camera over it" in capsys.readouterr().out
 
 
 def test_the_re_staging_is_bounded(ctx, tmp_path, monkeypatch):
-    """No lid in view, a lid more than RESTAGE_MAX_M off (not a re-staging:
-    the scene camera found something else), or one already under the
-    staging (the button is hidden by something else): nothing moves. And a
-    button still not found after RESTAGE_TRIES moves stops."""
-    for lids, word in (([None], "no lid in the wrist frame"), ([(0.475, -0.126)], "more than a re-staging"),
-                       ([(0.477, -0.276)], "moving would not show the button")):
+    """No lid in view, a lid more than RESTAGE_MAX_M from where the camera
+    looks, or one where it looks already (the button is hidden by something
+    else): nothing moves. A button still not found after RESTAGE_TRIES
+    moves stops."""
+    for lids, word in (([None], "no lid in the wrist frame"),
+                       ([((0.40, -0.20), (0.55, -0.20))], "more than a re-staging"),
+                       ([((0.40, -0.20), (0.405, -0.20))], "moving would not show the button")):
         ctx.client.executed.clear()
         press_demo, r, watcher, state = _restage_env(ctx, tmp_path, monkeypatch, lids=lids, aims=[None])
         got, status, moves, _seen = press_demo.restage_on_lid(None, ctx, _demo_cfg(), r, watcher, True, 0.0, "why")
         assert got is None and moves == 0 and word in status and ctx.client.executed == []
-        assert ctx.cpose.xyz[:2] == pytest.approx((0.475, -0.276))
     ctx.client.executed.clear()
     press_demo, r, watcher, state = _restage_env(
-        ctx, tmp_path, monkeypatch, lids=[(0.460, -0.204), (0.452, -0.215)], aims=[None, None])
+        ctx, tmp_path, monkeypatch, lids=[((0.46, -0.21), (0.55, -0.22)), ((0.46, -0.21), (0.48, -0.21))], aims=[None, None])
     got, status, moves, _seen = press_demo.restage_on_lid(None, ctx, _demo_cfg(), r, watcher, True, 0.0, "why")
     assert got is None and moves == press_demo.RESTAGE_TRIES == 2 and "after 2 moves" in status
     assert len(ctx.client.executed) == 2
+
+
+def test_an_aim_far_from_under_the_tool_is_not_centred_on(ctx, tmp_path, monkeypatch):
+    """Flatbot 2026-10-23 15:09: an aim 313 mm from under the tool (a circle
+    on a cabinet) and the centring flew there. Farther than
+    RECENTRE_MAX_MOVE_M, nothing moves to it and the run stops."""
+    homes = []
+    first = ((0.673, 0.005, 0.32), 0.0)
+    press_demo, r, watcher, state = _centring_env(ctx, tmp_path, monkeypatch, tool_xys=[(0.395, -0.193)], aims=[])
+    monkeypatch.setattr(press_demo, "try_home", lambda c, runner, execute, why: homes.append(why))
+    with pytest.raises(SystemExit):
+        press_demo.centre_over_button(None, ctx, _demo_cfg(), r, watcher, True, first)
+    assert ctx.client.executed == [] and state["n"] == 0
+    assert "more than a re-centre" in homes[0]
 
 
 def test_a_button_already_under_the_tool_is_pressed_from_where_it_stands(ctx, tmp_path, monkeypatch):
@@ -2546,7 +2573,8 @@ def test_before_the_depth_press_an_aim_beyond_its_reach_gets_one_planned_move(ct
 
     a = [((0.450, 0.0, 0.085), 0.0), ((0.452, 0.0, 0.085), 0.0), ((0.454, 0.0, 0.085), 0.0)]
     press_demo, r, watcher, state = _centring_env(
-        ctx, tmp_path, monkeypatch, tool_xys=[(0.45, CENTRE_MAX_M + 0.05), (0.45, 0.04), (0.45, 0.04)], aims=a[1:]
+        # beyond the depth press's own reach, inside a re-centre (RECENTRE_MAX_MOVE_M)
+        ctx, tmp_path, monkeypatch, tool_xys=[(0.45, CENTRE_MAX_M + 0.03), (0.45, 0.04), (0.45, 0.04)], aims=a[1:]
     )
     got, moves, off = press_demo.centre_for_press(None, ctx, _demo_cfg(), r, watcher, True, a[0], depth_press=True)
     assert moves == 1 and state["n"] == 1 and got == a[1] and len(ctx.client.executed) == 1
@@ -2579,6 +2607,7 @@ def test_the_depth_press_plans_no_descent_on_the_way_to_staging(ctx, tmp_path, m
     assert reach.got == FIX and reach.preplanned is None
     watcher = _Watcher()
     watcher.to_container_pose = lambda got: ContainerPose(xyz=(got[0][0], got[0][1], -0.027), yaw=got[1])
+    monkeypatch.setattr(press_demo, "tool_xy", lambda ctx: (FIX[0][0], FIX[0][1] + 0.12))  # staged beside it
     _got, at_staging, preplanned, _pf = press_demo.stage_over_search_fix(None, ctx, _demo_cfg(), r, watcher, True, FIX,
                                                                           depth_press=True)
     assert at_staging and preplanned is None

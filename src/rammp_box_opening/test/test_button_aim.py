@@ -763,9 +763,13 @@ def test_a_top_down_frame_takes_the_old_path_unchanged(name, cfg, distorted, bef
     got = (s.r_px, s.range_m, s.diameter_m, s.above_lid_m)
     assert got == pytest.approx((r_px, range_m, diameter_m, above), abs=1e-9)
     assert np.isnan(s.lid_z_m) and s.incidence_deg == 0.0
-    prior = (xyz[0] + 0.1, xyz[1])
+    prior = (xyz[0] + 0.05, xyz[1])
     s2, _ = find_button(z["color"], z["depth"], z["k"], z["rot_cam"], z["trans_cam"], TABLE_Z, m, dist=d, prior_xy=prior)
     np.testing.assert_equal(astuple(s2), astuple(s))
+    # ... until it says the box is elsewhere (DOWN_PRIOR_MAX_M)
+    s4, why4 = find_button(z["color"], z["depth"], z["k"], z["rot_cam"], z["trans_cam"], TABLE_Z, m, dist=d,
+                           prior_xy=(xyz[0] + 0.1, xyz[1]))
+    assert s4 is None and "from where the box is" in why4
     # nor does a lid height: the staging aim's lid is table_z + dims.z, as it was
     for lid_z in (xyz[2] - 0.02, xyz[2] + 0.03):
         s3, _ = find_button(
@@ -787,8 +791,12 @@ def test_a_synthetic_top_down_frame_takes_the_old_path(pink):
     assert why is None, why
     assert not s.oblique and np.isnan(s.lid_z_m)
     assert np.hypot(s.xyz[0] - b[0], s.xyz[1] - b[1]) < 0.002
-    s2, _ = find_button(color, depth, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z, pink, prior_xy=(b[0] + 0.1, b[1]))
+    # where the box is expected does not move the sighting; a circle too far
+    # from it is not the button (a cabinet's circle 28 cm off, 2026-10-23)
+    s2, _ = find_button(color, depth, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z, pink, prior_xy=(b[0] + 0.05, b[1]))
     np.testing.assert_equal(astuple(s2), astuple(s))
+    s3, why3 = find_button(color, depth, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z, pink, prior_xy=(b[0] + 0.1, b[1]))
+    assert s3 is None and "100 mm from where the box is" in why3
 
     cam8, rot8 = reach_out_pose(b, 8, 0.13, off_deg=0.0)
     color, depth = render(cam8, rot8, [(BUTTON_XY, h0, 0.0)], h0 - BOX_H)
