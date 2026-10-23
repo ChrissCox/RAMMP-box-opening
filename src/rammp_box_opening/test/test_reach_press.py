@@ -68,6 +68,9 @@ class _Chain:
                 return None, "IK did not converge"
         return [list(q0), [v + 0.01 for v in q0]], None
 
+    def walk(self, q0, xyz, quat, step_m=None, step_rad=None, max_step_rad=None):
+        return None, "no turning walk modelled"  # the depth press's slide in, then its turn
+
     def fk(self, q):
         return np.eye(3), np.array([0.5, -0.4, 0.45])
 
@@ -198,6 +201,49 @@ def test_the_gravity_model_is_checked_against_the_arm_before_any_guarded_line():
     assert reach_press.gravity_mismatch(grav, a, payload) is not None
 
 
+def _drift_of(monkeypatch, f, slide, stroke):
+    calls = []
+
+    def g(q):
+        calls.append(tuple(q))
+        return [f(q), 0.0, 0.0, 0.0]
+
+    monkeypatch.setattr(reach_press, "_wrist_gravity", lambda: g)
+    return reach_press._predicted_drift(SimpleNamespace(slide_pts=slide, stroke_pts=stroke)), calls
+
+
+def _line(n, tag=0.0):
+    return [[i / max(n - 1, 1), tag] + [0.0] * 5 for i in range(n)]
+
+
+def test_the_predicted_drift_line_samples_the_gravity_model_and_never_misses_the_last_point(monkeypatch):
+    # a display line computed with the arm at rest before the look leg: not
+    # every point (232 gravity evaluations, ~0.2 s), the start once per line
+    slide, stroke = _line(77), _line(39, tag=1.0)
+    (s, t), calls = _drift_of(monkeypatch, lambda q: 3.0 * q[0], slide, stroke)
+    every = reach_press.DRIFT_SAMPLE_EVERY
+    for pts, tag in ((slide, 0.0), (stroke, 1.0)):
+        mine = [q for q in calls if q[1] == tag]
+        assert len(mine) <= 2 + math.ceil(len(pts) / every) < len(pts)
+        assert mine.count(tuple(pts[0])) == 1 and len(set(mine)) == len(mine)  # the start once, nothing twice
+        assert tuple(pts[-1]) in mine
+    # rising along the path: the peak is at the last point, 77 and 39 not multiples of the stride
+    assert s == pytest.approx(3.0) and t == pytest.approx(3.0)
+
+
+def test_the_predicted_drift_on_a_smooth_path_is_the_per_point_peak(monkeypatch):
+    f = lambda q: 2.0 * math.sin(math.pi * q[0])  # noqa: E731 - peaks mid-path
+    slide, stroke = _line(77), _line(39)
+    (s, t), _calls = _drift_of(monkeypatch, f, slide, stroke)
+    full = [max(abs(f(q) - f(pts[0])) for q in pts) for pts in (slide, stroke)]
+    assert s == pytest.approx(full[0], rel=0.02) and t == pytest.approx(full[1], rel=0.02)
+
+
+def test_the_predicted_drift_of_a_one_point_or_empty_line_is_zero(monkeypatch):
+    (s, t), _calls = _drift_of(monkeypatch, lambda q: 5.0 + q[0], _line(1), [])
+    assert s == 0.0 and t == 0.0
+
+
 def test_the_box_is_put_where_its_aimed_button_is(model):
     from rammp_box_opening.models.container import from_container
 
@@ -250,6 +296,8 @@ class _Rec:
     def __init__(self):
         self.events = []
         self.legs = {}  # name -> the last leg of that name
+        self.owl = []  # the scene OWL's ("on"/"off", events before it)
+        self.reads = 0  # at-rest reads (client.settled_efforts)
 
 
 def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4), scene_after="same", settled=None,
@@ -306,7 +354,11 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
 
     monkeypatch.setattr(reach_press, "_aim", aim)
     seq = list(FREE if settled is None else settled)
-    ctx.client.settled_efforts = lambda *a, **k: (seq.pop(0) if seq else AT_START)
+    def settled(*a, **k):
+        rec.reads += 1
+        return seq.pop(0) if seq else AT_START
+
+    ctx.client.settled_efforts = settled
     # the touch trips with the fingertip exactly on `contact`
     quat = reach_press.reach_quat(ctx.model, BUTTON[:2], reach_press.REACH_TILTS_DEG[0])
     R_ = np.asarray(quat_to_mat(*quat), float)
@@ -321,7 +373,10 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
     fix = SimpleNamespace(pose=ContainerPose(xyz=(BUTTON[0], BUTTON[1], BUTTON[2] - 0.121), yaw=0.0), top_xyz=BUTTON)
     moved_pose = ContainerPose(xyz=(BUTTON[0] + 0.05, BUTTON[1], BUTTON[2] - 0.121), yaw=0.0)
     seen = {"same": fix, "none": None, "moved": SimpleNamespace(pose=moved_pose, top_xyz=(BUTTON[0] + 0.05, BUTTON[1], BUTTON[2]))}
-    locator = SimpleNamespace(locate=lambda s: (rec.events.append("scene"), seen[scene_after])[1])
+    # the scene OWL's enables/disables, each with how many events came before it
+    owl = SimpleNamespace(enable=lambda: rec.owl.append(("on", len(rec.events))),
+                          disable=lambda: rec.owl.append(("off", len(rec.events))))
+    locator = SimpleNamespace(owl=owl, locate=lambda s: (rec.events.append("scene"), seen[scene_after])[1])
     args = SimpleNamespace(execute=True, press_only=True)
     code = reach_press.run_reach_press(None, ctx, cfg, runner, SimpleNamespace(), args, fix, locator)
     return code, rec, chain, home
@@ -362,6 +417,65 @@ def test_the_reach_out_press_flies_in_presses_unloads_judges_and_only_then_goes_
     assert any(xyz[2] == pytest.approx(0.45 + reach_press.UNLOAD_CHECK_M) for xyz, _q in chain.lines)
     # every world from the aim on holds the box where the aim put it
     assert _reach_world_button(ctx) == pytest.approx(list(BUTTON))
+    # toward the box, or loaded, at CONTACT_SPEED; up and away after an at-rest check, faster
+    from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED
+
+    assert {n: L[n].speed for n in L if n.startswith(("reach:", "press:")) and n != "reach:look"} == {
+        "reach:re-aim": CONTACT_SPEED, "reach:slide-in": CONTACT_SPEED, "press:down": cfg.press_speed,
+        "press:push": cfg.press_speed, "reach:unload": CONTACT_SPEED, "reach:rise": FREE_LINE_SPEED,
+        "reach:slide-out": FREE_LINE_SPEED,
+    }
+    assert CONTACT_SPEED < FREE_LINE_SPEED < cfg.press_speed
+    # the slide and the stroke reach_from_here solved are flown as solved: the arm stood at their starts
+    quat = reach_press.reach_quat(ctx.model, BUTTON[:2], reach_press.REACH_TILTS_DEG[0])
+    start = reach_press.tool_for_contact((BUTTON[0], BUTTON[1], BUTTON[2] + reach_press.REACH_START_M), quat)
+    bottom = reach_press.tool_for_contact((BUTTON[0], BUTTON[1], BUTTON[2] - cfg.travel_m), quat)
+    # plan_reach's and reach_from_here's (and the rise's, back up to the start), none from the live joints
+    assert sum(x == pytest.approx(start) for x, _q in chain.lines) == 3
+    assert sum(x == pytest.approx(bottom) for x, _q in chain.lines) == 2
+
+
+def test_a_solved_line_is_flown_as_solved_only_from_where_it_starts(ctx, monkeypatch):
+    from rammp_box_opening.runtime import approach
+
+    chain = _Chain()
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    pts = [[0.1] * 7, [0.2] * 7]
+    ctx.client.live = [0.1 + 0.0009] + [0.1] * 6
+    assert reach_press._line_from(ctx, pts, [0.9, 0.0, 0.3], [0.0, 0.0, 0.0, 1.0]) == (pts, None) and chain.lines == []
+    ctx.client.live = [0.1 + 0.002] + [0.1] * 6  # drifted: solved again from where the arm is
+    got, why = reach_press._line_from(ctx, pts, [0.9, 0.0, 0.3], [0.0, 0.0, 0.0, 1.0])
+    assert got[0] == ctx.client.live and chain.lines == [([0.9, 0.0, 0.3], [0.0, 0.0, 0.0, 1.0])]
+
+
+def test_the_scene_owl_is_enabled_before_the_post_press_wrist_aim(ctx, monkeypatch, tmp_path):
+    # its first bbox (~1.2 s) comes while the wrist re-aims, not after it
+    code, rec, _c, _h = _flow(ctx, monkeypatch, tmp_path)
+    assert code == 0
+    assert rec.events == [
+        "reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "press:down", "press:push",
+        "reach:unload", "reach:rise", "reach:slide-out", "aim:reach-after", "scene", "home",
+    ]
+    ons = [i for word, i in rec.owl if word == "on"]
+    assert ons and min(ons) <= rec.events.index("aim:reach-after")
+
+
+def test_an_aim_that_raises_after_the_early_enable_disables_the_scene_owl(ctx, monkeypatch):
+    # the enable is latched: a Ctrl-C in the re-aim must not leave the scene OWL inferring
+    ctx.model = ContainerModel.load(PINK)
+    calls = []
+    owl = SimpleNamespace(enable=lambda: calls.append("on"), disable=lambda: calls.append("off"))
+    locator = SimpleNamespace(owl=owl, locate=lambda s: calls.append("scene"))
+
+    def aim(node, watcher, yaw, lid_z, prior_xy, runner_, tag):
+        assert tag == "reach-after"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(reach_press, "_aim", aim)
+    fix = SimpleNamespace(top_xyz=BUTTON)
+    with pytest.raises(KeyboardInterrupt):
+        reach_press._after_check(None, ctx, SimpleNamespace(), SimpleNamespace(), fix, locator, BUTTON, None, 0.0)
+    assert calls == ["on", "off"]
 
 
 def _reach_world_button(ctx):
@@ -380,7 +494,7 @@ def test_the_world_follows_the_aimed_button_not_the_scene_cameras(ctx, monkeypat
 
 
 def test_when_no_straight_line_reaches_the_aimed_look_pose_the_planner_plans_it(ctx, monkeypatch, tmp_path):
-    monkeypatch.setattr(reach_press, "reach_from_here", lambda *a: (None, None, "IK did not converge"))
+    monkeypatch.setattr(reach_press, "reach_from_here", lambda *a, **k: (None, None, "IK did not converge"))
     code, rec, _c, home = _flow(ctx, monkeypatch, tmp_path)
     assert code == 0 and rec.events[:4] == ["reach:look", "aim:reach-aim", "reach:look", "reach:slide-in"]
     from rammp_box_opening.models.container import from_container
@@ -396,6 +510,9 @@ def test_a_home_refused_from_inside_the_boxs_padded_volume_backs_off_toward_the_
     assert code == 1 and rec.events == ["reach:look", "reach:back-off", "home"]
     back = rec.legs["reach:back-off"]
     assert back.plan_free and back.guard.trip == "obstruction" and back.guard.gravity is not None
+    from rammp_box_opening.constants import FREE_LINE_SPEED
+
+    assert back.speed == FREE_LINE_SPEED and back.guard.touch_nm == reach_press.DRAG_NM and back.guard.hang is None
     # straight back toward the arm, level: from the fake fk's (0.5, -0.4, 0.45), against the box's bearing
     xyz, _q = chain.lines[-1]
     b = np.asarray(ctx.cpose.xyz[:2]) / np.hypot(*ctx.cpose.xyz[:2])
@@ -494,7 +611,7 @@ def test_without_the_oblique_aim_nothing_moves(ctx, monkeypatch, tmp_path):
     assert code == 1 and not ctx.client.executed
 
 
-def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path):
+def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys):
     from rammp_box_opening.models.container import ContainerPose
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.runner import Runner
@@ -512,3 +629,4 @@ def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path):
     code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None,
                                        SimpleNamespace(execute=False, press_only=True), fix, None)
     assert code == 0 and not ctx.client.executed
+    assert "gravity alone moves joint_4 0.00 Nm along the slide" in capsys.readouterr().out

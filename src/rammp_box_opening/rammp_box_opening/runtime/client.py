@@ -19,6 +19,8 @@ import time
 from collections import namedtuple
 
 import rclpy
+from action_msgs.msg import GoalStatus
+from action_msgs.srv import CancelGoal
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
@@ -190,19 +192,30 @@ class PlannerClient:
     # it only catches messages that arrive WITHOUT effort fields. Stale
     # readings must therefore read as no readings (review 2026-08-28).
     EFFORT_STALE_S = 0.5
+    # A guarded stroke's own limit, with no grace on top: ten periods of
+    # the ~49 Hz stream, which never went 83 ms without a message on the
+    # flatbot (2026-10-21). 0.5 s plus a 1 s grace was 1.5 s flown blind,
+    # ~126 mm of the depth touch's stroke (review 2026-10-22).
+    GUARD_STALE_S = 0.2
 
-    def wrist_efforts(self):
+    def wrist_efforts(self, max_age=None):
         if self._eff is None:
             return None
-        if time.monotonic() - self._eff_at > self.EFFORT_STALE_S:
+        if time.monotonic() - self._eff_at > (self.EFFORT_STALE_S if max_age is None else max_age):
             return None  # frozen stream: the guard has lost its senses
         return list(self._eff[3:])
 
-    def settled_efforts(self, duration_s=0.3, settle_s=0.15, timeout_s=2.0):
+    def settled_efforts(self, duration_s=0.15, settle_s=0.15, timeout_s=2.0):
         """(wrist efforts, joints), each averaged over `duration_s` of fresh
         /joint_states once `settle_s` has passed, or None: the arm at rest,
         read as a free-air reference (tasks/reach_press). The arm must be
-        standing still — this only reads."""
+        standing still — this only reads.
+
+        0.15 s is ~7 messages at 49 Hz: at rest one message is within
+        ~0.03 Nm, so the mean sits far below every threshold it feeds
+        (STATIC_NM 0.75 and up) and the gravity model's own ~0.12 Nm
+        residual. A longer window only holds the arm still (review
+        2026-10-22: 0.30 s cost ~1.3 s a depth run for nothing measurable)."""
         effs, qs = [], []
         t0 = time.monotonic()
         last = None
@@ -430,6 +443,23 @@ class PlannerClient:
                 "check the arm"
             )
 
+    # a cancel the driver took: it stopped the goal, or the goal had
+    # already ended (within the cancel's latency of the request)
+    _CANCEL_TAKEN = (CancelGoal.Response.ERROR_NONE, CancelGoal.Response.ERROR_GOAL_TERMINATED)
+
+    def _stop_confirmed(self, send, result_future, cancel_s=3.0, result_s=10.0):
+        """Cancel a goal in flight and say whether the driver confirmed the
+        stop: the result arrived, and either it reads CANCELED or the cancel
+        was taken. A SUCCESSFUL result after a cancel nobody took is a
+        stroke flown to its end past the request — not a stop."""
+        cresp = spin_until_done(self.node, send.cancel_goal_async(), cancel_s)
+        wrapped = spin_until_done(self.node, result_future, result_s)
+        if wrapped is None:
+            return False
+        if getattr(wrapped, "status", None) == GoalStatus.STATUS_CANCELED:
+            return True
+        return getattr(cresp, "return_code", None) in self._CANCEL_TAKEN
+
     def execute(self, traj, speed, guard=None, while_running=None, stop_when=None):
         """Run one trajectory on the driver; outcome 'arrived' | 'touch' | 'failed'.
 
@@ -489,6 +519,7 @@ class PlannerClient:
         # loop below then delivers the cancel on a LIVE context (abort.py)
         if self._abort is not None:
             self._abort.goal_in_flight = True
+        unwinding = False
         try:
             send = spin_until_done(
                 self.node,
@@ -506,7 +537,6 @@ class PlannerClient:
             stopped = False
             aborted = False
             t0 = time.monotonic()
-            efforts_ok_at = time.monotonic()
             try:
                 if while_running is not None and guard is None:
                     # INSIDE the cancel backstop: a second Ctrl+C raised from
@@ -529,36 +559,42 @@ class PlannerClient:
                         aborted = True
                         break
                     rclpy.spin_once(self.node, timeout_sec=0.05)
-                    if stop_when is not None and stop_when(info["progress"]):
-                        spin_until_done(self.node, send.cancel_goal_async(), 3.0)
-                        spin_until_done(self.node, result_future, 10.0)
-                        stopped = True
-                        break
                     if guard is not None:
-                        eff = self.wrist_efforts()
-                        if eff is not None:
-                            efforts_ok_at = time.monotonic()
-                        elif time.monotonic() - efforts_ok_at > 1.0:
+                        eff = self.wrist_efforts(max_age=self.GUARD_STALE_S)
+                        if eff is None:
                             # a guard that has lost its senses is no guard:
                             # stop the stroke instead of pressing blind
-                            spin_until_done(self.node, send.cancel_goal_async(), 3.0)
-                            spin_until_done(self.node, result_future, 10.0)
+                            ok = self._stop_confirmed(send, result_future)
                             info["message"] = (
                                 "effort stream lost during guarded leg — "
-                                "cancelled (guard blind > 1 s)"
+                                "cancelled (guard blind > %.1f s)%s"
+                                % (self.GUARD_STALE_S, "" if ok else " (stop unconfirmed)")
                             )
                             return "failed", info
                         if getattr(guard, "wants_joints", False):
                             # the same /joint_states message as the efforts:
                             # the guard takes gravity out at these joints
-                            tripped = guard.on_efforts(eff, None if eff is None else list(self._q))
+                            tripped = guard.on_efforts(eff, list(self._q))
                         else:
                             tripped = guard.on_efforts(eff)
                         if tripped:
+                            if not self._stop_confirmed(send, result_future):
+                                # never a contact height off an arm that may
+                                # have flown on, nor a push on top of it
+                                info["torque_peak"] = guard.peak
+                                info["message"] = "guard tripped; the driver did not confirm the stop — check the arm"
+                                return "failed", info
                             contact = True
-                            spin_until_done(self.node, send.cancel_goal_async(), 3.0)
-                            spin_until_done(self.node, result_future, 10.0)
                             break
+                    # after the guard: the age it judges is the stream's, not
+                    # a stop_when's own time (an in-flight confirm runs the
+                    # wrist's depth fix here)
+                    if stop_when is not None and stop_when(info["progress"]):
+                        if not self._stop_confirmed(send, result_future):
+                            info["message"] = "stop_when: the driver did not confirm the stop — check the arm"
+                            return "failed", info
+                        stopped = True
+                        break
                     if time.monotonic() - t0 > 240:
                         spin_until_done(self.node, send.cancel_goal_async(), 3.0)
                         info["message"] = "execution watchdog timeout (240 s)"
@@ -571,9 +607,17 @@ class PlannerClient:
                 raise
             if aborted:
                 raise KeyboardInterrupt  # unwind AFTER the confirmed cancel
+        except BaseException:
+            unwinding = True
+            raise
         finally:
             if self._abort is not None:
                 self._abort.goal_in_flight = False
+                if self._abort.requested and not unwinding:
+                    # a Ctrl+C that landed in the spin delivering the result
+                    # (or a rejection) only set the flag: the goal is over,
+                    # so nothing to cancel — but it must not be swallowed
+                    raise KeyboardInterrupt
         if guard is not None:
             info["torque_peak"] = guard.peak
         if contact:
@@ -633,6 +677,8 @@ class PlannerClient:
         whole close; the driver's gripper is not a control mode, so it rides
         alongside a trajectory by design. The caller MUST join before
         anything that depends on the fingers having arrived."""
+        if self._abort is not None and self._abort.requested:
+            raise KeyboardInterrupt  # the operator stopped the run: no more motion
         if not self._armed:
             return None
         if self._gripper_pos is None:

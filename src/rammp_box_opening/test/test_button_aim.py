@@ -820,7 +820,7 @@ def test_the_aimer_hands_its_priors_to_every_aim(pink, monkeypatch):
     from rammp_box_opening.perception import button_aim, depth_source
 
     color, depth, cam, rot, b = reach_out_frame(pink, 39, lid_drop=0.021)
-    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g, offset_s=None: (rot, cam))
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g, offset_s=None, stamp=None: (rot, cam))
     seen = []
     real = button_aim.find_button
 
@@ -833,7 +833,7 @@ def test_the_aimer_hands_its_priors_to_every_aim(pink, monkeypatch):
     prior = (b[0] + 0.06, b[1] - 0.05)
     aimer = button_aim.ButtonAimer(g, pink, FLAT_TABLE_Z, lid_z=b[2] + 0.01, prior_xy=prior)
     fixed = False
-    for i in range(1, button_aim.MIN_HITS + 2):  # the first frame never counts as still
+    for i in range(1, button_aim.MIN_HITS + 1):  # parked: the first frame votes too (FIRST_LOOKBACK_S)
         g.color_stamp = SimpleNamespace(sec=i, nanosec=0)
         fixed = aimer.tick()
     assert fixed, aimer.status()
@@ -842,3 +842,274 @@ def test_the_aimer_hands_its_priors_to_every_aim(pink, monkeypatch):
     fx = aimer.fix()
     assert np.hypot(fx[0] - b[0], fx[1] - b[1]) < 0.002 and fx[2] == pytest.approx(b[2], abs=0.003)
     assert aimer.last_sighting.oblique
+
+
+def _full_frame_d2(h, w, u, v, r_max):
+    """The aim's masks as they were before _window_d2: the whole frame."""
+    yy, xx = np.mgrid[0:h, 0:w]
+    return 0, 0, (xx - u) ** 2 + (yy - v) ** 2
+
+
+def test_the_window_holds_every_pixel_a_mask_can_pass():
+    """_window_d2's window holds every pixel nearer than r_max — centres
+    off the frame, on its border and between pixels — and never leaves the
+    frame; its d2 is the full frame's over that window."""
+    from rammp_box_opening.perception.button_aim import _window_d2
+
+    h, w = OAK_HW
+    rng = np.random.default_rng(7)
+    cases = [(0.0, 0.0, 30.0), (w - 1.0, h - 1.0, 30.0), (319.5, 199.5, 80.0), (-20.0, 50.0, 25.0), (w + 10.5, h + 3.0, 40.0)]
+    cases += [(rng.uniform(-80, w + 80), rng.uniform(-80, h + 80), rng.uniform(1, 80)) for _ in range(300)]
+    for u, v, r_max in cases:
+        v0, u0, d2 = _window_d2(h, w, u, v, r_max)
+        _, _, full = _full_frame_d2(h, w, u, v, r_max)
+        assert 0 <= v0 and 0 <= u0 and v0 + d2.shape[0] <= h and u0 + d2.shape[1] <= w
+        inside = np.zeros((h, w), bool)
+        inside[v0 : v0 + d2.shape[0], u0 : u0 + d2.shape[1]] = True
+        assert not (~inside & (full < r_max**2)).any(), (u, v, r_max)
+        np.testing.assert_array_equal(d2, full[inside].reshape(d2.shape))
+
+
+def test_the_aim_windows_change_no_result(frame, model, pink, monkeypatch):
+    """circle_gates, disc_height and ring_height read only the window their
+    disc or annulus can reach, not the whole frame (5-9 ms a call on the
+    Jetson): every gate verdict and height is the full frame's, bit for bit
+    — at the centre, clipped by each border, off the frame, between pixels."""
+    from rammp_box_opening.perception import button_aim
+
+    h0 = _h0(pink)
+    cam = np.r_[BUTTON_XY, h0] + np.r_[0.01, -0.008, 0.13]
+    color, depth = render(cam, ROT_DOWN, [(BUTTON_XY, h0, 0.0)], h0 - BOX_H)
+    s, why = find_button(color, depth, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z, pink)
+    assert why is None, why
+    frames = [
+        (frame["depth"], frame["k"], frame["rot_cam"], frame["trans_cam"], TABLE_Z + model.dims[2], (461.5, 274.5, 41.0)),
+        (depth, OAK_K, ROT_DOWN, cam, h0, (s.uv[0], s.uv[1], s.r_px)),
+    ]
+    reached = 0
+    for d, k, rot, trans, lid_z, (bu, bv, br) in frames:
+        hh, ww = d.shape
+        circles = [
+            (bu, bv, br), (bu + 0.3, bv - 0.7, br * 0.9), (508.0, 200.0, 33.5), (319.5, 199.5, 80.0),
+            (3.0, bv, 40.0), (4.5, bv, br), (ww - 4.0, bv, 40.0), (ww - 5.5, bv, br),
+            (bu, 3.0, 40.0), (bu, 4.5, br), (bu, hh - 4.0, 40.0), (bu, hh - 5.5, br),
+            (3.0, 3.0, 50.0), (ww - 4.0, hh - 4.0, 50.0), (ww - 1.0, hh - 1.0, 30.0),
+            (-60.0, bv, 30.0), (ww + 60.0, bv, 30.0), (bu, -60.0, 30.0), (bu, hh + 60.0, 30.0),
+        ]
+        for u, v, r in circles:
+            got = (
+                button_aim.circle_gates(d, k, rot, trans, u, v, r, lid_z),
+                button_aim.disc_height(d, k, rot, trans, u, v, r),
+                button_aim.ring_height(d, k, rot, trans, u, v, r),
+            )
+            with monkeypatch.context() as mp:
+                mp.setattr(button_aim, "_window_d2", _full_frame_d2)
+                want = (
+                    button_aim.circle_gates(d, k, rot, trans, u, v, r, lid_z),
+                    button_aim.disc_height(d, k, rot, trans, u, v, r),
+                    button_aim.ring_height(d, k, rot, trans, u, v, r),
+                )
+            assert got[0] == want[0], (u, v, r)
+            np.testing.assert_equal(got[1:], want[1:])
+            if got[0] is None or ("border" not in got[0] and "centre" not in got[0]):
+                reached += 1  # the gates got as far as the masks
+            if u < -r or v < -r or u > ww + r or v > hh + r:
+                assert np.isnan(got[1]) and np.isnan(got[2])
+    assert reached >= 6
+
+
+
+
+# --- one frame per tick: colour, depth and pose of the same moment ----------
+
+
+def _st(t):
+    """A header stamp at t seconds."""
+    from types import SimpleNamespace
+
+    sec = int(t)
+    return SimpleNamespace(sec=sec, nanosec=int(round((t - sec) * 1e9)))
+
+
+@pytest.fixture
+def aimer_env(monkeypatch):
+    """A ButtonAimer over a fake grabber, find_button and camera_pose_at
+    scripted: poses["now"] at the frame's stamp, poses["past"] at any offset
+    (the first frame's lookback); `calls` records (offset_s, stamp)."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import button_aim, depth_source
+
+    calls, found, poses = [], [], {}
+
+    def pose_at(g, offset_s=None, stamp=None):
+        calls.append((offset_s, stamp))
+        return poses.get("past" if offset_s else "now")
+
+    monkeypatch.setattr(depth_source, "camera_pose_at", pose_at)
+
+    def fake_find(*a, **kw):
+        found.append(1)
+        return SimpleNamespace(xyz=(0.5, -0.16, 0.40), above_lid_m=0.0), None
+
+    monkeypatch.setattr(button_aim, "find_button", fake_find)
+    g = SimpleNamespace(color=np.zeros((4, 4, 3), np.uint8), depth=np.ones((4, 4), np.float32),
+                        k=np.eye(3), dist=None, color_stamp=None, depth_stamp=None, stamp_offset_s=0.0)
+    model = SimpleNamespace(dims=(0.105, 0.105, 0.121), button_diameter_m=0.044)
+    rot, cam = np.diag([1.0, -1.0, -1.0]), np.array([0.5, -0.16, 0.7])
+    poses["now"] = poses["past"] = (rot, cam)  # parked unless a test says otherwise
+    return g, model, poses, calls, found
+
+
+def _paired_frames(aimer, g, n, dt=0.08):
+    """n frames dt apart, each depth stamped with its colour."""
+    out = []
+    for i in range(1, n + 1):
+        g.color_stamp = g.depth_stamp = _st(i * dt)
+        out.append(aimer.tick())
+    return out
+
+
+def test_a_frozen_depth_never_votes_again_while_colour_keeps_coming(aimer_env):
+    """A depth stream that stalls while colour keeps arriving (the reach-out's
+    after-press look: the knob popped in colour, the depth from before the
+    press) must not let every new colour frame vote the same old depth."""
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
+    assert not any(_paired_frames(aimer, g, button_aim.MIN_HITS - 1))  # one short of a fix
+    hits, frames, frozen = aimer.hits, aimer.frames, g.depth_stamp
+    for i in range(button_aim.MIN_HITS, button_aim.MIN_HITS + 10):  # colour advances, depth does not
+        g.color_stamp = _st(i * 0.08)
+        assert not aimer.tick()
+    assert g.depth_stamp is frozen and (aimer.hits, aimer.frames) == (hits, frames)
+    assert aimer.last_why == "depth not new"
+
+
+def test_a_depth_that_lands_after_its_colour_is_not_lost(aimer_env):
+    """Colour and depth are separate subscriptions: either may land first. A
+    colour frame refused for want of its depth is tried again, not consumed,
+    so a parked aim still fixes on MIN_HITS frames."""
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
+    g.depth_stamp = _st(0.0)
+    got = []
+    for i in range(1, button_aim.MIN_HITS + 1):
+        g.color_stamp = _st(i * 0.08)  # colour N, depth still N-1
+        assert not aimer.tick()
+        g.depth_stamp = _st(i * 0.08)  # ... then depth N lands
+        got.append(aimer.tick())
+    assert got[-1] and not any(got[:-1])
+    assert aimer.frames == aimer.hits == button_aim.MIN_HITS
+
+
+def test_a_depth_from_another_moment_than_its_colour_is_refused(aimer_env):
+    from rammp_box_opening.perception import button_aim
+    from rammp_box_opening.perception.depth_source import PAIR_TOL_S
+
+    g, model, poses, calls, found = aimer_env
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
+    for i in range(1, 6):
+        g.color_stamp = _st(1.0 + i * 0.08)
+        g.depth_stamp = _st(1.0 + i * 0.08 - PAIR_TOL_S - 0.01)
+        assert not aimer.tick()
+    assert aimer.frames == aimer.hits == 0 and not found
+    assert aimer.last_why.startswith("depth not paired with colour")
+
+
+def test_the_pose_is_looked_up_at_the_stamp_the_frame_was_deduplicated_by(monkeypatch):
+    """The grabber's callbacks run on the perception thread: a frame landing
+    between the aim's stamp read and the pose lookup used to place frame N
+    with frame N+1's pose — and the next tick then compared N+1's pose with
+    itself and called a camera moving 20 mm a frame still."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import button_aim, depth_source
+
+    rot = np.diag([1.0, -1.0, -1.0])
+
+    class Grab:
+        def __init__(self):
+            self.color, self.depth = np.zeros((4, 4, 3), np.uint8), np.zeros((4, 4), np.float32)
+            self.k, self.dist, self.stamp_offset_s = np.eye(3), None, 0.0
+            self.n, self.race = 0, False
+            self.arrive()
+
+        def arrive(self):  # both callbacks: frame n, 0.1 s apart
+            self.n += 1
+            self.color_stamp = self.depth_stamp = _st(0.1 * self.n)
+
+    asked = []
+
+    def pose_at(g, offset_s=None, stamp=None):
+        if g.race:  # the callback thread wins the GIL inside the window
+            g.arrive()
+            g.race = False
+        when = stamp if stamp is not None else g.color_stamp
+        asked.append(when)
+        t = when.sec + when.nanosec * 1e-9 + (offset_s or 0.0)
+        return rot, np.array([0.5 + 0.2 * t, 0.0, 0.7])  # 20 mm a frame
+
+    still = []
+    monkeypatch.setattr(depth_source, "camera_pose_at", pose_at)
+    monkeypatch.setattr(button_aim, "find_button", lambda *a, **kw: (still.append(a[4][0]), (None, "probe"))[1])
+    g = Grab()
+    aimer = button_aim.ButtonAimer(g, SimpleNamespace(dims=(0.1, 0.1, 0.1), button_diameter_m=0.044), 0.3)
+    for i in range(12):
+        g.arrive()
+        if i in (3, 8):
+            g.race = True
+        before = len(asked)
+        aimer.tick()
+        assert all((s.sec, s.nanosec) == aimer._last_stamp for s in asked[before:])
+        aimer.tick()  # the aim polls faster than frames land
+    assert aimer.frames >= 12 and still == []
+
+
+def test_a_parked_cameras_first_frame_votes(aimer_env):
+    """The first frame's previous pose is the camera's own TF pose
+    FIRST_LOOKBACK_S before its stamp: a parked arm fixes on MIN_HITS frames
+    (the reach-out aims after a 0.46 s at-rest read, and lost a frame each)."""
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
+    got = _paired_frames(aimer, g, button_aim.MIN_HITS)
+    assert got[-1] and not any(got[:-1])
+    assert aimer.frames == button_aim.MIN_HITS == aimer.hits
+    assert calls[1][0] == pytest.approx(-button_aim.FIRST_LOOKBACK_S)
+    assert calls[1][1] is calls[0][1]  # the lookback is from the same frame's stamp
+
+
+def test_a_camera_that_moved_before_the_first_frame_is_refused(aimer_env):
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    rot, cam = poses["now"]
+    poses["past"] = (rot, cam + [0.0, 0.006, 0.0])  # 6 mm in the lookback
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
+    got = _paired_frames(aimer, g, button_aim.MIN_HITS + 1)
+    assert not got[0] and aimer.hits == button_aim.MIN_HITS and got[-1]
+
+
+def test_without_tf_history_the_first_frame_still_never_votes(aimer_env):
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    del poses["past"]  # the lookback finds nothing
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
+    got = _paired_frames(aimer, g, button_aim.MIN_HITS + 1)
+    assert not got[0] and got[-1] and len(found) == button_aim.MIN_HITS
+
+
+def test_the_first_frames_lookback_honours_the_stamp_offset(aimer_env):
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    g.stamp_offset_s = 0.03
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
+    _paired_frames(aimer, g, 1)
+    assert [c[0] for c in calls] == [None, pytest.approx(0.03 - button_aim.FIRST_LOOKBACK_S)]

@@ -59,7 +59,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rammp_box_opening.constants import CONTACT_SPEED, TIP_TO_TOOL_M, TRANSIT_SPEED
+from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED, TIP_TO_TOOL_M, TRANSIT_SPEED
 from rammp_box_opening.geometry import rotate_about_world_axis
 from rammp_box_opening.models.container import ContainerPose, attitude_quat
 from rammp_box_opening.primitives.core import (
@@ -98,6 +98,9 @@ def reach_push_m(cfg, tilt_deg):
 # the stroke starts this far above the button (a straight-down press's final
 # approach) — and the unload ends there: above a popped knob's 10-25 mm
 REACH_START_M = 0.06
+# Before planning home from over the box, the tool this far above the box's
+# padded cuboid: the finger collision spheres reach 4-6 cm below tool_frame
+HOME_CLEAR_M = 0.06
 # The look pose, pulled back toward the arm from the stroke's start: 15-20 cm
 # plans in the full world at both spots, 10 cm does not — the gripper meets
 # the padded container cuboid (planner probe 2026-10-22).
@@ -243,11 +246,12 @@ def plan_reach(ctx, cfg, button, q_from, tilts=REACH_TILTS_DEG):
     return None, "; ".join(refused)
 
 
-def reach_from_here(ctx, cfg, button, tilt):
+def reach_from_here(ctx, cfg, button, tilt, need_stroke=True):
     """The reach for `button` at `tilt` as plan-free lines from where the arm
     stands: a MOVE to its look pose at its attitude, then the slide and the
-    stroke. Returns (move points — [] when already there —, ReachPlan with
-    no look_leg, None) or (None, None, why)."""
+    stroke (not solved without `need_stroke`: the depth press flies its own).
+    Returns (move points — [] when already there —, ReachPlan with no
+    look_leg, None) or (None, None, why)."""
     from rammp_box_opening.runtime import approach
 
     chain = approach._chain()
@@ -264,9 +268,11 @@ def reach_from_here(ctx, cfg, button, tilt):
     slide, why = chain.straight_line(q_look, start, quat)
     if slide is None:
         return None, None, "the slide in (%s)" % why
-    stroke, why = chain.straight_line(slide[-1], bottom, quat)
-    if stroke is None:
-        return None, None, "the stroke (%s)" % why
+    stroke = None
+    if need_stroke:
+        stroke, why = chain.straight_line(slide[-1], bottom, quat)
+        if stroke is None:
+            return None, None, "the stroke (%s)" % why
     return move, ReachPlan(int(tilt), quat, tuple(float(v) for v in button), look, start, bottom, None, slide, stroke), None
 
 
@@ -424,6 +430,18 @@ def _line(ctx, xyz, quat):
     return chain.straight_line(q, xyz, quat)
 
 
+REUSE_RAD = 1e-3  # the arm this close (every joint) to where a solved line starts: it is flown as solved
+
+
+def _line_from(ctx, pts, xyz, quat):
+    """`pts` (a line solved earlier, ending at `xyz`) when the arm stands at
+    its start, else _line from where it stands. The runner refuses a
+    plan-free line that no longer starts where the arm is all the same."""
+    if pts and float(np.abs(np.asarray(ctx.client.joints(), float) - np.asarray(pts[0], float)).max()) < REUSE_RAD:
+        return pts, None
+    return _line(ctx, xyz, quat)
+
+
 def _home_legs(ctx, cfg):
     from rammp_box_opening.tasks.press_demo import rest_joints
 
@@ -433,12 +451,13 @@ def _home_legs(ctx, cfg):
     return [leg]
 
 
-def _back_off(ctx, runner):
+def _back_off(ctx, runner, ref=None):
     """Straight back toward the arm by REACH_PULLBACK_M, level, at the
-    hand's own attitude — slow and guarded, like the slide out: out of the
+    hand's own attitude — guarded, like the slide out: out of the
     padded cuboid of a box that is not where the arm's pose was planned
-    around, so the planner takes the start again. False when it cannot be
-    flown or met something."""
+    around, so the planner takes the start again. Guarded against `ref`, a
+    free-air reading the caller already holds, else one read here. False
+    when it cannot be flown or met something."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
 
@@ -453,38 +472,89 @@ def _back_off(ctx, runner):
     if pts is None:
         print("[press_demo] the way back off toward the arm is not a straight line the arm can fly (%s)" % why)
         return False
-    ref = _settled(ctx, "where the arm stands")
+    ref = ref or _settled(ctx, "where the arm stands")
     if ref is None:
         return False
     print("[press_demo] the planner sees the arm inside the box's padded volume — backing %.0f cm straight off toward "
           "the arm first" % (100 * REACH_PULLBACK_M))
-    res = runner.run([line_leg(ctx, "reach:back-off", pts, quat, CONTACT_SPEED, drag_guard(ref), _full_world(ctx))],
+    # from free air only (_go_home's callers), level and away from the box
+    res = runner.run([line_leg(ctx, "reach:back-off", pts, quat, FREE_LINE_SPEED, drag_guard(ref), _full_world(ctx))],
                      execute=True)
     return all(r.ok for r in res)
 
 
-def _go_home(ctx, cfg, runner, why):
+def _go_home(ctx, cfg, runner, why, ref=None):
     """Home from free air (the look pose, or where the run started), planned
     in the full world around the box where it now is. A start the planner
     sees inside the box's padded cuboid (the box not where the pose was
     planned around: the scene camera 85 mm off, 2026-10-22) backs straight
-    off toward the arm first. False — the arm holds — when the plan is
+    off toward the arm first (guarded against `ref` when given). Every
+    refusal is in the run log. False — the arm holds — when the plan is
     refused or a move fails."""
     if why:
         print("[press_demo] %s — returning home" % why)
     try:
         legs = _home_legs(ctx, cfg)
     except RuntimeError as e:
-        if "INVALID_START" not in str(e) or not _back_off(ctx, runner):
+        runner.note("home_refused", why=str(e)[:300])
+        if "INVALID_START" not in str(e) or not _back_off(ctx, runner, ref):
             print("[press_demo] home plan refused (%s) — the arm holds; home it with sheppy's home_arm" % _short(e))
             return False
         try:
             legs = _home_legs(ctx, cfg)
         except RuntimeError as e2:
+            runner.note("home_refused", why=str(e2)[:300], after="reach:back-off")
             print("[press_demo] home plan refused (%s) — the arm holds; home it with sheppy's home_arm" % _short(e2))
             return False
     res = runner.run(legs, execute=True)
     return all(r.ok for r in res)
+
+
+def _clear_over_box(ctx, runner, ref):
+    """From over the box, before its home is planned: straight up until the
+    tool stands HOME_CLEAR_M above the box's cuboid as the planner pads it
+    (worlds.planned_top_z) — the fingers' collision spheres reach 4-6 cm
+    below tool_frame, and a start among them is refused (20:04: INVALID_START
+    twice, the arm held over the box). Slow, drag- and hang-guarded against
+    the free-air `ref`. True when there (or already clear), None when no
+    straight line up flies from here (the back-off is the fallback), False
+    — the arm holds — when it met something."""
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
+    from rammp_box_opening.worlds import planned_top_z
+
+    R, t = approach._chain().fk(ctx.client.joints())
+    want = planned_top_z(ctx.model, ctx.cpose) + HOME_CLEAR_M
+    if float(t[2]) >= want:
+        return True
+    quat = mat_to_quat_xyzw(R)
+    pts, why = _line(ctx, [float(t[0]), float(t[1]), want], quat)
+    if pts is None:
+        runner.note("depth_clear", flown=False, up_mm=round(1000 * (want - float(t[2])), 1), why=why)
+        return None
+    if not pts:
+        return True
+    print("[press_demo] up %.0f mm, clear of the box's padded volume, before home" % (1000 * (want - float(t[2]))))
+    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, CONTACT_SPEED, drag_guard(ref, tip_load_at(pts[0])),
+                               _full_world(ctx))], execute=True)
+    if any(not r.ok for r in res):
+        print("[press_demo] STOP: the way up from over the box met something — the arm holds; check the box")
+        return False
+    return True
+
+
+def _home_from_over_box(ctx, cfg, runner, result):
+    """Home after a free depth press (DepthPress.free): clear of the box's
+    padded volume first, then planned once, the back-off left as the
+    fallback. False — the arm holds — when it did not get there."""
+    ref = result.ref or _settled(ctx, "over the box")
+    if ref is not None:
+        clear = _clear_over_box(ctx, runner, ref)
+        if clear is False:
+            return False
+    from rammp_box_opening.tasks.depth_press import home_why
+
+    return _go_home(ctx, cfg, runner, home_why(result), ref=ref)
 
 
 def _unload_stopped(res):
@@ -529,14 +599,16 @@ def _back_out(ctx, runner, plan, world, ref_start):
     m = ctx.model
     _R, t = approach._chain().fk(ctx.client.joints())
     first = [float(t[0]), float(t[1]), min(float(t[2]) + UNLOAD_CHECK_M, float(plan.start_xyz[2]))]
-    for name, target, strict in (("reach:unload", first, False), ("reach:rise", plan.start_xyz, True)):
+    # the rise only after the at-rest check 15 mm up found nothing on the hand
+    for name, target, strict, speed in (("reach:unload", first, False, CONTACT_SPEED),
+                                        ("reach:rise", plan.start_xyz, True, FREE_LINE_SPEED)):
         up, why = _line(ctx, target, plan.quat)
         if up is None:
             print("[press_demo] STOP: the way up is not a straight line the arm can fly (%s) — the arm holds%s"
                   % (why, " with the fingertip still on the button" if name == "reach:unload" else ""))
             return False
         if up:
-            res = runner.run([line_leg(ctx, name, up, plan.quat, CONTACT_SPEED,
+            res = runner.run([line_leg(ctx, name, up, plan.quat, speed,
                                        unload_guard(m, ref_start, tip_load_at(up[0])), world)], execute=True)
             if any(not r.ok for r in res):
                 print("[press_demo] STOP: %s" % _unload_stopped(res))
@@ -551,7 +623,8 @@ def _back_out(ctx, runner, plan, world, ref_start):
         print("[press_demo] STOP: the slide out is not a straight line the arm can fly (%s) — the arm holds" % why)
         return False
     if out:
-        res = runner.run([line_leg(ctx, "reach:slide-out", out, plan.quat, CONTACT_SPEED,
+        # after the strict check at the stroke's start: away from the box, above it
+        res = runner.run([line_leg(ctx, "reach:slide-out", out, plan.quat, FREE_LINE_SPEED,
                                    drag_guard(ref_start, tip_load_at(out[0])), world)], execute=True)
         if any(not r.ok for r in res):
             print("[press_demo] STOP: something pulled on the way out (the box caught on the fingers?) — the arm "
@@ -568,7 +641,17 @@ def _after_check(node, ctx, runner, watcher, scene_fix, locator, button, lid_bef
     from rammp_box_opening.tasks.press_demo import SCENE_LOCATE_S, knob_is_up
 
     m = ctx.model
-    again, status, up_after = _aim(node, watcher, yaw, button[2], button[:2], runner, "reach-after")
+    if locator is not None:
+        # the first scene bbox takes ~1.2 s (tick + inference): let it come
+        # while the wrist re-aims (no OWL, no GPU, the arm still at the look
+        # pose); locate() enables again (idempotent) and disables in its finally
+        locator.owl.enable()
+    try:
+        again, status, up_after = _aim(node, watcher, yaw, button[2], button[:2], runner, "reach-after")
+    except BaseException:
+        if locator is not None:
+            locator.owl.disable()  # never leave the latched enable on
+        raise
     moved = None if again is None else judge_box_moved(button, again[0])
     lid_after = None if again is None else _lid_z(again[0][2], up_after)
     lifted = None if lid_before is None or lid_after is None else lid_after - lid_before
@@ -621,13 +704,27 @@ def _home_after_contact(node, ctx, cfg, runner, watcher, scene_fix, locator, but
     return _go_home(ctx, cfg, runner, ""), popped, up_after
 
 
+# _predicted_drift samples every this many points plus the last: it is a
+# printed estimate, and evaluating the gravity model at every point (and the
+# start again for each) cost ~0.2 s at rest before the look leg (2026-10-22)
+DRIFT_SAMPLE_EVERY = 4
+
+
 def _predicted_drift(plan):
     """joint_4's gravity torque change along the slide and the stroke (Nm):
-    what a raw guard would have read as a strike."""
+    what a raw guard would have read as a strike. A display estimate only
+    (gravity_mismatch is the gate): sampled every DRIFT_SAMPLE_EVERY points
+    plus the last."""
     g = _wrist_gravity()
-    slide = max(abs(float(g(q)[0]) - float(g(plan.slide_pts[0])[0])) for q in plan.slide_pts)
-    stroke = max(abs(float(g(q)[0]) - float(g(plan.stroke_pts[0])[0])) for q in plan.stroke_pts)
-    return slide, stroke
+
+    def drift(pts):
+        if len(pts) == 0:
+            return 0.0
+        g0 = float(g(pts[0])[0])
+        idx = sorted(set(range(DRIFT_SAMPLE_EVERY, len(pts), DRIFT_SAMPLE_EVERY)) | {len(pts) - 1})
+        return max(abs(float(g(pts[i])[0]) - g0) for i in idx)
+
+    return drift(plan.slide_pts), drift(plan.stroke_pts)
 
 
 def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
@@ -706,6 +803,10 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     # the box is where its button is, not where the scene camera put it: every
     # world from here on holds its cuboid there
     ctx.cpose = cpose_for_button(button, yaw, m.button_offset)
+    if ctx.mission_frames is not None:
+        # a "fix", not an "aim": the oblique aim goes through the wrist
+        # camera's mount in TF, which is known to be off (76 mm high, 20:04)
+        ctx.mission_frames.located(button, "fix")
     world = _interaction_world(ctx, button[2], cfg.travel_m, "reach")
     # To the look pose for the AIMED button. Where the scene camera's box was
     # wrong, the arm may already stand inside the padded cuboid of the box
@@ -713,7 +814,8 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     # (2026-10-22: the box 85 mm nearer the arm). So the arm moves there the
     # way it slides — a slow, guarded straight line at the tilt it holds —
     # and only when no such line flies does the planner plan the move.
-    move, plan2, why_line = reach_from_here(ctx, cfg, button, plan.tilt_deg)
+    depth = bool(getattr(args, "depth_press", False))
+    move, plan2, why_line = reach_from_here(ctx, cfg, button, plan.tilt_deg, need_stroke=not depth)
     if plan2 is not None:
         if move:
             res = runner.run([line_leg(ctx, "reach:re-aim", move, plan2.quat, CONTACT_SPEED, drag_guard(at_look), world)],
@@ -734,28 +836,45 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     at_look = _settled(ctx, "the look pose")
     if at_look is None:
         return 1
-    slide, why = _line(ctx, plan2.start_xyz, plan2.quat)
-    if not slide:
-        _go_home(ctx, cfg, runner, "STOP: the slide in to the button is not a straight line the arm can fly (%s)" % (why or "no length"))
-        return 1
-    res = runner.run([line_leg(ctx, "reach:slide-in", slide, plan2.quat, CONTACT_SPEED, drag_guard(at_look), world)], execute=True)
+    # With the depth press the slide in also turns the hand straight down,
+    # its pads ending where the tilted fingertip would: one walk, as slow
+    # and as guarded as the slide, never lower than it (tasks/depth_press
+    # walk_in_down). Where no such walk flies, the slide, then the TURN.
+    walk, turned = None, None
+    if depth:
+        from rammp_box_opening.tasks.depth_press import walk_in_down
+
+        walk, turned, why_walk = walk_in_down(ctx, plan2.start_xyz, plan2.quat)
+        if walk is None:
+            print("[press_demo] the slide in does not turn the hand down on the way (%s) — sliding, then turning" % why_walk)
+    if walk is not None:
+        slide, quat_in = walk, turned
+    else:
+        slide, why = _line_from(ctx, plan2.slide_pts, plan2.start_xyz, plan2.quat)
+        if not slide:
+            _go_home(ctx, cfg, runner, "STOP: the slide in to the button is not a straight line the arm can fly (%s)" % (why or "no length"))
+            return 1
+        quat_in = plan2.quat
+    res = runner.run([line_leg(ctx, "reach:slide-in", slide, quat_in, CONTACT_SPEED, drag_guard(at_look), world)], execute=True)
     if any(not r.ok for r in res):
         print("[press_demo] STOP: the slide in met something before the button — the arm holds; nothing was pressed")
         return 1
-    at_start = _settled(ctx, "the stroke's start")
+    at_start = _settled(ctx, "the stroke's start" if walk is None else "over the button, pointing down")
     if at_start is None:
         return 1
-    runner.note("reach_slid_in", residual_nm=[round(v, 3) for v in residual(_wrist_gravity(), at_look, at_start)])
-    if getattr(args, "depth_press", False):
+    runner.note("reach_slid_in", residual_nm=[round(v, 3) for v in residual(_wrist_gravity(), at_look, at_start)],
+                turned_down=walk is not None)
+    if depth:
         # over the box: from here the height is the wrist camera's depth and
         # the press the torques' (tasks/depth_press), not TF's lid
-        from rammp_box_opening.tasks.depth_press import exit_code, press_down_from_here
+        from rammp_box_opening.tasks import depth_press
 
-        result = press_down_from_here(node, ctx, cfg, runner, watcher, CONTACT_TOOL)
-        if result.free:
-            _go_home(ctx, cfg, runner, "")
+        result = depth_press.press_down_from_here(node, ctx, cfg, runner, watcher, CONTACT_TOOL, here=at_start,
+                                                  turned=turned)
+        result = depth_press.after_scene_check(ctx, runner, result, scene_fix, locator)
+        homed = result.free and _home_from_over_box(ctx, cfg, runner, result)
         runner.finish()
-        return exit_code(result)
+        return depth_press.finish(ctx, result, homed)
 
     def stop_after_back_out(why, code=1):
         print("[press_demo] STOP: %s" % why)
@@ -767,7 +886,7 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             _go_home(ctx, cfg, runner, "")
         return code
 
-    stroke, why = _line(ctx, plan2.bottom_xyz, plan2.quat)
+    stroke, why = _line_from(ctx, plan2.stroke_pts, plan2.bottom_xyz, plan2.quat)
     if not stroke:
         return stop_after_back_out("the stroke down is not a straight line the arm can fly (%s) — nothing was pressed" % (why or "no length"))
     touch = touch_leg(ctx, cfg, stroke, plan2.quat, world, at_start)
@@ -809,6 +928,8 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         if any(not r.ok for r in res):
             return stop_after_back_out("the push failed (%s)" % res[-1].detail)
         print("[press_demo] PRESSED — %s" % res[0].detail)
+        if ctx.mission_frames is not None:
+            ctx.mission_frames.note(stage="pressed")
     else:
         print("[press_demo] the knob is ALREADY up — the fingertip met it %.1f mm above the lid; not pushing it down" % (1000 * off))
     if not _back_out(ctx, runner, plan2, world, at_start):
@@ -816,6 +937,8 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
 
     # did the knob pop, did the box move — judged before the arm goes anywhere
     homed, popped, up_after = _home_after_contact(node, ctx, cfg, runner, watcher, scene_fix, locator, button, lid_before, yaw)
+    if ctx.mission_frames is not None and pressed:
+        ctx.mission_frames.note(popped=None if up_after is None else bool(popped))
     if not homed:
         return 1
     runner.finish()

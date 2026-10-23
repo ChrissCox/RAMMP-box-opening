@@ -26,15 +26,23 @@ thing it got wrong. So from over the box:
   RISE    straight back up to where the touch started, a pull at the
           fingertip stopping it (the reach-out's unload and its checks),
   LOOK    and the camera judges the knob and whether the box moved.
+
+What the touch measured is the box from then on: ctx.cpose is put where
+the fingertips met the button (TF's lid was 76 mm high on 20:04, so every
+home was planned from "inside" a box that was not there). After a contact,
+a wrist camera that no longer finds the box holds the arm unless the scene
+camera finds it (after_scene_check), the reach-out's own AFTER rule.
 """
 
+import dataclasses
 import math
 import time
 from dataclasses import dataclass
 
 import numpy as np
 
-from rammp_box_opening.constants import CONTACT_SPEED, TCP_OFFSET_M
+from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED, TCP_OFFSET_M
+from rammp_box_opening.models.container import ContainerPose
 from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
 from rammp_box_opening.primitives.core import CONTACT_SHIFT_PAD_M, _full_world, _push_guard_and_verify
 from rammp_box_opening.runtime.guards import GuardSpec
@@ -59,13 +67,23 @@ LENS_AHEAD_MAX_M = 0.25  # the fingertips are at most this far in front of the l
 # centre, on the lid's edge (flatbot 2026-10-22, run 20:04). Straight down,
 # only the lens's sideways offset from the fingers matters, not where it
 # sits along the tool, which is what tilted views get most wrong.
-CENTRE_TOL_M = 0.003  # the button this close under the fingers' line: press
+CENTRE_TOL_M = 0.003  # the button this close in world xy to the fingertip's vertical: press
 CENTRE_MAX_M = 0.10  # farther than this off is not a re-centre: stop
 CENTRE_MAX_MOVES = 2
-CENTRE_SPEED = 0.3  # the centring move: free air, the fingertips well above the lid
+CENTRE_SPEED = FREE_LINE_SPEED  # the centring move: free air, the fingertips well above the lid
 BOX_MOVED_M = 0.005  # the button this far from where the camera saw it before: the box moved
 LID_MOVED_M = 0.008  # ... or the lid this much nearer or farther
 KNOB_UP_MM = 6.0  # press_demo.KNOB_UP_MIN_MM
+# The lens offset CENTRE moves by is TF's mount, and the look after the move
+# uses the same offset, so a wrong mount "converges" anyway, its whole error
+# off the button (20:04: TF's lens y 0.100 against a true ~0.065 — the press
+# 35 mm off, on the lid's edge). CENTRE runs only when TF's lens agrees with
+# the measured one in the camera config (wrist_lens_in_hand_m) ...
+MOUNT_XY_TOL_M = 0.005
+MOUNT_Z_TOL_M = 0.020
+# ... and the touch must meet the lid where TF's lens says the fingertips
+# are in front of it, or nothing is pushed.
+AHEAD_TOL_M = 0.020
 
 # The camera's own frame with z turned up, so find_button's heights are
 # minus depths below the lens: a virtual camera at the origin looking
@@ -126,34 +144,42 @@ def find_in_camera(color, depth, k, model, dist=None):
 
 
 def lens_in_hand(ctx, grab):
-    """Where the wrist lens is from the tool frame, in the hand's own axes
-    (m): the camera's pose at its newest frame (TF: the arm's model and the
-    camera's mount) against the arm's own kinematics at the joints it holds
-    now — read while the arm is still, so the two are one moment. (x, y) is
-    how far the lens axis sits beside the fingers' line, z how far along the
-    tool (negative: behind the tool frame). None without a camera pose."""
+    """Where the wrist lens is from the tool frame, in the hand's own axes:
+    (lens xyz (m), R_hand_cam — the camera's axes in the hand's), from the
+    camera's pose at its newest frame (TF: the arm's model and the camera's
+    mount) against the arm's own kinematics at the joints it holds now —
+    read while the arm is still, so the two are one moment. (x, y) is how
+    far the lens axis sits beside the fingers' line, z how far along the
+    tool (negative: behind the tool frame). R_hand_cam is the identity on
+    flatbot's OAK, 180 deg about the lens axis on the bench's D405. None
+    without a camera pose."""
     from rammp_box_opening.perception.depth_source import camera_pose_at
     from rammp_box_opening.runtime import approach
 
     cam = camera_pose_at(grab)
     if cam is None:
         return None
-    _rot, trans = cam
+    rot, trans = cam
     R, t = approach._chain().fk(ctx.client.joints())
-    return [float(v) for v in np.asarray(R, float).T @ (np.asarray(trans, float) - np.asarray(t, float))]
+    R = np.asarray(R, float)
+    lens = [float(v) for v in R.T @ (np.asarray(trans, float) - np.asarray(t, float))]
+    return lens, R.T @ np.asarray(rot, float)
 
 
-def depth_under_fingers(depth, k, lens_xy):
+def depth_under_fingers(depth, k, lens, R_hand_cam=None):
     """The depth of whatever is straight under the fingers' line, from a lens
-    beside them looking parallel (m), or None. `lens_xy`: the lens's sideways
-    offset from the fingers' line (lens_in_hand). The line's point at depth Z
-    is at (-x, -y, Z) in the lens's frame; walked from far to near, the
-    surface under the fingers is where the depth read at that point's pixel
-    equals Z."""
+    beside them looking parallel (m), or None. `lens`, `R_hand_cam`: the
+    lens's offset from the fingers' line and its axes, in the hand
+    (lens_in_hand). The line's point at depth Z is at (-x, -y, Z) from the
+    lens in the hand's axes, R_hand_cam.T of that in the camera's; walked
+    from far to near, the surface under the fingers is where the depth read
+    at that point's pixel equals Z."""
     kk = np.asarray(k, float)
     d = np.asarray(depth, float)
     h, w = d.shape
-    px, py = -float(lens_xy[0]), -float(lens_xy[1])
+    r = np.eye(3) if R_hand_cam is None else np.asarray(R_hand_cam, float)
+    p = r.T @ np.array([-float(lens[0]), -float(lens[1]), 0.0])
+    px, py = float(p[0]), float(p[1])
     prev = None
     for z_line in np.arange(1.2, 0.12, -0.002):  # far to near: the point leaves the centre for the frame's edge
         u = kk[0, 0] * px / z_line + kk[0, 2]
@@ -179,16 +205,18 @@ def _stamp_ns(stamp):
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
 
-def look(node, watcher, model, tag, runner=None, ctx=None):
+def look(node, watcher, model, tag, runner=None, ctx=None, settled=False):
     """Still frames after the arm stopped, until LOOK_HITS agree within
     LOOK_AGREE_M. Returns (LensSighting or None, depth under the fingers or
-    None, the lens's offset in the hand (lens_in_hand) or None, status) —
+    None, the lens in the hand (lens_in_hand's pair) or None, status) —
     the median of the agreeing sightings. Without `ctx` there is no offset,
-    and no depth under the fingers."""
+    and no depth under the fingers. `settled`: an at-rest read (rp._settled,
+    0.45 s still) came just before, so frames count from now, without
+    LOOK_SETTLE_S more."""
     from rammp_box_opening.tasks.press_demo import _spin_detect, save_aim_frame
 
     g = watcher.grab
-    t_end = time.monotonic() + LOOK_SETTLE_S
+    t_end = time.monotonic() + (0.0 if settled else LOOK_SETTLE_S)
     while time.monotonic() < t_end:
         _spin_detect(node)
     after = node.get_clock().now().nanoseconds
@@ -205,7 +233,7 @@ def look(node, watcher, model, tag, runner=None, ctx=None):
         frames += 1
         if lens is None and ctx is not None:
             lens = lens_in_hand(ctx, g)
-        z = None if lens is None else depth_under_fingers(g.depth, g.k, lens[:2])
+        z = None if lens is None else depth_under_fingers(g.depth, g.k, lens[0], lens[1])
         if z is not None:
             under.append(z)
         s, why = find_in_camera(g.color, g.depth, g.k, model, dist=getattr(g, "dist", None))
@@ -227,21 +255,44 @@ def look(node, watcher, model, tag, runner=None, ctx=None):
                 runner.note(tag, lens_xy_mm=[round(1000 * med.x, 1), round(1000 * med.y, 1)],
                             lid_depth_mm=round(1000 * med.lid_depth, 1),
                             under_fingers_mm=None if z_under is None else round(1000 * z_under, 1),
-                            lens_in_hand_mm=None if lens is None else [round(1000 * v, 1) for v in lens],
+                            lens_in_hand_mm=None if lens is None else [round(1000 * v, 1) for v in lens[0]],
                             up_mm=None if not np.isfinite(med.up_mm) else round(med.up_mm, 1), hits=len(near), frames=frames)
             return med, z_under, lens, "%d/%d frames" % (len(near), frames)
     z_under = float(np.median(under)) if under else None
     if runner is not None:
         runner.note(tag, under_fingers_mm=None if z_under is None else round(1000 * z_under, 1), frames=frames, why=why,
-                    lens_in_hand_mm=None if lens is None else [round(1000 * v, 1) for v in lens])
+                    lens_in_hand_mm=None if lens is None else [round(1000 * v, 1) for v in lens[0]])
     return None, z_under, lens, "%d frame(s), the button in none (last: %s)" % (frames, why)
 
 
-def under_fingers(s, lens):
-    """The button from the fingers' line, along the hand's x and y (m): the
-    camera sees it at (s.x, s.y) from its own axis, which sits lens[:2] from
-    the fingers' line. (0, 0): the fingers are over it."""
-    return float(s.x) + float(lens[0]), float(s.y) + float(lens[1])
+def _in_hand(s, lens, R_hand_cam=None):
+    """The button top from the tool frame, in the hand's axes (m): the camera
+    sees it at (s.x, s.y, s.button_depth) in its own axes, from a lens at
+    `lens` turned by `R_hand_cam` (lens_in_hand)."""
+    r = np.eye(3) if R_hand_cam is None else np.asarray(R_hand_cam, float)
+    b = r @ np.array([float(s.x), float(s.y), float(s.button_depth)])
+    return np.array([float(lens[0]) + b[0], float(lens[1]) + b[1], (float(lens[2]) if len(lens) > 2 else 0.0) + b[2]])
+
+
+def under_fingers(s, lens, R_hand_cam=None):
+    """The button from the fingers' line, along the hand's x and y (m).
+    (0, 0): the fingers' line runs through it."""
+    b = _in_hand(s, lens, R_hand_cam)
+    return float(b[0]), float(b[1])
+
+
+def _off_in_world(ctx, s, lens, R_hand_cam):
+    """The button top from the fingertip's vertical, in world xy (m): what
+    the vertical stroke misses it by. Along the hand's axes it would be off
+    by the depth below the fingertips times the lean when the turn stopped
+    short (TURN_SHORT_DEG: 5 deg, 14 mm)."""
+    from rammp_box_opening.runtime import approach
+
+    R, t = approach._chain().fk(ctx.client.joints())
+    R, t = np.asarray(R, float), np.asarray(t, float)
+    b = t + R @ _in_hand(s, lens, R_hand_cam)
+    tip = t + R @ np.asarray(DOWN_CONTACT_TOOL, float)
+    return float(b[0] - tip[0]), float(b[1] - tip[1])
 
 
 def _hand_line(ctx, dx, dy, dz, quat):
@@ -260,10 +311,17 @@ def down_quat(model, xy, short_deg=0.0):
     return rp.reach_quat(model, xy, short_deg)
 
 
+def turn_target(model, tip, short_deg):
+    """The turn's end: (quat, tool_frame xyz) for the straight-down hand,
+    `short_deg` short, with its pads (DOWN_CONTACT_TOOL) at `tip`."""
+    quat = down_quat(model, (float(tip[0]), float(tip[1])), short_deg)
+    return quat, np.asarray(tip, float) - rp._rot(quat) @ np.asarray(DOWN_CONTACT_TOOL)
+
+
 def turn_down(ctx, runner, contact_tool, ref):
     """Turn the hand straight down where it stands, about its fingertip
-    (`contact_tool`, in tool_frame), slow and guarded. Returns (quat, None)
-    — also when it already points down — or (None, why)."""
+    (`contact_tool`, in tool_frame), guarded. Returns (quat, moved, None) —
+    moved False when it already points down — or (None, False, why)."""
     from rammp_box_opening.runtime import approach
 
     chain = approach._chain()
@@ -272,24 +330,51 @@ def turn_down(ctx, runner, contact_tool, ref):
     R = np.asarray(R, float)
     tip = np.asarray(t, float) + R @ np.asarray(contact_tool, float)
     if math.degrees(math.acos(float(np.clip(-R[2, 2], -1.0, 1.0)))) < 1.0:
-        return mat_to_quat_xyzw(R), None  # straight down already
+        return mat_to_quat_xyzw(R), False, None  # straight down already
     whys = []
     for short in TURN_SHORT_DEG:
-        quat = down_quat(ctx.model, (float(tip[0]), float(tip[1])), short)
-        goal = tip - rp._rot(quat) @ np.asarray(DOWN_CONTACT_TOOL)
+        quat, goal = turn_target(ctx.model, tip, short)
         pts, why = chain.walk(q, goal, quat, step_m=TURN_STEP_M, step_rad=TURN_STEP_RAD, max_step_rad=TURN_MAX_JUMP_RAD)
         if pts is not None:
             break
         whys.append("%.0f deg short: %s" % (short, why))
     else:
-        return None, "no straight-down hand reaches here (%s)" % "; ".join(whys)
+        return None, False, "no straight-down hand reaches here (%s)" % "; ".join(whys)
     if short:
         print("[press_demo] TURN: %.0f deg short of straight down (exactly down does not fly here)" % short)
-    res = runner.run([rp.line_leg(ctx, "depth:turn", pts, quat, CONTACT_SPEED, rp.drag_guard(ref), _full_world(ctx))],
+    # in place, the fingertip the pivot: free air, nothing nearer the lid
+    res = runner.run([rp.line_leg(ctx, "depth:turn", pts, quat, FREE_LINE_SPEED, rp.drag_guard(ref), _full_world(ctx))],
                      execute=True)
     if any(not r.ok for r in res):
-        return None, "the turn met something (%s)" % res[-1].detail
-    return quat, None
+        return None, False, "the turn met something (%s)" % res[-1].detail
+    return quat, True, None
+
+
+def walk_in_down(ctx, start_xyz, quat):
+    """The reach-out's slide in and the TURN as one walk from where the arm
+    stands (its look pose): to the straight-down hand whose pads stand where
+    the hand at `quat` would put its fingertip (rp.CONTACT_TOOL) at the
+    slide's end `start_xyz`, the tool in a straight line, the attitude
+    turning on the way — TURN_SHORT_DEG tried in order, as turn_down.
+    Flatbot, run 20:04's button at 35 deg: 7.7 s at the slide's speed
+    against 12.0 s for the slide and the turn, the fingertip within 0.6 mm
+    of the slide's line and height. Returns (points, the down quat, None)
+    or (None, None, why)."""
+    from rammp_box_opening.runtime import approach
+
+    chain = approach._chain()
+    q = ctx.client.joints()
+    tip = np.asarray(start_xyz, float) + rp._rot(quat) @ np.asarray(rp.CONTACT_TOOL)
+    whys = []
+    for short in TURN_SHORT_DEG:
+        down, goal = turn_target(ctx.model, tip, short)
+        pts, why = chain.walk(q, goal, down, step_m=TURN_STEP_M, step_rad=TURN_STEP_RAD, max_step_rad=TURN_MAX_JUMP_RAD)
+        if pts is not None:
+            if short:
+                print("[press_demo] TURN: %.0f deg short of straight down (exactly down does not fly here)" % short)
+            return pts, down, None
+        whys.append("%.0f deg short: %s" % (short, why))
+    return None, None, "; ".join(whys)
 
 
 def touch_leg(ctx, cfg, pts, quat, reference):
@@ -316,14 +401,16 @@ def _rise(ctx, runner, quat, top_z, ref):
 
     _R, t = approach._chain().fk(ctx.client.joints())
     first = min(float(t[2]) + rp.UNLOAD_CHECK_M, float(top_z))
-    for name, z, strict in (("depth:unload", first, False), ("depth:rise", float(top_z), True)):
+    # the rise only after the at-rest check 15 mm up found nothing on the hand
+    for name, z, strict, speed in (("depth:unload", first, False, CONTACT_SPEED),
+                                   ("depth:rise", float(top_z), True, FREE_LINE_SPEED)):
         _R, t = approach._chain().fk(ctx.client.joints())
         pts, why = rp._line(ctx, [float(t[0]), float(t[1]), z], quat)
         if pts is None:
             print("[press_demo] STOP: the way up is not a straight line the arm can fly (%s) — the arm holds" % why)
             return False
         if pts:
-            res = runner.run([rp.line_leg(ctx, name, pts, quat, CONTACT_SPEED,
+            res = runner.run([rp.line_leg(ctx, name, pts, quat, speed,
                                           rp.unload_guard(ctx.model, ref, rp.tip_load_at(pts[0])), _full_world(ctx))],
                              execute=True)
             if any(not r.ok for r in res):
@@ -347,33 +434,65 @@ class DepthPress:
     popped: bool = False  # the camera sees the knob up after
     moved: bool = False  # the camera sees the box moved
     why: str = None  # why it stopped short, when it did
+    lost: bool = False  # after a contact the wrist camera did not find the box again
+    touch_xyz: tuple = None  # where the pads met the button (the arm's own kinematics)
+    ref: object = None  # the free-air (efforts, joints) reading the press was judged against
 
 
-def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool):
+def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=None, turned=None):
     """TURN, DEPTH, TOUCH, PUSH, RISE, LOOK from where the hand stands over
     the button (`contact_tool`: the fingertip's point in tool_frame at the
-    hand's current attitude). Never goes home itself: DepthPress.free says
-    whether the arm may."""
+    hand's current attitude). `here`: the caller's at-rest reading where the
+    arm stands now, nothing flown since; `turned`: the hand already points
+    down at this quat (the reach-out slid in turning), no TURN. Never goes
+    home itself: DepthPress.free says whether the arm may."""
+    seen = {}
+    result = _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here, turned)
+    return dataclasses.replace(result, ref=seen.get("ref"), touch_xyz=seen.get("touch_xyz"))
+
+
+def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, turned=None):
+    from rammp_box_opening.models.container import from_container
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.tasks.press_demo import refuse_open_box
 
     m = ctx.model
-    here = rp._settled(ctx, "over the box")
+    if here is None:
+        here = rp._settled(ctx, "over the box")
     if here is None:
         return DepthPress(free=True, why="no steady efforts over the box")
-    quat, why = turn_down(ctx, runner, contact_tool, here)
-    if quat is None:
-        return DepthPress(free=why.startswith("no straight-down"), why=why)
-    over = rp._settled(ctx, "over the button, pointing down")
+    if turned is not None:
+        quat, moved = list(turned), False
+    else:
+        quat, moved, why = turn_down(ctx, runner, contact_tool, here)
+        if quat is None:
+            return DepthPress(free=why.startswith("no straight-down"), why=why)
+    # a turn that did not move leaves the arm where `here` was read
+    over = rp._settled(ctx, "over the button, pointing down") if moved else here
     if over is None:
         return DepthPress(free=True, why="no steady efforts pointing down")
+    seen["ref"] = over
     _R, t0 = approach._chain().fk(ctx.client.joints())
     top_z = float(t0[2])
 
-    s, z_under, lens, status = look(node, watcher, m, "depth-look", runner, ctx)
-    if lens is None:
+    s, z_under, lens_pair, status = look(node, watcher, m, "depth-look", runner, ctx, settled=True)
+    if lens_pair is None:
         return DepthPress(free=True, why="no camera pose for the wrist's frames: where the lens sits from the fingers "
                                          "is unknown (%s)" % status)
+    lens, r_hc = lens_pair
+    measured = getattr(getattr(watcher, "grab", None), "wrist_lens_in_hand_m", None)
+    if measured is None:
+        return DepthPress(free=True, why="no measured wrist lens offset (wrist_lens_in_hand_m) in the camera config — "
+                                         "not centring on TF's mount")
+    measured = [float(v) for v in measured]
+    if (math.hypot(lens[0] - measured[0], lens[1] - measured[1]) > MOUNT_XY_TOL_M
+            or abs(lens[2] - measured[2]) > MOUNT_Z_TOL_M):
+        runner.note("depth_mount_refused", lens_in_hand_mm=[round(1000 * v, 1) for v in lens],
+                    measured_mm=[round(1000 * v, 1) for v in measured])
+        return DepthPress(free=True, why="the wrist camera's mount in TF puts the lens at (%s) mm from the tool frame, "
+                                         "the measured wrist_lens_in_hand_m at (%s) mm — fix the mount before centring "
+                                         "on it" % (", ".join("%+.0f" % (1000 * v) for v in lens),
+                                                    ", ".join("%+.0f" % (1000 * v) for v in measured)))
     if s is None:
         return DepthPress(free=True, why="the wrist camera does not see the button from over the box (%s) — not "
                                          "pressing blind" % status)
@@ -382,8 +501,9 @@ def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool):
         if open_already is not None:
             return DepthPress(free=True, why=open_already)
 
-    # CENTRE: the fingers over the button the camera sees
-    off = under_fingers(s, lens)
+    # CENTRE: the fingertip's vertical through the button the camera sees,
+    # in world xy — the stroke is vertical whatever the hand's lean
+    off = _off_in_world(ctx, s, lens, r_hc)
     moves = 0
     while math.hypot(*off) > CENTRE_TOL_M:
         miss = math.hypot(*off)
@@ -393,9 +513,10 @@ def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool):
         if moves >= CENTRE_MAX_MOVES:
             return DepthPress(free=True, why="the button is still %.0f mm from under the fingers after %d moves" % (
                 1000 * miss, moves))
-        print("[press_demo] CENTRE: the button %.0f mm from under the fingers (hand x %+.0f, y %+.0f mm) — moving over it"
+        print("[press_demo] CENTRE: the button %.0f mm from under the fingers (world x %+.0f, y %+.0f mm) — moving over it"
               % (1000 * miss, 1000 * off[0], 1000 * off[1]))
-        pts, why = _hand_line(ctx, off[0], off[1], 0.0, quat)
+        _R, t = approach._chain().fk(ctx.client.joints())
+        pts, why = rp._line(ctx, [float(t[0]) + off[0], float(t[1]) + off[1], float(t[2])], quat)  # level
         if pts is None:
             return DepthPress(free=True, why="the move over the button is not a straight line the arm can fly (%s)" % why)
         if pts:
@@ -405,13 +526,13 @@ def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool):
                 return DepthPress(free=False, why="the move over the button met something — the arm holds")
         moves += 1
         s, z_under, lens2, status = look(node, watcher, m, "depth-look", runner, ctx)
-        lens = lens2 or lens
+        lens, r_hc = lens2 or (lens, r_hc)
         if s is None:
             return DepthPress(free=True, why="the wrist camera lost the button after moving over it (%s)" % status)
-        off = under_fingers(s, lens)
+        off = _off_in_world(ctx, s, lens, r_hc)
         if math.hypot(*off) > 0.5 * miss:
             return DepthPress(free=True, why="moving over the button did not bring it under the fingers (%.0f -> %.0f mm)"
-                                             " — the hand's axes are not the camera's?" % (1000 * miss, 1000 * math.hypot(*off)))
+                                             " — the camera's axes in TF are wrong?" % (1000 * miss, 1000 * math.hypot(*off)))
     runner.note("depth_centred", moves=moves, off_mm=[round(1000 * v, 1) for v in off],
                 lens_in_hand_mm=[round(1000 * v, 1) for v in lens])
     depth = s.lid_depth
@@ -430,17 +551,31 @@ def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool):
         ctx.contact_pad = CONTACT_SHIFT_PAD_M
     if any(not r.ok for r in touched):
         return DepthPress(free=_rise(ctx, runner, quat, top_z, over), why=touched[-1].detail)
-    _R, t1 = approach._chain().fk(ctx.client.joints())
+    R1, t1 = approach._chain().fk(ctx.client.joints())
     down = top_z - float(t1[2])
     ahead = float(depth) - down
     ahead_tf = float(DOWN_CONTACT_TOOL[2]) - float(lens[2])  # where TF's mount puts the pads before the lens
+    pad = np.asarray(t1, float) + np.asarray(R1, float) @ np.asarray(DOWN_CONTACT_TOOL)
+    world_dz = float(pad[2]) - float(from_container(ctx.cpose, m.button_offset)[2])
     runner.note("depth_touch", down_mm=round(1000 * down, 1), lid_depth_mm=round(1000 * depth, 1),
-                fingertips_ahead_of_lens_mm=round(1000 * ahead, 1), tf_says_mm=round(1000 * ahead_tf, 1))
+                fingertips_ahead_of_lens_mm=round(1000 * ahead, 1), tf_says_mm=round(1000 * ahead_tf, 1),
+                pad_xyz=[round(float(v), 4) for v in pad], world_dz_mm=round(1000 * world_dz, 1))
     print("[press_demo] TOUCHED after %.0f mm down: the fingertips are %.0f mm in front of the wrist lens (the camera's "
           "mount in TF says %.0f)" % (1000 * down, 1000 * ahead, 1000 * ahead_tf))
     if ahead > LENS_AHEAD_MAX_M or ahead < -float(cfg.travel_m):
         return DepthPress(free=_rise(ctx, runner, quat, top_z, over), contact=True,
                           why="the contact %.0f mm down is not where this hand's fingertips can meet the lid" % (1000 * down))
+    if abs(ahead - ahead_tf) > AHEAD_TOL_M:  # the mount is wrong after all, or the touch met something else
+        return DepthPress(free=_rise(ctx, runner, quat, top_z, over), contact=True,
+                          why="the touch met something %.0f mm from where the camera saw the lid — not pushing" % (
+                              1000 * abs(ahead - ahead_tf)))
+    # the box is where the fingertips met its button, flush before the push:
+    # every world from here on (the home's too) holds it there, not where TF
+    # put it (76 mm high on 20:04, so every home started "inside" it). The
+    # table is the scene camera's own measurement and is left as it is.
+    seen["touch_xyz"] = tuple(round(float(v), 5) for v in pad)
+    ctx.cpose = rp.cpose_for_button([float(v) for v in pad], ctx.cpose.yaw, m.button_offset)
+    print("[press_demo] the box is put where the fingertips met it: %+.0f mm from where TF had its button" % (1000 * world_dz))
 
     pts, why = _hand_line(ctx, 0.0, 0.0, -float(cfg.button_travel_m), quat)
     if not pts:
@@ -468,20 +603,67 @@ def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool):
     if not _rise(ctx, runner, quat, top_z, over):
         return DepthPress(free=False, contact=True, felt=felt, why="the way up stopped")
 
-    after, _z, _lens, status = look(node, watcher, m, "depth-after", runner, ctx)
+    after, _z, _lens, status = look(node, watcher, m, "depth-after", runner, ctx, settled=True)  # after _rise's read
     popped = after is not None and np.isfinite(after.up_mm) and after.up_mm >= KNOB_UP_MM
-    moved = False
     if after is None:
+        # the reach-out's AFTER rule: a box no camera finds after a contact
+        # holds the arm — the caller asks the scene camera (after_scene_check)
         print("[press_demo] AFTER: the wrist camera does not find the button again (%s)" % status)
-    else:
-        shift = None if s is None else math.hypot(after.x - s.x, after.y - s.y)
-        moved = s is not None and (shift > BOX_MOVED_M or abs(after.lid_depth - s.lid_depth) > LID_MOVED_M)
-        print("[press_demo] AFTER: the knob %s%s" % (
-            "UP %.0f mm — the box is open" % after.up_mm if popped else (
-                "%.1f mm above the lid" % after.up_mm if np.isfinite(after.up_mm) else "not judged"),
-            "" if s is None else "; the button %.0f mm from where it was, the lid %+.0f mm" % (
-                1000 * shift, 1000 * (after.lid_depth - s.lid_depth))))
+        return DepthPress(free=False, contact=True, felt=felt, lost=True,
+                          why="the wrist camera does not find the button after the press — the knob is not judged")
+    shift = math.hypot(after.x - s.x, after.y - s.y)
+    moved = shift > BOX_MOVED_M or abs(after.lid_depth - s.lid_depth) > LID_MOVED_M
+    print("[press_demo] AFTER: the knob %s; the button %.0f mm from where it was, the lid %+.0f mm" % (
+        "UP %.0f mm — the box is open" % after.up_mm if popped else (
+            "%.1f mm above the lid" % after.up_mm if np.isfinite(after.up_mm) else "not judged"),
+        1000 * shift, 1000 * (after.lid_depth - s.lid_depth)))
+    if moved:
+        # home is planned around the box where the camera sees it now: the
+        # sighting's shift, turned from the camera's axes into the hand's
+        # (R_hand_cam: 180 deg on the bench's D405), then into the world
+        R2, _t2 = approach._chain().fk(ctx.client.joints())
+        dh = _in_hand(after, lens, r_hc) - _in_hand(s, lens, r_hc)
+        dh[2] = 0.0  # the lid's depth change is not a shift
+        d = np.asarray(R2, float) @ dh
+        c = ctx.cpose
+        ctx.cpose = ContainerPose(xyz=(float(c.xyz[0] + d[0]), float(c.xyz[1] + d[1]), float(c.xyz[2])), yaw=c.yaw)
     return DepthPress(free=True, contact=True, felt=felt, popped=popped, moved=moved)
+
+
+def after_scene_check(ctx, runner, result, scene_fix, locator):
+    """After a contact the wrist camera lost the box (DepthPress.lost): the
+    scene camera looks again, as the reach-out's AFTER does. Seen, the arm
+    may go home around it — shifted by what the scene camera saw it move,
+    from where the arm measured it; unseen, the arm holds. Returns the
+    DepthPress to finish with."""
+    from rammp_box_opening.tasks.press_demo import SCENE_LOCATE_S
+
+    if not result.lost:
+        return result
+    again = locator.locate(SCENE_LOCATE_S) if locator is not None and scene_fix is not None else None
+    if again is None:
+        runner.note("depth_after_scene", found=False)
+        print("[press_demo] STOP: neither camera finds the box after the press — it may have left the table. The arm "
+              "holds over where it was; check the box, then home the arm with sheppy's home_arm")
+        return result
+    d = np.asarray(again.top_xyz, float) - np.asarray(scene_fix.top_xyz, float)
+    moved = math.hypot(d[0], d[1]) > rp.SCENE_MOVED_M or abs(d[2]) > rp.SCENE_MOVED_M
+    runner.note("depth_after_scene", found=True, scene_moved_mm=round(1000 * math.hypot(d[0], d[1]), 1),
+                scene_dz_mm=round(1000 * d[2], 1))
+    print("[press_demo] AFTER: the scene camera puts the box %.0f mm from where it was, %+.0f mm in height" % (
+        1000 * math.hypot(d[0], d[1]), 1000 * d[2]))
+    if moved:
+        # the scene camera's own shift: its box can stand 8-10 cm from the
+        # arm's, but where it saw the box go is its own two looks' difference
+        c = ctx.cpose
+        ctx.cpose = ContainerPose(xyz=(float(c.xyz[0] + d[0]), float(c.xyz[1] + d[1]), float(c.xyz[2])), yaw=c.yaw)
+    return dataclasses.replace(result, free=True, moved=moved)
+
+
+def home_why(result):
+    """What the home after a depth press says first: a moved box is a STOP
+    before the arm goes anywhere."""
+    return "STOP: the press MOVED the box — check it is still standing on the table" if result.moved else ""
 
 
 def exit_code(result):
@@ -498,3 +680,22 @@ def exit_code(result):
         return 0
     print("[press_demo] STOP: %s, and the knob is not up" % ("pressed by feel" if result.felt else "not pressed"))
     return 1
+
+
+def finish(ctx, result, homed):
+    """The process exit code after a depth press and the home that followed
+    it (`homed`: the arm got there). An arm left away from home is never a
+    success. What the press established goes into the mission's record."""
+    frames = getattr(ctx, "mission_frames", None)
+    if frames is not None:
+        facts = dict(popped=None if not result.contact or result.lost else bool(result.popped),
+                     touch_xyz=None if result.touch_xyz is None else list(result.touch_xyz))
+        if result.felt:
+            facts["stage"] = "pressed"
+        frames.note(**facts)
+    code = exit_code(result)
+    if not homed:
+        if result.free:
+            print("[press_demo] STOP: the arm did not get home — it holds; home it with sheppy's home_arm")
+        code = max(code, 1)
+    return code
