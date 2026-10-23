@@ -62,16 +62,16 @@ def robust_yaw(xy):
     between 10 % and 90 %, so a 10-90 box hardly knows the angle at all."""
     xy = np.asarray(xy, float)
 
-    def area(theta):
-        c, s = np.cos(-theta), np.sin(-theta)
-        r = xy @ np.array([[c, -s], [s, c]]).T
-        lo, hi = np.percentile(r, [3, 97], axis=0)
-        return float(np.prod(hi - lo))
+    def best_of(th):
+        # every angle's rotation in one stacked matmul and its trimmed box
+        # in one percentile call (a Python loop of these was 16 ms)
+        c, s = np.cos(-th), np.sin(-th)
+        rot = np.stack([np.stack([c, -s], -1), np.stack([s, c], -1)], -2)
+        lo, hi = np.percentile(xy @ rot.transpose(0, 2, 1), [3, 97], axis=1)
+        return th[int(np.argmin(np.prod(hi - lo, axis=-1)))]
 
-    coarse = np.radians(np.arange(0.0, 90.0, 1.0))
-    best = coarse[int(np.argmin([area(t) for t in coarse]))]
-    fine = best + np.radians(np.arange(-1.0, 1.0, 0.1))
-    best = fine[int(np.argmin([area(t) for t in fine]))]
+    best = best_of(np.radians(np.arange(0.0, 90.0, 1.0)))
+    best = best_of(best + np.radians(np.arange(-1.0, 1.0, 0.1)))
     return float(best % (np.pi / 2))
 
 
@@ -244,23 +244,52 @@ class SceneBoxFix:
     lift: str = ""  # "top" or "side": which view of it won
 
 
+# The top face is seen only from above it. A camera that stands less than
+# this slope above the lid (rise over horizontal distance to the box, ~6
+# deg) sees the lid's side band edge-on, and that band passes the top-face
+# lift's footprint gates: flatbot 2026-10-22, camera z 0.400, lid top 0.397 —
+# the top lift won or lost on a few pixels of the OWL box and moved the fix
+# 13 mm and the lid 7.5 mm between runs of the same placement.
+TOP_VIEW_MIN_SLOPE = 0.1
+
+
+def sees_top_face(pts_base, uv, bbox, lid_z, cam_xyz):
+    """Does a camera at `cam_xyz` stand high enough over a lid at `lid_z`
+    to see its top face, for the depth points inside `bbox`?"""
+    x0, y0, x1, y1 = bbox
+    inside = (uv[:, 0] >= x0) & (uv[:, 0] <= x1) & (uv[:, 1] >= y0) & (uv[:, 1] <= y1)
+    if not inside.any():
+        return True  # the lift refuses it with its own reason
+    cam = np.asarray(cam_xyz, float)
+    d = float(np.median(np.hypot(pts_base[inside, 0] - cam[0], pts_base[inside, 1] - cam[1])))
+    return cam[2] - float(lid_z) >= TOP_VIEW_MIN_SLOPE * d
+
+
 def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side_table_z=None):
-    """The OWL's candidates (score, [x0, y0, x1, y1]) best first, each
-    lifted to the lid slab (box_from_scene_points) when a table height is
-    known (`table_z`), then — with `cam_xyz`, the camera's position — from
-    its side (box_from_side_points), against `side_table_z` when surveyed or
-    the table around it. Which view works depends on how high the table
-    stands against the camera, so neither is assumed. The first that is
-    this container wins. What the live locate() does with every message,
-    and what an offline replay of recorded frames computes the same way."""
+    """The OWL's candidates (score, [x0, y0, x1, y1]) best first: every
+    candidate lifted to the lid slab (box_from_scene_points) when a table
+    height is known (`table_z`) and the camera stands above the lid
+    (sees_top_face), then — with `cam_xyz`, the camera's position — every
+    candidate from its side (box_from_side_points), against `side_table_z`
+    when surveyed or the table around it. Which view works depends on how
+    high the table stands against the camera, so neither is assumed. Two
+    passes, not both lifts per candidate: the side lift never measures how
+    far a container runs along the view, so a tray the top-face lift just
+    refused would pass it ahead of the real box. The first that is this
+    container wins. What the live locate() does with every message, and
+    what an offline replay of recorded frames computes the same way."""
     tried = []
-    for score, box in boxes:
-        if table_z is not None:
+    if table_z is not None:
+        lid_z = float(table_z) + float(model.dims[2])
+        for score, box in boxes:
+            if cam_xyz is not None and not sees_top_face(pts_base, uv, box, lid_z, cam_xyz):
+                continue
             pose, top, n = box_from_scene_points(pts_base, uv, box, table_z, model)
             if pose is not None:
                 return SceneBoxFix(pose, top, n, box, tuple(tried), float(table_z), "top")
             tried.append("%s (OWL %.2f)" % (top, score))
-        if cam_xyz is not None:
+    if cam_xyz is not None:
+        for score, box in boxes:
             pose, top, n, tz = box_from_side_points(pts_base, uv, box, side_table_z, model, cam_xyz)
             if pose is not None:
                 return SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side")

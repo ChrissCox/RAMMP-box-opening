@@ -20,6 +20,13 @@ A joint too near its limit for the planner to start from
 gets a plan-free step along the joint line toward HOME first, the shortest
 that HOME plans from (primitives.ClearMarginFree): refused if the tool
 would drop on the way, and obstruction-guarded.
+
+The band stands on the table, so it exists only where a table is known.
+A world YAML without one (flatbot: the table changes with every place
+the chair goes) and a fresh home_arm process, which measures none, make
+the guarded world the floor alone, the same as the bare one. There the
+caution prints BEFORE planning, and HOME is planned once in the bare
+world: re-planning a refused start in an identical world cannot help.
 """
 
 from rammp_box_opening.constants import HOME, TRANSIT_SPEED
@@ -35,7 +42,15 @@ from rammp_box_opening.tasks import cli_common
 
 def _plan_home(ctx, state, say=print):
     """HOME from `state`: the guarded bench world first, then the bare
-    table world with a caution. Raises the bare world's refusal."""
+    table world with a caution. Raises the bare world's refusal. With no
+    table known the two are the same world: once, in the bare one (the
+    caution was printed before planning)."""
+    if ctx.worlds.table_top_z is None:
+        bare = ctx.worlds.push_name("bench", model=None, tag="bare")
+        leg, _ = _plan_motion(
+            ctx, state, "home", ("joints", list(HOME)), bare, TRANSIT_SPEED
+        )
+        return leg
     guarded = ctx.worlds.push_name("bench", model=ctx.model)
     try:
         leg, _ = _plan_motion(
@@ -76,6 +91,15 @@ def build_legs(ctx, lift_first_m=0.0):
         print(
             "[home_arm] plan-free lift of %.0f mm first (straight up, attitude held, "
             "obstruction-guarded) — HOME is planned from where it ends" % (1000 * lift_first_m)
+        )
+    if ctx.worlds.table_top_z is None:
+        # no table, so no band: the guarded world would be the bare one.
+        # Say so before anything is planned, and plan once.
+        print(
+            "[home_arm] CAUTION: no table is known (this bench YAML has none and "
+            "home_arm measures none) — this home knows neither the table nor the "
+            "box. With --execute it flies NOW; run without it first, or use "
+            "--lift-first 0.08 to rise straight up before the planned sweep."
         )
     clear = ClearMarginFree(HOME)
     near = clear.near(ctx, state.joints)
