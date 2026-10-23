@@ -148,11 +148,11 @@ def run_main(monkeypatch, tmp_path, argv, approach, table_extent, depth=None, pu
         def spin_once(node, timeout_sec=0.0):
             return None
 
-    def fake_approach(node, ctx, cfg, runner, watcher, execute, scene_fix):
+    def fake_approach(node, ctx, cfg, runner, watcher, execute, scene_fix, lookahead=True):
         ctx.cpose = scene_fix.pose
         return approach(ctx)
 
-    def no_centre(node, ctx, cfg, runner, watcher, execute, got):
+    def no_centre(node, ctx, cfg, runner, watcher, execute, got, max_moves=None):
         ctx.cpose = watcher.to_container_pose(got)
         return got, 0, 0.0
 
