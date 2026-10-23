@@ -1201,12 +1201,15 @@ def build_push_legs(ctx, cfg, contact_xyz, touch_leg=None, push=True):
     return legs
 
 
-def build_home_from_hop(ctx, cfg):
+def build_home_from_hop(ctx, cfg, start_joints=None):
     """Home from the hop, where press-only ends up: the fingers stand 5 cm
     over the lid, inside the band the blind home world blocks, so rise out
     of the corridor first (in the button's own world), then home in the
-    full world — one execution."""
-    _world, rise, st = _rise_over_button(ctx, cfg, _state(ctx.client.joints()), "retreat:rise")
+    full world — one execution. start_joints: the post-press retreat's
+    end, when built as a lookahead while that retreat flies (run_push) —
+    both plans were made with the arm standing at the hop."""
+    q = ctx.client.joints() if start_joints is None else list(start_joints)
+    _world, rise, st = _rise_over_button(ctx, cfg, _state(q), "retreat:rise")
     home, _ = _plan_motion(ctx, st, "home", ("joints", list(rest_joints(cfg))), _full_world(ctx), TRANSIT_SPEED)
     return [rise, home]
 
@@ -1576,8 +1579,9 @@ def run_push(ctx, cfg, runner, args, touch, touch_leg=None, node=None, watcher=N
         execute=args.execute,
         # the WHOLE tail is planned here, under the retreat: grip, carry
         # and place as one chain, so the lift flows into the carry and the
-        # set-down without a stop (build_grip_and_place_legs)
-        lookahead=None
+        # set-down without a stop (build_grip_and_place_legs); press-only's
+        # tail is the rise and home from the hop (fly_home_from_hop)
+        lookahead=(lambda q: build_home_from_hop(ctx, cfg, start_joints=q))
         if args.press_only
         else (lambda q: build_grip_and_place_legs(ctx, cfg, start_joints=q)),
     )
@@ -1714,12 +1718,18 @@ def _rise_over_button(ctx, cfg, st, name):
 
 
 def build_restage_legs(ctx, cfg):
-    """From the hop, fingers open over a knob that did not pop: close them
-    and rise back to staging height above the button (_rise_over_button)."""
+    """From the hop, fingers open over a knob that did not pop: rise back
+    to staging height above the button (_rise_over_button) and close them
+    on the way up — the close rides the rise (it used to stand still at the
+    hop for the whole close first). Up and away from a flush button, the
+    closing fingers touch nothing; the Runner joins the close before the
+    guarded press descends."""
     st = _state(ctx.client.joints())
-    world, rise, _st = _rise_over_button(ctx, cfg, st, "retreat:restage")
-    close = _gripper_leg(ctx, st, "press:close", GRIPPER_CMD_CLOSED, world)
-    return [close, rise]
+    world, rise, st = _rise_over_button(ctx, cfg, st, "retreat:restage")
+    close = _gripper_leg(
+        ctx, st, "press:close", GRIPPER_CMD_CLOSED, world, defer_join=True, send_with_previous_motion=True
+    )
+    return [rise, close]
 
 
 def _press_again(ctx, cfg, runner, args, node, watcher, retries):
@@ -1729,10 +1739,17 @@ def _press_again(ctx, cfg, runner, args, node, watcher, retries):
     except RuntimeError as e:
         try_home(ctx, runner, args.execute, "STOP before pressing again — %s" % e)
         sys.exit(1)
-    res = runner.run(legs, execute=args.execute)
+    # the descent is planned while the rise flies, from its end
+    res = runner.run(legs, execute=args.execute, lookahead=lambda q: build_press_legs(ctx, cfg, start_joints=q))
     if any(not r.ok for r in res):
         sys.exit(1)
-    legs = build_press_legs(ctx, cfg)
+    try:
+        legs = runner.lookahead_result or build_press_legs(ctx, cfg)
+    except RuntimeError as e:
+        try_home(ctx, runner, args.execute, "STOP before pressing again — %s" % e)
+        sys.exit(1)
+    fly_free_air_fast(legs[0], cfg)  # as the first press: free air fast, the line at contact speed
+    ctx.last_pose = (list(legs[-1].target[1]), list(legs[-1].target[2]))
     res = runner.run(legs, execute=args.execute)
     if any(not r.ok for r in res):
         sys.exit(1)
@@ -1881,6 +1898,20 @@ def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S, camera_cfg
                 "the OWL detectors) is not running: `sheppy up box-opening`. Nothing moved." % (client._base_frame, parent)
             )
     return None
+
+
+def fly_home_from_hop(ctx, cfg, runner, execute):
+    """Press-only's last motion: home from the hop (build_home_from_hop),
+    planned under the retreat (run_push's lookahead) or, when that failed,
+    from here. A refused plan goes through try_home — never a traceback with
+    the arm left 5 cm over the open box. Returns True when home flew."""
+    try:
+        legs = runner.lookahead_result or build_home_from_hop(ctx, cfg)
+    except RuntimeError as e:
+        try_home(ctx, runner, execute, "STOP after the press — home from the hop refused (%s)" % e)
+        return False
+    res = runner.run(legs, execute=execute)
+    return all(r.ok for r in res)
 
 
 def depth_press_refusal(depth_press, cfg, scene, cfg_path=None):
@@ -2217,8 +2248,9 @@ def main():
                     tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
                     scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
                 )
-                # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
-                # and the readiness checks below are that long — by the time
+                # enable its OWL NOW: the first bbox takes ~0.7 s (the node
+                # infers on the enable edge: one inference, no tick wait) and
+                # the readiness checks below are about that long — by the time
                 # locate() asks, the box is already on the topic
                 locator.owl.enable()
         # camera on from here to exit
@@ -2644,8 +2676,7 @@ def main():
         if args.press_only:
             if args.execute:
                 # the pop is confirmed (or pressed again) at the hop; home from there
-                res = runner.run(build_home_from_hop(ctx, cfg), execute=args.execute)
-                if any(not r.ok for r in res):
+                if not fly_home_from_hop(ctx, cfg, runner, args.execute):
                     sys.exit(1)
             runner.finish()
             sys.exit(0)
