@@ -467,6 +467,14 @@ CLEAR_MARGIN_MAX_STEP_RAD = 0.35
 # and the tool never goes lower than its start by more than this on the way
 # (the table and the box are below it)
 CLEAR_MARGIN_DROP_M = 0.005
+# The step's guard watches its first this-much of the step without tripping
+# and takes its baseline there. A pose held long at rest reads far under
+# the arm's weight (2026-10-23: arm_joint_4 4.6 of the 9.3 Nm the gravity
+# model holds there, arm_joint_6 0.6 of 2.2: a support or the joints'
+# friction carrying the rest), and the weight comes back onto the joints as
+# the step starts (arm_joint_4 at 8.9 Nm by 9% of it): judged from rest that
+# read as a 4.3 Nm strike, 1 mm into a lift.
+CLEAR_MARGIN_SETTLE = 0.2
 
 
 class ClearMarginFree:
@@ -483,7 +491,8 @@ class ClearMarginFree:
     margin, and the caller plans from each until one plans. Along the line
     each joint's room never falls below the smaller of its two ends (the
     goal's is clear); a step is refused when the tool would drop on the way.
-    Guarded as an obstruction trip like LiftFree."""
+    Guarded as an obstruction trip, compensated for the arm's weight, from a
+    baseline taken once the step is under way (CLEAR_MARGIN_SETTLE)."""
 
     def __init__(self, goal, name="clear-margin", speed=None, touch_nm=4.0):
         self.goal = [float(v) for v in goal]
@@ -574,7 +583,12 @@ class ClearMarginFree:
                 kind=Kind.MOTION,
                 traj=line_trajectory(ctx.client.joint_names, [[float(v) for v in q] for q in pts]),
                 speed=self.speed,
-                guard=GuardSpec(touch_nm=self.touch_nm, trip="obstruction"),
+                # the arm's weight changes along the step: compensated, from
+                # a baseline past its start (CLEAR_MARGIN_SETTLE)
+                guard=GuardSpec(
+                    touch_nm=self.touch_nm, trip="obstruction", gravity=approach._gravity().wrist_holding,
+                    rebaseline_after=CLEAR_MARGIN_SETTLE, arm_after=CLEAR_MARGIN_SETTLE,
+                ),
                 world=world_name,
                 world_path=str(world_path),
                 chain=state.chain,
