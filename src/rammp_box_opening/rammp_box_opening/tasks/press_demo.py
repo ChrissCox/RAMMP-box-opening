@@ -73,6 +73,7 @@ sent to the driver: the client is not armed.
 
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 from dataclasses import replace
@@ -480,11 +481,27 @@ CAPTURES_DIR = state_dir() / "captures"
 AIM_CAPTURES_KEPT = 20  # newest folders kept of each every-run capture (aim, pop); older ones are pruned
 
 
-def _save_wrist_frame(grab, folder, caption, draw=None):
+_PENDING_WRITES = []  # capture writes still in flight (background=True), joined by wait_capture_writes
+_WRITE_LOCK = threading.Lock()  # one write at a time: two aims in one second share a folder
+
+
+def wait_capture_writes(timeout_s=5.0):
+    """Let every capture write still in flight finish (at most `timeout_s`
+    in all): before anything copies a capture folder (MissionFrames.close)."""
+    end = time.monotonic() + timeout_s
+    for t in list(_PENDING_WRITES):
+        t.join(max(0.0, end - time.monotonic()))
+    _PENDING_WRITES[:] = [t for t in _PENDING_WRITES if t.is_alive()]
+
+
+def _save_wrist_frame(grab, folder, caption, draw=None, background=False, after=None):
     """One wrist frame (colour, depth, K, camera pose, stamp) into `folder`
     in the recorder's format (replay: scripts/record_scan_frames.py
-    --analyze), plus a JPEG with `caption` and whatever `draw(img)` adds.
-    Returns the folder, or None when there is no frame or no pose for it."""
+    --analyze), plus a JPEG with `caption` and whatever `draw(img)` adds,
+    then `after()`. Returns the folder, or None when there is no frame or
+    no pose for it. With `background` the frame is taken now and written on
+    a thread (compressing it is ~45 ms the next leg need not wait for): the
+    folder exists at once, its files a moment later (wait_capture_writes)."""
     import numpy as np
 
     from rammp_box_opening.perception.depth_source import camera_pose_at
@@ -494,17 +511,43 @@ def _save_wrist_frame(grab, folder, caption, draw=None):
     pose = camera_pose_at(grab)
     if pose is None:
         return None
-    write_frame(folder, wrist_frame(grab, pose))
+    # one snapshot: the grabber assigns new arrays per message, so these
+    # stay this frame while a thread writes them, and the JPEG is the npz's
+    arrays = wrist_frame(grab, pose)
+    img = None
     try:
         import cv2
 
-        img = np.ascontiguousarray(grab.color).copy()
+        img = np.ascontiguousarray(arrays["color"]).copy()
         if draw is not None:
             draw(img)
         cv2.putText(img, str(caption)[:90], (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        cv2.imwrite(str(folder / "frame_000.jpg"), img)
     except Exception:
-        pass
+        img = None
+
+    def job():
+        with _WRITE_LOCK:
+            try:
+                write_frame(folder, arrays)
+            except Exception as e:  # a full disk: the run goes on without its evidence
+                print("[press_demo] (wrist frame not written to %s: %s)" % (folder, e))
+            if img is not None:
+                try:
+                    import cv2
+
+                    cv2.imwrite(str(folder / "frame_000.jpg"), img)
+                except Exception:
+                    pass
+            if after is not None:
+                after()
+
+    if not background:
+        job()
+        return folder
+    folder.mkdir(parents=True, exist_ok=True)
+    t = threading.Thread(target=job, name="capture-write", daemon=False)  # not daemon: exit waits for it
+    _PENDING_WRITES[:] = [p for p in _PENDING_WRITES if p.is_alive()] + [t]
+    t.start()
     return folder
 
 
@@ -562,10 +605,10 @@ def save_aim_frame(grab, sighting, tag="aim"):
         cv2.drawMarker(img, (u, v), (0, 0, 255), cv2.MARKER_CROSS, 26, 2)
 
     caption = "press point: the circle's centre, button %.0f mm, r %.0f px" % (1000 * sighting.diameter_m, sighting.r_px)
-    out = _save_wrist_frame(grab, folder, caption, draw)
+    # written off the critical path: the next leg need not wait for zlib
+    out = _save_wrist_frame(grab, folder, caption, draw, background=True, after=lambda: _prune_captures(tag))
     if out is None:
         return None
-    _prune_captures(tag)
     print("[press_demo] aim frame saved: %s" % out)
     return out
 
@@ -2013,6 +2056,7 @@ def keep_mission_frames(frames, exc):
     code = exc.code if isinstance(exc, SystemExit) else (0 if exc is None else type(exc).__name__)
     try:
         t0 = time.monotonic()
+        wait_capture_writes()  # close() copies the aim's folder: it must be whole
         out = frames.close(exit_code=code)
     except (Exception, KeyboardInterrupt) as e:  # a full disk, a second Ctrl+C
         print("[press_demo] (this run's frames were not kept: %s)" % (str(e) or type(e).__name__))

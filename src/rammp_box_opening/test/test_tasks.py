@@ -1631,6 +1631,92 @@ def test_the_pop_check_keeps_the_frame_it_judged(ctx, tmp_path, monkeypatch):
         assert 0 <= u < 848 and 0 <= v < 480
 
 
+def _aim_frame_env(ctx, tmp_path, monkeypatch):
+    """press_demo with captures in tmp_path, a hop frame and its pose, a
+    sighting on it, and write_frame held until the returned gate is set.
+    Returns (press_demo, grab, pose, sighting, gate)."""
+    import threading
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import depth_source
+    from rammp_box_opening.tasks import press_demo
+
+    monkeypatch.setattr(press_demo, "CAPTURES_DIR", tmp_path)
+    grab, pose = _hop_frame(ctx, 0.0)
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g, offset_s=None: pose)
+    gate, real = threading.Event(), press_demo.write_frame
+
+    def held(folder, arrays, **kw):
+        assert gate.wait(5.0)
+        return real(folder, arrays, **kw)
+
+    monkeypatch.setattr(press_demo, "write_frame", held)
+    sighting = SimpleNamespace(uv=(424.0, 238.0), r_px=40.0, diameter_m=0.045)
+    return press_demo, grab, pose, sighting, gate
+
+
+def test_the_aim_frame_is_written_off_the_critical_path(ctx, tmp_path, monkeypatch):
+    """run-20261022-200421: every aim waited ~45 ms for its evidence frame's
+    zlib before the next leg could start. The aim returns its folder at
+    once; the frame — the one the aim was taken on, not a newer one the
+    grabber has since put in its place — lands a moment later."""
+    import numpy as np
+
+    press_demo, grab, pose, sighting, gate = _aim_frame_env(ctx, tmp_path, monkeypatch)
+    color, depth = grab.color, grab.depth
+    folder = press_demo.save_aim_frame(grab, sighting, "aim")
+    try:
+        assert folder is not None and folder.is_dir() and not (folder / "frame_000.npz").exists()
+        # the grabber's next message: new arrays, as d405.py assigns them
+        grab.color, grab.depth = np.full_like(color, 255), np.zeros_like(depth)
+    finally:
+        gate.set()
+    press_demo.wait_capture_writes()
+    saved = np.load(folder / "frame_000.npz")
+    assert np.allclose(saved["trans_cam"], pose[1])
+    assert np.array_equal(saved["color"], color) and np.array_equal(saved["depth"], depth)
+    assert (folder / "frame_000.jpg").exists()
+
+
+def test_the_aim_frame_prunes_old_captures_after_its_write(ctx, tmp_path, monkeypatch):
+    import numpy as np
+
+    press_demo, grab, pose, sighting, gate = _aim_frame_env(ctx, tmp_path, monkeypatch)
+    for i in range(press_demo.AIM_CAPTURES_KEPT + 1):
+        (tmp_path / ("wrist-aim-20000101-0000%02d" % i)).mkdir()
+    gate.set()
+    folder = press_demo.save_aim_frame(grab, sighting, "aim")
+    press_demo.wait_capture_writes()
+    kept = sorted(tmp_path.glob("wrist-aim-*"))
+    assert len(kept) == press_demo.AIM_CAPTURES_KEPT and folder in kept
+    assert np.load(folder / "frame_000.npz")["depth"].shape == (480, 848)
+
+
+def test_the_mission_frames_wait_for_the_aim_frame_they_copy(ctx, tmp_path, monkeypatch):
+    """MissionFrames.close copies the aim's folder in as "staging": a run
+    that ends straight after the aim must not copy it half written."""
+    import threading
+
+    import numpy as np
+
+    from rammp_box_opening.detection_set import MissionFrames
+
+    press_demo, grab, pose, sighting, gate = _aim_frame_env(ctx, tmp_path / "captures", monkeypatch)
+    folder = press_demo.save_aim_frame(grab, sighting, "aim")
+    frames = MissionFrames(tmp_path / "missions", "ankou_pink.yaml", 0.05)
+    frames.located([0.4, 0.0, 0.15], "aim", aim_capture=folder)
+    timer = threading.Timer(0.2, gate.set)
+    timer.start()
+    try:
+        press_demo.keep_mission_frames(frames, None)
+    finally:
+        gate.set()
+        timer.cancel()
+    staging = frames.dir / "staging"
+    assert np.allclose(np.load(staging / "frame_000.npz")["trans_cam"], pose[1])
+    assert (staging / "frame_000.jpg").exists()
+
+
 def _centring_env(ctx, tmp_path, monkeypatch, tool_xys, aims):
     """press_demo with the tool's position and the wrist's aims scripted:
     tool_xys[i] is where the tool stands before aim i+1; aims[i] is what
