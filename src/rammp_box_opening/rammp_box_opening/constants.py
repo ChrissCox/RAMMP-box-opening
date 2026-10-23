@@ -51,6 +51,10 @@ DRIFT_REPLAN_RAD = 0.04  # < START_GATE_RAD: replan before the gate would refuse
 # the live joints (the old planner-side executor's own start gate).
 START_GATE_RAD = 0.05
 SANITY_MARGIN_RAD = 0.35  # per-joint excursion allowance beyond |start->end|
+# rammp-curobo plans inside the URDF joint limits narrowed by this much
+# (its configs/gen3.yaml joint_limit_margin_rad) and refuses a start or a
+# goal inside it: START_IN_LIMIT_MARGIN / GOAL_IN_LIMIT_MARGIN
+PLANNER_LIMIT_MARGIN_RAD = 0.10
 # A mission must START near HOME: every legit run begins there, so a
 # distant start means the last run ended badly. Refuse before any motion
 # instead of planning something dramatic from wreckage (field
