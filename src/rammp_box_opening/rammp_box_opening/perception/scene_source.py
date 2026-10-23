@@ -154,6 +154,18 @@ def table_extent(pts_base, table_z, centre_xy, radius=TABLE_EXTENT_R_M):
     return (float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1]))
 
 
+def seen_table_extent(pts_base, table_z, centre_xy):
+    """(extent, assumed): table_extent, or, when too few points say, the
+    ring square table_around measured the height from (assumed True), so a
+    measured height never reaches the planner as no table at all."""
+    ext = table_extent(pts_base, table_z, centre_xy)
+    if ext is not None:
+        return ext, False
+    r = TABLE_RING_M[1]
+    cx, cy = float(centre_xy[0]), float(centre_xy[1])
+    return (cx - r, cx + r, cy - r, cy + r), True
+
+
 def table_around(pts_base, centre_xy, below_z, ring=TABLE_RING_M):
     """The table's height under `centre_xy`: the commonest height (1 cm
     bins) in a ring around it below `below_z`, refined by a plane through
@@ -497,7 +509,12 @@ class SceneLocator:
             )
             # no survey: the table the box was found on is the one the
             # planner must know about (WorldStore.table_extent)
-            extent = None if self.table_z is not None else table_extent(pts_base, got.table_z, top[:2])
+            extent = None
+            if self.table_z is None:
+                extent, assumed = seen_table_extent(pts_base, got.table_z, top[:2])
+                if assumed:
+                    print("[scene] too few table points to measure its extent; planning the %.2f m ring "
+                          "square around the box at the measured height" % (2 * TABLE_RING_M[1]))
             return SceneFix(pose=pose, top_xyz=top, n_points=n, score=float(bbox[4]), table_z_scene=table_seen,
                             table_extent=extent)
         finally:
