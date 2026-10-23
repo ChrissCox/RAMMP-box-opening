@@ -5,7 +5,8 @@
 #
 # There is NO static table obstacle. The working surface in front of the
 # wheelchair varies with the environment; SceneLocator measures it from the
-# scene OAK-D depth on every run (table_from_scene_points → SceneFix.table_z_scene).
+# scene OAK-D depth on every run, around the box it found (scene_source.table_around
+# → SceneFix.table_z_scene).
 # The planner's dynamic collision world is populated from OAK-D RGBD streams
 # (depth_collision: true) — RAMMP-CuRobo must expose a depth-world interface
 # for this to be active; until then the planner runs without surface obstacles.

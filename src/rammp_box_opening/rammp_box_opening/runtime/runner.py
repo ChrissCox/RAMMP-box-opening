@@ -27,6 +27,7 @@ from rammp_box_opening.runtime.guards import (
     ARM_AFTER_CAP,
     GROUP_SETTLE_S,
     WARP_SETTLE_FRAC,
+    CompensatedGuard,
     TorqueGuard,
     sanity_violations,
 )
@@ -374,6 +375,19 @@ class Runner:
                 # speed, guardless, and stalled the arm (field
                 # 2026-09-02). Post-touch, replan from live always; the
                 # arm stop-and-holds at contact for the ~0.6 s it costs.
+                if (after_touch or self._drifted(group)) and any(g.plan_free for g in group):
+                    # a plan-free line (the arm's own straight line, built
+                    # from live joints) re-planned by the planner would be a
+                    # bowed path under a straight line's guard: fail it, the
+                    # caller rebuilds it from where the arm is
+                    res = LegResult(
+                        lead.name, "refused", False,
+                        "a plan-free line no longer starts where the arm is — rebuild it from live joints",
+                    )
+                    self._log(res, lead)
+                    results.append(res)
+                    print("STOP: leg %s -> refused (%s) — arm holds" % (res.leg_name, res.detail))
+                    return results
                 if after_touch or self._drifted(group):
                     # a later leg's plan failing from the fresh chain is
                     # usually an unlucky cuRobo family draw (the
@@ -627,6 +641,11 @@ class Runner:
         a recoil plans the next leg from its own predicted end while it is
         still flying), same targets."""
         live = self.client.joints() if start is None else list(start)
+        if any(leg.plan_free for leg in group):
+            # the arm's own straight line, guarded for that line: the
+            # planner's path is not it (the recoil's lookahead lands here too)
+            print("REFUSED replan of %s — a plan-free line is rebuilt from live joints, never re-planned" % group[0].name)
+            return None, next_chain
         for leg in group:
             # Push THIS leg's world before re-planning it. Without this the
             # replan used whatever world happened to be loaded — for the
@@ -763,14 +782,21 @@ class Runner:
                     )
 
         def make_guard():
-            return (
-                TorqueGuard(
+            if not guard_spec:
+                return None
+            if guard_spec.gravity is not None:
+                return CompensatedGuard(
                     guard_spec.touch_nm,
+                    guard_spec.gravity,
+                    reference=guard_spec.reference,
+                    hang=guard_spec.hang,
                     rebaseline_after=guard_spec.rebaseline_after,
                     arm_after=guard_spec.arm_after,
                 )
-                if guard_spec
-                else None
+            return TorqueGuard(
+                guard_spec.touch_nm,
+                rebaseline_after=guard_spec.rebaseline_after,
+                arm_after=guard_spec.arm_after,
             )
 
         guard = make_guard()

@@ -182,3 +182,34 @@ def test_detection_is_one_function_the_node_and_an_offline_replay_share():
     assert [s for s, _b in top] == pytest.approx([0.47, 0.20])  # best first; 0.13 is under the floor
     assert top[0][1] == [10, 20, 60, 80]
     assert seen["text"] == [["a pink lid", "a round pink lid"]] and seen["threshold"] == 0.15 and seen["device"] == "cpu"
+
+
+def test_an_upside_down_camera_is_shown_upright_and_its_boxes_come_back_in_its_pixels():
+    """Flatbot 2026-10-22: the scene OAK hangs upside down, and OWLv2 scored
+    the pink lid 0.04 on its frame as published, 0.44 turned upright. The
+    depth the box is lifted from stays in the published frame's pixels."""
+    import torch
+
+    from rammp_box_opening.perception.owl_source import owl_detect
+
+    seen = {}
+
+    class Batch(dict):
+        def to(self, device):
+            return self
+
+    class Proc:
+        def __call__(self, text, images, return_tensors):
+            seen["image"] = images[0]
+            return Batch()
+
+        def post_process_object_detection(self, out, threshold, target_sizes):
+            return [{"scores": torch.tensor([0.44]), "labels": torch.tensor([0]), "boxes": torch.tensor([[10.0, 20, 60, 80]])}]
+
+    rgb = np.zeros((400, 640, 3), np.uint8)
+    rgb[0, 0] = 255  # the published frame's top-left pixel
+    top = owl_detect(Proc(), lambda **kw: "out", rgb, ["a pink lid"], 0.12, device="cpu", upside_down=True)
+    assert seen["image"][-1, -1, 0] == 255  # shown turned over
+    assert top[0][0] == pytest.approx(0.44) and top[0][1] == [580, 320, 630, 380]  # back in the frame's own pixels
+    top = owl_detect(Proc(), lambda **kw: "out", rgb, ["a pink lid"], 0.12, device="cpu")
+    assert seen["image"][0, 0, 0] == 255 and top[0][1] == [10, 20, 60, 80]  # a camera the right way up: untouched

@@ -198,6 +198,39 @@ class PlannerClient:
             return None  # frozen stream: the guard has lost its senses
         return list(self._eff[3:])
 
+    def settled_efforts(self, duration_s=0.3, settle_s=0.15, timeout_s=2.0):
+        """(wrist efforts, joints), each averaged over `duration_s` of fresh
+        /joint_states once `settle_s` has passed, or None: the arm at rest,
+        read as a free-air reference (tasks/reach_press). The arm must be
+        standing still — this only reads."""
+        effs, qs = [], []
+        t0 = time.monotonic()
+        last = None
+        while time.monotonic() - t0 < timeout_s:
+            rclpy.spin_once(self.node, timeout_sec=0.02)
+            if time.monotonic() - t0 < settle_s:
+                continue
+            if self._eff is None or self._q is None or time.monotonic() - self._eff_at > self.EFFORT_STALE_S:
+                continue
+            if self._eff_at == last:
+                continue
+            last = self._eff_at
+            effs.append(list(self._eff[3:]))
+            qs.append(list(self._q))
+            if time.monotonic() - t0 >= settle_s + duration_s and len(effs) >= 3:
+                break
+        if len(effs) < 3:
+            return None
+        # continuous joints are reported wrapped into (-pi, pi]: HOME's
+        # joint_3 sits 4.6 mrad from the wrap, and a plain mean of readings
+        # either side of it is a different arm (branches.py)
+        from rammp_box_opening.geometry import ang_diff
+
+        n = float(len(effs))
+        q0 = qs[0]
+        q = [q0[j] + sum(ang_diff(row[j], q0[j]) for row in qs) / n for j in range(len(q0))]
+        return [sum(c) / n for c in zip(*effs)], q
+
     def efforts_present(self):
         self.joints()  # ensure at least one message arrived
         return self._eff is not None
@@ -515,7 +548,13 @@ class PlannerClient:
                                 "cancelled (guard blind > 1 s)"
                             )
                             return "failed", info
-                        if guard.on_efforts(eff):
+                        if getattr(guard, "wants_joints", False):
+                            # the same /joint_states message as the efforts:
+                            # the guard takes gravity out at these joints
+                            tripped = guard.on_efforts(eff, None if eff is None else list(self._q))
+                        else:
+                            tripped = guard.on_efforts(eff)
+                        if tripped:
                             contact = True
                             spin_until_done(self.node, send.cancel_goal_async(), 3.0)
                             spin_until_done(self.node, result_future, 10.0)

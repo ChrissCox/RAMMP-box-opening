@@ -56,8 +56,8 @@ class OwlDetector(Node):
         # the arm moves). One model per instance; each infers only inside
         # its own enable window, so two instances never load the GPU at once.
         self.camera = str(self.declare_parameter("camera", "wrist").value)
-        # camera_config: name of the camera YAML to use for the wrist instance
-        # (e.g. "camera_oak_wrist.yaml" on flatbot). Ignored for scene camera.
+        # camera_config: name of the camera YAML this instance reads (e.g.
+        # "camera_oak_wrist.yaml" / "camera_oak_scene.yaml" on flatbot).
         self._camera_cfg_name = str(self.declare_parameter("camera_config", "").value) or None
         bbox_topic, enable_topic = topics_for(self.camera)
         # the score floor; the container yaml's owl_min_score unless the
@@ -115,12 +115,16 @@ class OwlDetector(Node):
             )
         )
 
+        self._upside_down = False
         if self.camera == "scene":
             from rammp_box_opening.perception.d405 import camera_config
             from rammp_box_opening.perception.scene import SceneGrabber
 
             _scfg = camera_config(self._camera_cfg_name) if self._camera_cfg_name else None
             self.grab = SceneGrabber(self, keep=1, need_depth=False, scene_cfg=_scfg)
+            self._upside_down = bool((_scfg or {}).get("upside_down", False))
+            if self._upside_down:
+                self.get_logger().info("the scene camera hangs upside down (%s): frames are turned upright for OWLv2" % self._camera_cfg_name)
         else:
             from rammp_box_opening.perception.d405 import D405Grabber
 
@@ -208,7 +212,8 @@ class OwlDetector(Node):
 
         # D405Grabber stores BGR; the processor expects RGB (measured
         # harmless on the capture set, but it is the wrong buffer)
-        top = owl_detect(self._proc, self._model, g.color[:, :, ::-1], self.cfg.owl_queries, self.min_score)
+        top = owl_detect(self._proc, self._model, g.color[:, :, ::-1], self.cfg.owl_queries, self.min_score,
+                         upside_down=self._upside_down)
         best = top[0] if top else None
         msg = Float32MultiArray()
         now = self.get_clock().now().nanoseconds * 1e-9

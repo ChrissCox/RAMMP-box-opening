@@ -285,3 +285,71 @@ def test_no_gripper_command_goes_out_while_the_client_is_not_armed():
     c = _client(armed=False)
     assert c.gripper_send(0.8) is None
     assert c._gripper_pub.sent == []
+
+
+def test_a_compensated_guard_is_fed_the_joints_of_the_same_joint_states_message():
+    """The reach-out's guards take gravity out at the joints the efforts
+    were read at (runtime/guards.CompensatedGuard): the client hands both."""
+    driver = _FlyingDriver()
+    c = _client(driver)
+    c._eff = [9.0, 9.0, 9.0, 1.0, 2.0, 3.0, 4.0]
+    seen = []
+
+    class Guard(_Guard):
+        wants_joints = True
+
+        def on_efforts(self, eff, joints=None):
+            seen.append((eff, joints))
+            return True  # a trip cancels the goal
+
+    end = [v + 0.05 for v in LIVE]
+    outcome, _info = c.execute(_traj(LIVE, end), 1.0, guard=Guard())
+    assert outcome == "touch" and driver.handle.cancels == 1
+    assert seen == [([1.0, 2.0, 3.0, 4.0], list(LIVE))]
+    # a plain guard is called as it always was
+    c2 = _client(_FlyingDriver())
+    calls = []
+
+    class Plain(_Guard):
+        def on_efforts(self, eff):
+            calls.append(eff)
+            return True
+
+    assert c2.execute(_traj(LIVE, end), 1.0, guard=Plain())[0] == "touch" and calls == [[0.0] * 4]
+
+
+def test_settled_efforts_average_fresh_readings_and_refuse_a_frozen_stream(monkeypatch):
+    c = _client()
+    ticks = {"n": 0}
+
+    def spin(node, timeout_sec=0.0):  # a /joint_states message per spin
+        ticks["n"] += 1
+        c._eff = [0.0, 0.0, 0.0, float(ticks["n"] % 2), 0.0, 0.0, 0.0]
+        c._eff_at = time.monotonic()
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    eff, q = c.settled_efforts(duration_s=0.05, settle_s=0.0)
+    assert eff[0] == pytest.approx(0.5, abs=0.2) and q == pytest.approx(LIVE)
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", lambda node, timeout_sec=0.0: None)
+    c._eff_at = time.monotonic() - 5.0  # the stream stopped
+    assert c.settled_efforts(duration_s=0.05, settle_s=0.0, timeout_s=0.2) is None
+
+
+def test_settled_joints_are_averaged_on_one_branch_across_the_wrap(monkeypatch):
+    """joint_3 at HOME sits 4.6 mrad from +-pi and is reported either side
+    of it: the average is pi, not 0."""
+    import math
+
+    c = _client()
+    flip = {"n": 0}
+
+    def spin(node, timeout_sec=0.0):
+        flip["n"] += 1
+        q = list(LIVE)
+        q[2] = math.pi - 0.002 if flip["n"] % 2 else -math.pi + 0.002
+        c._q = q
+        c._eff_at = time.monotonic()
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    _eff, q = c.settled_efforts(duration_s=0.05, settle_s=0.0)
+    assert abs(abs(q[2]) - math.pi) < 0.003

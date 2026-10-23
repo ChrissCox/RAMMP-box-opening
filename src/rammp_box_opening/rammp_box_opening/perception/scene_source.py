@@ -14,6 +14,13 @@ is not enough: the OWL node's scene instance says WHICH thing is the box
 above the table give its position. No smoothness or footprint gates — the
 scene depth at a metre is noisier than those gates were tuned for, and the
 wrist fix that follows carries the precision.
+
+A camera level with the lid never sees a top face (flatbot's, on a table
+that high — tables change, so which view holds is not assumed): when the
+top-face lift finds nothing, the nearest object in the pixel box is checked
+against the table around it and placed half its width behind the face the
+camera sees (box_from_side_points). With no survey, the table the box was
+found on is measured for the planner too (table_extent).
 """
 
 from dataclasses import dataclass
@@ -44,6 +51,7 @@ class SceneFix:
     n_points: int
     score: float  # the OWL score behind it
     table_z_scene: float  # the table height the scene depth itself shows, or nan
+    table_extent: object = None  # (x0, x1, y0, y1) where it shows that table, when no survey says
 
 
 def robust_yaw(xy):
@@ -122,6 +130,109 @@ def box_from_scene_points(pts_base, uv, bbox, table_z, model):
     return pose, (float(centre[0]), float(centre[1]), float(centre[2])), n
 
 
+# A camera level with the lid sees the box's SIDE, never its top face (the
+# flatbot scene OAK on a table this high; a lower table shows it the top).
+SIDE_DEPTH_SLACK_M = 0.03  # the nearest object: this far past its own width behind its front
+ABOVE_TABLE_M = 0.015  # an object point sits at least this far above the table
+TABLE_RING_M = (0.08, 0.30)  # the table is read this far (horizontally) from the box's centre
+TABLE_SLAB_M = 0.015  # ... from the points within this of the ring's commonest height
+MIN_TABLE_POINTS = 300
+TABLE_EXTENT_R_M = 0.6  # the table's extent is read this far around the box
+
+
+def table_extent(pts_base, table_z, centre_xy, radius=TABLE_EXTENT_R_M):
+    """(x0, x1, y0, y1): where the scene depth shows the table — the points
+    within TABLE_SLAB_M of its height, within `radius` of the box — as their
+    2nd-98th percentile box, so stray points do not set it. None when too
+    few points say. Only what the camera sees: the table behind the box, or
+    out of view, is not in it."""
+    d = np.hypot(pts_base[:, 0] - centre_xy[0], pts_base[:, 1] - centre_xy[1])
+    on = pts_base[(d < radius) & (np.abs(pts_base[:, 2] - table_z) < TABLE_SLAB_M)]
+    if len(on) < MIN_TABLE_POINTS:
+        return None
+    lo, hi = np.percentile(on[:, :2], 2, axis=0), np.percentile(on[:, :2], 98, axis=0)
+    return (float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1]))
+
+
+def table_around(pts_base, centre_xy, below_z, ring=TABLE_RING_M):
+    """The table's height under `centre_xy`: the commonest height (1 cm
+    bins) in a ring around it below `below_z`, refined by a plane through
+    the points near that height and read at the centre. A camera level with
+    the table also sees under it (flatbot 2026-10-22: streaks down to the
+    floor through the gap below its front edge); those spread over every
+    height while the table piles into one. nan when the ring holds too
+    little."""
+    d = np.hypot(pts_base[:, 0] - centre_xy[0], pts_base[:, 1] - centre_xy[1])
+    ringed = pts_base[(d > ring[0]) & (d < ring[1]) & (pts_base[:, 2] < below_z)]
+    if len(ringed) < MIN_TABLE_POINTS:
+        return float("nan")
+    hist, edges = np.histogram(ringed[:, 2], bins=np.arange(ringed[:, 2].min(), below_z + 0.01, 0.01))
+    k = int(np.argmax(hist))
+    slab = ringed[np.abs(ringed[:, 2] - 0.5 * (edges[k] + edges[k + 1])) < TABLE_SLAB_M]
+    if len(slab) < MIN_TABLE_POINTS:
+        return float("nan")
+    fit = fit_plane(slab, tol_m=0.008, iters=150, max_points=3000)
+    if fit is None or abs(fit[0][2]) < 0.9:
+        return float(np.median(slab[:, 2]))
+    n, c, _frac = fit
+    return float(c[2] - (n[0] * (centre_xy[0] - c[0]) + n[1] * (centre_xy[1] - c[1])) / n[2])
+
+
+def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz):
+    """Coarse container pose from a camera level with the lid. It sees the
+    box's side, never its top face, and the wall behind a round lid falls
+    inside the pixel box too (flatbot 2026-10-22: 22 of 252 points, at lid
+    height, stretched the top-face lift's "top" to 621 mm). So: the nearest
+    object in the box, its top checked against the table around it
+    (`table_z` when surveyed), its centre half its width behind the face the
+    camera sees. Returns (ContainerPose, top_xyz, n_points, table_z) or
+    (None, why, n_points, table_z or nan)."""
+    x0, y0, x1, y1 = bbox
+    inside = (uv[:, 0] >= x0) & (uv[:, 0] <= x1) & (uv[:, 1] >= y0) & (uv[:, 1] <= y1)
+    if inside.sum() < MIN_LID_POINTS:
+        return None, "only %d depth points inside the box (need %d)" % (int(inside.sum()), MIN_LID_POINTS), int(inside.sum()), float("nan")
+    cam = np.asarray(cam_xyz, float)
+    q = pts_base[inside]
+    rng = np.linalg.norm(q - cam, axis=1)
+    half = 0.5 * min(float(model.dims[0]), float(model.dims[1]))
+    near = q[rng <= np.percentile(rng, 5) + 2 * half + SIDE_DEPTH_SLACK_M]
+    upper = near[near[:, 2] >= np.median(near[:, 2])]
+    along = upper[:, :2].mean(axis=0) - cam[:2]  # the view across the box, horizontally
+    along /= np.linalg.norm(along)
+    across = np.array([-along[1], along[0]])
+
+    def centre_of(p):
+        rel = p[:, :2] - cam[:2]
+        return cam[:2] + (np.percentile(rel @ along, 5) + half) * along + np.median(rel @ across) * across
+
+    if table_z is None:
+        table_z = table_around(pts_base, centre_of(upper), float(np.percentile(near[:, 2], TOP_PCTL)) - 0.03)
+        if np.isnan(table_z):
+            return None, "no table around it", len(near), table_z
+    obj = near[near[:, 2] > table_z + ABOVE_TABLE_M]
+    n = len(obj)
+    if n < MIN_LID_POINTS:
+        return None, "only %d depth points above the table (need %d)" % (n, MIN_LID_POINTS), n, table_z
+    top_z = float(np.percentile(obj[:, 2], TOP_PCTL))
+    lid_z = float(table_z) + float(model.dims[2])
+    if abs(top_z - lid_z) > LID_BAND_M:
+        return None, "its top is %+.0f mm from lid height (the table at %.3f + %.0f mm)" % (
+            1000 * (top_z - lid_z), table_z, 1000 * model.dims[2]), n, table_z
+    lo, hi = np.percentile((obj[:, :2] - cam[:2]) @ across, [10, 90])
+    width = float(hi - lo)
+    need = MIN_FOOTPRINT_FRAC * min(float(model.dims[0]), float(model.dims[1]))
+    if width < need:
+        return None, "it is %.0f mm across, not a container (need %.0f mm)" % (1000 * width, 1000 * need), n, table_z
+    too_big = MAX_FOOTPRINT_FRAC * max(float(model.dims[0]), float(model.dims[1]))
+    if width > too_big:
+        return None, "it is %.0f mm across, the container %.0f — another container" % (
+            1000 * width, 1000 * max(model.dims[0], model.dims[1])), n, table_z
+    cx, cy = centre_of(obj)
+    yaw = robust_yaw(obj[:, :2] - (cx, cy)) if n >= YAW_MIN_POINTS else 0.0
+    pose = container_pose_from_top((cx, cy, top_z), yaw, model, table_z)
+    return pose, (float(cx), float(cy), top_z), n, float(table_z)
+
+
 @dataclass(frozen=True)
 class SceneBoxFix:
     pose: object  # ContainerPose, or None when no box was this container
@@ -129,28 +240,40 @@ class SceneBoxFix:
     n: int  # lid points behind it
     box: object  # the OWL candidate that won ([x0, y0, x1, y1]), or None
     tried: tuple  # why each refused candidate was refused, in order
+    table_z: float = float("nan")  # the table the winner was measured against
+    lift: str = ""  # "top" or "side": which view of it won
 
 
-def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model):
+def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side_table_z=None):
     """The OWL's candidates (score, [x0, y0, x1, y1]) best first, each
-    lifted to the lid slab (box_from_scene_points); the first that is this
-    container's size wins. What the live locate() does with every message,
+    lifted to the lid slab (box_from_scene_points) when a table height is
+    known (`table_z`), then — with `cam_xyz`, the camera's position — from
+    its side (box_from_side_points), against `side_table_z` when surveyed or
+    the table around it. Which view works depends on how high the table
+    stands against the camera, so neither is assumed. The first that is
+    this container wins. What the live locate() does with every message,
     and what an offline replay of recorded frames computes the same way."""
     tried = []
     for score, box in boxes:
-        pose, top, n = box_from_scene_points(pts_base, uv, box, table_z, model)
-        if pose is not None:
-            return SceneBoxFix(pose, top, n, box, tuple(tried))
-        tried.append("%s (OWL %.2f)" % (top, score))
+        if table_z is not None:
+            pose, top, n = box_from_scene_points(pts_base, uv, box, table_z, model)
+            if pose is not None:
+                return SceneBoxFix(pose, top, n, box, tuple(tried), float(table_z), "top")
+            tried.append("%s (OWL %.2f)" % (top, score))
+        if cam_xyz is not None:
+            pose, top, n, tz = box_from_side_points(pts_base, uv, box, side_table_z, model, cam_xyz)
+            if pose is not None:
+                return SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side")
+            tried.append("from the side, %s (OWL %.2f)" % (top, score))
     return SceneBoxFix(None, None, 0, None, tuple(tried))
 
 
-def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6):
+def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6, upside_down=False):
     """The table height the scene depth shows, from a plane fit over the
-    lower part of the image; nan when there is no clean plane. Logged
-    beside the surveyed height so a wrong survey, or a knocked camera,
-    shows up in every run."""
-    low = uv[:, 1] > row_frac * image_h
+    lower part of the view (the image's top rows for a camera hung upside
+    down); nan when there is no clean plane. Logged beside the surveyed
+    height so a wrong survey, or a knocked camera, shows up in every run."""
+    low = uv[:, 1] < (1.0 - row_frac) * image_h if upside_down else uv[:, 1] > row_frac * image_h
     if low.sum() < 500:
         return float("nan")
     # a few thousand points are plenty for a table plane, and this number
@@ -165,12 +288,27 @@ def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6):
     return float(c[2])
 
 
+# |image-down . base +z| below this: the camera looks too steeply down for
+# "which way up" to mean anything
+UPRIGHT_COS = 0.5
+
+
+def image_upside_down(T_base_color):
+    """True when the colour image's down axis points up in the base frame,
+    False when it points down, None when the camera looks too steeply down
+    to tell."""
+    down_z = float(np.asarray(T_base_color)[2, 1])
+    if abs(down_z) < UPRIGHT_COS:
+        return None
+    return down_z > 0
+
+
 class SceneLocator:
     """The ROS side: the scene grabber, the scene OWL rung and the
     calibration, answering `locate()` with a SceneFix or None."""
 
     def __init__(self, node, cfg, model, table_z, T_base_link, spins=True, tag_px=None,
-                 scene_cfg=None):
+                 scene_cfg=None, base_frame=None):
         from rammp_box_opening.perception.owl_source import OwlRung
         from rammp_box_opening.perception.scene import SceneGrabber
 
@@ -181,7 +319,11 @@ class SceneLocator:
         self.cfg = cfg
         self.model = model
         self.table_z = float(table_z) if table_z is not None else None
-        self.T_base_link = np.asarray(T_base_link, dtype=float)
+        # None: the robot's TF carries the camera's mount (a world with
+        # external_static_tf), read as base_frame <- the camera's link
+        self.T_base_link = None if T_base_link is None else np.asarray(T_base_link, dtype=float)
+        self.base_frame = base_frame
+        self.upside_down = bool((scene_cfg or {}).get("upside_down", False))
         self.grab = SceneGrabber(node, keep=3, need_depth=True, scene_cfg=scene_cfg)
         self.owl = OwlRung(node, cfg, camera="scene")
         self.last_why = None
@@ -191,8 +333,26 @@ class SceneLocator:
         self.tag_px = tag_px
         self.moved_note = None  # "tag not in view" and the like, for the log
 
+    def base_to_link(self):
+        """T(base <- the camera's link): the calibration's, or TF's."""
+        if self.T_base_link is not None:
+            return self.T_base_link
+        return self.grab.lookup(self.base_frame, self.grab.link_frame)
+
+    def base_to_color(self):
+        T_bl, T_lc = self.base_to_link(), self.grab.link_to_color()
+        return None if T_bl is None or T_lc is None else T_bl @ T_lc
+
     def ready(self):
-        return not self.grab.missing() and self.grab.depth_to_color() is not None and self.grab.link_to_color() is not None
+        return not self.grab.missing() and self.grab.depth_to_color() is not None and self.base_to_color() is not None
+
+    def _unplaced_why(self):
+        if self.grab.depth_to_color() is None:
+            return "no TF between the scene camera's depth and colour frames"
+        if self.T_base_link is None:
+            return "no TF from %s to the scene camera (%s) — is sheppy's static_tf node up?" % (
+                self.base_frame, self.grab.link_frame)
+        return "no TF from the scene camera's link to its colour frame"
 
     def locate(self, timeout_s):
         """Enable the scene OWL, wait for its box, lift the depth inside it."""
@@ -221,6 +381,15 @@ class SceneLocator:
                 if t_ready is None:
                     t_ready = time.monotonic()
                     self.last_timing["streams_s"] = round(t_ready - t0, 2)
+                    # OWL turns the frame by the config's word; TF has the mount's
+                    hangs = image_upside_down(self.base_to_color())
+                    if hangs is not None and hangs != self.upside_down:
+                        self.last_why = (
+                            "TF hangs the scene camera %s but its config says upside_down: %s — "
+                            "the OWL would look at its frames the wrong way up"
+                            % ("upside down" if hangs else "upright", "true" if self.upside_down else "false")
+                        )
+                        return None
                     # is the calibration's tag where it was? Said, never
                     # refused: it rides the cabinet door (scene_calib
                     # TAG_MOVED_PX); a re-aimed camera is caught by what its
@@ -249,24 +418,26 @@ class SceneLocator:
                     self.last_why = "no scene depth cloud"
                     return None
                 pc, uv = cloud
-                T_base_color = self.T_base_link @ self.grab.link_to_color()
+                T_base_color = self.base_to_color()
+                if T_base_color is None:
+                    continue
                 pts_base = pc @ T_base_color[:3, :3].T + T_base_color[:3, 3]
                 cands = bboxes_in_msg(m)
-                effective_table_z = self.table_z
-                if effective_table_z is None:
-                    import math as _math
-                    measured = table_from_scene_points(pts_base, uv, self.grab.color.shape[0])
-                    if _math.isnan(measured):
-                        self.last_why = "no table_z: depth scan found no horizontal plane"
-                        return None
-                    effective_table_z = measured
+                # the top-face lift needs a table height up front: surveyed,
+                # else read off the image rows (no clean plane there is no
+                # refusal: the side lift reads the table around each box)
+                top_table_z = self.table_z
+                if top_table_z is None:
+                    measured = table_from_scene_points(pts_base, uv, self.grab.color.shape[0], upside_down=self.upside_down)
+                    top_table_z = None if np.isnan(measured) else measured
                 got = scene_fix_from_boxes(
-                    [(c[4], c[:4]) for c in cands], pts_base, uv, effective_table_z, self.model
+                    [(c[4], c[:4]) for c in cands], pts_base, uv, top_table_z, self.model,
+                    cam_xyz=T_base_color[:3, 3], side_table_z=self.table_z,
                 )
                 tried.extend(got.tried)
                 if got.pose is not None:
                     cand = next(c for c in cands if c[:4] == got.box)
-                    found = (cand, got.pose, got.top, got.n, pts_base, uv)
+                    found = (cand, got.pose, got.top, got.n, pts_base, uv, got)
                 if found is not None:
                     self.last_timing["lift_s"] = round(time.monotonic() - t_cloud, 2)
                     break
@@ -279,6 +450,8 @@ class SceneLocator:
                 self.last_why = (
                     "scene camera streams missing: %s" % ", ".join(self.grab.missing())
                     if self.grab.missing()
+                    else self._unplaced_why()
+                    if t_ready is None
                     else "the scene OWL is SILENT (no heartbeat in %.1f s) — not started, still "
                     "loading, or not receiving frames: check the launch terminal" % timeout_s
                     if not heard
@@ -287,8 +460,16 @@ class SceneLocator:
                     else "none of the OWL's %d candidate(s) is this container: %s" % (len(tried), "; ".join(tried[-3:]))
                 )
                 return None
-            bbox, pose, top, n, pts_base, uv = found
-            table_seen = table_from_scene_points(pts_base, uv, self.grab.color.shape[0])
-            return SceneFix(pose=pose, top_xyz=top, n_points=n, score=float(bbox[4]), table_z_scene=table_seen)
+            bbox, pose, top, n, pts_base, uv, got = found
+            table_seen = (
+                got.table_z
+                if got.lift == "side"
+                else table_from_scene_points(pts_base, uv, self.grab.color.shape[0], upside_down=self.upside_down)
+            )
+            # no survey: the table the box was found on is the one the
+            # planner must know about (WorldStore.table_extent)
+            extent = None if self.table_z is not None else table_extent(pts_base, got.table_z, top[:2])
+            return SceneFix(pose=pose, top_xyz=top, n_points=n, score=float(bbox[4]), table_z_scene=table_seen,
+                            table_extent=extent)
         finally:
             self.owl.disable()

@@ -220,3 +220,40 @@ def test_a_table_capped_at_the_reduction_plane_still_ends_there_when_padded(tmp_
     )
     table = _cuboids(yaml.safe_load(path.read_text()))["table"]
     assert table["position"][2] + table["dims"][2] / 2 + 0.02 == pytest.approx(-0.082)
+
+
+FLATBOT = "src/rammp_box_opening/config/world_flatbot.yaml"
+
+
+def _written(path):
+    with open(path) as f:
+        return _cuboids(yaml.safe_load(f))
+
+
+def test_a_measured_table_is_planned_around_wherever_it_stands(tmp_path):
+    """Flatbot 2026-10-22: no table in its world file (the chair goes to a
+    different one every time), and the table the scene camera measured
+    never reached the planner, which planned as if there were none."""
+    from rammp_box_opening.worlds import PLANNER_PADDING_M
+
+    m = ContainerModel.load(CFG)
+    store = WorldStore(FLATBOT, out_dir=tmp_path)
+    cp = ContainerPose(xyz=(0.55, -0.40, 0.30), yaw=0.0)
+    assert "table" not in _written(store.push_name("full", model=m, cpose=cp)[1])  # nothing measured yet
+    store.table_top_z, store.table_extent = 0.30, (0.45, 1.10, -0.90, -0.10)
+    for kind in ("full", "bench"):
+        t = _written(store.push_name(kind, model=m, cpose=cp)[1])["table"]
+        assert t["position"][2] + t["dims"][2] / 2 == pytest.approx(0.30 - PLANNER_PADDING_M)  # padded back onto 0.30
+        assert t["position"][0] - t["dims"][0] / 2 == pytest.approx(0.45)  # its near edge where it was seen
+        assert t["position"][1] + t["dims"][1] / 2 == pytest.approx(-0.10)
+    band = _written(store.push_name("bench", model=m)[1])["unseen_container_band"]
+    assert band["position"][0] - band["dims"][0] / 2 == pytest.approx(0.45)  # over the table seen, not the dojo's reach map
+    assert band["position"][2] - band["dims"][2] / 2 == pytest.approx(0.30)
+
+
+def test_a_surveyed_table_is_not_doubled_by_a_measured_one(tmp_path):
+    m, cp = _model_pose()
+    store = WorldStore(BENCH, out_dir=tmp_path)
+    store.table_top_z, store.table_extent = -0.06, (0.2, 0.9, -0.5, 0.5)
+    tables = [o for o in yaml.safe_load(open(store.push_name("full", model=m, cpose=cp)[1]))["obstacles"] if o["name"] == "table"]
+    assert len(tables) == 1 and tables[0]["dims"][0] == pytest.approx(1.68)  # the bench file's own

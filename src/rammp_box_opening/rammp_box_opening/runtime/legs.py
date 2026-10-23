@@ -94,6 +94,10 @@ class Leg:
     # called on every replan, warp and merge (primitives.core.press_stroke)
     contact_path_frac: float = field(default=None, compare=False)
     retime: object = field(default=None, compare=False)
+    # MOTION legs: the arm's own straight line (runtime/kinematics
+    # straight_line), built from live joints. Never re-planned: a planner
+    # path is not that line, and its guard was set for the line
+    plan_free: bool = False
 
 
 def can_merge(a, b):

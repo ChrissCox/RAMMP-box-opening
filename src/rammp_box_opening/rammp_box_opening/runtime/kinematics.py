@@ -176,6 +176,16 @@ class ArmChain:
 
         The walk is only a way to FIND the goal joints; it is not flown. The
         planner still plans, and collision-checks, the path to them."""
+        pts, _why = self.walk(q_start, xyz, quat_xyzw, step_m=step_m, step_rad=step_rad)
+        return None if pts is None else pts[-1]
+
+    def walk(self, q_start, xyz, quat_xyzw, step_m=REACH_STEP_M, step_rad=REACH_STEP_RAD, max_step_rad=MAX_REACH_STEP_RAD):
+        """reach()'s continuation with every step kept: joint waypoints from
+        q_start to tool_frame at (xyz, quat_xyzw) — position in a straight
+        line, orientation about one axis, each step solved from the last.
+        With small steps and max_step_rad it is a path to FLY (a turn in
+        place, tasks/depth_press). (points, None) with points[0] == q_start,
+        or (None, why)."""
         q = np.array(q_start, float)
         R0, t0 = self.fk(q)
         R_goal = quat_to_mat(*quat_xyzw)
@@ -184,13 +194,19 @@ class ArmChain:
         ang = float(np.linalg.norm(w))
         axis = w / ang if ang > 1e-9 else np.array([0.0, 0.0, 1.0])
         n = max(1, int(math.ceil(max(float(np.linalg.norm(xyz - t0)) / step_m, ang / step_rad))))
+        pts = [q]
         for k in range(1, n + 1):
             f = k / n
             nxt = self.solve_pose(q, t0 + (xyz - t0) * f, _axis_rot(axis, ang * f) @ R0)
-            if nxt is None or float(np.abs(nxt - q).max()) > MAX_REACH_STEP_RAD or not self.within_limits(nxt):
-                return None
+            if nxt is None:
+                return None, "IK did not converge %.0f%% of the way" % (100.0 * f)
+            if float(np.abs(nxt - q).max()) > max_step_rad:
+                return None, "a joint jump of %.2f rad %.0f%% of the way — near a singularity" % (float(np.abs(nxt - q).max()), 100.0 * f)
+            if not self.within_limits(nxt):
+                return None, "a joint limit %.0f%% of the way" % (100.0 * f)
+            pts.append(nxt)
             q = nxt
-        return q
+        return pts, None
 
     def nearest_solution(self, q_start, xyz, quat_xyzw, seeds=()):
         """Of the redundant arm's IK solutions for tool_frame at (xyz,
@@ -271,3 +287,132 @@ class ArmChain:
             pts.append(nxt)
             q = nxt
         return pts, None
+
+
+G_MPS2 = 9.81
+GRIPPER_CLOSED_RAD = 0.8  # the 2F-85's knuckle shut: the reach-out presses with the fingers closed
+
+
+class GravityModel:
+    """What the arm's own weight puts on each joint, from the URDF's
+    <inertial> masses: the torque each joint HOLDS against gravity at q.
+
+    The driver's /joint_states effort reads this plus a steady offset per
+    joint. Flatbot, recorded 2026-10-21 (vsp_boxer_test: 345 samples at
+    rest across 0.46 rad of joint_4 and 0.48 of joint_6; every 4th sample is
+    kept in test/data/joint_states_flatbot_20261021.npz): effort =
+    holding(q) + const to 0.11 / 0.13 / 0.07 Nm rms on joints 4 / 5 / 6. Over
+    that recording joint_4's effort drifted 1.47 Nm; with this model's
+    share taken out, 0.76. The wrist camera and its mount are not in the
+    generated URDF (the driver README's known gaps); fitted in, they moved
+    those residuals by under 0.03 Nm, so they stay out. The driver turns
+    KORTEX's reaction-signed torque into this sign itself (its
+    kortex_transport.cpp fill_feedback: "~ +g(q) at free hold").
+
+    A guard judged on what this does NOT explain feels the same push
+    wherever along a reach it comes (runtime/guards.CompensatedGuard)."""
+
+    def __init__(self, path=None, root="base_link", gripper_rad=GRIPPER_CLOSED_RAD):
+        path = path or urdf_path()
+        xml_root = ET.parse(path).getroot()
+        self._joints = {}  # child link -> (name, type, parent, xyz, R, unit axis, mimic)
+        for j in xml_root.findall("joint"):
+            o = j.find("origin")
+            xyz = [float(v) for v in (o.get("xyz", "0 0 0") if o is not None else "0 0 0").split()]
+            rpy = [float(v) for v in (o.get("rpy", "0 0 0") if o is not None else "0 0 0").split()]
+            ax = j.find("axis")
+            axis = np.array([float(v) for v in (ax.get("xyz") if ax is not None else "0 0 1").split()])
+            n = float(np.linalg.norm(axis))
+            mim = j.find("mimic")
+            mimic = None if mim is None else (mim.get("joint"), float(mim.get("multiplier", "1")), float(mim.get("offset", "0")))
+            self._joints[j.find("child").get("link")] = (
+                j.get("name"), j.get("type"), j.find("parent").get("link"), np.array(xyz), _rpy(*rpy),
+                axis / n if n > 0 else np.array([0.0, 0.0, 1.0]), mimic,
+            )
+        self._mass = {}  # link -> (kg, centre of mass in the link)
+        for link in xml_root.findall("link"):
+            i = link.find("inertial")
+            if i is None or i.find("mass") is None:
+                continue
+            o = i.find("origin")
+            com = [float(v) for v in (o.get("xyz", "0 0 0") if o is not None else "0 0 0").split()]
+            self._mass[link.get("name")] = (float(i.find("mass").get("value")), np.array(com))
+        arm = ArmChain(path, root=root)
+        self.joint_names = list(arm.joint_names)
+        children = {}
+        for child, jt in self._joints.items():
+            children.setdefault(jt[2], []).append(child)
+        order, frontier = [], [root]
+        while frontier:  # parents before children
+            link = frontier.pop(0)
+            order.append(link)
+            frontier += children.get(link, [])
+        self._root = root
+        self._order = order[1:]
+        child_of = {jt[0]: child for child, jt in self._joints.items()}
+        self._below = {}  # arm joint -> the links with mass it carries
+        for name in self.joint_names:
+            out, stack = set(), [child_of[name]]
+            while stack:
+                link = stack.pop()
+                out.add(link)
+                stack += children.get(link, [])
+            self._below[name] = [link for link in out if link in self._mass]
+        # tool_frame: TOOL_FROM_EE_M along the end-effector link's z, as ArmChain
+        self._ee = next(child for child, jt in self._joints.items() if jt[0] == arm.chain[-1][0])
+        self._tool = np.array(arm.tool_from_tip, float)
+        self.gripper_rad = float(gripper_rad)
+
+    def _frames(self, q):
+        qmap = dict(zip(self.joint_names, (float(v) for v in q)))
+        T = {self._root: np.eye(4)}
+        axes = {}
+        for link in self._order:
+            name, typ, parent, xyz, R, axis, mimic = self._joints[link]
+            A = np.eye(4)
+            A[:3, :3] = R
+            A[:3, 3] = xyz
+            Tj = T[parent] @ A
+            if typ in ("revolute", "continuous"):
+                if name in qmap:
+                    th = qmap[name]
+                    axes[name] = (Tj[:3, 3].copy(), Tj[:3, :3] @ axis)
+                elif mimic is not None:
+                    th = mimic[1] * self.gripper_rad + mimic[2]  # the gripper's mimic joints follow its knuckle
+                else:
+                    th = self.gripper_rad
+                J = np.eye(4)
+                J[:3, :3] = _axis_rot(axis, th)
+                Tj = Tj @ J
+            T[link] = Tj
+        return T, axes
+
+    def holding(self, q, extra=(), first=0):
+        """The torque each arm joint holds against gravity at q (Nm), in the
+        sign the driver reports — joints `first` onward. `extra`: (kg,
+        (x, y, z) in tool_frame) point masses the URDF does not carry."""
+        T, axes = self._frames(q)
+        g = np.array([0.0, 0.0, -G_MPS2])
+        ee = T[self._ee]
+        com = {link: T[link][:3, :3] @ c + T[link][:3, 3] for link, (_m, c) in self._mass.items() if link in T}
+        pts = [(float(m), ee[:3, :3] @ (np.asarray(p, float) + self._tool) + ee[:3, 3]) for m, p in extra]
+        out = []
+        for name in self.joint_names[first:]:
+            p, a = axes[name]
+            f = np.zeros(3)  # the weight's moment about the joint, summed: sum m (r - p) x g
+            for link in self._below[name]:
+                f += self._mass[link][0] * (com[link] - p)
+            for m, r in pts:
+                f += m * (r - p)
+            out.append(-float(a @ np.cross(f, g)))
+        return np.array(out)
+
+    def wrist_holding(self, q):
+        """holding(q) for the joints the guards are fed (client.wrist_efforts: joints 4-7)."""
+        return self.holding(q, first=3)
+
+    def tip_load(self, q, point_tool):
+        """The wrist joints' holding torque per newton pulling straight DOWN
+        at `point_tool` (tool_frame): a weight hanging there — or, negated, a
+        surface pushing up on it."""
+        return self.holding(q, extra=[(1.0 / G_MPS2, point_tool)], first=3) - self.wrist_holding(q)

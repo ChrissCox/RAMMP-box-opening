@@ -4,7 +4,7 @@
     # terminal A (this): record for 40 s
     python3 scripts/record_scan_frames.py
     # terminal B: park the camera over the bench
-    ros2 run rammp_box_opening press_demo --execute --detect-only
+    ros2 run rammp_box_opening press_demo --execute --detect-only --no-scene
 
 Nothing here moves the arm — it only subscribes. Frames land in
 ~/.ros/rammp_box_opening/captures/<stamp>/frame_*.npz with color, depth,
@@ -45,7 +45,7 @@ def record(seconds, period, lag_sweep=False):
     out = CAPTURES / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
     print(
-        "recording to %s for %.0f s — run --detect-only in another shell"
+        "recording to %s for %.0f s — run press_demo --execute --detect-only --no-scene in another shell"
         % (out, seconds)
     )
 
