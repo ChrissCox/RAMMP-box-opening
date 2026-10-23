@@ -1287,7 +1287,7 @@ def test_a_stop_above_the_box_still_gets_home(ctx, tmp_path, capsys):
         trajectory = None
 
     c.client.plans = [Refused()]  # the first plan asked for — home from the hop — is refused
-    press_demo.try_home(c, make_runner(c.client, tmp_path), True, "STOP: test")
+    assert press_demo.try_home(c, make_runner(c.client, tmp_path), True, "STOP: test") is True
     said = capsys.readouterr().out
     assert "arm holds" not in said and "rising over the box first" in said
     # the rise flows into the home: ONE execution, like the mission's own retreat + home
@@ -1314,8 +1314,57 @@ def test_a_stop_with_no_box_located_holds_honestly(ctx, tmp_path, capsys):
         trajectory = None
 
     c.client.plans = [Refused()]
-    press_demo.try_home(c, make_runner(c.client, tmp_path), True, "STOP: test")
+    assert press_demo.try_home(c, make_runner(c.client, tmp_path), True, "STOP: test") is False
     assert "arm holds" in capsys.readouterr().out and c.client.executed == []
+
+
+def test_a_home_that_was_refused_or_did_not_arrive_says_so(ctx, tmp_path):
+    """try_home's answer is whether the arm got home: the depth press exits
+    on it (a popped knob with the arm held over the box is not a success)."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.tasks import press_demo
+
+    class Refused:
+        success = False
+        message = "INVALID_START_STATE_WORLD_COLLISION"
+        trajectory = None
+
+    ctx.press_cfg = _demo_cfg()
+    assert press_demo.try_home(ctx, make_runner(ctx.client, tmp_path), True, "STOP: test") is True
+    ctx.client.exec_script = [("failed", {"message": "driver aborted the goal", "progress": 0.2})]
+    assert press_demo.try_home(ctx, make_runner(ctx.client, tmp_path), True, "STOP: test") is False
+    ctx.client.plans = [Refused(), Refused()]  # from here, and the rise over the box
+    assert press_demo.try_home(ctx, make_runner(ctx.client, tmp_path), True, "STOP: test") is False
+
+
+def test_the_mission_record_keeps_the_table_the_scene_camera_measured(ctx, tmp_path):
+    """Flatbot (no survey): the record was built before the scene measured
+    the table, and every truth.json said table_z NaN."""
+    import json
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from rammp_box_opening.detection_set import MissionFrames
+    from rammp_box_opening.tasks import press_demo
+
+    worlds = SimpleNamespace(table_top_z=None, table_extent=None)
+    watcher = SimpleNamespace(table_z=None)
+    ctx.mission_frames = MissionFrames(tmp_path / "set", "ankou_pink.yaml", worlds.table_top_z, now=0)
+    fix = SimpleNamespace(table_z_scene=0.2933, table_extent=(0.3, 0.9, -0.5, 0.2))
+    press_demo.adopt_scene_table(ctx, worlds, watcher, fix)
+    assert worlds.table_top_z == watcher.table_z == 0.2933 and worlds.table_extent == fix.table_extent
+    ctx.mission_frames.frames.append(("scene_0", {"x": np.zeros(1)}))
+    doc = json.loads((ctx.mission_frames.close(exit_code=1) / "truth.json").read_text())
+    assert doc["table_z"] == pytest.approx(0.2933)
+    # a surveyed table is the one kept; an unmeasured one changes nothing
+    worlds2 = SimpleNamespace(table_top_z=0.05, table_extent=None)
+    press_demo.adopt_scene_table(ctx, worlds2, watcher, fix)
+    assert worlds2.table_top_z == 0.05
+    worlds3 = SimpleNamespace(table_top_z=None, table_extent=None)
+    press_demo.adopt_scene_table(ctx, worlds3, watcher, SimpleNamespace(table_z_scene=float("nan"), table_extent=None))
+    assert worlds3.table_top_z is None
 
 
 def test_an_open_box_is_not_pressed_shut():

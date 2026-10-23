@@ -1856,7 +1856,10 @@ def try_home(ctx, runner, execute, why):
     world ...) — arm holds" (bench 2026-09-21). When the mission has located
     this box, it first rises out of the corridor it came down, back to
     staging height above the button (_rise_over_button: planned against the
-    button's interaction world), and goes home from there."""
+    button's interaction world), and goes home from there.
+
+    True when the home was planned and every leg of it flew; False — the
+    arm holds — otherwise."""
     print("[press_demo] %s — returning home" % why)
     cfg = getattr(ctx, "press_cfg", None)
     rest = None if cfg is None else rest_joints(cfg)
@@ -1865,16 +1868,17 @@ def try_home(ctx, runner, execute, why):
     except RuntimeError as e:
         if cfg is None or getattr(ctx, "cpose", None) is None:
             print("[press_demo] home plan refused (%s) — arm holds" % e)
-            return
+            return False
         print("[press_demo] home refused from here (%s) — rising over the box first" % e)
         try:
             _world, rise, st = _rise_over_button(ctx, cfg, _state(ctx.client.joints()), "retreat:rise")
             home, _ = _plan_motion(ctx, st, "home", ("joints", list(HOME if rest is None else rest)), _full_world(ctx), TRANSIT_SPEED)
         except RuntimeError as e2:
             print("[press_demo] home plan refused (%s) — arm holds" % e2)
-            return
+            return False
         legs = [rise, home]
-    runner.run(legs, execute=execute)
+    res = runner.run(legs, execute=execute)
+    return all(r.ok for r in res)
 
 
 DETECT_REPORT_S = 15.0
@@ -2000,6 +2004,20 @@ def home_first(ctx, runner, execute, rest):
         return False
     res = runner.run([leg], execute=execute)
     return all(r.ok for r in res)
+
+
+def adopt_scene_table(ctx, worlds, watcher, scene_fix):
+    """No survey: this run's table, measured where the box stands, is the
+    one every world from here on is planned around — and the one the
+    mission's record keeps (it was built before the scene measured it, and
+    kept no table on an unsurveyed rig: flatbot 2026-10-22)."""
+    if worlds.table_top_z is not None or math.isnan(scene_fix.table_z_scene):
+        return
+    worlds.table_top_z = scene_fix.table_z_scene
+    worlds.table_extent = scene_fix.table_extent
+    watcher.table_z = scene_fix.table_z_scene
+    if ctx.mission_frames is not None:
+        ctx.mission_frames.note(table_z=float(scene_fix.table_z_scene))
 
 
 def keep_mission_frames(frames, exc):
@@ -2259,12 +2277,7 @@ def main():
                         "decides, and this run's pair judges the camera again" % distrust
                     )
             sp = scene_fix.pose
-            if worlds.table_top_z is None and not math.isnan(scene_fix.table_z_scene):
-                # no survey: this run's table, measured where the box stands,
-                # is the one every world from here on is planned around
-                worlds.table_top_z = scene_fix.table_z_scene
-                worlds.table_extent = scene_fix.table_extent
-                watcher.table_z = scene_fix.table_z_scene
+            adopt_scene_table(ctx, worlds, watcher, scene_fix)
             surveyed = watcher.table_z
             print(
                 "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points "
@@ -2499,12 +2512,12 @@ def main():
             # over the button at staging, the hand already straight down: how
             # far down from the wrist camera's depth, the press by the
             # torques (tasks/depth_press)
-            from rammp_box_opening.tasks.depth_press import DOWN_CONTACT_TOOL, exit_code, press_down_from_here
+            from rammp_box_opening.tasks import depth_press
 
-            result = press_down_from_here(node, ctx, cfg, runner, watcher, DOWN_CONTACT_TOOL)
-            if result.free:
-                try_home(ctx, runner, args.execute, "DEPTH PRESS done")
-            sys.exit(exit_code(result))
+            result = depth_press.press_down_from_here(node, ctx, cfg, runner, watcher, depth_press.DOWN_CONTACT_TOOL)
+            result = depth_press.after_scene_check(ctx, runner, result, scene_fix, locator)
+            homed = result.free and try_home(ctx, runner, args.execute, depth_press.home_why(result) or "DEPTH PRESS done")
+            sys.exit(depth_press.finish(ctx, result, homed))
         if at_staging and reach.pressed is not None:
             # the reach carried its descent and touched: nothing to fly here
             runner.note("press_plan", in_flight=True)
