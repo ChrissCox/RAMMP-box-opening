@@ -73,6 +73,7 @@ sent to the driver: the client is not armed.
 
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 from dataclasses import replace
@@ -468,6 +469,8 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
                     diameter_mm=round(1000 * s.diameter_m, 1), press_xyz=[round(v, 4) for v in xyz],
                     button_above_lid_mm=None if up_mm is None else round(up_mm, 1),
                     hits=aimer.hits, frames=aimer.frames, aim_s=round(time.monotonic() - t0, 2),
+                    # the wrist's depth-vs-colour stamp offsets: what PAIR_TOL_S rests on
+                    pair_dt_ms=[round(v, 1) for v in aimer.pair_dt_ms] or None,
                     capture=None if folder is None else str(folder),
                 )
             return (xyz, yaw), aimer.status()
@@ -480,11 +483,27 @@ CAPTURES_DIR = state_dir() / "captures"
 AIM_CAPTURES_KEPT = 20  # newest folders kept of each every-run capture (aim, pop); older ones are pruned
 
 
-def _save_wrist_frame(grab, folder, caption, draw=None):
+_PENDING_WRITES = []  # capture writes still in flight (background=True), joined by wait_capture_writes
+_WRITE_LOCK = threading.Lock()  # one write at a time: two aims in one second share a folder
+
+
+def wait_capture_writes(timeout_s=5.0):
+    """Let every capture write still in flight finish (at most `timeout_s`
+    in all): before anything copies a capture folder (MissionFrames.close)."""
+    end = time.monotonic() + timeout_s
+    for t in list(_PENDING_WRITES):
+        t.join(max(0.0, end - time.monotonic()))
+    _PENDING_WRITES[:] = [t for t in _PENDING_WRITES if t.is_alive()]
+
+
+def _save_wrist_frame(grab, folder, caption, draw=None, background=False, after=None):
     """One wrist frame (colour, depth, K, camera pose, stamp) into `folder`
     in the recorder's format (replay: scripts/record_scan_frames.py
-    --analyze), plus a JPEG with `caption` and whatever `draw(img)` adds.
-    Returns the folder, or None when there is no frame or no pose for it."""
+    --analyze), plus a JPEG with `caption` and whatever `draw(img)` adds,
+    then `after()`. Returns the folder, or None when there is no frame or
+    no pose for it. With `background` the frame is taken now and written on
+    a thread (compressing it is ~45 ms the next leg need not wait for): the
+    folder exists at once, its files a moment later (wait_capture_writes)."""
     import numpy as np
 
     from rammp_box_opening.perception.depth_source import camera_pose_at
@@ -494,17 +513,43 @@ def _save_wrist_frame(grab, folder, caption, draw=None):
     pose = camera_pose_at(grab)
     if pose is None:
         return None
-    write_frame(folder, wrist_frame(grab, pose))
+    # one snapshot: the grabber assigns new arrays per message, so these
+    # stay this frame while a thread writes them, and the JPEG is the npz's
+    arrays = wrist_frame(grab, pose)
+    img = None
     try:
         import cv2
 
-        img = np.ascontiguousarray(grab.color).copy()
+        img = np.ascontiguousarray(arrays["color"]).copy()
         if draw is not None:
             draw(img)
         cv2.putText(img, str(caption)[:90], (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        cv2.imwrite(str(folder / "frame_000.jpg"), img)
     except Exception:
-        pass
+        img = None
+
+    def job():
+        with _WRITE_LOCK:
+            try:
+                write_frame(folder, arrays)
+            except Exception as e:  # a full disk: the run goes on without its evidence
+                print("[press_demo] (wrist frame not written to %s: %s)" % (folder, e))
+            if img is not None:
+                try:
+                    import cv2
+
+                    cv2.imwrite(str(folder / "frame_000.jpg"), img)
+                except Exception:
+                    pass
+            if after is not None:
+                after()
+
+    if not background:
+        job()
+        return folder
+    folder.mkdir(parents=True, exist_ok=True)
+    t = threading.Thread(target=job, name="capture-write", daemon=False)  # not daemon: exit waits for it
+    _PENDING_WRITES[:] = [p for p in _PENDING_WRITES if p.is_alive()] + [t]
+    t.start()
     return folder
 
 
@@ -562,10 +607,10 @@ def save_aim_frame(grab, sighting, tag="aim"):
         cv2.drawMarker(img, (u, v), (0, 0, 255), cv2.MARKER_CROSS, 26, 2)
 
     caption = "press point: the circle's centre, button %.0f mm, r %.0f px" % (1000 * sighting.diameter_m, sighting.r_px)
-    out = _save_wrist_frame(grab, folder, caption, draw)
+    # written off the critical path: the next leg need not wait for zlib
+    out = _save_wrist_frame(grab, folder, caption, draw, background=True, after=lambda: _prune_captures(tag))
     if out is None:
         return None
-    _prune_captures(tag)
     print("[press_demo] aim frame saved: %s" % out)
     return out
 
@@ -819,42 +864,6 @@ def build_approach_leg(ctx, cfg):
 # stood well off the box.
 RECENTRE_TOL_M = 0.025
 RECENTRE_MAX = 2  # moves over the button before pressing from the last aim (detect.recentre_max_moves)
-
-
-def _arm_urdf_path(node, base_frame):
-    """Return a temp-file path to the arm's URDF, or None for the bench default.
-
-    On flatbot the nightly arm_state_publisher renders the URDF with arm_mount
-    as root (incorporating the adapter plate tilt) and publishes it latched on
-    /arm/robot_description. The FK chain must use THAT URDF so its root matches
-    the planning frame. On the bench the installed kinova_gen3.urdf is correct."""
-    if base_frame == "base_link":
-        return None
-    import tempfile
-    from std_msgs.msg import String
-
-    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-    latched = QoSProfile(
-        depth=1,
-        reliability=ReliabilityPolicy.RELIABLE,
-        durability=DurabilityPolicy.TRANSIENT_LOCAL,
-    )
-    got = []
-    sub = node.create_subscription(String, "/arm/robot_description", got.append, latched)
-    t0 = time.monotonic()
-    while not got and time.monotonic() - t0 < 5.0:
-        rclpy.spin_once(node, timeout_sec=0.1)
-    node.destroy_subscription(sub)
-    if not got:
-        node.get_logger().error(
-            "/arm/robot_description not received in 5 s — ArmChain will use the "
-            "bench URDF (base_link root). FK in arm_mount frame will be wrong."
-        )
-        return None
-    f = tempfile.NamedTemporaryFile(suffix=".urdf", delete=False, mode="w")
-    f.write(got[0].data)
-    f.close()
-    return f.name
 
 
 def tool_xy(ctx):
@@ -1875,6 +1884,23 @@ def fly_home_from_hop(ctx, cfg, runner, execute):
     return all(r.ok for r in res)
 
 
+def depth_press_refusal(depth_press, cfg, scene, cfg_path=None):
+    """Why --depth-press must not start with this container, or None. Checked
+    before the runtime comes up, so before anything is actuated.
+
+    With detect.confirm_in_flight the scene approach carries the TF-height
+    guarded descent in its own goal (approach_from_scene); once that touches,
+    reach.pressed is set, the depth press is skipped and the press that runs
+    is TF's — the very stroke --depth-press exists to replace."""
+    if depth_press and scene and getattr(cfg, "confirm_in_flight", False):
+        return (
+            "--depth-press with detect.confirm_in_flight: the approach would carry the TF-height descent and "
+            "press before the depth press could run. Set detect.confirm_in_flight: false in %s, or drop "
+            "--depth-press. Nothing moved." % (cfg_path or "the container yaml")
+        )
+    return None
+
+
 def try_home(ctx, runner, execute, why):
     """Recovery home that cannot crash the exit path: a refused home plan
     leaves the arm holding with an honest line (2026-08-25 review). Goes
@@ -2026,7 +2052,7 @@ def home_first(ctx, runner, execute, rest):
         print(
             "[press_demo] not starting: the move home was refused in the bench world (%s) — the arm is "
             "probably down at the table. Clear the bench and recover by hand:\n"
-            "    ros2 run rammp_box_opening home_arm --execute    (add --lift-first 0.08 if that is refused too)" % e
+            "    scripts/sheppy_task.sh home_arm --execute    (add --lift-first 0.08 if that is refused too)" % e
         )
         return False
     res = runner.run([leg], execute=execute)
@@ -2044,6 +2070,7 @@ def keep_mission_frames(frames, exc):
     code = exc.code if isinstance(exc, SystemExit) else (0 if exc is None else type(exc).__name__)
     try:
         t0 = time.monotonic()
+        wait_capture_writes()  # close() copies the aim's folder: it must be whole
         out = frames.close(exit_code=code)
     except (Exception, KeyboardInterrupt) as e:  # a full disk, a second Ctrl+C
         print("[press_demo] (this run's frames were not kept: %s)" % (str(e) or type(e).__name__))
@@ -2105,11 +2132,22 @@ def main():
     # empty close read 0.793 when it was measured, 0.636 since 2026-09-25)
     cfg = replace(cfg, grip_band=tuple(round(v, 3) for v in fingers.scaled_band(cfg.grip_band)))
     cli_common.refuse_unmeasured(model, args.execute, measuring=args.detect_only)
+    why = depth_press_refusal(args.depth_press, cfg, scene=not args.no_scene, cfg_path=cfg_path)
+    if why:
+        sys.exit("[press_demo] not starting: %s" % why)
     node, client = cli_common.init_runtime(args.execute)
     worlds = WorldStore(bench)
     client._base_frame = worlds.base_frame
-    from rammp_box_opening.runtime.approach import set_chain_root
-    set_chain_root(worlds.base_frame, urdf_path=_arm_urdf_path(node, worlds.base_frame))
+    from rammp_box_opening.runtime.approach import chain_ready, set_chain_root
+    set_chain_root(worlds.base_frame, urdf_path=cli_common._arm_urdf_path(node, worlds.base_frame))
+    ok, why = chain_ready()
+    if not ok:
+        # every aim, press and reach check needs the chain: without it the
+        # run flew to staging and died there on a KeyError (review 2026-10-22)
+        sys.exit(
+            "[press_demo] not starting: /arm/robot_description not heard in 5 s (arm_state_publisher down?) — "
+            "the arm kinematics for %s are unavailable (%s). Nothing moved." % (worlds.base_frame, why)
+        )
     runner = Runner(client)
     cli_common.apply_speed_scale(runner, args)
     # The persistent owl_detector node owns the OWL model; there is no
@@ -2131,73 +2169,74 @@ def main():
     import threading
 
     pthread = threading.Thread(target=pexec.spin, name="perception", daemon=True)
+    ctx = None  # the finally below runs even if startup fails before Ctx
     pthread.start()
-    # the owl_detector nodes were started by the launch with no container
-    # of their own: tell them which one this run is for, so their prompts
-    # and floor are this container's
-    from rammp_box_opening.perception.owl_source import announce_container
-
-    announce_container(pnode, cfg_path)
-
-    impls = {}
-    owl = None
-    watcher_holder = {}
-    if cfg.detect_source == "vlm":
-        from rammp_box_opening.perception.vlm_source import fetch_box_roi
-
-        impls["claude"] = fetch_box_roi  # bounded at call time, below
-        if "owl" in cfg.vlm_backends:
-            from rammp_box_opening.perception.owl_source import OwlRung
-
-            # listener starts NOW, not at detect time: the node sees the
-            # box as the arm settles and its bbox gates the depth watcher,
-            # so the fix is usually ready within a few still frames
-            owl = OwlRung(pnode, cfg, watcher_holder)
-            impls["owl"] = owl
-    # the box found by geometry: the lid plateau above the surveyed table
-    watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame,
-                            camera_cfg_name=worlds.wrist_camera_config)
-    watcher_holder["watcher"] = watcher
-    # The scene camera finds the box before the arm moves — the only thing
-    # that does, unless --no-scene. It is placed by its calibration
-    # (scripts/calibrate_scene_camera.py), or by TF where the robot's TF
-    # carries its mount: flatbot's static_tf, whose camera is not the one
-    # the installed camera_scene.yaml calibrates.
-    from rammp_box_opening.perception.scene import load_scene_calibration, scene_calib_path
-
-    scene_by_tf = worlds.external_static_tf
-    locator = None
-    if not args.no_scene:
-        T_base_scene_link = None if scene_by_tf else load_scene_calibration(args.scene_calib)
-        if scene_by_tf or T_base_scene_link is not None:
-            from rammp_box_opening.perception.scene_source import SceneLocator
-            from rammp_box_opening.perception.scene_calib import scene_tag_px
-
-            locator = SceneLocator(
-                pnode, cfg, model, worlds.table_top_z, T_base_scene_link, spins=False,
-                tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
-                scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
-            )
-            # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
-            # and the readiness checks below are that long — by the time
-            # locate() asks, the box is already on the topic
-            locator.owl.enable()
-    # camera on from here to exit
-    ctx = Ctx(
-        model=model,
-        cpose=None,
-        client=client,
-        worlds=worlds,
-        config_path=cfg_path,
-    )
-
-    ctx.press_cfg = cfg  # recovery homes go to the mission's rest pose
-    if args.execute and not args.detect_only:
-        # every run keeps what its cameras saw and, when the press lands,
-        # where the button really was: a detection set that grows with the
-        # bench's own runs (detection_set.MissionFrames; written at the end)
-        ctx.mission_frames = MissionFrames(state_dir() / "detection_sets" / MISSIONS_SET, Path(cfg_path).name, worlds.table_top_z)
     try:
+        # the owl_detector nodes were started by the launch with no container
+        # of their own: tell them which one this run is for, so their prompts
+        # and floor are this container's
+        from rammp_box_opening.perception.owl_source import announce_container
+
+        announce_container(pnode, cfg_path)
+
+        impls = {}
+        owl = None
+        watcher_holder = {}
+        if cfg.detect_source == "vlm":
+            from rammp_box_opening.perception.vlm_source import fetch_box_roi
+
+            impls["claude"] = fetch_box_roi  # bounded at call time, below
+            if "owl" in cfg.vlm_backends:
+                from rammp_box_opening.perception.owl_source import OwlRung
+
+                # listener starts NOW, not at detect time: the node sees the
+                # box as the arm settles and its bbox gates the depth watcher,
+                # so the fix is usually ready within a few still frames
+                owl = OwlRung(pnode, cfg, watcher_holder)
+                impls["owl"] = owl
+        # the box found by geometry: the lid plateau above the surveyed table
+        watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame,
+                                camera_cfg_name=worlds.wrist_camera_config)
+        watcher_holder["watcher"] = watcher
+        # The scene camera finds the box before the arm moves — the only thing
+        # that does, unless --no-scene. It is placed by its calibration
+        # (scripts/calibrate_scene_camera.py), or by TF where the robot's TF
+        # carries its mount: flatbot's static_tf, whose camera is not the one
+        # the installed camera_scene.yaml calibrates.
+        from rammp_box_opening.perception.scene import load_scene_calibration, scene_calib_path
+
+        scene_by_tf = worlds.external_static_tf
+        locator = None
+        if not args.no_scene:
+            T_base_scene_link = None if scene_by_tf else load_scene_calibration(args.scene_calib)
+            if scene_by_tf or T_base_scene_link is not None:
+                from rammp_box_opening.perception.scene_source import SceneLocator
+                from rammp_box_opening.perception.scene_calib import scene_tag_px
+
+                locator = SceneLocator(
+                    pnode, cfg, model, worlds.table_top_z, T_base_scene_link, spins=False,
+                    tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
+                    scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
+                )
+                # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
+                # and the readiness checks below are that long — by the time
+                # locate() asks, the box is already on the topic
+                locator.owl.enable()
+        # camera on from here to exit
+        ctx = Ctx(
+            model=model,
+            cpose=None,
+            client=client,
+            worlds=worlds,
+            config_path=cfg_path,
+        )
+
+        ctx.press_cfg = cfg  # recovery homes go to the mission's rest pose
+        if args.execute and not args.detect_only:
+            # every run keeps what its cameras saw and, when the press lands,
+            # where the button really was: a detection set that grows with the
+            # bench's own runs (detection_set.MissionFrames; written at the end)
+            ctx.mission_frames = MissionFrames(state_dir() / "detection_sets" / MISSIONS_SET, Path(cfg_path).name, worlds.table_top_z)
         why = readiness_refusal(client, args.execute, camera_cfg_name=worlds.wrist_camera_config)
         if why:
             sys.exit("[press_demo] not starting: %s" % why)
@@ -2479,7 +2518,10 @@ def main():
             detect_s=round(time.monotonic() - t_detect, 2),
         )
 
-        if not args.press_only:
+        # the depth press (tasks/depth_press) ends the run at the press and
+        # never handles the lid; a run that skips it still grips and places
+        depth_here = args.depth_press and at_staging and reach.pressed is None
+        if not args.press_only and not depth_here:
             # the box lands wherever it lands: resolve the drop spot NOW,
             # before any container-directed motion — configured lid_place
             # when clear, slid away from the box when crowded, refusal
@@ -2526,7 +2568,7 @@ def main():
             "[press_demo] PRESS target origin [%.3f, %.3f, %.3f] yaw %.1f deg"
             % (ctx.cpose.xyz[0], ctx.cpose.xyz[1], ctx.cpose.xyz[2], math.degrees(ctx.cpose.yaw))
         )
-        if args.depth_press and at_staging and reach.pressed is None:
+        if depth_here:
             # over the button at staging, the hand already straight down: how
             # far down from the wrist camera's depth, the press by the
             # torques (tasks/depth_press)
@@ -2647,7 +2689,7 @@ def main():
         except Exception:
             pass
         # the run is over and the arm stopped: now its frames are written
-        keep_mission_frames(ctx.mission_frames, ending)
+        keep_mission_frames(getattr(ctx, "mission_frames", None), ending)
 
 
 if __name__ == "__main__":

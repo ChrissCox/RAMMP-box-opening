@@ -11,13 +11,16 @@ off Cyclone DDS, the middleware sheppy's driver and planner containers speak.
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 import rclpy
 from rclpy.signals import SignalHandlerOptions
 
+from rammp_box_opening.constants import state_dir
 from rammp_box_opening.models.container import ContainerModel
 from rammp_box_opening.primitives.core import Ctx
+from rammp_box_opening.runtime import approach
 from rammp_box_opening.runtime.abort import AbortFlag, install_sigint
 from rammp_box_opening.runtime.client import PlannerClient
 from rammp_box_opening.runtime.driver import rmw_refusal
@@ -111,6 +114,52 @@ def init_runtime(execute):
     return node, PlannerClient(node, abort=abort, motion_enabled=bool(execute))
 
 
+def arm_urdf_file():
+    """Where the robot's own URDF is kept for this run: one fixed file,
+    overwritten each start (a temp file per run left 44 in /tmp in a day)."""
+    return state_dir() / "arm_robot_description.urdf"
+
+
+def _arm_urdf_path(node, base_frame):
+    """Return a path to the arm's URDF, or None for the bench default.
+
+    On flatbot the nightly arm_state_publisher renders the URDF with arm_mount
+    as root (incorporating the adapter plate tilt) and publishes it latched on
+    /arm/robot_description. The FK chain must use THAT URDF so its root matches
+    the planning frame. On the bench the installed kinova_gen3.urdf is correct.
+    Off the bench None means there are no kinematics at all (the bench URDF
+    has no arm_mount): runtime.approach refuses every chain, so a plan-free
+    line or FK refuses instead of being solved in the wrong frame."""
+    if base_frame == "base_link":
+        return None
+    from std_msgs.msg import String
+
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+    latched = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+    got = []
+    sub = node.create_subscription(String, "/arm/robot_description", got.append, latched)
+    t0 = time.monotonic()
+    while not got and time.monotonic() - t0 < 5.0:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    node.destroy_subscription(sub)
+    if not got:
+        node.get_logger().error(
+            "/arm/robot_description not received in 5 s — no arm kinematics rooted at %s: "
+            "plan-free lines and FK are unavailable this run" % base_frame
+        )
+        return None
+    out = arm_urdf_file()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".tmp")
+    tmp.write_text(got[0].data)
+    os.replace(tmp, out)
+    return str(out)
+
+
 def build_ctx(args):
     """Ctx + Runner for a CLI that has not detected a container (cpose
     None): only pre-detection (bench-world) legs can be planned from it."""
@@ -121,6 +170,10 @@ def build_ctx(args):
     node, client = init_runtime(args.execute)
     worlds = WorldStore(bench)
     client._base_frame = worlds.base_frame
+    # the arm's chain in the frame it plans in, as press_demo — no exit
+    # when the description is missing: HOME is a joint goal and needs no
+    # chain; only a plan-free lift refuses (LiftFree)
+    approach.set_chain_root(worlds.base_frame, urdf_path=_arm_urdf_path(node, worlds.base_frame))
     ctx = Ctx(
         model=model,
         cpose=None,

@@ -198,6 +198,49 @@ def test_the_gravity_model_is_checked_against_the_arm_before_any_guarded_line():
     assert reach_press.gravity_mismatch(grav, a, payload) is not None
 
 
+def _drift_of(monkeypatch, f, slide, stroke):
+    calls = []
+
+    def g(q):
+        calls.append(tuple(q))
+        return [f(q), 0.0, 0.0, 0.0]
+
+    monkeypatch.setattr(reach_press, "_wrist_gravity", lambda: g)
+    return reach_press._predicted_drift(SimpleNamespace(slide_pts=slide, stroke_pts=stroke)), calls
+
+
+def _line(n, tag=0.0):
+    return [[i / max(n - 1, 1), tag] + [0.0] * 5 for i in range(n)]
+
+
+def test_the_predicted_drift_line_samples_the_gravity_model_and_never_misses_the_last_point(monkeypatch):
+    # a display line computed with the arm at rest before the look leg: not
+    # every point (232 gravity evaluations, ~0.2 s), the start once per line
+    slide, stroke = _line(77), _line(39, tag=1.0)
+    (s, t), calls = _drift_of(monkeypatch, lambda q: 3.0 * q[0], slide, stroke)
+    every = reach_press.DRIFT_SAMPLE_EVERY
+    for pts, tag in ((slide, 0.0), (stroke, 1.0)):
+        mine = [q for q in calls if q[1] == tag]
+        assert len(mine) <= 2 + math.ceil(len(pts) / every) < len(pts)
+        assert mine.count(tuple(pts[0])) == 1 and len(set(mine)) == len(mine)  # the start once, nothing twice
+        assert tuple(pts[-1]) in mine
+    # rising along the path: the peak is at the last point, 77 and 39 not multiples of the stride
+    assert s == pytest.approx(3.0) and t == pytest.approx(3.0)
+
+
+def test_the_predicted_drift_on_a_smooth_path_is_the_per_point_peak(monkeypatch):
+    f = lambda q: 2.0 * math.sin(math.pi * q[0])  # noqa: E731 - peaks mid-path
+    slide, stroke = _line(77), _line(39)
+    (s, t), _calls = _drift_of(monkeypatch, f, slide, stroke)
+    full = [max(abs(f(q) - f(pts[0])) for q in pts) for pts in (slide, stroke)]
+    assert s == pytest.approx(full[0], rel=0.02) and t == pytest.approx(full[1], rel=0.02)
+
+
+def test_the_predicted_drift_of_a_one_point_or_empty_line_is_zero(monkeypatch):
+    (s, t), _calls = _drift_of(monkeypatch, lambda q: 5.0 + q[0], _line(1), [])
+    assert s == 0.0 and t == 0.0
+
+
 def test_the_box_is_put_where_its_aimed_button_is(model):
     from rammp_box_opening.models.container import from_container
 
@@ -489,7 +532,7 @@ def test_without_the_oblique_aim_nothing_moves(ctx, monkeypatch, tmp_path):
     assert code == 1 and not ctx.client.executed
 
 
-def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path):
+def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys):
     from rammp_box_opening.models.container import ContainerPose
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.runner import Runner
@@ -507,3 +550,4 @@ def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path):
     code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None,
                                        SimpleNamespace(execute=False, press_only=True), fix, None)
     assert code == 0 and not ctx.client.executed
+    assert "gravity alone moves joint_4 0.00 Nm along the slide" in capsys.readouterr().out
