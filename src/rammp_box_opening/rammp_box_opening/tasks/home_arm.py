@@ -15,6 +15,11 @@ clears the bench before running it (review 2026-09-02). The attended
 abort drill Ctrl+Cs this mid-motion. When even the bare world refuses
 the START (the fingers are at the table), --lift-first M flies a plan-free
 straight vertical line of M metres first and plans HOME from its end.
+A joint too near its limit for the planner to start from
+(START_IN_LIMIT_MARGIN, or FINETUNE_TRAJOPT_FAIL just outside the margin)
+gets a plan-free step along the joint line toward HOME first, the shortest
+that HOME plans from (primitives.ClearMarginFree): refused if the tool
+would drop on the way, and obstruction-guarded.
 
 The band stands on the table, so it exists only where a table is known.
 A world YAML without one (flatbot: the table changes with every place
@@ -25,8 +30,49 @@ world: re-planning a refused start in an identical world cannot help.
 """
 
 from rammp_box_opening.constants import HOME, TRANSIT_SPEED
-from rammp_box_opening.primitives.core import LiftFree, PlanState, _plan_motion
+from rammp_box_opening.primitives.core import (
+    CLEAR_MARGIN_MAX_STEP_RAD,
+    ClearMarginFree,
+    LiftFree,
+    PlanState,
+    _plan_motion,
+)
 from rammp_box_opening.tasks import cli_common
+
+
+def _plan_home(ctx, state, say=print):
+    """HOME from `state`: the guarded bench world first, then the bare
+    table world with a caution. Raises the bare world's refusal. With no
+    table known the two are the same world: once, in the bare one (the
+    caution was printed before planning)."""
+    if ctx.worlds.table_top_z is None:
+        bare = ctx.worlds.push_name("bench", model=None, tag="bare")
+        leg, _ = _plan_motion(
+            ctx, state, "home", ("joints", list(HOME)), bare, TRANSIT_SPEED
+        )
+        return leg
+    guarded = ctx.worlds.push_name("bench", model=ctx.model)
+    try:
+        leg, _ = _plan_motion(
+            ctx, state, "home", ("joints", list(HOME)), guarded, TRANSIT_SPEED
+        )
+        return leg
+    except RuntimeError as e:
+        say("[home_arm] home refused in the guarded bench world (%s)" % e)
+    # there is no typed confirmation any more (--execute alone arms a run),
+    # so this cannot ask for the bench to be cleared first: it says what the
+    # move about to fly does NOT know, and the dry-run preview is the place
+    # to read it before adding --execute
+    say(
+        "[home_arm] CAUTION: planning in the bare table world — this move "
+        "ignores where the box may be. With --execute it flies NOW; run "
+        "without it first if the bench is not clear."
+    )
+    bare = ctx.worlds.push_name("bench", model=None, tag="bare")
+    leg, _ = _plan_motion(
+        ctx, state, "home", ("joints", list(HOME)), bare, TRANSIT_SPEED
+    )
+    return leg
 
 
 def build_legs(ctx, lift_first_m=0.0):
@@ -34,7 +80,9 @@ def build_legs(ctx, lift_first_m=0.0):
     that much FIRST (primitives.LiftFree), and HOME planned from where the
     lift ends. For the pose the planner refuses as a start — fingers at
     the table after an abort or a jog (2026-09-17: refused in both worlds
-    40 mm above the table, 23 deg off vertical)."""
+    40 mm above the table, 23 deg off vertical). A joint too near its limit
+    for the planner gets a plan-free step toward HOME first, the shortest
+    one HOME plans from (primitives.ClearMarginFree, 2026-10-23)."""
     state = PlanState(joints=list(ctx.client.joints()), chain=0)
     legs = []
     if lift_first_m > 0:
@@ -53,33 +101,38 @@ def build_legs(ctx, lift_first_m=0.0):
             "box. With --execute it flies NOW; run without it first, or use "
             "--lift-first 0.08 to rise straight up before the planned sweep."
         )
-        bare = ctx.worlds.push_name("bench", model=None, tag="bare")
-        leg, _ = _plan_motion(
-            ctx, state, "home", ("joints", list(HOME)), bare, TRANSIT_SPEED
-        )
-        return legs + [leg]
-    guarded = ctx.worlds.push_name("bench", model=ctx.model)
-    try:
-        leg, _ = _plan_motion(
-            ctx, state, "home", ("joints", list(HOME)), guarded, TRANSIT_SPEED
-        )
-        return legs + [leg]
-    except RuntimeError as e:
-        print("[home_arm] home refused in the guarded bench world (%s)" % e)
-    # there is no typed confirmation any more (--execute alone arms a run),
-    # so this cannot ask for the bench to be cleared first: it says what the
-    # move about to fly does NOT know, and the dry-run preview is the place
-    # to read it before adding --execute
+    clear = ClearMarginFree(HOME)
+    near = clear.near(ctx, state.joints)
+    if not near:
+        return legs + [_plan_home(ctx, state)]
     print(
-        "[home_arm] CAUTION: planning in the bare table world — this move "
-        "ignores where the box may be. With --execute it flies NOW; run "
-        "without it first if the bench is not clear."
+        "[home_arm] %s: too near for the planner to start from — trying plan-free steps "
+        "along the joint line toward HOME, shortest first"
+        % ", ".join("%s is %.3f rad from its limit" % jr for jr in near)
     )
-    bare = ctx.worlds.push_name("bench", model=None, tag="bare")
-    leg, _ = _plan_motion(
-        ctx, state, "home", ("joints", list(HOME)), bare, TRANSIT_SPEED
+    why = None
+    for step, at, info in clear.steps(ctx, state):
+        notes = []
+        try:
+            home = _plan_home(ctx, at, say=notes.append)
+        except RuntimeError as e:
+            why = e
+            continue
+        for note in notes:
+            print(note)
+        if step:
+            d = info["tool_move"]
+            print(
+                "[home_arm] a plan-free step %.0f%% of the way to HOME first (the largest joint "
+                "%.3f rad, the tool %+.0f mm up and %.0f mm across; obstruction-guarded) — HOME "
+                "is planned from where it ends"
+                % (100 * info["fraction"], info["largest_rad"], 1000 * d[2], 1000 * (d[0] ** 2 + d[1] ** 2) ** 0.5)
+            )
+        return legs + step + [home]
+    raise RuntimeError(
+        "no plan-free step toward HOME of up to %.2f rad per joint lets the planner plan HOME "
+        "(last: %s) — jog the arm clear by hand" % (CLEAR_MARGIN_MAX_STEP_RAD, why)
     )
-    return legs + [leg]
 
 
 def main():

@@ -60,10 +60,23 @@ def set_chain_root(root, urdf_path=None):
     _GRAVITY = None
 
 
+def chain_ready():
+    """(ok, why): whether _chain() has a URDF for its root. Off the bench
+    root there is no installed URDF to fall back to — the bench one has no
+    arm_mount — so a root set without the robot's own description has no
+    kinematics at all, and every plan-free line and FK must refuse."""
+    if _ROOT != "base_link" and _URDF_PATH is None:
+        return False, "no arm URDF rooted at %s (is /arm/robot_description published?)" % _ROOT
+    return True, ""
+
+
 def _chain():
     """The arm's kinematic chain, parsed once from the driver's URDF."""
     global _CHAIN
     if _CHAIN is None:
+        ok, why = chain_ready()
+        if not ok:
+            raise RuntimeError(why)
         from rammp_box_opening.runtime.kinematics import ArmChain
 
         _CHAIN = ArmChain(root=_ROOT, path=_URDF_PATH)
@@ -77,6 +90,9 @@ def _gravity():
     """The arm's gravity model, from the same URDF and root as _chain()."""
     global _GRAVITY
     if _GRAVITY is None:
+        ok, why = chain_ready()
+        if not ok:
+            raise RuntimeError(why)
         from rammp_box_opening.runtime.kinematics import GravityModel
 
         _GRAVITY = GravityModel(root=_ROOT, path=_URDF_PATH)
