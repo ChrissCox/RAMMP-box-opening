@@ -1528,8 +1528,8 @@ def test_a_re_press_rises_over_the_button_whatever_the_lookahead_left_behind(ctx
     assert c.lid_at is not None and abs(c.last_pose[0][1] - button[1]) > 0.1
 
     legs = press_demo.build_restage_legs(c, cfg)
-    assert names(legs) == ["press:close", "retreat:restage"]
-    close, rise = legs
+    assert names(legs) == ["retreat:restage", "press:close"]
+    rise, close = legs
     assert rise.world == "interaction_button" and close.world == "interaction_button"
     assert rise.target[1] == pytest.approx([button[0], button[1], button[2] + cfg.staging_m])
     assert rise.speed == pytest.approx(TRANSIT_SPEED)
@@ -1539,6 +1539,186 @@ def test_a_re_press_rises_over_the_button_whatever_the_lookahead_left_behind(ctx
     # descended, like retreat and lift)
     res = make_runner(c.client, tmp_path).run(legs, execute=True)
     assert [r.ok for r in res] == [True, True]
+
+
+class _Refused:
+    success = False
+    message = "MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION"
+    trajectory = None
+
+
+def _timeline(client):
+    """Instrument a FakeClient: every execution, gripper send and join, in
+    order, as (event, detail) — a send inside an execution is tagged with
+    the execution it rode."""
+    events = []
+    execute, send, join = client.execute, client.gripper_send, client.gripper_join
+
+    def ex(traj_, speed, guard=None, while_running=None, stop_when=None):
+        events.append(("execute", "guarded" if guard is not None else "free"))
+        out = execute(traj_, speed, guard=guard, while_running=while_running, stop_when=stop_when)
+        events.append(("arrived", None))
+        return out
+
+    client.execute = ex
+    client.gripper_send = lambda pos: events.append(("send", pos)) or send(pos)
+    client.gripper_join = lambda h: events.append(("join", h[1])) or join(h)
+    return events
+
+
+def test_the_re_press_closes_the_fingers_while_it_rises(ctx, tmp_path):
+    """A NOT POPPED retry stood at the hop for the whole blocking close
+    before it rose. The close now rides the rise: sent as the rise starts,
+    joined when it arrives — before anything guarded can descend."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.tasks import press_demo
+
+    c = ctx
+    rise, close = press_demo.build_restage_legs(c, _demo_cfg())
+    assert close.name == "press:close" and close.world == "interaction_button"
+    assert close.defer_join and close.send_with_previous_motion and close.verify is None
+    events = _timeline(c.client)
+    res = make_runner(c.client, tmp_path).run([rise, close], execute=True)
+    assert [r.ok for r in res] == [True, True]
+    cmd = close.gripper_cmd
+    assert events == [("execute", "free"), ("send", cmd), ("arrived", None), ("join", cmd)]
+
+
+def _press_again_setup(ctx, tmp_path, monkeypatch, build):
+    """_press_again with the descent built by `build` and run_push patched
+    out: the restage rise is planned to end where the descent starts."""
+    from conftest import runner as make_runner
+    from conftest import traj
+
+    from rammp_box_opening.tasks import press_demo
+
+    descent = _descent_leg()
+
+    class Rise:
+        success, message = True, "ok"
+        trajectory = traj(ctx.client.live, list(descent.traj.points[0].positions))
+
+    ctx.client.plans = [Rise()]
+    ctx.press_cfg = _demo_cfg()
+    pushed = []
+    monkeypatch.setattr(press_demo, "build_press_legs", lambda c, cfg, start_joints=None: build(descent, start_joints))
+    monkeypatch.setattr(
+        press_demo, "run_push", lambda c, cfg, runner, args, touch, touch_leg=None, **k: pushed.append(touch_leg) or ([], touch)
+    )
+    args = type("A", (), {"execute": True, "press_only": True})()
+    return descent, pushed, args, make_runner(ctx.client, tmp_path)
+
+
+def test_the_re_press_is_planned_under_the_rise_and_flies_its_free_air_fast(ctx, tmp_path, monkeypatch):
+    """The second press planned its descent with the arm standing at
+    staging, then flew all 75 mm of free air at contact speed (4.2 s on the
+    real waypoint descent, against 2.3 s for the first press). It is now
+    planned while the rise flies, from the rise's end, and warped like the
+    first press — the guarded line and where its guard arms unchanged."""
+    from rammp_box_opening.runtime.guards import GROUP_SETTLE_S
+    from rammp_box_opening.runtime.stamps import secs
+    from rammp_box_opening.tasks import press_demo
+
+    c = ctx
+    events = _timeline(c.client)
+    built = []
+
+    def build(descent, start_joints):
+        built.append((None if start_joints is None else list(start_joints), list(events)))
+        return [descent]
+
+    descent, pushed, args, r = _press_again_setup(c, tmp_path, monkeypatch, build)
+    c.client.exec_script = [
+        ("arrived", {"message": "ok", "progress": 1.0, "torque_peak": 0.0}),  # the rise
+        ("touch", {"message": "contact", "progress": 0.97, "torque_peak": 3.2}),  # the press
+    ]
+    press_demo._press_again(c, _demo_cfg(), r, args, None, None, 0)
+    # one build, from the rise's end, while the rise flew (the close riding it)
+    assert len(built) == 1
+    assert built[0][0] == pytest.approx(list(descent.traj.points[0].positions))
+    assert built[0][1][-1] == ("send", press_demo.GRIPPER_CMD_CLOSED)
+    # the press handed on is warped as the first press is
+    assert pushed == [descent]
+    assert descent.warp is not None and descent.speed == 1.0
+    idx = descent.waypoint[0]
+    start = secs(descent.traj.points[idx].time_from_start)
+    total = secs(descent.traj.points[-1].time_from_start)
+    assert descent.guard.arm_after * total == pytest.approx(start + GROUP_SETTLE_S, abs=0.01)
+    assert c.last_pose == (list(descent.target[1]), list(descent.target[2]))
+    # the close is joined before the guarded press descends
+    assert [e for e in events if e[0] in ("join", "execute")] == [
+        ("execute", "free"), ("join", press_demo.GRIPPER_CMD_CLOSED), ("execute", "guarded")
+    ]
+
+
+def test_a_refused_re_press_goes_home_instead_of_a_traceback(ctx, tmp_path, monkeypatch, capsys):
+    """The descent of the second press refused under the rise and again
+    from staging: an honest stop and a recovery home, exit 1."""
+    from rammp_box_opening.tasks import press_demo
+
+    def build(descent, start_joints):
+        raise RuntimeError("planning failed for press:down")
+
+    _d, pushed, args, r = _press_again_setup(ctx, tmp_path, monkeypatch, build)
+    homes = []
+    monkeypatch.setattr(press_demo, "try_home", lambda c, runner, execute, why: homes.append(why))
+    with pytest.raises(SystemExit) as e:
+        press_demo._press_again(ctx, _demo_cfg(), r, args, None, None, 0)
+    assert e.value.code == 1 and pushed == []
+    assert len(homes) == 1 and "STOP before pressing again" in homes[0] and "press:down" in homes[0]
+
+
+def test_press_only_plans_its_home_from_the_hop_under_the_retreat(ctx, tmp_path, monkeypatch):
+    """--press-only planned the rise and home from the hop only after the
+    pop check, the arm standing 5 cm over the lid. They are planned while
+    the retreat flies, from its end, as the full mission's grip is; home
+    then flies with no plan made after the pop check, in one execution."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.tasks import press_demo
+
+    c = ctx
+    cl = c.client
+    cfg = _demo_cfg()
+    r = make_runner(cl, tmp_path)
+    args = type("A", (), {"execute": True, "press_only": True})()
+    touch = [type("R", (), {"contact_xyz": predicted_contact(c), "leg_name": "press:down"})()]
+    plans = lambda: len(cl.approach_offsets) + len(cl.joint_starts)  # noqa: E731
+    at_check = []
+    monkeypatch.setattr(press_demo, "knob_height_mm", lambda node, watcher, ctx, **kw: at_check.append(plans()) or 11.0)
+    press_demo.run_push(c, cfg, r, args, touch, node=object(), watcher=object())
+    legs = r.lookahead_result
+    assert names(legs) == ["retreat:rise", "home"]
+    assert legs[0].world == "interaction_button" and legs[1].world == "full"
+    assert list(legs[0].traj.points[0].positions) == pytest.approx(cl.live)  # from the hop
+    n_exec = len(cl.executed)
+    assert press_demo.fly_home_from_hop(c, cfg, r, True)
+    assert at_check == [plans()]  # nothing planned after the pop check
+    assert len(cl.executed) == n_exec + 1  # rise and home: one execution
+    assert cl.live == pytest.approx(press_demo.rest_joints(cfg))
+
+
+def test_press_only_home_refused_from_the_hop_is_an_honest_stop(ctx, tmp_path, capsys):
+    """main built the press-only home from the hop outside any guard: a
+    refused rise ended the run in a RuntimeError traceback, the arm over
+    the open box and no recovery tried. It now goes through try_home and
+    reports False (main exits 1); nothing moves on a refused plan."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.tasks import press_demo
+
+    c = ctx
+    cfg = _demo_cfg()
+    c.press_cfg = cfg
+    r = make_runner(c.client, tmp_path)
+    r.lookahead_result = None  # the lookahead failed under the retreat
+    # the rise from the hop, try_home's bench-world home, its rise
+    c.client.plans = [_Refused(), _Refused(), _Refused()]
+    assert not press_demo.fly_home_from_hop(c, cfg, r, True)
+    out = capsys.readouterr().out
+    assert "home from the hop refused" in out and "returning home" in out and "arm holds" in out
+    assert c.client.executed == []
 
 
 def _hop_frame(ctx, knob_up_m):
