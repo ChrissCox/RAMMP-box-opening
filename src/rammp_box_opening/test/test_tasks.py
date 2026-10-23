@@ -1712,6 +1712,128 @@ def test_a_dry_run_says_it_would_recentre_and_moves_nothing(ctx, tmp_path, monke
     assert "would move 40 mm" in capsys.readouterr().out
 
 
+class _IkFail:
+    success = False
+    message = "MotionGenStatus.IK_FAIL"
+    trajectory = None
+
+
+def test_a_refused_recentre_plan_presses_from_the_last_aim(ctx, tmp_path, monkeypatch, capsys):
+    """Near the reach edge the move over the button can be IK_FAIL: a
+    refused plan sends nothing, so the arm still stands at staging and the
+    last aim stands — it used to escape main() as a RuntimeError traceback,
+    the arm left hanging over the lid."""
+    first = ((0.450, 0.0, 0.085), 0.0)
+    press_demo, r, watcher, state = _centring_env(ctx, tmp_path, monkeypatch, tool_xys=[(0.45, 0.06)], aims=[])
+    ctx.client.plans = [_IkFail()]
+    got, moves, off = press_demo.centre_over_button(None, ctx, _demo_cfg(), r, watcher, True, first)
+    assert (got, moves, state["n"]) == (first, 0, 0) and ctx.client.executed == []
+    out = capsys.readouterr().out
+    assert "move over the button was refused" in out and "IK_FAIL" in out and "pressing from the last aim" in out
+
+
+def test_a_recentre_the_runner_refused_presses_from_the_last_aim(ctx, tmp_path, monkeypatch):
+    """The runner refusing the move (outcome 'refused': nothing sent) is the
+    same: the arm is still at staging, the last aim stands."""
+    first = ((0.450, 0.0, 0.085), 0.0)
+    press_demo, r, watcher, state = _centring_env(ctx, tmp_path, monkeypatch, tool_xys=[(0.45, 0.06)], aims=[])
+    monkeypatch.setattr(r, "_refusal", lambda leg: "wrist efforts stale")
+    got, moves, off = press_demo.centre_over_button(None, ctx, _demo_cfg(), r, watcher, True, first)
+    assert (got, moves, state["n"]) == (first, 0, 0) and ctx.client.executed == []
+
+
+def test_a_recentre_that_failed_in_flight_does_not_go_on_to_press(ctx, tmp_path, monkeypatch, capsys):
+    """A move that went out and failed partway (an aborted goal, a following
+    error) leaves the arm wherever it stopped: the run ends there with the
+    arm holding, as for every other failed motion — no press after a motion
+    fault, and no automatic recovery move either."""
+    first = ((0.450, 0.0, 0.085), 0.0)
+    press_demo, r, watcher, state = _centring_env(ctx, tmp_path, monkeypatch, tool_xys=[(0.45, 0.06)], aims=[first])
+    ctx.client.exec_script = [("failed", {"message": "goal aborted: following error", "progress": 0.4})]
+    with pytest.raises(SystemExit) as e:
+        press_demo.centre_over_button(None, ctx, _demo_cfg(), r, watcher, True, first)
+    assert e.value.code == 1
+    assert len(ctx.client.executed) == 1 and state["n"] == 0  # the failed move alone: no aim, no home
+    out = capsys.readouterr().out
+    assert "the move over the button failed" in out and "returning home" not in out
+
+
+def test_the_re_aim_over_the_button_is_asked_whether_the_box_is_open(ctx, tmp_path, monkeypatch, capsys):
+    """The aim from straight over the button is the best look at the knob:
+    an open box it shows (10 mm up) stops the run and goes home, like the
+    first aim's. A flush reading (2 mm) carries on."""
+    from rammp_box_opening.models.container import ContainerPose
+
+    first, second = ((0.450, 0.0, 0.085), 0.0), ((0.451, 0.001, 0.085), 0.0)
+    for up_mm, stops in ((10.0, True), (2.0, False)):
+        press_demo, r, watcher, state = _centring_env(
+            ctx, tmp_path, monkeypatch, tool_xys=[(0.45, 0.06), (0.451, 0.0015)], aims=[second]
+        )
+        asked = []
+
+        def aim(node, watcher, yaw, out=None, up_mm=up_mm, asked=asked, state=state, **kw):
+            state["n"] += 1  # the tool stands over the button from here
+            asked.append(out is not None)
+            if out is not None:
+                out["button_up_mm"] = up_mm
+            return second, "3/3 still frames found the button circle"
+
+        monkeypatch.setattr(press_demo, "aim_button_at_staging", aim)
+        ctx.cpose = ContainerPose(xyz=(0.45, 0.0, -0.07), yaw=0.0)
+        ctx.client.executed.clear()
+        if stops:
+            with pytest.raises(SystemExit) as e:
+                press_demo.centre_over_button(None, ctx, _demo_cfg(), r, watcher, True, first)
+            assert e.value.code == 1
+            out = capsys.readouterr().out
+            assert "already OPEN" in out and "returning home" in out
+            assert len(ctx.client.executed) == 2  # the move over it, then home
+        else:
+            got, moves, _off = press_demo.centre_over_button(None, ctx, _demo_cfg(), r, watcher, True, first)
+            assert (got, moves) == (second, 1)
+        assert asked == [True], up_mm
+
+
+def test_a_refused_staging_over_the_search_fix_goes_home(ctx, tmp_path, monkeypatch, capsys):
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.models.container import ContainerPose
+
+    press_demo = _search_env(monkeypatch)
+    monkeypatch.setattr(press_demo, "aim_button_at_staging", lambda *a, **k: (FIX, "3/3"))
+    watcher = _Watcher()
+    watcher.to_container_pose = lambda got: ContainerPose(xyz=(got[0][0], got[0][1], -0.027), yaw=got[1])
+    ctx.client.plans = [_IkFail()]  # approach:staging
+    with pytest.raises(SystemExit) as e:
+        press_demo.stage_over_search_fix(None, ctx, _demo_cfg(), make_runner(ctx.client, tmp_path), watcher, True, FIX)
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "over the search's fix was refused" in out and "returning home" in out
+
+
+def test_a_refused_second_press_plan_goes_home_not_a_traceback(ctx, tmp_path, monkeypatch, capsys):
+    """NOT POPPED: the arm rises back to staging and the second press is
+    planned there. A refusal of that plan stops with a STOP line and the
+    recovery home, not a traceback over the box."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.tasks import press_demo
+
+    args = type("A", (), {"execute": True, "press_only": True})()
+    touch = [type("R", (), {"contact_xyz": predicted_contact(ctx), "leg_name": "press:down"})()]
+    monkeypatch.setattr(press_demo, "knob_height_mm", lambda node, watcher, ctx, **kw: 0.2)
+
+    def refused(ctx, cfg, **kw):
+        raise RuntimeError("planning failed for press:down: MotionGenStatus.IK_FAIL")
+
+    monkeypatch.setattr(press_demo, "build_press_legs", refused)
+    with pytest.raises(SystemExit) as e:
+        press_demo.run_push(ctx, _demo_cfg(), make_runner(ctx.client, tmp_path), args, touch, node=object(), watcher=object())
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "NOT POPPED" in out and "STOP before pressing again" in out and "returning home" in out
+
+
 def _descent_leg():
     """A press descent as the planner client builds it: a planned segment
     from staging to the waypoint 60 mm above the target, at rest there,

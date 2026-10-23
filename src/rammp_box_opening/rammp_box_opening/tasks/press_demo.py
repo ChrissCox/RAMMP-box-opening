@@ -889,16 +889,36 @@ def centre_over_button(node, ctx, cfg, runner, watcher, execute, got):
             print("[press_demo] (dry run) would move %.0f mm over the button and aim again" % (1000 * off))
             break
         print("[press_demo] CENTRE: the button is %.0f mm from under the tool — moving over it" % (1000 * off))
-        leg = build_approach_leg(ctx, cfg)
+        try:
+            leg = build_approach_leg(ctx, cfg)
+        except RuntimeError as e:
+            # a refused plan sends nothing: the arm still stands at staging
+            print("[press_demo] CENTRE: the move over the button was refused (%s) — pressing from the last aim" % e)
+            break
         leg.name = "approach:recentre"
         res = runner.run([leg], execute=execute)
-        if any(not r.ok for r in res):
-            break  # the arm holds where the refused move left it; the last aim stands
+        bad = [r for r in res if not r.ok]
+        if bad and all(r.outcome == "refused" for r in bad):
+            break  # nothing was sent: the arm is still at staging; the last aim stands
+        if bad:
+            # the move went out and failed in flight (an aborted goal, a
+            # following error): the arm holds where it stopped — no press
+            # after a motion fault, and no automatic motion either
+            print("[press_demo] STOP: the move over the button failed (%s) — not pressing; arm holds" % bad[-1].detail)
+            sys.exit(1)
         moves += 1
-        again, status = aim_button_at_staging(node, watcher, got[1], runner=runner)
+        seen = {}
+        again, status = aim_button_at_staging(node, watcher, got[1], runner=runner, out=seen)
         if again is None:
             print("[press_demo] CENTRE: lost the button after the move (%s) — pressing from the last aim" % status)
             break
+        # the aim from straight over the button is the best look at the knob
+        # the run gets: an open box it shows stops the run like the first aim's
+        open_already = refuse_open_box(seen.get("button_up_mm"))
+        if open_already is not None:
+            runner.note("open_box", button_above_lid_mm=round(seen["button_up_mm"], 1))
+            try_home(ctx, runner, execute, "STOP: " + open_already)
+            sys.exit(1)
         got = again
         ctx.cpose = watcher.to_container_pose(got)
         off = _off_button(ctx, cfg)
@@ -928,8 +948,13 @@ def stage_over_search_fix(node, ctx, cfg, runner, watcher, execute, got, coarse=
     the lid. It may bring the arm here; it may not aim a press, so an aim
     that sees nothing stops the run."""
     ctx.cpose = planned_for = watcher.to_container_pose(got)
+    try:
+        approach = build_approach_leg(ctx, cfg)
+    except RuntimeError as e:
+        try_home(ctx, runner, execute, "STOP: the move to staging over the search's fix was refused — %s" % e)
+        sys.exit(1)
     res = runner.run(
-        [build_approach_leg(ctx, cfg)],
+        [approach],
         execute=execute,
         # the descent, planned while the arm flies there (as from the scene
         # camera's fix): at staging it is re-fitted to the aim, no plan
@@ -1567,7 +1592,12 @@ def run_push(ctx, cfg, runner, args, touch, touch_leg=None, node=None, watcher=N
                 "[press_demo] NOT POPPED — the knob reads %.1f mm above the lid after the push; "
                 "pressing once more" % up_mm
             )
-            return _press_again(ctx, cfg, runner, args, node, watcher, retries - 1)
+            try:
+                return _press_again(ctx, cfg, runner, args, node, watcher, retries - 1)
+            except RuntimeError as e:
+                # its re-plan refused: the arm stands at the hop over the box
+                try_home(ctx, runner, args.execute, "STOP before pressing again — %s" % e)
+                sys.exit(1)
         else:
             try_home(
                 ctx, runner, args.execute,
@@ -2516,7 +2546,13 @@ def main():
                 # alone — the one pre-planned during the approach when the aim
                 # agrees with the scene's fix, re-FITTED to the aim when it
                 # moved the target a little, re-planned only otherwise
-                press_legs, how = descent_from_staging(ctx, cfg, planned_for, preplanned)
+                try:
+                    press_legs, how = descent_from_staging(ctx, cfg, planned_for, preplanned)
+                except RuntimeError as e:
+                    # a refused press plan: nothing has touched the box —
+                    # rise over it and go home, never a traceback over the lid
+                    try_home(ctx, runner, args.execute, "STOP before the press — %s" % e)
+                    sys.exit(1)
                 runner.note("press_plan", from_staging=True, preplanned=press_legs is preplanned, how=how)
                 print("[press_demo] PRESS from staging — %s" % how)
             else:
@@ -2529,11 +2565,15 @@ def main():
                 # planned in its OWN world, so the lateral run happens where
                 # the container is visible.
                 runner.note("press_plan", chained=True)
-                approach = build_approach_leg(ctx, cfg)
-                press_legs = [
-                    approach,
-                    *build_press_legs(ctx, cfg, start_joints=approach.goal_joints),
-                ]
+                try:
+                    approach = build_approach_leg(ctx, cfg)
+                    press_legs = [
+                        approach,
+                        *build_press_legs(ctx, cfg, start_joints=approach.goal_joints),
+                    ]
+                except RuntimeError as e:
+                    try_home(ctx, runner, args.execute, "STOP before the press — %s" % e)
+                    sys.exit(1)
             touch_leg = press_legs[-1]
             # what follows the touch (the push's xy, the retreat) is relative
             # to the pose this stroke is ACTUALLY aimed at — a re-fitted or
