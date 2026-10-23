@@ -628,7 +628,7 @@ def _prune_captures(tag):
         pass
 
 
-def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix):
+def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix, lookahead=True):
     """The arm straight to staging above the scene camera's box, the descent
     pre-planned on the way, then the wrist's precise fix.
 
@@ -643,6 +643,9 @@ def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix):
     staging is tried, down to the clearance floor load_press_demo allows
     (staging_for_reach); when none reaches the box, nothing moves here and
     `reach_out` hands the press to tasks/reach_press.
+
+    `lookahead` False: no descent is planned on the way (--depth-press flies
+    its own).
 
     Returns a SceneApproach; `got` is None when the approach failed or the
     wrist saw nothing, `status` says which — the caller then stops. Its
@@ -678,7 +681,7 @@ def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix):
         res = runner.run(
             approach,
             execute=execute,
-            lookahead=lambda q: build_press_legs(ctx, cfg, start_joints=q),
+            lookahead=(lambda q: build_press_legs(ctx, cfg, start_joints=q)) if lookahead else None,
         )
         if any(not r.ok for r in res):
             return SceneApproach(failed=True, cfg=cfg, status="the approach to staging failed")
@@ -943,18 +946,20 @@ def _off_button(ctx, cfg):
     return math.hypot(button[0] + cfg.press_offset_xy[0] - tx, button[1] + cfg.press_offset_xy[1] - ty)
 
 
-def centre_over_button(node, ctx, cfg, runner, watcher, execute, got):
+def centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=None):
     """From staging, with a first aim `got` ((xyz, yaw)): until the tool
     stands within RECENTRE_TOL_M over the button, fly to staging over the
     aimed button (planned, collision-checked) and aim again from there — at
     most RECENTRE_MAX times. Returns (got, moves, off_m): the aim to press
     from (the last good one), how many moves it took, and how far the tool
     then stood from over the button. Sets ctx.cpose from that aim. A dry run
-    says what it would do and moves nothing."""
+    says what it would do and moves nothing. `max_moves` overrides
+    detect.recentre_max_moves."""
     moves = 0
     ctx.cpose = watcher.to_container_pose(got)
     off = _off_button(ctx, cfg)
-    max_moves = int(getattr(cfg, "recentre_max_moves", RECENTRE_MAX))
+    if max_moves is None:
+        max_moves = int(getattr(cfg, "recentre_max_moves", RECENTRE_MAX))
     while off > RECENTRE_TOL_M and moves < max_moves:
         if not execute:
             print("[press_demo] (dry run) would move %.0f mm over the button and aim again" % (1000 * off))
@@ -1004,7 +1009,27 @@ def centre_over_button(node, ctx, cfg, runner, watcher, execute, got):
     return got, moves, off
 
 
-def stage_over_search_fix(node, ctx, cfg, runner, watcher, execute, got, coarse=False):
+def centre_for_press(node, ctx, cfg, runner, watcher, execute, got, depth_press=False):
+    """centre_over_button at staging — but not before the depth press, which
+    centres the fingers itself from straight down by the wrist camera's own
+    frame (tasks/depth_press CENTRE), not by the wrist mount's TF this one
+    aims through (wrong on flatbot, rammp-deployments#128): there an aim
+    farther off than that may move (CENTRE_MAX_M) gets one planned move over
+    the button, and nothing else moves. Sets ctx.cpose from the aim either
+    way. Returns (got, moves, off_m) as centre_over_button."""
+    if not depth_press:
+        return centre_over_button(node, ctx, cfg, runner, watcher, execute, got)
+    from rammp_box_opening.tasks.depth_press import CENTRE_MAX_M
+
+    ctx.cpose = watcher.to_container_pose(got)
+    off = _off_button(ctx, cfg)
+    if off > CENTRE_MAX_M:
+        return centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=1)
+    runner.note("centre", moves=0, off_mm=round(1000 * off, 1), depth_press=True)
+    return got, 0, off
+
+
+def stage_over_search_fix(node, ctx, cfg, runner, watcher, execute, got, coarse=False, depth_press=False):
     """The wrist search's fix was taken from the look pose, half a metre
     up: fly to staging over it, aim at the button close up, and centre over
     it (centre_over_button) — the same aim every press gets, wherever the
@@ -1017,7 +1042,10 @@ def stage_over_search_fix(node, ctx, cfg, runner, watcher, execute, got, coarse=
     `coarse`: the fix is a sighting only (a top cut by the fingers or the
     image edge, or no button circle from high up) — biased by up to half
     the lid. It may bring the arm here; it may not aim a press, so an aim
-    that sees nothing stops the run."""
+    that sees nothing stops the run.
+
+    `depth_press`: no descent planned on the way, and centred as
+    centre_for_press says."""
     ctx.cpose = planned_for = watcher.to_container_pose(got)
     try:
         approach = build_approach_leg(ctx, cfg)
@@ -1029,7 +1057,7 @@ def stage_over_search_fix(node, ctx, cfg, runner, watcher, execute, got, coarse=
         execute=execute,
         # the descent, planned while the arm flies there (as from the scene
         # camera's fix): at staging it is re-fitted to the aim, no plan
-        lookahead=lambda q: build_press_legs(ctx, cfg, start_joints=q),
+        lookahead=None if depth_press else (lambda q: build_press_legs(ctx, cfg, start_joints=q)),
     )
     if any(not r.ok for r in res):
         sys.exit(1)
@@ -1052,7 +1080,7 @@ def stage_over_search_fix(node, ctx, cfg, runner, watcher, execute, got, coarse=
         runner.note("open_box", button_above_lid_mm=round(seen["button_up_mm"], 1))
         try_home(ctx, runner, execute, "STOP: " + open_already)
         sys.exit(1)
-    aim, _moves, _off = centre_over_button(node, ctx, cfg, runner, watcher, execute, aim)
+    aim, _moves, _off = centre_for_press(node, ctx, cfg, runner, watcher, execute, aim, depth_press=depth_press)
     return aim, True, preplanned, planned_for
 
 
@@ -2464,7 +2492,7 @@ def main():
                 else round(scene_fix.table_z_scene, 4),
             )
             reach = approach_from_scene(
-                node, ctx, cfg, runner, watcher, args.execute, scene_fix
+                node, ctx, cfg, runner, watcher, args.execute, scene_fix, lookahead=not args.depth_press
             )
             if reach.reach_out:
                 # no straight-down staging reaches this box: and ONLY then,
@@ -2488,7 +2516,8 @@ def main():
             if at_staging and not reach.in_flight:
                 # a move over the button leaves the pre-planned descent
                 # behind the arm: it is re-fitted from where it stands
-                got, _moves, _off = centre_over_button(node, ctx, cfg, runner, watcher, args.execute, got)
+                got, _moves, _off = centre_for_press(node, ctx, cfg, runner, watcher, args.execute, got,
+                                                     depth_press=args.depth_press)
             if reach.failed:
                 try_home(
                     ctx, runner, args.execute,
@@ -2577,7 +2606,7 @@ def main():
 
         if not at_staging and args.execute and not args.detect_only:
             got, at_staging, preplanned, planned_for = stage_over_search_fix(
-                node, ctx, cfg, runner, watcher, args.execute, got, coarse=coarse_search
+                node, ctx, cfg, runner, watcher, args.execute, got, coarse=coarse_search, depth_press=args.depth_press
             )
         pos, _yaw = got
         ctx.cpose = watcher.to_container_pose(got)
