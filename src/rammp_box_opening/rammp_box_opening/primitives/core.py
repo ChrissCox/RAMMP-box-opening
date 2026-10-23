@@ -599,11 +599,13 @@ def press_push(ctx, state, cfg, contact_xyz, world, name="press:push"):
     )
 
 
-def _push_guard_and_verify(m, cfg):
+def _push_guard_and_verify(m, cfg, depth_m=None):
+    """The push's backstop and its verdict; `depth_m` the push's own bound
+    when it is not button_travel_m (the reach-out's shallower push)."""
     guard = GuardSpec(touch_nm=max(0.5, m.touch_nm - cfg.contact_nm), trip="press")
 
     def verify(v):
-        mm = cfg.button_travel_m * 1000
+        mm = (cfg.button_travel_m if depth_m is None else float(depth_m)) * 1000
         if v.outcome == "touch":
             peak = "" if v.torque_peak is None else " at %.1f Nm" % v.torque_peak
             return True, "pressed — met a stop%s inside the %.0f mm push" % (peak, mm)

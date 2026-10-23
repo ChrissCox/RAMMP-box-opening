@@ -53,10 +53,11 @@ def set_chain_root(root, urdf_path=None):
     URDF is rendered with arm_mount as root and published on
     /arm/robot_description). Resets the singleton so the next _chain() call
     rebuilds with the new root and path."""
-    global _ROOT, _URDF_PATH, _CHAIN
+    global _ROOT, _URDF_PATH, _CHAIN, _GRAVITY
     _ROOT = str(root)
     _URDF_PATH = urdf_path
     _CHAIN = None
+    _GRAVITY = None
 
 
 def _chain():
@@ -67,6 +68,19 @@ def _chain():
 
         _CHAIN = ArmChain(root=_ROOT, path=_URDF_PATH)
     return _CHAIN
+
+
+_GRAVITY = None
+
+
+def _gravity():
+    """The arm's gravity model, from the same URDF and root as _chain()."""
+    global _GRAVITY
+    if _GRAVITY is None:
+        from rammp_box_opening.runtime.kinematics import GravityModel
+
+        _GRAVITY = GravityModel(root=_ROOT, path=_URDF_PATH)
+    return _GRAVITY
 
 
 def line_trajectory(joint_names, points):

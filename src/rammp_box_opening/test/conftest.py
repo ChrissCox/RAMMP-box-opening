@@ -64,6 +64,9 @@ class FakeClient:
     def efforts_present(self):
         return self.efforts
 
+    def settled_efforts(self, duration_s=0.3, settle_s=0.15, timeout_s=2.0):
+        return ([0.0] * 4, list(self.live)) if self.efforts else None
+
     def contact_xyz(self, timeout_s=0.25):
         return list(self.contact_at) if self.contact_at is not None else None
 
@@ -138,6 +141,7 @@ class FakeClient:
 class FakeStore:
     def __init__(self):
         self.pushes = []  # (kind, kwargs) — world-shape assertions
+        self.table_extent = None  # the surveyed bench: no measured table
 
     def push_name(self, kind, **kw):
         self.pushes.append((kind, kw))
