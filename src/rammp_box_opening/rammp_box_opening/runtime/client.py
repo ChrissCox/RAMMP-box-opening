@@ -205,11 +205,17 @@ class PlannerClient:
             return None  # frozen stream: the guard has lost its senses
         return list(self._eff[3:])
 
-    def settled_efforts(self, duration_s=0.3, settle_s=0.15, timeout_s=2.0):
+    def settled_efforts(self, duration_s=0.15, settle_s=0.15, timeout_s=2.0):
         """(wrist efforts, joints), each averaged over `duration_s` of fresh
         /joint_states once `settle_s` has passed, or None: the arm at rest,
         read as a free-air reference (tasks/reach_press). The arm must be
-        standing still — this only reads."""
+        standing still — this only reads.
+
+        0.15 s is ~7 messages at 49 Hz: at rest one message is within
+        ~0.03 Nm, so the mean sits far below every threshold it feeds
+        (STATIC_NM 0.75 and up) and the gravity model's own ~0.12 Nm
+        residual. A longer window only holds the arm still (review
+        2026-10-22: 0.30 s cost ~1.3 s a depth run for nothing measurable)."""
         effs, qs = [], []
         t0 = time.monotonic()
         last = None

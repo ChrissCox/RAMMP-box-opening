@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from rammp_box_opening.constants import (
     JOINT_ARC_PER_M,
     JOINT_VMAX,
+    PLANNER_LIMIT_MARGIN_RAD,
     TCP_OFFSET_M,
     TIP_TO_TOOL_M,
     CONTACT_SPEED,
@@ -414,9 +415,17 @@ class LiftFree:
         self.touch_nm = float(touch_nm)
 
     def plan(self, ctx, state):
+        from rammp_box_opening.runtime import approach
         from rammp_box_opening.runtime.approach import _chain, line_trajectory
         from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
 
+        # "vertical" is the chain root's z: on flatbot base_link leans 30 deg
+        # from the gravity-aligned arm_mount the planner works in, and a lift
+        # solved there moved the fingers 40 mm sideways for 69 mm up
+        if approach._ROOT != ctx.worlds.base_frame:
+            raise RuntimeError(
+                "plan-free lift refused: chain root %s != planning frame %s" % (approach._ROOT, ctx.worlds.base_frame)
+            )
         chain = _chain()
         q0 = list(state.joints if state.joints is not None else ctx.client.joints())
         R, t = chain.fk(q0)
@@ -442,6 +451,141 @@ class LiftFree:
         )
         ctx.last_pose = (end_xyz, list(quat))
         return [leg], PlanState(joints=list(leg.goal_joints), chain=state.chain + 1)
+
+
+# ClearMarginFree: a joint this near its limit is too near for the planner
+# to start from. It refuses a start inside its margin, and its finetune
+# trajopt (bound activation_distance 0.05 beyond that) failed every HOME from
+# 0.120-0.154 rad of room and planned it from 0.161 (2026-10-23)
+CLEAR_MARGIN_ROOM_RAD = PLANNER_LIMIT_MARGIN_RAD + 0.08
+# the shortest step leaves every joint this far from its limits, just
+# outside the margin; each next step moves the largest joint this much more
+CLEAR_MARGIN_FIRST_RAD = PLANNER_LIMIT_MARGIN_RAD + 0.02
+CLEAR_MARGIN_STRIDE_RAD = 0.05
+# it is plan-free, so it stays a step: no joint moves more than this
+CLEAR_MARGIN_MAX_STEP_RAD = 0.35
+# and the tool never goes lower than its start by more than this on the way
+# (the table and the box are below it)
+CLEAR_MARGIN_DROP_M = 0.005
+
+
+class ClearMarginFree:
+    """Plan-free steps along the straight joint line toward `goal`, for a
+    start with a joint too near its limit for the planner to plan from.
+
+    rammp-curobo refuses a start inside its joint-limit margin ("jog it away
+    from the limit first"), and its retiming fails from starts just outside
+    it, and from some farther out while the wrist is still folded:
+    2026-10-23, arm_joint_4 0.047 rad from -2.57 and the tool 268 mm above
+    arm_mount, HOME was refused from that joint jogged alone to 0.18-0.26
+    rad of room, and planned from 45% of the way along the joint line. So
+    steps() offers steps shortest first, from the one that just clears the
+    margin, and the caller plans from each until one plans. Along the line
+    each joint's room never falls below the smaller of its two ends (the
+    goal's is clear); a step is refused when the tool would drop on the way.
+    Guarded as an obstruction trip like LiftFree."""
+
+    def __init__(self, goal, name="clear-margin", speed=None, touch_nm=4.0):
+        self.goal = [float(v) for v in goal]
+        self.name = name
+        self.speed = CONTACT_SPEED if speed is None else float(speed)
+        self.touch_nm = float(touch_nm)
+
+    @staticmethod
+    def _limited():
+        from rammp_box_opening.runtime.approach import _chain
+
+        # continuous joints are left out: the planner's +-2 pi is never near
+        return [(j, lo, hi) for j, (lo, hi) in enumerate(_chain().limits) if lo is not None and hi is not None]
+
+    def near(self, ctx, q):
+        """[(joint name, room)] for each joint too near its limit for the
+        planner; [] when none is, or when there is no URDF to read the
+        limits from (the planner's own refusal stands, as before)."""
+        from rammp_box_opening.runtime import approach
+
+        if not approach.chain_ready()[0]:
+            return []
+        names = list(ctx.client.joint_names)
+        rooms = [(names[j], float(min(q[j] - lo, hi - q[j]))) for j, lo, hi in self._limited()]
+        return [(n, r) for n, r in rooms if r < CLEAR_MARGIN_ROOM_RAD]
+
+    def steps(self, ctx, state):
+        """Yield (legs, PlanState, info) per step, shortest first: no legs
+        for a start already outside the margin, then one plan-free leg each.
+        info: {"fraction", "largest_rad", "tool_move" (m, planning frame)}."""
+        import math
+
+        import numpy as np
+
+        from rammp_box_opening.runtime import approach
+        from rammp_box_opening.runtime.approach import _chain, line_trajectory
+
+        # the drop is the chain root's z: it must be the planning frame's
+        # (on flatbot base_link leans 30 deg from the gravity-aligned arm_mount)
+        if approach._ROOT != ctx.worlds.base_frame:
+            raise RuntimeError(
+                "%s refused: chain root %s != planning frame %s" % (self.name, approach._ROOT, ctx.worlds.base_frame)
+            )
+        chain = _chain()
+        names = list(ctx.client.joint_names)
+        q0 = np.asarray(state.joints if state.joints is not None else ctx.client.joints(), float)
+        goal = np.asarray(self.goal, float)
+        limited = self._limited()
+        first = 0.0
+        for j, lo, hi in limited:
+            if min(goal[j] - lo, hi - goal[j]) < CLEAR_MARGIN_ROOM_RAD:
+                raise RuntimeError(
+                    "%s refused: the goal's %s is %.3f rad from its limit, too near for the planner"
+                    % (self.name, names[j], min(goal[j] - lo, hi - goal[j]))
+                )
+            # the room to each limit is linear along the line and clear at its end
+            for f0, f1 in ((q0[j] - lo, goal[j] - lo), (hi - q0[j], hi - goal[j])):
+                if f0 < CLEAR_MARGIN_FIRST_RAD:
+                    first = max(first, (CLEAR_MARGIN_FIRST_RAD - f0) / (f1 - f0))
+        span = float(np.max(np.abs(goal - q0)))
+        if first == 0.0:
+            yield [], state, {"fraction": 0.0, "largest_rad": 0.0, "tool_move": np.zeros(3)}
+            if span == 0.0:
+                return
+        k = 0
+        while True:
+            frac = min(1.0, first + k * CLEAR_MARGIN_STRIDE_RAD / span)
+            k += 1
+            if frac == 0.0:
+                continue
+            largest = frac * span
+            if largest > CLEAR_MARGIN_MAX_STEP_RAD + 1e-9:
+                return
+            q1 = q0 + frac * (goal - q0)
+            n = max(2, int(math.ceil(largest / 0.01)))
+            pts = [q0 + (i / n) * (q1 - q0) for i in range(n + 1)]
+            tool = [chain.fk(q)[1] for q in pts]
+            drop = float(tool[0][2] - min(t[2] for t in tool))
+            if drop > CLEAR_MARGIN_DROP_M:
+                # a longer step runs the same line: it drops as much or more
+                raise RuntimeError(
+                    "%s refused: the joint line toward the goal drops the tool %.0f mm — jog the "
+                    "arm clear by hand first" % (self.name, 1000 * drop)
+                )
+            world_name, world_path = ctx.worlds.push_name("bench", model=None, tag="bare")
+            leg = Leg(
+                name=self.name,
+                kind=Kind.MOTION,
+                traj=line_trajectory(ctx.client.joint_names, [[float(v) for v in q] for q in pts]),
+                speed=self.speed,
+                guard=GuardSpec(touch_nm=self.touch_nm, trip="obstruction"),
+                world=world_name,
+                world_path=str(world_path),
+                chain=state.chain,
+                target=("joints", [float(v) for v in q1]),
+                goal_joints=[float(v) for v in q1],
+                plan_s=0.0,
+            )
+            info = {"fraction": float(frac), "largest_rad": float(largest), "tool_move": tool[-1] - tool[0]}
+            yield [leg], PlanState(joints=list(leg.goal_joints), chain=state.chain + 1), info
+            if frac >= 1.0:
+                return
 
 
 class Retreat:

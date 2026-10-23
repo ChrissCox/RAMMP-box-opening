@@ -127,3 +127,54 @@ def test_frames_land_as_bgr_and_metres_and_complete_the_streams():
     node.subscribed[INFO](info)
     assert g.k[0, 0] == 600.0 and g.k[1, 2] == 240.0
     assert g.missing() == []
+
+
+def test_each_image_is_kept_with_its_own_stamp_and_snapshots_read_them_once():
+    """Colour and depth are separate streams: each is stored with its own
+    stamp as one pair, so a consumer can tell a stalled or lagging depth
+    from the depth of the colour frame it judges."""
+    node = _Node()
+    g = D405Grabber(node, need_depth=True)
+    s = g.snapshot()
+    assert s.color is None and s.color_stamp is None and s.depth is None and s.depth_stamp is None
+
+    img = Image()
+    img.height, img.width, img.encoding = 1, 1, "bgr8"
+    img.data = bytes([1, 2, 3])
+    img.header.stamp.sec, img.header.stamp.nanosec = 7, 100
+    node.subscribed[COLOR](img)
+    assert g.depth_stamp is None and any(m.startswith("depth") for m in g.missing())
+
+    d = Image()
+    d.height, d.width, d.encoding = 1, 1, "16UC1"
+    d.data = np.array([500], dtype=np.uint16).tobytes()
+    d.header.stamp.sec, d.header.stamp.nanosec = 7, 200
+    node.subscribed[DEPTH](d)
+    assert not any(m.startswith("depth") for m in g.missing())
+    s = g.snapshot()
+    assert s.color.tolist() == [[[1, 2, 3]]] and (s.color_stamp.sec, s.color_stamp.nanosec) == (7, 100)
+    assert s.depth == pytest.approx(np.array([[0.5]])) and (s.depth_stamp.sec, s.depth_stamp.nanosec) == (7, 200)
+    assert s.color is g.color and s.depth is g.depth and s.depth_stamp is g.depth_stamp
+
+    # a new colour frame changes the colour pair only, and a snapshot taken
+    # before it keeps the frame it read
+    img2 = Image()
+    img2.height, img2.width, img2.encoding = 1, 1, "bgr8"
+    img2.data = bytes([4, 5, 6])
+    img2.header.stamp.sec = 8
+    node.subscribed[COLOR](img2)
+    assert g.color_stamp.sec == 8 and g.color.tolist() == [[[4, 5, 6]]] and g.depth_stamp.nanosec == 200
+    assert s.color_stamp.sec == 7 and s.color.tolist() == [[[1, 2, 3]]]
+
+
+def test_frame_snapshot_reads_a_grabber_without_a_snapshot():
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception.d405 import MISSING, frame_snapshot
+
+    fake = SimpleNamespace(color=1, color_stamp=2, depth=3, k=4)
+    s = frame_snapshot(fake)
+    assert (s.color, s.color_stamp, s.depth, s.k, s.dist) == (1, 2, 3, 4, None)
+    assert s.depth_stamp is MISSING  # it keeps none: nothing to pair
+    fake.depth_stamp = None
+    assert frame_snapshot(fake).depth_stamp is None  # a real "no depth yet": the frame waits
