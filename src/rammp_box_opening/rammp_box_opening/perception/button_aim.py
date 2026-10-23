@@ -106,6 +106,24 @@ class ButtonSighting:
     oblique: bool = False  # found by find_button_oblique
 
 
+def centre_depth(depth, u, v, r):
+    """The range at the circle's centre (m), or nan: the 7x7 window there,
+    or — that window empty — the disc's (0.8 r) median, which the gates hold
+    flat anyway. The flat pink disc seen straight down reads patchily, and
+    its centre window was empty in a whole aim's 38 frames (flatbot
+    2026-10-23 16:34) while the disc around it held depth."""
+    h, w = depth.shape
+    ui, vi = int(round(u)), int(round(v))
+    win = depth[max(0, vi - 3) : vi + 4, max(0, ui - 3) : ui + 4]
+    valid = win[(win > DEPTH_MIN_M) & (win < DEPTH_MAX_M) & np.isfinite(win)]
+    if valid.size >= 5:
+        return float(np.median(valid))
+    v0, u0, d2 = _window_d2(h, w, u, v, r)
+    disc = depth[v0 : v0 + d2.shape[0], u0 : u0 + d2.shape[1]][d2 < (0.8 * r) ** 2]
+    disc = disc[(disc > DEPTH_MIN_M) & (disc < DEPTH_MAX_M) & np.isfinite(disc)]
+    return float(np.median(disc)) if disc.size >= 20 else float("nan")
+
+
 def circle_gates(depth, k, rot_cam, trans_cam, u, v, r, lid_z):
     """Why this Hough circle is not the button, or None (it may be).
 
@@ -113,17 +131,25 @@ def circle_gates(depth, k, rot_cam, trans_cam, u, v, r, lid_z):
     in base. The centre must sit at lid height; the disc must be flat; the
     annulus around it must ALSO be at lid height — a rounded lid corner
     passes the first two and fails the third (the real frame of 2026-09-17
-    had four of them at Hough radii 25-34 px)."""
+    had four of them at Hough radii 25-34 px).
+
+    "Lid height" is the lid this frame measures — the annulus around the
+    circle — when that stands within LID_PRIOR_TOL_M of `lid_z`, else
+    `lid_z` itself. `lid_z` is the scene camera's table plus the box's
+    height, and that table swung 0.180-0.200 m over one afternoon with the
+    box standing still (flatbot 2026-10-23): judged against it alone, the
+    real button read "12 mm from lid height" and was refused."""
     h, w = depth.shape
     ui, vi = int(round(u)), int(round(v))
     if ui - 3 < 0 or vi - 3 < 0 or ui + 4 > w or vi + 4 > h:
         return "at the image border"
-    win = depth[vi - 3 : vi + 4, ui - 3 : ui + 4]
-    valid = win[(win > DEPTH_MIN_M) & (win < DEPTH_MAX_M) & np.isfinite(win)]
-    if valid.size < 5:
+    zc = centre_depth(depth, u, v, r)
+    if not np.isfinite(zc):
         return "no depth at the centre"
-    zc = float(np.median(valid))
     kk = np.asarray(k, float)
+    here = ring_height(depth, kk, rot_cam, trans_cam, u, v, r)
+    if np.isfinite(here) and abs(here - lid_z) <= LID_PRIOR_TOL_M:
+        lid_z = here  # the lid where this frame measures it
     pc = np.array([(u - kk[0, 2]) / kk[0, 0] * zc, (v - kk[1, 2]) / kk[1, 1] * zc, zc])
     p = np.asarray(rot_cam, float) @ pc + np.asarray(trans_cam, float)
     # at lid height — or ABOVE it by as much as a popped knob stands: an
@@ -259,8 +285,7 @@ def find_button(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=No
             whys.append(why)
             continue
         ui, vi = int(round(u)), int(round(v))
-        win = depth[vi - 3 : vi + 4, ui - 3 : ui + 4]
-        zc = float(np.median(win[(win > DEPTH_MIN_M) & (win < DEPTH_MAX_M) & np.isfinite(win)]))
+        zc = centre_depth(depth, float(u), float(v), float(r))
         # the centre's xy from its own (undistorted) pixel at its own range;
         # the height is the disc's median — the honest "top" for the
         # calibration line

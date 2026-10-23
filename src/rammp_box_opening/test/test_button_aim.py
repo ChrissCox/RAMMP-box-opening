@@ -1170,3 +1170,40 @@ def test_the_cut_lid_at_staging_is_found_where_the_box_was():
     assert info["cut"] and 0.15 < info["frac"] < 0.6
     assert lid[0] == pytest.approx(0.460, abs=0.01) and lid[1] == pytest.approx(-0.204, abs=0.01)
     assert 0.06 < np.hypot(lid[0] - 0.475, lid[1] + 0.276) < 0.10  # a re-staging, not a search
+
+
+def test_the_button_is_judged_against_the_lid_this_frame_measures(pink):
+    """Flatbot 2026-10-23: the scene camera's table swung 0.180-0.200 m with
+    the box still, and against table + dims.z alone the real button read
+    "12 mm from lid height" and was refused at 16:30. The lid ring around
+    the circle, when within LID_PRIOR_TOL_M of that, is the lid it is
+    judged against; farther, the prior stands and refuses."""
+    from rammp_box_opening.perception.button_aim import LID_PRIOR_TOL_M
+
+    h0 = _h0(pink)
+    b = np.r_[BUTTON_XY, h0]
+    cam = b + np.r_[0.01, -0.008, 0.13]
+    color, depth = render(cam, ROT_DOWN, [(BUTTON_XY, h0, 0.0)], h0 - BOX_H)
+    s, why = find_button(color, depth, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z, pink)
+    assert why is None, why
+    high, why_h = find_button(color, depth, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z + 0.015, pink)  # the table read 15 mm high
+    assert why_h is None and high.xyz == pytest.approx(s.xyz)
+    off, why_o = find_button(color, depth, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z + LID_PRIOR_TOL_M + 0.015, pink)
+    assert off is None, why_o  # a lid that far from the box's is no lid of this box
+
+
+def test_a_button_with_no_depth_at_its_very_centre_is_read_off_its_disc(pink):
+    """16:34: the flat disc seen straight down read patchily, its centre's
+    7x7 window empty in every frame: the disc's own median ranges it."""
+    h0 = _h0(pink)
+    b = np.r_[BUTTON_XY, h0]
+    cam = b + np.r_[0.01, -0.008, 0.13]
+    color, depth = render(cam, ROT_DOWN, [(BUTTON_XY, h0, 0.0)], h0 - BOX_H)
+    s, why = find_button(color, depth, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z, pink)
+    assert why is None, why
+    u, v = (int(round(c)) for c in s.uv)
+    holed = depth.copy()
+    holed[v - 6 : v + 7, u - 6 : u + 7] = 0.0
+    s2, why2 = find_button(color, holed, OAK_K, ROT_DOWN, cam, FLAT_TABLE_Z, pink)
+    assert why2 is None, why2
+    assert np.hypot(s2.xyz[0] - s.xyz[0], s2.xyz[1] - s.xyz[1]) < 0.002
