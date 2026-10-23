@@ -2259,6 +2259,15 @@ def test_the_lid_is_set_down_on_the_table_the_camera_measured():
     assert spots and all(x0 <= s[0] <= x1 and y0 <= s[1] <= y1 for s, _d in spots)
     assert [d for _s, d in spots] != [d for _s, d in press_demo.lid_drop_candidates(m, box, 0.30)]  # not the bench's zone
     assert press_demo.drop_zone(m, SimpleNamespace(table_extent=None)) == (*press_demo.DROP_X_M, *press_demo.DROP_Y_M)
+    # too few table points for an extent: the ring square assumed around the
+    # pink canister still leaves the lid somewhere to go
+    import numpy as np
+
+    from rammp_box_opening.perception.scene_source import seen_table_extent
+
+    pink = ContainerModel.load("src/rammp_box_opening/config/containers/ankou_pink.yaml")
+    ring, assumed = seen_table_extent(np.zeros((0, 3)), 0.30, box.xyz[:2])
+    assert assumed and press_demo.lid_drop_candidates(pink, box, 0.30, zone=press_demo.drop_zone(pink, SimpleNamespace(table_extent=ring)))
 
 
 def test_the_staging_aim_builds_its_aimer_the_straight_down_way_when_no_reach_out_priors_are_given(monkeypatch):

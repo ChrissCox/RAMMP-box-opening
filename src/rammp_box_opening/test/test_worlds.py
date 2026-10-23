@@ -262,6 +262,36 @@ def test_the_flatbot_world_file_carries_only_keys_worldstore_reads():
     assert "table" not in {o["name"] for o in w["obstacles"]}
 
 
+def test_a_measured_table_height_without_extent_says_the_planner_has_no_table(tmp_path, capsys):
+    """Review 2026-10-22: a height with no extent was dropped from every
+    world without a word. worlds does not invent a slab; it says so, once."""
+    m = ContainerModel.load(CFG)
+    store = WorldStore(FLATBOT, out_dir=tmp_path)
+    cp = ContainerPose(xyz=(0.55, -0.40, 0.2933), yaw=0.0)
+    store.table_top_z, store.table_extent = 0.2933, None
+    assert sorted(_written(store.push_name("bench", model=m)[1])) == ["floor"]
+    assert sorted(_written(store.push_name("full", model=m, cpose=cp)[1])) == ["container", "floor"]
+    assert capsys.readouterr().out.count("measured but no extent: the planner has NO table") == 1
+
+
+def test_a_measured_table_height_with_the_assumed_ring_square_is_planned(tmp_path):
+    import numpy as np
+
+    from rammp_box_opening.perception.scene_source import seen_table_extent
+    from rammp_box_opening.worlds import PLANNER_PADDING_M
+
+    m = ContainerModel.load(CFG)
+    store = WorldStore(FLATBOT, out_dir=tmp_path)
+    ext, assumed = seen_table_extent(np.zeros((0, 3)), 0.2933, (0.55, -0.40))
+    assert assumed
+    store.table_top_z, store.table_extent = 0.2933, ext
+    world = _written(store.push_name("bench", model=m)[1])
+    assert sorted(world) == ["floor", "table", "unseen_container_band"]
+    t = world["table"]
+    assert t["position"][2] + t["dims"][2] / 2 == pytest.approx(0.2933 - PLANNER_PADDING_M)
+    assert t["dims"][:2] == pytest.approx([0.60, 0.60])
+
+
 def test_a_surveyed_table_is_not_doubled_by_a_measured_one(tmp_path):
     m, cp = _model_pose()
     store = WorldStore(BENCH, out_dir=tmp_path)
