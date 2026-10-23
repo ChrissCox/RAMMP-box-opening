@@ -4,12 +4,15 @@ FAIL (nonzero exit): this shell not on Cyclone DDS; /joint_states missing
 or without effort fields; the driver's trajectory action or the planner's
 actions unreachable; the planner unable to load a world this repo writes
 (it runs in a container, so the worlds directory must be mounted into it
-at the same path); no TF for the finger tips; no gripper reported; a
-wrist camera stream the mission reads silent (colour, camera_info, and the
+at the same path); no TF for the finger tips, or for the wrist camera's
+parent frame; another program that moves this arm on the graph (both of
+which press_demo --execute refuses on); no gripper reported; a wrist
+camera stream the mission reads silent (colour, camera_info, and the
 ALIGNED depth, which only exists with align_depth.enable:=true).
-WARN (exit unaffected — the mission has a fallback): a silent scene camera
-stream (it searches with the wrist instead), an owl_detector not running,
-or running but deaf (no frame reaching it).
+WARN (exit unaffected — the mission has a fallback): no TF for the scene
+camera where TF places it (flatbot), a silent scene camera stream (it
+searches with the wrist instead), an owl_detector not running, or running
+but deaf (no frame reaching it).
 Report-only: the gripper's position.
 
 Preflight never moves anything: its client is not armed.
@@ -72,6 +75,47 @@ def camera_topics(store=None):
         (scene_depth, False, scene_fix),
         (scene_dinfo, False, scene_fix),
     ]
+
+
+def tf_checks(store):
+    """(target, source, required, fix) for every TF lookup the mission
+    refuses on (required) or loses the scene camera without. The wrist
+    frame is the one press_demo.readiness_refusal looks up."""
+    from rammp_box_opening.perception.d405 import CAMERA_CONFIG, camera_config
+    from rammp_box_opening.perception.scene import LINK_FRAME
+
+    parent = camera_config(store.wrist_camera_config or CAMERA_CONFIG)["parent_frame"]
+    out = [(store.base_frame, parent, True,
+            "is sheppy's `box_opening` node up (`sheppy up box-opening`)? press_demo --execute refuses without it")]
+    if store.external_static_tf:
+        # flatbot: the scene camera is placed by TF, not by a calibration
+        # (SceneLocator.base_to_link looks up the config's link_frame)
+        scfg = store.scene_camera_cfg or {}
+        out.append((store.base_frame, scfg.get("link_frame", LINK_FRAME), False,
+                    "the mission cannot place the scene camera — is sheppy's static_tf node up?"))
+    return out
+
+
+def tf_verdicts(checks, ok):
+    """[("PASS" | "FAIL" | "WARN", text)] from tf_checks and whether each
+    lookup succeeded (ok[i]). Pure."""
+    out = []
+    for (target, source, required, fix), got in zip(checks, ok):
+        if got:
+            out.append(("PASS", "TF %s -> %s" % (target, source)))
+        else:
+            out.append(("FAIL" if required else "WARN", "no TF %s -> %s — %s" % (target, source, fix)))
+    return out
+
+
+def other_clients_verdict(others):
+    """("PASS" | "FAIL", text) from client.other_arm_clients(). Pure."""
+    if others:
+        return "FAIL", (
+            "another program that moves this arm is running (%s) — `sheppy up box-opening` stops it"
+            % ", ".join(others)
+        )
+    return "PASS", "no other arm client on the graph"
 
 
 def stream_verdicts(topics, counts, window_s=STREAM_WINDOW_S):
@@ -229,6 +273,19 @@ def main():
             "(tf:=true starts robot_state_publisher)"
         )
         failures += 1
+
+    # 5b. TF for the wrist camera (press_demo --execute refuses without it)
+    #     and, where TF places it, the scene camera
+    checks = tf_checks(store)
+    ok = [client.tf_ready(target, source, timeout_s=3.0) for target, source, _r, _f in checks]
+    for level, text in tf_verdicts(checks, ok):
+        print("%-4s  %s" % (level, text))
+        failures += level == "FAIL"
+
+    # 5c. no other program that moves this arm (press_demo --execute refuses)
+    level, text = other_clients_verdict(client.other_arm_clients())
+    print("%-4s  %s" % (level, text))
+    failures += level == "FAIL"
 
     # 6. the gripper
     state = _gripper_state(node)

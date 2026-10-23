@@ -281,22 +281,29 @@ class ArmChain:
         the other way (joint_5 and joint_7 a half turn round, joint_6
         mirrored, re-solved to the same tool pose), each continuous joint
         taken the short way round from q_start (branches.nearest_branch) —
-        those inside every limit."""
+        those inside every limit. The fold is solved once and its whole-turn
+        copies on joint_5 and joint_7 added: FK repeats every 2*pi on those
+        continuous joints, so the -pi seeds converge to the same solve shifted
+        by a turn, and near the planner's +/-6 rad bound nearest_branch leaves
+        them raw, so each copy is still kept."""
         from rammp_box_opening.runtime.branches import (
             CONTINUOUS_JOINTS, PLANNER_CONTINUOUS_LIMIT_RAD, nearest_branch,
         )
 
         R, t = self.fk(q)
         out = [np.array(q, float)]
-        for d5 in (math.pi, -math.pi):
-            for d7 in (math.pi, -math.pi):
-                flip = np.array(q, float)
-                flip[4] += d5
-                flip[5] = -flip[5]
-                flip[6] += d7
-                qf = self.solve_pose(flip, t, R)
-                if qf is not None:
-                    out.append(qf)
+        flip = np.array(q, float)
+        flip[4] += math.pi
+        flip[5] = -flip[5]
+        flip[6] += math.pi
+        qf = self.solve_pose(flip, t, R)
+        if qf is not None:
+            for s5 in (0.0, -2.0 * math.pi):
+                for s7 in (0.0, -2.0 * math.pi):
+                    c = np.array(qf, float)
+                    c[4] += s5
+                    c[6] += s7
+                    out.append(c)
         out = [np.array(nearest_branch(c, q_start), float) for c in out]
         return [
             c for c in out

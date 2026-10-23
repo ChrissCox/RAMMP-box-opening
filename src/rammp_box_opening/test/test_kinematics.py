@@ -111,6 +111,83 @@ def test_the_same_reach_question_twice_is_walked_once(monkeypatch):
 
 
 
+def _four_solve_equivalents(chain, q_start, q):
+    """equivalents() as it was: the folded wrist re-solved from all four
+    half-turn seeds on joint_5 and joint_7."""
+    from rammp_box_opening.runtime.branches import (
+        CONTINUOUS_JOINTS, PLANNER_CONTINUOUS_LIMIT_RAD, nearest_branch,
+    )
+
+    R, t = chain.fk(q)
+    out = [np.array(q, float)]
+    for d5 in (math.pi, -math.pi):
+        for d7 in (math.pi, -math.pi):
+            flip = np.array(q, float)
+            flip[4] += d5
+            flip[5] = -flip[5]
+            flip[6] += d7
+            qf = chain.solve_pose(flip, t, R)
+            if qf is not None:
+                out.append(qf)
+    out = [np.array(nearest_branch(c, q_start), float) for c in out]
+    return [
+        c for c in out
+        if chain.within_limits(c) and all(abs(c[i]) <= PLANNER_CONTINUOUS_LIMIT_RAD for i in CONTINUOUS_JOINTS)
+    ]
+
+
+def test_the_folded_wrist_is_solved_once(chain, monkeypatch):
+    # joint_5 and joint_7 are continuous: the four half-turn seeds differ by
+    # whole turns and converge together, so one solve is all equivalents pays
+    calls = []
+    solve = chain.solve_pose
+
+    def counting(*a, **kw):
+        calls.append(1)
+        return solve(*a, **kw)
+
+    # on the instance: a test that patched the shared chain's instance
+    # attribute leaves it behind, and that would hide a class patch
+    monkeypatch.setattr(chain, "solve_pose", counting)
+    q = np.array(HOME, float) + np.array([0.05, -0.05, 0.03, 0.05, -0.04, 0.06, 0.02])
+    cands = chain.equivalents(HOME, q)
+    assert len(calls) == 1
+    assert len(cands) >= 2  # q and its fold
+
+
+def test_one_fold_solve_gives_the_four_solves_candidates(chain):
+    from rammp_box_opening.runtime.branches import CONTINUOUS_JOINTS, joint_time
+
+    rng = np.random.default_rng(20261022)
+    lo = np.array([-math.pi if a is None else a for a, _b in chain.limits])
+    hi = np.array([math.pi if b is None else b for _a, b in chain.limits])
+    checked = 0
+    for k in range(30):
+        q = rng.uniform(lo * 0.8, hi * 0.8)
+        for i in CONTINUOUS_JOINTS:
+            q[i] += 2.0 * math.pi * rng.integers(-1, 2)
+        q_start = rng.uniform(lo * 0.8, hi * 0.8)
+        if k % 2:  # continuous joints right at the planner's +/-6 rad bound
+            for i in CONTINUOUS_JOINTS:
+                q_start[i] = rng.choice([-1.0, 1.0]) * rng.uniform(5.0, 5.99)
+        new = chain.equivalents(q_start, q)
+        old = _four_solve_equivalents(chain, q_start, q)
+        assert len(new) == len(old)
+        unmatched = list(old)
+        for c in new:
+            j = next((j for j, o in enumerate(unmatched) if np.allclose(c, o, atol=1e-6)), None)
+            assert j is not None, (q, q_start, c)
+            unmatched.pop(j)
+        if old:
+            pick_new = min(new, key=lambda c: joint_time(q_start, c))
+            pick_old = min(old, key=lambda c: joint_time(q_start, c))
+            assert np.allclose(pick_new, pick_old, atol=1e-6)
+            checked += 1
+    assert checked >= 10
+
+
+
+
 # fk's precomputed chain and the analytic Jacobian: the same FK as the chain
 # multiplied out link by link, the exact derivative of it, and the same
 # lines (and refusals) the finite-difference Jacobian built.
