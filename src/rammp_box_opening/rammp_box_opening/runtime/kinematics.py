@@ -127,6 +127,7 @@ class ArmChain:
         self._segs = segs
         self._tail = (Racc, tacc)
         self._I3 = np.eye(3)
+        self._nearest_memo = None  # (inputs, answer) of the last nearest_solution
 
     def _fk_axes(self, q):
         """fk()'s (R, t), plus each moving joint's world axis z_k and origin p_k."""
@@ -249,20 +250,30 @@ class ArmChain:
 
         Measured from HOME to staging over boxes across the table (2026-09-25):
         the planner's own pick took 2.4-4.7 s and turned the wrist 3.2-3.6
-        rad; the walk from HOME 2.4-2.5 s; the folded wrist 1.6 s."""
+        rad; the walk from HOME 2.4-2.5 s; the folded wrist 1.6 s.
+
+        The last answer is kept for the exact same inputs: the staging's
+        reach proof (press_demo.staging_out_of_reach) and the planner client
+        ask the same question back to back, ~0.29 s of IK each (2026-10-22)."""
         from rammp_box_opening.runtime.branches import joint_time
 
-        start = np.array(q_start, float)
-        cands = []
-        for seed in [start, *[np.array(s, float) for s in seeds]]:
-            if cands:
-                break  # the seeds are only for when the walk from where the arm is found nothing
-            q = self.reach(seed, xyz, quat_xyzw)
-            if q is not None:
-                cands = self.equivalents(start, q)
-        if not cands:
-            return None
-        return min(cands, key=lambda q: joint_time(start, q))
+        key = (
+            tuple(float(v) for v in q_start), tuple(float(v) for v in xyz), tuple(float(v) for v in quat_xyzw),
+            tuple(tuple(float(v) for v in s) for s in seeds),
+        )
+        if self._nearest_memo is None or self._nearest_memo[0] != key:
+            start = np.array(q_start, float)
+            cands = []
+            for seed in [start, *[np.array(s, float) for s in seeds]]:
+                if cands:
+                    break  # the seeds are only for when the walk from where the arm is found nothing
+                q = self.reach(seed, xyz, quat_xyzw)
+                if q is not None:
+                    cands = self.equivalents(start, q)
+            best = min(cands, key=lambda q: joint_time(start, q)) if cands else None
+            self._nearest_memo = (key, best)
+        best = self._nearest_memo[1]
+        return None if best is None else np.array(best, float)  # a copy: the caller may change it
 
     def equivalents(self, q_start, q):
         """Every way this arm can hold tool_frame where `q` holds it, written
