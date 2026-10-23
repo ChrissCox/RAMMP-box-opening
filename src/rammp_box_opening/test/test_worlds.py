@@ -268,3 +268,19 @@ def test_a_surveyed_table_is_not_doubled_by_a_measured_one(tmp_path):
     store.table_top_z, store.table_extent = -0.06, (0.2, 0.9, -0.5, 0.5)
     tables = [o for o in yaml.safe_load(open(store.push_name("full", model=m, cpose=cp)[1]))["obstacles"] if o["name"] == "table"]
     assert len(tables) == 1 and tables[0]["dims"][0] == pytest.approx(1.68)  # the bench file's own
+
+
+def test_flatbot_guarded_bench_world_exists_only_with_a_measured_table(tmp_path):
+    """home_arm's guarded world on flatbot: the floor alone (the bare one)
+    until a table is measured, then the table and the band over it."""
+    m = ContainerModel.load(CFG)
+    store = WorldStore(FLATBOT, out_dir=tmp_path)
+    assert store.table_top_z is None
+    guarded = _written(store.push_name("bench", model=m)[1])
+    bare = _written(store.push_name("bench", model=None, tag="bare")[1])
+    assert guarded == bare  # why home_arm plans once there, with the caution first
+    store.table_top_z, store.table_extent = 0.30, (0.45, 1.10, -0.90, -0.10)
+    guarded = _written(store.push_name("bench", model=m)[1])
+    bare = _written(store.push_name("bench", model=None, tag="bare")[1])
+    assert {"table", "unseen_container_band"} <= set(guarded)
+    assert "unseen_container_band" not in bare and guarded != bare

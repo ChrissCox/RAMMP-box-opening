@@ -15,6 +15,13 @@ clears the bench before running it (review 2026-09-02). The attended
 abort drill Ctrl+Cs this mid-motion. When even the bare world refuses
 the START (the fingers are at the table), --lift-first M flies a plan-free
 straight vertical line of M metres first and plans HOME from its end.
+
+The band stands on the table, so it exists only where a table is known.
+A world YAML without one (flatbot: the table changes with every place
+the chair goes) and a fresh home_arm process, which measures none, make
+the guarded world the floor alone, the same as the bare one. There the
+caution prints BEFORE planning, and HOME is planned once in the bare
+world: re-planning a refused start in an identical world cannot help.
 """
 
 from rammp_box_opening.constants import HOME, TRANSIT_SPEED
@@ -37,6 +44,20 @@ def build_legs(ctx, lift_first_m=0.0):
             "[home_arm] plan-free lift of %.0f mm first (straight up, attitude held, "
             "obstruction-guarded) — HOME is planned from where it ends" % (1000 * lift_first_m)
         )
+    if ctx.worlds.table_top_z is None:
+        # no table, so no band: the guarded world would be the bare one.
+        # Say so before anything is planned, and plan once.
+        print(
+            "[home_arm] CAUTION: no table is known (this bench YAML has none and "
+            "home_arm measures none) — this home knows neither the table nor the "
+            "box. With --execute it flies NOW; run without it first, or use "
+            "--lift-first 0.08 to rise straight up before the planned sweep."
+        )
+        bare = ctx.worlds.push_name("bench", model=None, tag="bare")
+        leg, _ = _plan_motion(
+            ctx, state, "home", ("joints", list(HOME)), bare, TRANSIT_SPEED
+        )
+        return legs + [leg]
     guarded = ctx.worlds.push_name("bench", model=ctx.model)
     try:
         leg, _ = _plan_motion(

@@ -142,6 +142,7 @@ class FakeStore:
     def __init__(self):
         self.pushes = []  # (kind, kwargs) — world-shape assertions
         self.table_extent = None  # the surveyed bench: no measured table
+        self.table_top_z = -0.027  # world_bench.yaml's surveyed table top
 
     def push_name(self, kind, **kw):
         self.pushes.append((kind, kw))
