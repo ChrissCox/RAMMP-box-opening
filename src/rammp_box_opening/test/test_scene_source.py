@@ -360,3 +360,77 @@ def test_a_camera_that_sees_the_top_face_keeps_the_top_face_lift(model):
     boxes = [(0.5, list(_bbox_around(pts, uv, (0.45, -0.12))))]
     got = scene_fix_from_boxes(boxes, pts, uv, TABLE_Z, model, cam_xyz=np.array([0.0, 0.0, 0.6]))
     assert got.pose is not None and got.lift == "top"
+
+
+def test_a_tray_ranked_first_does_not_beat_the_box_from_the_side(model):
+    """Every candidate's top-face lift before any side lift: the side lift
+    never measures how far a container runs along the view, so the 19x9 cm
+    tray the top-face lift refuses would pass it ahead of the real box."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    rng = np.random.default_rng(5)
+    pts, uv = _scene(model, rng=rng)
+    lid_z = TABLE_Z + model.dims[2]
+    tray = np.c_[rng.uniform(0.25, 0.44, 1200), rng.uniform(0.25, 0.34, 1200), lid_z + rng.normal(0, 0.004, 1200)]
+    tray_uv = np.c_[(tray[:, 1] + 0.5) * 1000, (0.8 - tray[:, 0]) * 1000]
+    pts = np.vstack([pts, tray]); uv = np.vstack([uv, tray_uv])
+    tray_box = [tray_uv[:, 0].min() - 5, tray_uv[:, 1].min() - 5, tray_uv[:, 0].max() + 5, tray_uv[:, 1].max() + 5]
+    true_box = list(_bbox_around(pts, uv, (0.45, -0.12)))
+    got = scene_fix_from_boxes([(0.26, tray_box), (0.255, true_box)], pts, uv, TABLE_Z, model,
+                               cam_xyz=np.array([0.0, 0.0, 0.6]))
+    assert got.box == true_box and got.lift == "top", got.tried
+    assert got.pose.xyz[0] == pytest.approx(0.45, abs=0.01) and got.pose.xyz[1] == pytest.approx(-0.12, abs=0.01)
+    assert "another container" in got.tried[0]
+
+
+def test_a_camera_level_with_the_lid_takes_the_side_lift():
+    """The recorded flatbot frame of the 20:04 run (2026-10-22, camera z
+    0.400, the pink lid's top ~0.397, a table height read off the scene):
+    the top-face 'slab' is the lid's side band seen edge-on, and whether
+    it passed decided the fix on a few pixels of the OWL box — 13 mm in xy,
+    7.5 mm in lid height between runs of the same placement."""
+    import itertools
+    from pathlib import Path
+
+    from rammp_box_opening.perception.scene import color_cloud
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    z = np.load(Path(__file__).parent / "data" / "scene_level_flatbot_20261022_2004.npz")
+    T = z["T_base_color"]
+    pc, uv = color_cloud(z["depth_mm"].astype(float) / 1000.0, z["kd"], z["k"], z["dist"], z["T_color_depth"], stride=2)
+    pts = pc @ T[:3, :3].T + T[:3, 3]
+    model = ContainerModel.load(PINK)
+    table_z = table_from_scene_points(pts, uv, z["color"].shape[0], upside_down=True)  # what locate() does unsurveyed
+    assert not np.isnan(table_z)
+    x0, y0, x1, y1 = (float(v) for v in z["lid_box"])
+    tops = []
+    for dx, dy in itertools.product((0, 2, 4), (0, 3, 6)):  # an OWL box a few pixels looser
+        got = scene_fix_from_boxes([(0.6, [x0 - dx, y0 - dy, x1 + dx, y1 + dy])], pts, uv, table_z, model,
+                                   cam_xyz=T[:3, 3])
+        assert got.pose is not None and got.lift == "side", (dx, dy, got.lift, got.tried)
+        tops.append(got.top)
+    tops = np.asarray(tops)
+    assert np.all(tops.max(0) - tops.min(0) < 0.010)
+
+
+def test_the_top_face_is_seen_only_from_above_the_lid():
+    import itertools
+
+    from rammp_box_opening.perception.scene_source import sees_top_face
+
+    lid_z = 0.094
+    xs, ys = np.meshgrid(np.linspace(-0.05, 0.05, 11), np.linspace(-0.05, 0.05, 11))
+
+    def lid_at(x, y):
+        pts = np.c_[x + xs.ravel(), y + ys.ravel(), np.full(xs.size, lid_z)]
+        uv = np.c_[100 + 100 * xs.ravel(), 100 + 100 * ys.ravel()]
+        return pts, uv
+
+    bbox = (90, 90, 110, 110)
+    pts, uv = lid_at(0.5, 0.0)
+    assert not sees_top_face(pts, uv, bbox, lid_z, (0.0, 0.0, lid_z + 0.003))  # level with it, 0.5 m away
+    bench_cam = (-0.06506, 0.64157, 0.35206)  # config/camera_scene.yaml
+    for x, y in itertools.product((0.3, 0.75), (-0.45, 0.45)):
+        pts, uv = lid_at(x, y)
+        assert sees_top_face(pts, uv, bbox, lid_z, bench_cam), (x, y)
+    assert sees_top_face(pts, uv, (500, 500, 510, 510), lid_z, (0.0, 0.0, lid_z))  # nothing in the box: its lift says why
