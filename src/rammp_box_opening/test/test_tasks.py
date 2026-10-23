@@ -1085,9 +1085,9 @@ def test_the_scene_approach_says_so_when_the_wrist_sees_nothing_at_staging(ctx, 
 
 def test_a_box_out_of_straight_down_reach_goes_to_the_reach_out_press_with_nothing_moved(ctx, tmp_path, monkeypatch):
     """Flatbot 2026-10-22: staging above a box 0.89 m out was IK_FAIL (it
-    came out of the run as a traceback). That refusal, and only that — the
-    planner's IK_FAIL with the arm's own kinematics finding no staging pose
-    either — hands the press to tasks/reach_press."""
+    came out of the run as a traceback). The arm's own kinematics finding
+    no staging pose, neither at staging_m nor at the clearance floor, hands
+    the press to tasks/reach_press — before the planner is asked at all."""
     from conftest import runner as make_runner
 
     press_demo = _search_env(monkeypatch)
@@ -1097,32 +1097,163 @@ def test_a_box_out_of_straight_down_reach_goes_to_the_reach_out_press_with_nothi
 
     real = press_demo.build_approach_leg
     why = {"e": "planning failed for approach:staging: MotionGenStatus.IK_FAIL"}
+    planned = []
 
-    def refused(ctx, cfg):
+    def refused(ctx, cfg, start_joints=None):
+        planned.append(cfg.staging_m)
         raise RuntimeError(why["e"])
 
     out_of_reach = {"v": True}
     monkeypatch.setattr(press_demo, "build_approach_leg", refused)
-    monkeypatch.setattr(press_demo, "staging_out_of_reach", lambda ctx, cfg: out_of_reach["v"])
+    monkeypatch.setattr(press_demo, "staging_out_of_reach", lambda ctx, cfg, live=None: out_of_reach["v"])
     reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
-    assert reach.reach_out and reach.failed and reach.got is None and "IK_FAIL" in reach.status
-    assert not ctx.client.executed
+    assert reach.reach_out and reach.failed and reach.got is None and "no straight-down staging" in reach.status
+    assert reach.cfg is cfg  # the reach-out press gets the config as asked
+    assert not planned and not ctx.client.executed  # no doomed plan: the kinematics decided
     # IK_FAIL on a staging the arm CAN reach (a goal in collision): a STOP, not a different press
     out_of_reach["v"] = False
     reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
     assert reach.failed and not reach.reach_out and "refused" in reach.status
-    # any other refusal is a STOP too, whatever the kinematics say
-    out_of_reach["v"] = True
+    # any other refusal of a reachable staging is a STOP too
     why["e"] = "set_world before planning approach:staging failed: set_world timed out"
     reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
     assert reach.failed and not reach.reach_out
-    assert not ctx.client.executed
+    assert planned == [cfg.staging_m, cfg.staging_m] and not ctx.client.executed
     # a box straight down DOES reach is pressed the old way
     monkeypatch.setattr(press_demo, "build_approach_leg", real)
     monkeypatch.setattr(press_demo, "aim_button_at_staging", lambda *a, **k: (FIX, "3/3 frames"))
     near = _SceneFix((0.45, 0.0, -0.027), 0.0, (0.45, 0.0, 0.085))
     reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, near)
-    assert not reach.reach_out and reach.got == FIX
+    assert not reach.reach_out and reach.got == FIX and reach.cfg is cfg
+
+
+def _ladder_env(ctx, tmp_path, monkeypatch, ceiling_m, plan_error=None):
+    """approach_from_scene with the reach proof a function of the staging
+    height alone (in reach at and below `ceiling_m`) and the approach plan
+    recorded; `plan_error` makes the planner refuse it."""
+    from conftest import runner as make_runner
+
+    press_demo = _search_env(monkeypatch)
+    seen = {"proved": [], "planned": [], "proof_live": [], "plan_live": [], "reads": 0}
+    real_joints = ctx.client.joints
+
+    def joints():
+        seen["reads"] += 1
+        return real_joints()
+
+    def proof(ctx, cfg, live=None):
+        seen["proved"].append(round(cfg.staging_m, 4))
+        seen["proof_live"].append(live)
+        return cfg.staging_m > ceiling_m + 1e-9
+
+    real_leg = press_demo.build_approach_leg
+
+    def leg(ctx, cfg, start_joints=None):
+        seen["planned"].append(round(cfg.staging_m, 4))
+        seen["plan_live"].append(start_joints)
+        seen["reads_by_plan"] = seen["reads"]  # the runner reads them again while flying
+        if plan_error is not None:
+            raise RuntimeError(plan_error)
+        return real_leg(ctx, cfg, start_joints=start_joints)
+
+    monkeypatch.setattr(ctx.client, "joints", joints)
+    monkeypatch.setattr(press_demo, "staging_out_of_reach", proof)
+    monkeypatch.setattr(press_demo, "build_approach_leg", leg)
+    monkeypatch.setattr(press_demo, "aim_button_at_staging", lambda *a, **k: (FIX, "3/3 frames"))
+    return press_demo, make_runner(ctx.client, tmp_path), seen
+
+
+def test_a_staging_above_the_reach_ceiling_is_lowered_with_a_step_of_margin(ctx, tmp_path, monkeypatch):
+    """Flatbot 2026-10-22: on a high table the 0.12 staging is above the
+    straight-down ceiling where 0.10-0.11 reaches. The approach stages at
+    the highest step that reaches, one step lower for margin, and the press
+    stroke goes by that height."""
+    cfg = load_press_demo(CFG)
+    assert cfg.staging_m == pytest.approx(0.12)
+    press_demo, r, seen = _ladder_env(ctx, tmp_path, monkeypatch, ceiling_m=0.11)
+    floor = press_demo.staging_floor(ctx.model)
+    assert floor == pytest.approx(0.10)  # oxo_pop: dims.z - button_offset.z + 0.10
+    fix = _SceneFix((0.45, 0.0, -0.027), 0.0, (0.45, 0.0, 0.085))
+    reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
+    assert not reach.reach_out and not reach.failed and reach.got == FIX
+    assert seen["proved"] == [0.12, 0.10, 0.115, 0.11]  # the floor first, then down from the top
+    assert seen["planned"] == [0.105] and reach.cfg.staging_m == pytest.approx(0.105)
+    assert min(seen["proved"] + seen["planned"]) >= floor - 1e-9  # never below the clearance floor
+    assert cfg.staging_m == pytest.approx(0.12)  # the caller's config untouched
+    # the descent pre-planned on the way is the lowered staging's
+    down = reach.preplanned[0]
+    assert down.contact_path_frac == pytest.approx(0.105 / (0.105 + cfg.travel_m))
+    # one read of the joints, the same one to the proof and the plan
+    assert seen["reads_by_plan"] == 1 and seen["proof_live"][0] is not None
+    assert all(q is seen["proof_live"][0] for q in seen["proof_live"] + seen["plan_live"])
+
+
+def test_a_box_out_of_reach_even_at_the_floor_costs_two_proofs_and_no_plan(ctx, tmp_path, monkeypatch):
+    """Tonight's boxes, 0.59-0.60 m out, reached at neither 0.12 nor the
+    0.10 floor: the reach-out press, after two proofs, not the whole ladder."""
+    cfg = load_press_demo(CFG)
+    press_demo, r, seen = _ladder_env(ctx, tmp_path, monkeypatch, ceiling_m=0.07)
+    fix = _SceneFix((0.45, 0.0, -0.027), 0.0, (0.45, 0.0, 0.085))
+    reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
+    assert reach.reach_out and reach.failed and reach.cfg is cfg
+    assert seen["proved"] == [0.12, 0.10] and seen["planned"] == []
+    assert not ctx.client.executed
+    # a staging_m already at the floor is proved once
+    seen["proved"].clear()
+    reach = press_demo.approach_from_scene(None, ctx, replace(cfg, staging_m=0.10), r, _Watcher(), True, fix)
+    assert reach.reach_out and seen["proved"] == [0.10]
+
+
+def test_a_lowered_staging_the_planner_refuses_goes_to_the_reach_out_press(ctx, tmp_path, monkeypatch):
+    """The kinematics reaches a lowered staging, the planner (its padded
+    cuboid, its finger spheres) does not: staging_m itself was already out
+    of reach, so it is the reach-out press, as it was before the ladder."""
+    cfg = load_press_demo(CFG)
+    press_demo, r, seen = _ladder_env(
+        ctx, tmp_path, monkeypatch, ceiling_m=0.105,
+        plan_error="planning failed for approach:staging: MotionGenStatus.IK_FAIL",
+    )
+    fix = _SceneFix((0.45, 0.0, -0.027), 0.0, (0.45, 0.0, 0.085))
+    reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
+    assert seen["planned"] == [0.10]
+    assert reach.reach_out and reach.failed and reach.cfg is cfg and "IK_FAIL" in reach.status
+    assert not ctx.client.executed
+
+
+def test_a_reachable_staging_the_planner_refuses_is_a_stop_proved_once(ctx, tmp_path, monkeypatch):
+    cfg = load_press_demo(CFG)
+    fix = _SceneFix((0.45, 0.0, -0.027), 0.0, (0.45, 0.0, 0.085))
+    for error in ("planning failed for approach:staging: MotionGenStatus.IK_FAIL",
+                  "set_world before planning approach:staging failed: set_world timed out"):
+        press_demo, r, seen = _ladder_env(ctx, tmp_path, monkeypatch, ceiling_m=0.2, plan_error=error)
+        reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
+        assert reach.failed and not reach.reach_out and "refused" in reach.status
+        assert seen["proved"] == [0.12] and seen["planned"] == [0.12]
+
+
+def test_flatbots_high_table_lowers_the_staging_where_straight_down_reaches(ctx, monkeypatch):
+    """Flatbot's URDF, the pink canister on the 2026-10-22 table (0.2933 in
+    arm_mount): the 200421 box, 0.59 m out, reaches at no staging down to
+    the floor (the reach-out press, as that night); the same table 0.40 m
+    out along the same bearing presses straight down from a lower staging."""
+    from rammp_box_opening.models.container import ContainerModel
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.kinematics import ArmChain
+    from rammp_box_opening.tasks import press_demo
+
+    pink = "src/rammp_box_opening/config/containers/ankou_pink.yaml"
+    chain = ArmChain(path="src/rammp_box_opening/test/data/arm_flatbot_20261021.urdf", root="arm_mount")
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    ctx.model = ContainerModel.load(pink)
+    cfg = load_press_demo(pink)
+    live = [0.067, -1.897, -3.137, -2.269, -0.211, -0.683, 1.725]  # flatbot's HOME
+    x, y, z, yaw = 0.565, -0.1794, 0.2933, math.radians(86.2)
+    ctx.cpose = ContainerPose(xyz=(x, y, z), yaw=yaw)
+    assert press_demo.staging_for_reach(ctx, cfg, live=live) is None
+    k = 0.40 / math.hypot(x, y)
+    ctx.cpose = ContainerPose(xyz=(x * k, y * k, z), yaw=yaw)
+    lowered = press_demo.staging_for_reach(ctx, cfg, live=live)
+    assert lowered is not None and 0.10 - 1e-9 <= lowered.staging_m <= 0.115 + 1e-9
 
 
 def test_the_scene_approach_returns_the_precise_fix_and_the_preplanned_descent(ctx, tmp_path, monkeypatch):
