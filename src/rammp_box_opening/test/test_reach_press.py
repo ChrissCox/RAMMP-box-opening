@@ -250,6 +250,7 @@ class _Rec:
     def __init__(self):
         self.events = []
         self.legs = {}  # name -> the last leg of that name
+        self.owl = []  # the scene OWL's ("on"/"off", events before it)
 
 
 def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4), scene_after="same", settled=None,
@@ -321,7 +322,10 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
     fix = SimpleNamespace(pose=ContainerPose(xyz=(BUTTON[0], BUTTON[1], BUTTON[2] - 0.121), yaw=0.0), top_xyz=BUTTON)
     moved_pose = ContainerPose(xyz=(BUTTON[0] + 0.05, BUTTON[1], BUTTON[2] - 0.121), yaw=0.0)
     seen = {"same": fix, "none": None, "moved": SimpleNamespace(pose=moved_pose, top_xyz=(BUTTON[0] + 0.05, BUTTON[1], BUTTON[2]))}
-    locator = SimpleNamespace(locate=lambda s: (rec.events.append("scene"), seen[scene_after])[1])
+    # the scene OWL's enables/disables, each with how many events came before it
+    owl = SimpleNamespace(enable=lambda: rec.owl.append(("on", len(rec.events))),
+                          disable=lambda: rec.owl.append(("off", len(rec.events))))
+    locator = SimpleNamespace(owl=owl, locate=lambda s: (rec.events.append("scene"), seen[scene_after])[1])
     args = SimpleNamespace(execute=True, press_only=True)
     code = reach_press.run_reach_press(None, ctx, cfg, runner, SimpleNamespace(), args, fix, locator)
     return code, rec, chain, home
@@ -357,6 +361,36 @@ def test_the_reach_out_press_flies_in_presses_unloads_judges_and_only_then_goes_
     assert any(xyz[2] == pytest.approx(0.45 + reach_press.UNLOAD_CHECK_M) for xyz, _q in chain.lines)
     # every world from the aim on holds the box where the aim put it
     assert _reach_world_button(ctx) == pytest.approx(list(BUTTON))
+
+
+def test_the_scene_owl_is_enabled_before_the_post_press_wrist_aim(ctx, monkeypatch, tmp_path):
+    # its first bbox (~1.2 s) comes while the wrist re-aims, not after it
+    code, rec, _c, _h = _flow(ctx, monkeypatch, tmp_path)
+    assert code == 0
+    assert rec.events == [
+        "reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "press:down", "press:push",
+        "reach:unload", "reach:rise", "reach:slide-out", "aim:reach-after", "scene", "home",
+    ]
+    ons = [i for word, i in rec.owl if word == "on"]
+    assert ons and min(ons) <= rec.events.index("aim:reach-after")
+
+
+def test_an_aim_that_raises_after_the_early_enable_disables_the_scene_owl(ctx, monkeypatch):
+    # the enable is latched: a Ctrl-C in the re-aim must not leave the scene OWL inferring
+    ctx.model = ContainerModel.load(PINK)
+    calls = []
+    owl = SimpleNamespace(enable=lambda: calls.append("on"), disable=lambda: calls.append("off"))
+    locator = SimpleNamespace(owl=owl, locate=lambda s: calls.append("scene"))
+
+    def aim(node, watcher, yaw, lid_z, prior_xy, runner_, tag):
+        assert tag == "reach-after"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(reach_press, "_aim", aim)
+    fix = SimpleNamespace(top_xyz=BUTTON)
+    with pytest.raises(KeyboardInterrupt):
+        reach_press._after_check(None, ctx, SimpleNamespace(), SimpleNamespace(), fix, locator, BUTTON, None, 0.0)
+    assert calls == ["on", "off"]
 
 
 def _reach_world_button(ctx):
