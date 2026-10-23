@@ -269,8 +269,10 @@ run for grip and place.
   `home_arm --execute`; when that is refused as an INVALID START in both
   worlds (the fingers are at the table after an abort or a jog — 40 mm
   up, 23 deg off vertical was refused on 2026-09-17), run
-  `home_arm --execute --lift-first 0.08`: a plan-free straight vertical
-  lift of 80 mm at contact speed (the arm's own kinematics, attitude
+  `scripts/sheppy_task.sh home_arm --execute --lift-first 0.08` (on
+  flatbot it must be that wrapper: it passes world_flatbot.yaml, and the
+  lift refuses when the arm chain's root is not the planning frame) — a
+  plan-free straight vertical lift of 80 mm at contact speed (the arm's own kinematics, attitude
   held, obstruction-guarded — anything met on the way UP stops it), then
   HOME planned from where the lift ends. Straight up is the one direction
   that cannot meet the table; keep the space above the fingers clear.
