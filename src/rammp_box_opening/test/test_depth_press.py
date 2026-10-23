@@ -1006,3 +1006,35 @@ def test_the_lid_is_gripped_only_off_a_popped_box_standing_where_it_was_seen():
         dp.DepthPress(free=True, contact=True, popped=True, moved=True, shift_m=0.004, lid_dz_m=0.02),  # tipped
     ):
         assert not dp.lid_ready(bad), bad
+
+
+def test_at_rest_the_lens_is_placed_even_when_tf_lags_the_newest_frame(monkeypatch):
+    """Flatbot 2026-10-23 16:51: right over the box, both of the depth look's
+    frames were newer than the newest arm TF, the lookup at their stamps
+    failed, and the press stopped "no camera pose for the wrist's frames".
+    The arm had not moved since the look began, so the camera's pose a
+    little earlier — never before the arm stopped — places the lens."""
+    from rclpy.time import Time
+
+    from rammp_box_opening.runtime import approach
+
+    stamp_ns = 1_000_000_000_000
+    latest_ns = stamp_ns - 40_000_000  # TF is 40 ms behind the frame
+
+    class Buffer:
+        def lookup_transform(self, root, parent, when):
+            if when.nanoseconds > latest_ns:
+                raise RuntimeError("extrapolation into the future")
+            return SimpleNamespace(transform=SimpleNamespace(
+                translation=SimpleNamespace(x=0.0, y=0.065, z=-0.105), rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)))
+
+    grab = SimpleNamespace(tf_buffer=Buffer(), parent="wrist_camera_color_optical_frame", _base_frame="arm_mount",
+                           mount_xyz=[0.0, 0.0, 0.0], mount_quat=[0.0, 0.0, 0.0, 1.0], stamp_offset_s=0.0,
+                           color_stamp=Time(nanoseconds=stamp_ns).to_msg())
+    monkeypatch.setattr(approach, "_chain", lambda: SimpleNamespace(fk=lambda q: (np.eye(3), np.zeros(3))))
+    ctx = SimpleNamespace(client=SimpleNamespace(joints=lambda: [0.0] * 7))
+    assert dp.lens_in_hand(ctx, grab) is None  # at the frame's own stamp: TF has nothing yet
+    lens, r_hc = dp.lens_in_hand(ctx, grab, still_since_ns=stamp_ns - 1_000_000_000)
+    assert lens == pytest.approx([0.0, 0.065, -0.105])
+    # ... but never from before the arm stopped
+    assert dp.lens_in_hand(ctx, grab, still_since_ns=stamp_ns - 20_000_000) is None

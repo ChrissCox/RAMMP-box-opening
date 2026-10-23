@@ -158,7 +158,12 @@ def find_in_camera(color, depth, k, model, dist=None):
     return None, "; ".join(whys) if whys else "no flat surface in depth"
 
 
-def lens_in_hand(ctx, grab):
+# lens_in_hand at rest: when TF has no pose yet at the newest frame's stamp,
+# the pose this much earlier — never before the arm stopped — is the same one
+STILL_POSE_BACK_S = 0.15
+
+
+def lens_in_hand(ctx, grab, still_since_ns=None):
     """Where the wrist lens is from the tool frame, in the hand's own axes:
     (lens xyz (m), R_hand_cam — the camera's axes in the hand's), from the
     camera's pose at its newest frame (TF: the arm's model and the camera's
@@ -167,11 +172,23 @@ def lens_in_hand(ctx, grab):
     far the lens axis sits beside the fingers' line, z how far along the
     tool (negative: behind the tool frame). R_hand_cam is the identity on
     flatbot's OAK, 180 deg about the lens axis on the bench's D405. None
-    without a camera pose."""
+    without a camera pose.
+
+    `still_since_ns`: the arm has not moved since then (look()'s frames
+    count from it). TF can lag the newest frame's stamp, and the lookup at
+    it fails — both of a look's two frames did at 16:51 on 2026-10-23, and
+    the depth press stopped "no camera pose" right over the box — so the
+    pose STILL_POSE_BACK_S before it, never before the arm stopped, stands
+    in: the camera has not moved in between."""
     from rammp_box_opening.perception.depth_source import camera_pose_at
     from rammp_box_opening.runtime import approach
 
     cam = camera_pose_at(grab)
+    if cam is None and still_since_ns is not None and getattr(grab, "color_stamp", None) is not None:
+        from rclpy.time import Time
+
+        back = max(int(still_since_ns), _stamp_ns(grab.color_stamp) - int(STILL_POSE_BACK_S * 1e9))
+        cam = camera_pose_at(grab, stamp=Time(nanoseconds=back).to_msg())
     if cam is None:
         return None
     rot, trans = cam
@@ -247,7 +264,7 @@ def look(node, watcher, model, tag, runner=None, ctx=None, settled=False):
         last = st
         frames += 1
         if lens is None and ctx is not None:
-            lens = lens_in_hand(ctx, g)
+            lens = lens_in_hand(ctx, g, still_since_ns=after)
         z = None if lens is None else depth_under_fingers(g.depth, g.k, lens[0], lens[1])
         if z is not None:
             under.append(z)
@@ -256,7 +273,9 @@ def look(node, watcher, model, tag, runner=None, ctx=None, settled=False):
             continue
         seen.append(s)
         near = [o for o in seen if math.hypot(o.x - s.x, o.y - s.y) < LOOK_AGREE_M]
-        if len(near) >= LOOK_HITS:
+        # with ctx, the sighting is no use without the lens to place it by:
+        # keep looking until the camera's pose is had too
+        if len(near) >= LOOK_HITS and (lens is not None or ctx is None):
             med = LensSighting(
                 x=float(np.median([o.x for o in near])), y=float(np.median([o.y for o in near])),
                 lid_depth=float(np.median([o.lid_depth for o in near])),
