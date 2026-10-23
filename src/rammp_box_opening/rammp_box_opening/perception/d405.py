@@ -106,6 +106,10 @@ class D405Grabber:
         # the stamp lag against the arm; camera_pose_at looks the pose up at
         # stamp + this
         self.stamp_offset_s = float(cfg.get("stamp_offset_s", 0.0) or 0.0)
+        # the measured lens from tool_frame the depth press checks TF
+        # against (tasks/depth_press); None: unmeasured, it does not centre
+        lens = cfg.get("wrist_lens_in_hand_m")
+        self.wrist_lens_in_hand_m = None if lens is None else [float(v) for v in lens]
         # Topic paths: explicit keys take precedence over namespace-derived
         # defaults (OAK-D uses /rgb and /stereo instead of /color and
         # /aligned_depth_to_color).
