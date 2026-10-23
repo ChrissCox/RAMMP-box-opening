@@ -889,6 +889,22 @@ def test_a_run_refuses_before_any_motion_without_the_arms_tf_or_beside_adl():
     assert press_demo.readiness_refusal(_Readiness(tf=False, others=["rammp_adl_runtime"]), execute=False) is None
 
 
+def test_the_tf_gate_asks_for_the_worlds_wrist_camera_frame():
+    """Flatbot 2026-10-22: the gate looked up the D405 default's
+    end_effector_link, which flatbot (arm_-prefixed, OAK wrist) never
+    publishes, and refused a healthy stack."""
+    from rammp_box_opening.tasks import press_demo
+
+    asked = []
+    client = _Readiness()
+    client.tf_ready = lambda target, source, timeout_s=2.0: asked.append(source) or True
+    assert press_demo.readiness_refusal(client, execute=True, camera_cfg_name="camera_oak_wrist.yaml") is None
+    assert asked == ["wrist_camera_color_optical_frame"]
+    asked.clear()
+    press_demo.readiness_refusal(client, execute=True)
+    assert asked == ["end_effector_link"]  # the D405 default, unchanged
+
+
 class _SceneFix:
     def __init__(self, xyz, yaw, top):
         from rammp_box_opening.models.container import ContainerPose
@@ -1047,9 +1063,10 @@ def test_a_camera_knocked_since_its_calibration_is_corrected_from_the_pairs_sinc
     assert said is not None and "REFINED" in said
 
 
-def test_the_scene_approach_falls_back_to_the_search_when_the_wrist_sees_nothing(ctx, tmp_path, monkeypatch):
+def test_the_scene_approach_says_so_when_the_wrist_sees_nothing_at_staging(ctx, tmp_path, monkeypatch):
     """The scene camera is coarse and may be wrong by a few centimetres; the
-    wrist must confirm at staging or the old search runs from there."""
+    wrist must confirm at staging, or the run stops there — the wrist aims,
+    it does not search (owner, 2026-10-22)."""
     from conftest import runner as make_runner
 
     press_demo = _search_env(monkeypatch)
@@ -1061,9 +1078,51 @@ def test_the_scene_approach_falls_back_to_the_search_when_the_wrist_sees_nothing
     monkeypatch.setattr(press_demo, "aim_button_at_staging", lambda *a, **k: (None, "no button"))
     reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
     assert reach.got is None and reach.status == "no button"  # nothing confirmed
-    assert ctx.client.executed  # ... but the arm did fly to staging first
+    assert not reach.failed and ctx.client.executed  # ... but the arm did fly to staging first
     # the descent was still planned on the way, from the coarse pose
     assert reach.preplanned is not None and reach.preplanned[0].name == "press:down"
+
+
+def test_a_box_out_of_straight_down_reach_goes_to_the_reach_out_press_with_nothing_moved(ctx, tmp_path, monkeypatch):
+    """Flatbot 2026-10-22: staging above a box 0.89 m out was IK_FAIL (it
+    came out of the run as a traceback). That refusal, and only that — the
+    planner's IK_FAIL with the arm's own kinematics finding no staging pose
+    either — hands the press to tasks/reach_press."""
+    from conftest import runner as make_runner
+
+    press_demo = _search_env(monkeypatch)
+    cfg = load_press_demo(CFG)
+    r = make_runner(ctx.client, tmp_path)
+    fix = _SceneFix((0.67, -0.58, -0.027), 0.0, (0.67, -0.58, 0.085))
+
+    real = press_demo.build_approach_leg
+    why = {"e": "planning failed for approach:staging: MotionGenStatus.IK_FAIL"}
+
+    def refused(ctx, cfg):
+        raise RuntimeError(why["e"])
+
+    out_of_reach = {"v": True}
+    monkeypatch.setattr(press_demo, "build_approach_leg", refused)
+    monkeypatch.setattr(press_demo, "staging_out_of_reach", lambda ctx, cfg: out_of_reach["v"])
+    reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
+    assert reach.reach_out and reach.failed and reach.got is None and "IK_FAIL" in reach.status
+    assert not ctx.client.executed
+    # IK_FAIL on a staging the arm CAN reach (a goal in collision): a STOP, not a different press
+    out_of_reach["v"] = False
+    reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
+    assert reach.failed and not reach.reach_out and "refused" in reach.status
+    # any other refusal is a STOP too, whatever the kinematics say
+    out_of_reach["v"] = True
+    why["e"] = "set_world before planning approach:staging failed: set_world timed out"
+    reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
+    assert reach.failed and not reach.reach_out
+    assert not ctx.client.executed
+    # a box straight down DOES reach is pressed the old way
+    monkeypatch.setattr(press_demo, "build_approach_leg", real)
+    monkeypatch.setattr(press_demo, "aim_button_at_staging", lambda *a, **k: (FIX, "3/3 frames"))
+    near = _SceneFix((0.45, 0.0, -0.027), 0.0, (0.45, 0.0, 0.085))
+    reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, near)
+    assert not reach.reach_out and reach.got == FIX
 
 
 def test_the_scene_approach_returns_the_precise_fix_and_the_preplanned_descent(ctx, tmp_path, monkeypatch):
@@ -1939,3 +1998,167 @@ def test_a_home_the_bench_world_refuses_moves_nothing_and_names_the_recovery(ctx
     assert not press_demo.home_first(ctx, make_runner(ctx.client, tmp_path), True, list(HOME))
     assert ctx.client.executed == []
     assert "home_arm --execute" in capsys.readouterr().out
+
+
+def test_detect_only_reports_the_scene_cameras_fixes_with_nothing_moving(monkeypatch, capsys):
+    """--detect-only is the scene camera's answer, repeated: the wrist does
+    not find the box (owner, 2026-10-22), and nothing is flown to ask."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.tasks import press_demo
+
+    clock = [0.0]
+    monkeypatch.setattr(press_demo.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(press_demo.time, "sleep", lambda s: None)
+
+    class Locator:
+        last_why = None
+        calls = 0
+
+        def locate(self, timeout_s):
+            clock[0] += 2.0  # a locate takes OWL ticks
+            self.calls += 1
+            if self.calls == 2:
+                self.last_why = "the scene OWL saw no box in 5.0 s"
+                return None
+            top = (0.42, 0.22 + 0.001 * self.calls, 0.21)
+            return SimpleNamespace(pose=SimpleNamespace(xyz=(0.42, 0.22, 0.09), yaw=0.1), top_xyz=top,
+                                   n_points=120, score=0.44, table_z_scene=0.089, table_extent=(0.3, 0.9, -0.2, 0.6))
+
+    assert press_demo.scene_detect_report(Locator(), duration_s=15.0) == 7
+    out = capsys.readouterr().out
+    assert "nothing moves" in out and "no fix: the scene OWL saw no box" in out
+    assert "7 fix(es), spread [0, 7, 0] mm" in out
+
+    class Blind:
+        last_why = "scene camera streams missing: depth"
+
+        def locate(self, timeout_s):
+            clock[0] += 5.0
+            return None
+
+    assert press_demo.scene_detect_report(Blind(), duration_s=15.0) == 0
+    out = capsys.readouterr().out
+    assert out.count("no fix: scene camera streams missing") == 1  # said once, not every try
+    assert "NO BOX — scene camera streams missing: depth" in out
+
+
+def test_the_lid_is_set_down_on_the_table_the_camera_measured():
+    """Flatbot: no surveyed bench, so no fixed set-down zone either — the
+    lid goes beside the box on the table measured this run, whole."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.models.container import ContainerModel
+    from rammp_box_opening.tasks import press_demo
+
+    m = ContainerModel.load(CFG)
+    measured = SimpleNamespace(table_extent=(0.45, 1.10, -0.90, -0.10))
+    x0, x1, y0, y1 = press_demo.drop_zone(m, measured)
+    inset = 0.5 * max(m.lid_dims[:2]) + press_demo.DROP_EDGE_M
+    assert (x0, x1, y0, y1) == pytest.approx((0.45 + inset, 1.10 - inset, -0.90 + inset, -0.10 - inset))
+    box = ContainerPose(xyz=(0.70, -0.55, 0.30), yaw=0.0)
+    spots = press_demo.lid_drop_candidates(m, box, 0.30, zone=(x0, x1, y0, y1))
+    assert spots and all(x0 <= s[0] <= x1 and y0 <= s[1] <= y1 for s, _d in spots)
+    assert [d for _s, d in spots] != [d for _s, d in press_demo.lid_drop_candidates(m, box, 0.30)]  # not the bench's zone
+    assert press_demo.drop_zone(m, SimpleNamespace(table_extent=None)) == (*press_demo.DROP_X_M, *press_demo.DROP_Y_M)
+
+
+def test_the_staging_aim_builds_its_aimer_the_straight_down_way_when_no_reach_out_priors_are_given(monkeypatch):
+    """Review 2026-10-22: aim_button_at_staging always passed lid_z/prior_xy,
+    and a ButtonAimer without them raised TypeError at every straight-down
+    aim — with the arm already at staging. Unset, they are not passed."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import button_aim
+    from rammp_box_opening.tasks import press_demo
+
+    made = []
+
+    class Aimer:
+        last_why = None
+
+        def __init__(self, grab, model, table_z, **kw):
+            made.append(kw)
+
+        def status(self):
+            return "still frames"
+
+    monkeypatch.setattr(button_aim, "ButtonAimer", Aimer)
+    w = SimpleNamespace(grab=SimpleNamespace(color=None, depth=None, k=None, color_stamp=None), model=None, table_z=0.1)
+    got, status = press_demo.aim_button_at_staging(None, w, 0.0, timeout_s=0)
+    assert got is None and "still frames" in status and made == [{}]
+    press_demo.aim_button_at_staging(None, w, 0.0, timeout_s=0, lid_z=0.2, prior_xy=(0.8, 0.0))
+    assert made[-1] == {"lid_z": 0.2, "prior_xy": (0.8, 0.0)}
+
+
+def test_staging_reach_is_judged_by_the_arms_own_kinematics(ctx, monkeypatch):
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks import press_demo
+
+    cfg = load_press_demo(CFG)
+    asked = []
+
+    class Chain:
+        def __init__(self, walk=None, seeded=None):
+            self.walk, self.seeded = walk, seeded
+
+        def nearest_solution(self, q, xyz, quat, seeds=()):
+            asked.append(list(xyz))
+            return self.walk
+
+        def solve_pose(self, seed, xyz, R):
+            return self.seeded
+
+        def equivalents(self, q_start, q):
+            return [q]
+
+    monkeypatch.setattr(approach, "_chain", lambda: Chain())
+    assert press_demo.staging_out_of_reach(ctx, cfg)
+    button = press_demo.from_container(ctx.cpose, ctx.model.button_offset)
+    assert asked[-1] == pytest.approx([button[0], button[1], button[2] + cfg.staging_m])  # build_approach_leg's staging
+    monkeypatch.setattr(approach, "_chain", lambda: Chain(walk=[0.0] * 7))
+    assert not press_demo.staging_out_of_reach(ctx, cfg)
+    # the walk misses it, a seed on another branch finds it: not out of reach
+    monkeypatch.setattr(approach, "_chain", lambda: Chain(seeded=[0.0] * 7))
+    assert not press_demo.staging_out_of_reach(ctx, cfg)
+
+    def broken():
+        raise KeyError("arm_mount")  # the bench URDF under flatbot's root
+
+    monkeypatch.setattr(approach, "_chain", broken)
+    assert not press_demo.staging_out_of_reach(ctx, cfg)  # a kinematics problem proves nothing
+
+
+def test_flatbots_own_kinematics_separate_a_box_straight_down_reaches_from_one_it_cannot(ctx, monkeypatch):
+    """On flatbot's URDF (arm_mount, 30 deg mount), with the pink canister's
+    straight-down attitude: a box 0.45 m out on a low table solves; the
+    2026-10-22 box 0.89 m out does not, from any seed."""
+    from rammp_box_opening.models.container import ContainerModel
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.kinematics import ArmChain
+    from rammp_box_opening.tasks import press_demo
+
+    pink = "src/rammp_box_opening/config/containers/ankou_pink.yaml"
+    chain = ArmChain(path="src/rammp_box_opening/test/data/arm_flatbot_20261021.urdf", root="arm_mount")
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    ctx.model = ContainerModel.load(pink)
+    cfg = load_press_demo(pink)
+    ctx.client.live = [0.067, -1.897, -3.137, -2.269, -0.211, -0.683, 1.725]  # flatbot's HOME
+    oz = ctx.model.button_offset[2]
+    ctx.cpose = ContainerPose(xyz=(0.45, 0.0, 0.25 - oz), yaw=0.0)
+    assert not press_demo.staging_out_of_reach(ctx, cfg)
+    ctx.cpose = ContainerPose(xyz=(0.675, -0.578, 0.40 - oz), yaw=0.0)
+    assert press_demo.staging_out_of_reach(ctx, cfg)
+
+
+def test_an_in_flight_touch_the_wrist_never_confirmed_is_a_stop(ctx, tmp_path, monkeypatch):
+    from conftest import runner as make_runner
+
+    press_demo = _search_env(monkeypatch)
+    cfg = replace(load_press_demo(CFG), confirm_in_flight=True)
+    ctx.client.exec_script = [("touch", {"message": "torque guard trip", "progress": 0.9})]
+    r = make_runner(ctx.client, tmp_path)
+    fix = _SceneFix((0.45, 0.0, -0.027), 0.0, (0.45, 0.0, 0.085))
+    reach = press_demo.approach_from_scene(None, ctx, cfg, r, _Watcher(), True, fix)
+    assert reach.failed and reach.pressed is not None and reach.got is None and not reach.reach_out
+    assert "never confirmed" in reach.status

@@ -44,8 +44,10 @@ def default_bench_yaml():
 
 
 def make_parser(desc):
+    # allow_abbrev=False: "--exec" must not arm a run that scripts/
+    # sheppy_task.sh's drift gate took for a dry run (review 2026-10-22)
     ap = argparse.ArgumentParser(
-        description=desc, formatter_class=argparse.RawDescriptionHelpFormatter
+        description=desc, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False
     )
     ap.add_argument(
         "--execute",

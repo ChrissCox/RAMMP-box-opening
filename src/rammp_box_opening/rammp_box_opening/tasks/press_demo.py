@@ -10,15 +10,19 @@ Flow, states logged one line each:
 
   SCENE   before any motion, the fixed scene camera finds the box: its
           OWL instance boxes it, the depth inside the box at lid height
-          gives its position through config/camera_scene.yaml (a few cm).
+          gives its position through config/camera_scene.yaml (a few cm),
+          or through TF where the robot's TF carries the camera's mount
+          (world external_static_tf: flatbot).
           The arm flies straight to staging above it, the wrist confirms
           from 12 cm, and the descent pre-planned during the approach
           flies when the wrist agrees within 2 mm (else it is re-fitted to
           the aim: the press goes to the circle's centre). detect.confirm_in_flight
           makes approach and descent ONE goal with the wrist confirming on
-          the way (needs the wrist camera's timestamp lag measured). No
-          scene fix, or no wrist confirmation -> the search below.
-  LOOK    the arm's own rest pose with the hand lifted and the wrist
+          the way (needs the wrist camera's timestamp lag measured). The
+          scene camera alone finds the box; the wrist only aims (owner,
+          2026-10-22): no scene fix, or no button at staging -> home, exit 2.
+  LOOK    --no-scene only (the stub harness, A/B runs): the wrist searches
+          instead. The arm's own rest pose with the hand lifted and the wrist
           turned down — a joint-space move of two joints, 3.42 s,
           against 3.89 s to fly to the old fixed scan pose. Nothing in it
           is expressed in the bench frame, so it holds wherever the chair
@@ -57,7 +61,8 @@ Flow, states logged one line each:
 
 Each next phase is planned as a Runner lookahead while the previous
 phase's last unguarded motion flies. --press-only stops after the press
-(retreat to staging, home).
+(retreat to staging, home). --detect-only reports the scene camera's
+fixes for 15 s with nothing moving.
 
 --execute alone arms it: NO typed confirmation (owner decision
 2026-08-24 — autonomous once started, Ctrl+C stops everything via the
@@ -275,8 +280,10 @@ def record_residual(scene_fix, wrist_top, wrist_yaw, path=RESIDUALS_FILE):
 
 
 # The scene camera's box this far (xy) from the button the wrist found, on
-# the last run under the calibration in force: it is not flown to this run
-# (scene_trust). Its fixes were 9-11 cm off after a re-aim (2026-09-23) and
+# the last run under the calibration in force: scene_trust distrusts it.
+# Since the wrist stopped searching (2026-10-22) a distrusted fix is still
+# flown and the distrust only printed: the aim at staging decides, so the
+# pairs correct only an offset the wrist can still see from staging. Its fixes were 9-11 cm off after a re-aim (2026-09-23) and
 # 12 cm off under a bad calibration (2026-09-24); the close-up aim corrects
 # a few centimetres by itself (RECENTRE_TOL_M, a move over the button).
 SCENE_TRUST_M = 0.05
@@ -297,9 +304,10 @@ def scene_trust(path, calib):
     run under the calibration in force, its box was more than
     SCENE_TRUST_M from the button the wrist then found — what a re-aimed
     camera looks like. The cabinet-door tag used to decide this, and
-    misfired (scene_calib.TAG_MOVED_PX). A fix not flown is still recorded
-    against the wrist's (main), so each run judges the camera afresh and the
-    pairs can correct it (auto_refine)."""
+    misfired (scene_calib.TAG_MOVED_PX). main flies a distrusted fix anyway
+    and prints why: with no wrist search, the aim at staging is the check,
+    and its pair against the scene's is recorded so the next run judges the
+    camera afresh (auto_refine)."""
     from rammp_box_opening.perception.scene_refine import calibrated_at, load_pairs
 
     try:
@@ -404,7 +412,10 @@ def in_flight_stop(progress, junction, confirmed, disagrees, margin=JUNCTION_MAR
 class SceneApproach:
     """What the reach from the scene fix came back with."""
 
-    def __init__(self, got=None, preplanned=None, pressed=None, press_leg=None, in_flight=False, status="", button_up_mm=None):
+    def __init__(self, got=None, preplanned=None, pressed=None, press_leg=None, in_flight=False, status="", button_up_mm=None,
+                 failed=False, reach_out=False):
+        self.failed = failed  # the approach's own motion failed (the runner said why)
+        self.reach_out = reach_out  # no straight-down staging reaches the box: the reach-out press's case
         self.button_up_mm = button_up_mm  # the aim's button-above-its-lid reading (refuse_open_box)
         self.got = got  # the wrist's precise fix, or None
         self.preplanned = preplanned  # the descent planned during the approach
@@ -414,16 +425,22 @@ class SceneApproach:
         self.status = status  # what the aim saw, for the log when got is None
 
 
-def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=None, tag="aim", out=None):
+def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=None, tag="aim", out=None,
+                          lid_z=None, prior_xy=None):
     """The press aim from staging: the button's circle alone (owner's
     design 2026-09-17 — no OWL and no box-footprint gate here; the scene
     camera already said which thing is the box), the press point its
     centre. Returns (got, status) where got is
     ((x, y, z), yaw) like the watcher's fix, or None. The aimed frame is
-    saved and the aim logged (`runner`) every time."""
+    saved and the aim logged (`runner`) every time.
+
+    lid_z / prior_xy: the lid height to expect and where the button should
+    be — what the reach-out press's oblique look aims with (button_aim)."""
     from rammp_box_opening.perception.button_aim import ButtonAimer
 
-    aimer = ButtonAimer(watcher.grab, watcher.model, watcher.table_z)
+    # only what is set: unset, the call is the straight-down aim's own
+    kw = {k: v for k, v in (("lid_z", lid_z), ("prior_xy", prior_xy)) if v is not None}
+    aimer = ButtonAimer(watcher.grab, watcher.model, watcher.table_z, **kw)
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout_s:
         _spin_detect(node)
@@ -576,24 +593,33 @@ def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix):
     IN_FLIGHT_TOL_M. Otherwise the approach stops at staging and the wrist
     confirms from 12 cm at rest.
 
+    When no straight-down staging reaches the box, nothing moves here and
+    `reach_out` hands the press to tasks/reach_press.
+
     Returns a SceneApproach; `got` is None when the approach failed or the
-    wrist saw nothing — the caller then falls back to the search, from
-    wherever the arm is."""
+    wrist saw nothing, `status` says which — the caller then stops."""
     ctx.cpose = scene_fix.pose
     watcher.roi = None  # the scene bbox never applied to the wrist frame
-    approach = [build_approach_leg(ctx, cfg)]
+    try:
+        approach = [build_approach_leg(ctx, cfg)]
+    except RuntimeError as e:
+        # a box out of straight-down reach (flatbot 2026-10-22) — and ONLY
+        # that: a late set_world, a start in collision or an unlucky plan
+        # raise here too, and they are a STOP, not a different press
+        if "IK_FAIL" in str(e) and staging_out_of_reach(ctx, cfg):
+            return SceneApproach(failed=True, reach_out=True, status="no straight-down staging reaches the box (%s)" % e)
+        return SceneApproach(failed=True, status="the approach to staging was refused (%s)" % e)
     if not cfg.confirm_in_flight:
         # No OWL and no plateau detector on this path: the scene camera
         # said which thing is the box; at staging the button's circle
-        # alone aims the press (aim_button_at_staging). The OWL-gated
-        # wrist search is the fallback, when the scene found nothing.
+        # alone aims the press (aim_button_at_staging).
         res = runner.run(
             approach,
             execute=execute,
             lookahead=lambda q: build_press_legs(ctx, cfg, start_joints=q),
         )
         if any(not r.ok for r in res):
-            return SceneApproach()
+            return SceneApproach(failed=True, status="the approach to staging failed")
         preplanned = runner.lookahead_result
         seen = {}
         got, status = aim_button_at_staging(node, watcher, scene_fix.pose.yaw, runner=runner, out=seen)
@@ -623,16 +649,15 @@ def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix):
     finally:
         watcher.active = False
     if any(not r.ok for r in res):
-        return SceneApproach(in_flight=True)
+        return SceneApproach(in_flight=True, failed=True, status="the approach to staging failed")
     outcome = res[-1].outcome
     if outcome == "touch":
         # the descent flew and found the surface: pressed, no stop anywhere
         got = state["got"] if state["got"] is not None else watcher.fix()
         if got is None:
-            print(
-                "[press_demo] WARNING: pressed on the scene camera's pose alone — the wrist "
-                "never confirmed it; the grip's guard and band check are the only checks left"
-            )
+            # main stops: the wrist aims every press, and none confirmed this one
+            return SceneApproach(failed=True, pressed=res, press_leg=press[0], in_flight=True,
+                                 status="the arm touched on the scene camera's pose alone — the wrist never confirmed it")
         return SceneApproach(got=got, pressed=res, press_leg=press[0], in_flight=True)
     # stopped at the junction: confirm at rest, as the two-goal path does
     print(
@@ -714,6 +739,49 @@ def build_home_leg(ctx, start_joints, joints=None):
         TRANSIT_SPEED,
     )
     return leg
+
+
+# joint_1 swings and elbow flips of HOME: IK seeds spread over the arm's
+# branches, for the out-of-reach proof (a continuation walk from one seed
+# misses solutions near the workspace edge — review 2026-10-22)
+REACH_SEED_J1_RAD = (-2.4, -1.2, 0.0, 1.2, 2.4)
+
+
+def staging_out_of_reach(ctx, cfg):
+    """True only when the arm's own kinematics finds NO pose inside every
+    limit for the straight-down staging build_approach_leg asks for (the
+    same button, attitude and height) — walked from the live joints and
+    look_joints(HOME), and solved from seeds spread over the arm's
+    branches: the planner's IK_FAIL also covers a goal in collision on a
+    box well inside reach. Flatbot 2026-10-22: at 0.80-0.89 m nothing
+    solves; at 0.45 m it does. A kinematics problem proves nothing."""
+    from rammp_box_opening.perception.d405 import quat_to_mat
+    from rammp_box_opening.primitives.look import look_joints
+    from rammp_box_opening.runtime.approach import _chain
+    from rammp_box_opening.runtime.branches import planner_branch
+
+    m = ctx.model
+    button = from_container(ctx.cpose, m.button_offset)
+    staging = [button[0], button[1], button[2] + cfg.staging_m]
+    quat = m.press_quat(button)
+    try:
+        chain = _chain()
+        live = planner_branch(ctx.client.joints())
+        if chain.nearest_solution(live, staging, quat, seeds=(look_joints(HOME),)) is not None:
+            return False
+        R = quat_to_mat(*quat)
+        for j1 in REACH_SEED_J1_RAD:
+            for elbow in (1.0, -1.0):
+                seed = list(HOME)
+                seed[0] += j1
+                seed[3] *= elbow
+                q = chain.solve_pose(seed, staging, R)
+                if q is not None and chain.equivalents(live, q):
+                    return False
+        return True
+    except Exception as e:  # noqa: BLE001 - e.g. the bench URDF under arm_mount
+        print("[press_demo] could not check staging's reach with the arm's kinematics (%s)" % e)
+        return False
 
 
 def build_approach_leg(ctx, cfg):
@@ -1234,6 +1302,18 @@ def build_grip_legs(ctx, cfg, start_joints=None):
 
 DROP_X_M = (0.28, 0.65)  # set-down zone: inside the tool-down reach band
 DROP_Y_M = (-0.42, 0.42)
+DROP_EDGE_M = 0.03  # a lid set down on a measured table: this far inside its edge, past its own half-width
+
+
+def drop_zone(m, worlds):
+    """(x0, x1, y0, y1) the lid may be set down in: on the table the scene
+    camera measured this run (inset so the whole lid lands on it — the
+    planner then says what the arm reaches), or the surveyed bench's zone."""
+    ext = worlds.table_extent
+    if ext is None:
+        return (*DROP_X_M, *DROP_Y_M)
+    inset = 0.5 * max(float(m.lid_dims[0]), float(m.lid_dims[1])) + DROP_EDGE_M
+    return (ext[0] + inset, ext[1] - inset, ext[2] + inset, ext[3] - inset)
 
 
 def lid_place_min_clear(m):
@@ -1246,10 +1326,11 @@ def lid_place_min_clear(m):
     ) / 2 + 0.05
 
 
-def lid_drop_candidates(m, cpose, table_z, prefer_xy=None):
+def lid_drop_candidates(m, cpose, table_z, prefer_xy=None, zone=None):
     """Every drop spot beside the DETECTED box, best first: a list of
     (xyz, direction), each lid_place_min_clear from the box and inside the
-    set-down zone.
+    set-down zone (`zone`: drop_zone's (x0, x1, y0, y1); the bench's when
+    None).
 
     Only the four base-axis directions are offered. The planner holds the
     (padded) container as a cuboid aligned to the BASE axes whatever the
@@ -1269,15 +1350,16 @@ def lid_drop_candidates(m, cpose, table_z, prefer_xy=None):
     for d in ((0.0, -1.0), (0.0, 1.0), (1.0, 0.0), (-1.0, 0.0)):
         if d not in dirs:
             dirs.append(d)
+    x0, x1, y0, y1 = zone if zone is not None else (*DROP_X_M, *DROP_Y_M)
     out = []
     for ux, uy in dirs:
         x, y = bx + ux * need, by + uy * need
-        if DROP_X_M[0] <= x <= DROP_X_M[1] and DROP_Y_M[0] <= y <= DROP_Y_M[1]:
+        if x0 <= x <= x1 and y0 <= y <= y1:
             out.append(([x, y, float(table_z)], (ux, uy)))
     return out
 
 
-def box_relative_lid_drop(m, cpose, table_z, prefer_xy=None):
+def box_relative_lid_drop(m, cpose, table_z, prefer_xy=None, zone=None):
     """Where the lid goes: beside the DETECTED box, on the table the camera
     measured. Returns (xyz, direction) or (None, None).
 
@@ -1287,7 +1369,7 @@ def box_relative_lid_drop(m, cpose, table_z, prefer_xy=None):
     every run: the first of lid_drop_candidates (the configured lid_place
     chooses only which side is tried first, and its z is not used at all).
     build_place_legs falls through the rest when the planner refuses one."""
-    spots = lid_drop_candidates(m, cpose, table_z, prefer_xy)
+    spots = lid_drop_candidates(m, cpose, table_z, prefer_xy, zone=zone)
     return spots[0] if spots else (None, None)
 
 
@@ -1331,7 +1413,7 @@ def build_place_legs(ctx, cfg, start_joints=None, chain=0):
                 # only now pay for the alternatives: the first spot
                 # plans on almost every run
                 prefer = load_lid_place(ctx.config_path).xyz
-                for xyz, _d in lid_drop_candidates(m, ctx.cpose, first.xyz[2], prefer):
+                for xyz, _d in lid_drop_candidates(m, ctx.cpose, first.xyz[2], prefer, zone=drop_zone(m, ctx.worlds)):
                     if math.hypot(xyz[0] - first.xyz[0], xyz[1] - first.xyz[1]) > 1e-3:
                         spots.append(ContainerPose(xyz=tuple(xyz), yaw=first.yaw))
     else:
@@ -1712,7 +1794,7 @@ def wait_for_fix(node, watcher, cfg, timeout_s=None):
 PLANNER_WAIT_S = 30.0
 
 
-def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S):
+def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S, camera_cfg_name=None):
     """Why this run must not start, or None. Checked before ANYTHING is
     actuated — the gripper close included.
 
@@ -1746,9 +1828,11 @@ def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S):
                 "one arm. `sheppy up box-opening` stops it and brings up what the mission needs. Nothing moved."
                 % ", ".join(others)
             )
-        from rammp_box_opening.perception.d405 import camera_config
+        from rammp_box_opening.perception.d405 import CAMERA_CONFIG, camera_config
 
-        parent = camera_config()["parent_frame"]
+        # the world's wrist camera, as the grabber uses: flatbot's OAK hangs off
+        # arm_-prefixed frames, the D405 default's end_effector_link does not exist there
+        parent = camera_config(camera_cfg_name or CAMERA_CONFIG)["parent_frame"]
         if not client.tf_ready(client._base_frame, parent, timeout_s=2.0):
             # bench 2026-09-25: box_opening stopped, no /tf at all; the run
             # flew to staging and then could not place one wrist frame
@@ -1793,9 +1877,50 @@ def try_home(ctx, runner, execute, why):
     runner.run(legs, execute=execute)
 
 
+DETECT_REPORT_S = 15.0
+
+
+def table_seen_over(extent):
+    """' seen over x a..b, y c..d' for a measured table, '' for none."""
+    if extent is None:
+        return ""
+    return " seen over x %.2f..%.2f, y %.2f..%.2f" % tuple(extent)
+
+
+def scene_detect_report(locator, duration_s=DETECT_REPORT_S):
+    """--detect-only: the scene camera's fixes for `duration_s` with nothing
+    moving — where the mission would fly, and how steady that is. Returns
+    how many fixes it made."""
+    print("[press_demo] DETECT-ONLY: the scene camera's fixes for %.0f s — nothing moves" % duration_s)
+    t0 = time.monotonic()
+    tops = []
+    said = None
+    while time.monotonic() - t0 < duration_s:
+        fix = locator.locate(min(SCENE_LOCATE_S, max(0.5, duration_s - (time.monotonic() - t0))))
+        if fix is None:
+            if locator.last_why != said:  # a refusal repeats every OWL tick: say it once
+                print("[press_demo]   no fix: %s" % locator.last_why)
+                said = locator.last_why
+            time.sleep(0.5)  # an instant refusal must not spin the OWL's enable gate
+            continue
+        tops.append(fix.top_xyz)
+        print(
+            "[press_demo]   SCENE: box at [%.3f, %.3f] yaw %.1f deg, lid top z %.3f, table %.3f%s, OWL %.2f, %d lid points"
+            % (fix.pose.xyz[0], fix.pose.xyz[1], math.degrees(fix.pose.yaw), fix.top_xyz[2],
+               fix.table_z_scene, table_seen_over(fix.table_extent), fix.score, fix.n_points)
+        )
+    if not tops:
+        print("[press_demo] detect-only done: NO BOX — %s" % locator.last_why)
+        return 0
+    spread = [1000 * (max(t[i] for t in tops) - min(t[i] for t in tops)) for i in range(3)]
+    print("[press_demo] detect-only done: %d fix(es), spread [%.0f, %.0f, %.0f] mm" % (len(tops), *spread))
+    return len(tops)
+
+
 def detect_only_report(node, watcher, ctx, cfg, runner, execute):
-    """Mount-calibration observation: hold at the look pose reporting every
-    fresh fix (top-face centre, yaw, footprint), then park home.
+    """--detect-only --no-scene, the wrist-mount calibration observation:
+    hold at the look pose reporting every fresh fix (top-face centre, yaw,
+    footprint), then park home.
 
     Place the container at a TAPE-MEASURED spot first; the printed base
     pose vs truth solves the wrist-mount error."""
@@ -1914,16 +2039,25 @@ def main():
         help="stop after the press (the step-1 demo): press, retreat, home",
     )
     ap.add_argument(
+        "--depth-press",
+        action="store_true",
+        help="once the hand is over the box (the scene camera and the wrist's aim, as ever), the hand turns "
+        "straight down, the wrist camera's own depth says how far down the lid is, and the joint torques find "
+        "it and judge the press (tasks/depth_press)",
+    )
+    ap.add_argument(
         "--detect-only",
         action="store_true",
-        help="scan, report fixes + camera-frame diagnostics for 15 s, home, "
-        "exit — the wrist-mount calibration observation (no press)",
+        help="report the scene camera's fixes for 15 s and exit; nothing moves. "
+        "With --no-scene: the wrist-mount calibration observation (look pose, "
+        "15 s of wrist fixes, home)",
     )
     ap.add_argument(
         "--no-scene",
         action="store_true",
-        help="ignore the scene camera even when it is calibrated: search with "
-        "the wrist camera as before (the stub harness, and A/B runs)",
+        help="find the box with the wrist camera's search instead of the scene "
+        "camera (the stub harness, and A/B runs); without it the scene camera "
+        "alone finds the box",
     )
     ap.add_argument(
         "--scene-calib",
@@ -1993,24 +2127,25 @@ def main():
     watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame,
                             camera_cfg_name=worlds.wrist_camera_config)
     watcher_holder["watcher"] = watcher
-    # The scene camera, when it has been calibrated to the arm
-    # (scripts/calibrate_scene_camera.py): it finds the box before the arm
-    # moves, and the search below becomes the fallback.
+    # The scene camera finds the box before the arm moves — the only thing
+    # that does, unless --no-scene. It is placed by its calibration
+    # (scripts/calibrate_scene_camera.py), or by TF where the robot's TF
+    # carries its mount: flatbot's static_tf, whose camera is not the one
+    # the installed camera_scene.yaml calibrates.
+    from rammp_box_opening.perception.scene import load_scene_calibration, scene_calib_path
+
+    scene_by_tf = worlds.external_static_tf
     locator = None
-    if not args.no_scene and not args.detect_only:
-        from rammp_box_opening.perception.scene import load_scene_calibration
-
-        T_base_scene_link = load_scene_calibration(args.scene_calib)
-        if T_base_scene_link is not None:
+    if not args.no_scene:
+        T_base_scene_link = None if scene_by_tf else load_scene_calibration(args.scene_calib)
+        if scene_by_tf or T_base_scene_link is not None:
             from rammp_box_opening.perception.scene_source import SceneLocator
-
-            from rammp_box_opening.perception.scene import scene_calib_path
             from rammp_box_opening.perception.scene_calib import scene_tag_px
 
             locator = SceneLocator(
                 pnode, cfg, model, worlds.table_top_z, T_base_scene_link, spins=False,
-                tag_px=scene_tag_px(args.scene_calib or scene_calib_path()),
-                scene_cfg=worlds.scene_camera_cfg,
+                tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
+                scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
             )
             # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
             # and the readiness checks below are that long — by the time
@@ -2032,9 +2167,17 @@ def main():
         # bench's own runs (detection_set.MissionFrames; written at the end)
         ctx.mission_frames = MissionFrames(state_dir() / "detection_sets" / MISSIONS_SET, Path(cfg_path).name, worlds.table_top_z)
     try:
-        why = readiness_refusal(client, args.execute)
+        why = readiness_refusal(client, args.execute, camera_cfg_name=worlds.wrist_camera_config)
         if why:
             sys.exit("[press_demo] not starting: %s" % why)
+        if locator is None and not args.no_scene:
+            sys.exit(
+                "[press_demo] not starting: the scene camera finds the box, and it is not calibrated (no %s: "
+                "scripts/calibrate_scene_camera.py). `--no-scene` searches with the wrist instead. Nothing moved."
+                % (args.scene_calib or scene_calib_path())
+            )
+        if args.detect_only and locator is not None:
+            sys.exit(0 if scene_detect_report(locator) else 2)
         # THE FIRST MOTION: the arm to its exact rest pose, when it is not
         # already there (home_first) — every run starts from the same place
         if not home_first(ctx, runner, args.execute, rest_joints(cfg)):
@@ -2080,87 +2223,109 @@ def main():
             detect_only_report(node, watcher, ctx, cfg, runner, args.execute)
             sys.exit(0)
 
-        # THE SCENE CAMERA FIRST. It sees the whole workspace from where it
-        # stands, so the box is found before the arm has moved at all, and
-        # the arm flies straight to staging above it. The wrist camera then
-        # confirms from 12 cm, where it is good, and the descent that was
-        # pre-planned during the approach flies at once when it agrees.
+        # THE SCENE CAMERA ALONE FINDS THE BOX. It sees the whole workspace
+        # from where it stands, so the box is found before the arm has moved
+        # at all, and the arm flies straight to staging above it. The wrist
+        # camera then aims from 12 cm, where it is good, and the descent that
+        # was pre-planned during the approach flies at once when it agrees.
+        # The wrist never searches for it (owner, 2026-10-22): no scene fix,
+        # or no button at staging, and the run stops.
         got, preplanned, scene_fix, at_staging, reach = None, None, None, False, SceneApproach()
-        scene_seen = None  # the scene camera's box, flown to or not (scene_trust)
+        scene_seen = None  # the scene camera's box, for its residual against the wrist's button
         planned_for = None  # the pose `preplanned` was planned for
         if locator is not None:
             t_scene = time.monotonic()
             scene_fix = locator.locate(SCENE_LOCATE_S)
             if ctx.mission_frames is not None:
                 ctx.mission_frames.scene(
-                    scene_frame(locator.grab, locator.T_base_link),
+                    scene_frame(locator.grab, locator.base_to_link()),
                     fix_xyz=None if scene_fix is None else scene_fix.top_xyz,
                     score=None if scene_fix is None else scene_fix.score,
                     why=locator.last_why if scene_fix is None else None,
                 )
             if locator.moved_note and scene_fix is not None:
                 print("[press_demo] scene camera: %s" % locator.moved_note)  # e.g. the tag was not in view
-            scene_seen = scene_fix  # recorded against the wrist's button, flown or not
-            if scene_fix is not None:
+            if scene_fix is None:
+                try_home(ctx, runner, args.execute, "NO BOX — scene camera: %s" % locator.last_why)
+                sys.exit(2)
+            scene_seen = scene_fix
+            if not scene_by_tf:
                 trusted, distrust = scene_trust(
                     residuals_path_for(args.scene_calib), args.scene_calib or scene_calib_path()
                 )
                 if not trusted:
                     print(
-                        "[press_demo] scene camera: box at [%.3f, %.3f], NOT FLOWN — %s; searching with the wrist "
-                        "(this run's pair judges it again)" % (scene_fix.pose.xyz[0], scene_fix.pose.xyz[1], distrust)
+                        "[press_demo] scene camera: %s — flying to its box anyway; the aim at staging "
+                        "decides, and this run's pair judges the camera again" % distrust
                     )
-                    scene_fix = None
-            elif locator.last_why:
-                print("[press_demo] scene camera: %s — searching with the wrist" % locator.last_why)
-            if scene_fix is not None:
-                sp = scene_fix.pose
-                if worlds.table_top_z is None and not math.isnan(scene_fix.table_z_scene):
-                    worlds.table_top_z = scene_fix.table_z_scene
-                    watcher.table_z = scene_fix.table_z_scene
-                surveyed = watcher.table_z
-                print(
-                    "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points "
-                    "(OWL %.2f; the scene reads the table at %.3f, surveyed %s; %.1f s to locate "
-                    "[%s], %.1f s since start) — flying to staging"
-                    % (sp.xyz[0], sp.xyz[1], math.degrees(sp.yaw), scene_fix.n_points,
-                       scene_fix.score, scene_fix.table_z_scene,
-                       ("%.3f" % surveyed) if surveyed is not None else "n/a",
-                       time.monotonic() - t_scene,
-                       " ".join("%s %.2f" % (k[:-2], v) for k, v in locator.last_timing.items()),
-                       time.monotonic() - t_main)
+            sp = scene_fix.pose
+            if worlds.table_top_z is None and not math.isnan(scene_fix.table_z_scene):
+                # no survey: this run's table, measured where the box stands,
+                # is the one every world from here on is planned around
+                worlds.table_top_z = scene_fix.table_z_scene
+                worlds.table_extent = scene_fix.table_extent
+                watcher.table_z = scene_fix.table_z_scene
+            surveyed = watcher.table_z
+            print(
+                "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points "
+                "(OWL %.2f; the scene reads the table at %.3f%s, surveyed %s; %.1f s to locate "
+                "[%s], %.1f s since start) — flying to staging"
+                % (sp.xyz[0], sp.xyz[1], math.degrees(sp.yaw), scene_fix.n_points,
+                   scene_fix.score, scene_fix.table_z_scene, table_seen_over(scene_fix.table_extent),
+                   ("%.3f" % surveyed) if surveyed is not None else "n/a",
+                   time.monotonic() - t_scene,
+                   " ".join("%s %.2f" % (k[:-2], v) for k, v in locator.last_timing.items()),
+                   time.monotonic() - t_main)
+            )
+            runner.note(
+                "scene_fix",
+                origin_xyz=[round(float(v), 4) for v in sp.xyz],
+                yaw_deg=round(math.degrees(sp.yaw), 2),
+                top_xyz=[round(float(v), 4) for v in scene_fix.top_xyz],
+                n_points=scene_fix.n_points,
+                owl_score=round(scene_fix.score, 3),
+                table_z_scene=None if scene_fix.table_z_scene != scene_fix.table_z_scene
+                else round(scene_fix.table_z_scene, 4),
+            )
+            reach = approach_from_scene(
+                node, ctx, cfg, runner, watcher, args.execute, scene_fix
+            )
+            if reach.reach_out:
+                # no straight-down staging reaches this box: and ONLY then,
+                # the reach-out press (hand tilted back, fingertip straight down)
+                from rammp_box_opening.tasks.reach_press import run_reach_press
+
+                print("[press_demo] straight down is out of reach: %s" % reach.status)
+                sys.exit(run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator))
+            got, preplanned, planned_for = reach.got, reach.preplanned, scene_fix.pose
+            at_staging = got is not None
+            open_already = refuse_open_box(reach.button_up_mm)
+            if open_already is not None:
+                runner.note("open_box", button_above_lid_mm=round(reach.button_up_mm, 1))
+                try_home(ctx, runner, args.execute, "STOP: " + open_already)
+                sys.exit(1)
+            if at_staging and not reach.in_flight:
+                # a move over the button leaves the pre-planned descent
+                # behind the arm: it is re-fitted from where it stands
+                got, _moves, _off = centre_over_button(node, ctx, cfg, runner, watcher, args.execute, got)
+            if reach.failed:
+                try_home(
+                    ctx, runner, args.execute,
+                    "STOP: %s — the scene camera's box is %.2f m out from %s"
+                    % (reach.status, math.hypot(sp.xyz[0], sp.xyz[1]), worlds.base_frame),
                 )
-                runner.note(
-                    "scene_fix",
-                    origin_xyz=[round(float(v), 4) for v in sp.xyz],
-                    yaw_deg=round(math.degrees(sp.yaw), 2),
-                    top_xyz=[round(float(v), 4) for v in scene_fix.top_xyz],
-                    n_points=scene_fix.n_points,
-                    owl_score=round(scene_fix.score, 3),
-                    table_z_scene=None if scene_fix.table_z_scene != scene_fix.table_z_scene
-                    else round(scene_fix.table_z_scene, 4),
+                sys.exit(1)
+            if got is None and not args.execute:
+                print("[press_demo] preview ends at staging: the aim, the press and what follows need --execute")
+                sys.exit(0)
+            if got is None:
+                dump_wrist_frame(watcher, "staging")
+                try_home(
+                    ctx, runner, args.execute,
+                    "STOP: no button at staging (%s) — the wrist aims, it does not search; is the scene "
+                    "camera's box off?" % (reach.status or watcher.status()),
                 )
-                reach = approach_from_scene(
-                    node, ctx, cfg, runner, watcher, args.execute, scene_fix
-                )
-                got, preplanned, planned_for = reach.got, reach.preplanned, scene_fix.pose
-                at_staging = got is not None
-                open_already = refuse_open_box(reach.button_up_mm)
-                if open_already is not None:
-                    runner.note("open_box", button_above_lid_mm=round(reach.button_up_mm, 1))
-                    try_home(ctx, runner, args.execute, "STOP: " + open_already)
-                    sys.exit(1)
-                if at_staging and not reach.in_flight:
-                    # a move over the button leaves the pre-planned descent
-                    # behind the arm: it is re-fitted from where it stands
-                    got, _moves, _off = centre_over_button(node, ctx, cfg, runner, watcher, args.execute, got)
-                if got is None:
-                    print(
-                        "[press_demo] the wrist did not find the button at staging (%s) — "
-                        "searching from here" % (reach.status or watcher.status())
-                    )
-                    dump_wrist_frame(watcher, "staging")
-                    ctx.cpose = None
+                sys.exit(2)
         if got is None:
             print("[press_demo] LOOK: wrist down over the table, sweeping if empty")
             if owl is not None:
@@ -2254,22 +2419,24 @@ def main():
         )
         if scene_seen is not None and at_staging and aim_source(watcher, pos) == "aim":
             # the pair: where the scene camera put the box, against the
-            # button the close-up aim found — whether the scene fix was
-            # flown or not (scene_trust), and it corrects the calibration
-            # by itself when enough of them agree (auto_refine)
+            # button the close-up aim found; under a calibration file it
+            # corrects that file by itself when enough agree (auto_refine)
             dx, dy, dz, dyaw = scene_residual(scene_seen.top_xyz, pos, scene_seen.pose.yaw, ctx.cpose.yaw)
             print(
-                "[press_demo] scene camera was off by [%+.0f, %+.0f] mm, %+.1f deg here "
-                "(recorded for the calibration refinement)" % (dx, dy, dyaw)
+                "[press_demo] scene camera was off by [%+.0f, %+.0f] mm, %+.1f deg here %s" % (
+                    dx, dy, dyaw,
+                    "(its mount is TF's: re-measure it, or scripts/calibrate_scene_camera.py --transforms-out)"
+                    if scene_by_tf else "(recorded for the calibration refinement)")
             )
             runner.note("scene_residual", dx_mm=round(dx, 1), dy_mm=round(dy, 1), dz_mm=round(dz, 1), dyaw_deg=round(dyaw, 2))
-            residuals = residuals_path_for(args.scene_calib)
-            record_residual(scene_seen, pos, ctx.cpose.yaw, path=residuals)
-            refined = auto_refine(residuals, args.scene_calib or scene_calib_path())
-            if refined:
-                print(refined)
-            else:
-                residual_hint(residuals, args.scene_calib or scene_calib_path())
+            if not scene_by_tf:
+                residuals = residuals_path_for(args.scene_calib)
+                record_residual(scene_seen, pos, ctx.cpose.yaw, path=residuals)
+                refined = auto_refine(residuals, args.scene_calib or scene_calib_path())
+                if refined:
+                    print(refined)
+                else:
+                    residual_hint(residuals, args.scene_calib or scene_calib_path())
         runner.note(
             "fix",
             top_xyz=[round(float(v), 4) for v in pos],
@@ -2287,8 +2454,9 @@ def main():
             # when clear, slid away from the box when crowded, refusal
             # only when nothing in the set-down zone clears
             lid = load_lid_place(ctx.config_path)
+            zone = drop_zone(model, worlds)
             drop, _side = box_relative_lid_drop(
-                model, ctx.cpose, watcher.table_z, lid.xyz
+                model, ctx.cpose, watcher.table_z, lid.xyz, zone=zone
             )
             if drop is None:
                 try_home(
@@ -2296,14 +2464,15 @@ def main():
                     runner,
                     args.execute,
                     "no lid drop spot beside the box at [%.2f, %.2f] falls "
-                    "inside the set-down zone (need %.0f mm clear, x %s y %s) "
+                    "inside the set-down zone (need %.0f mm clear, x %s y %s%s) "
                     "— move the box"
                     % (
                         ctx.cpose.xyz[0],
                         ctx.cpose.xyz[1],
                         lid_place_min_clear(model) * 1000,
-                        list(DROP_X_M),
-                        list(DROP_Y_M),
+                        [round(v, 2) for v in zone[:2]],
+                        [round(v, 2) for v in zone[2:]],
+                        ": the table the scene camera saw" if worlds.table_extent is not None else "",
                     ),
                 )
                 sys.exit(4)
@@ -2326,6 +2495,16 @@ def main():
             "[press_demo] PRESS target origin [%.3f, %.3f, %.3f] yaw %.1f deg"
             % (ctx.cpose.xyz[0], ctx.cpose.xyz[1], ctx.cpose.xyz[2], math.degrees(ctx.cpose.yaw))
         )
+        if args.depth_press and at_staging and reach.pressed is None:
+            # over the button at staging, the hand already straight down: how
+            # far down from the wrist camera's depth, the press by the
+            # torques (tasks/depth_press)
+            from rammp_box_opening.tasks.depth_press import DOWN_CONTACT_TOOL, exit_code, press_down_from_here
+
+            result = press_down_from_here(node, ctx, cfg, runner, watcher, DOWN_CONTACT_TOOL)
+            if result.free:
+                try_home(ctx, runner, args.execute, "DEPTH PRESS done")
+            sys.exit(exit_code(result))
         if at_staging and reach.pressed is not None:
             # the reach carried its descent and touched: nothing to fly here
             runner.note("press_plan", in_flight=True)
