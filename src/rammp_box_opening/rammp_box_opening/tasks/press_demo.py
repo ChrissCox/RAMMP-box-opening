@@ -1065,7 +1065,7 @@ def _off_button(ctx, cfg):
     return math.hypot(button[0] + cfg.press_offset_xy[0] - tx, button[1] + cfg.press_offset_xy[1] - ty)
 
 
-def centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=None):
+def centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=None, open_ok=False):
     """From staging, with a first aim `got` ((xyz, yaw)): until the tool
     stands within RECENTRE_TOL_M over the button, fly to staging over the
     aimed button (planned, collision-checked) and aim again from there — at
@@ -1073,7 +1073,9 @@ def centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=
     from (the last good one), how many moves it took, and how far the tool
     then stood from over the button. Sets ctx.cpose from that aim. A dry run
     says what it would do and moves nothing. `max_moves` overrides
-    detect.recentre_max_moves."""
+    detect.recentre_max_moves. `open_ok`: an open box the re-aim sees is
+    the caller's to open (the depth press feels its lid, never presses the
+    knob) — not a stop here."""
     moves = 0
     ctx.cpose = watcher.to_container_pose(got)
     off = _off_button(ctx, cfg)
@@ -1116,7 +1118,7 @@ def centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=
         # the aim from straight over the button is the best look at the knob
         # the run gets: an open box it shows stops the run like the first aim's
         open_already = refuse_open_box(seen.get("button_up_mm"))
-        if open_already is not None:
+        if open_already is not None and not open_ok:
             runner.note("open_box", button_above_lid_mm=round(seen["button_up_mm"], 1))
             try_home(ctx, runner, execute, "STOP: " + open_already)
             sys.exit(1)
@@ -1149,7 +1151,7 @@ def centre_for_press(node, ctx, cfg, runner, watcher, execute, got, depth_press=
     ctx.cpose = watcher.to_container_pose(got)
     off = _off_button(ctx, cfg)
     if off > CENTRE_MAX_M:
-        return centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=1)
+        return centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=1, open_ok=True)
     runner.note("centre", moves=0, off_mm=round(1000 * off, 1), depth_press=True)
     return got, 0, off
 
@@ -1349,12 +1351,14 @@ POPPED_MAX_M = 0.035  # ... and above this it is not this button at all
 def refuse_open_box(up_mm):
     """Why this box must not be pressed, or None: the aim found its button
     already standing `up_mm` above its own lid. Pressing an open OXO shuts
-    it — three runs did exactly that on 2026-09-21 (13:35, 14:14, 14:14)."""
+    it — three runs did exactly that on 2026-09-21 (13:35, 14:14, 14:14).
+    The depth press at staging opens it instead (depth_press._feel_the_lid)."""
     if not knob_is_up(up_mm):
         return None
     return (
         "the button already stands %.0f mm above its lid — this box is already OPEN (left up by the "
-        "run before?). Pressing it would shut it. Push the button down flush and run again" % up_mm
+        "run before?). Pressing it would shut it. Push the button down flush and run again, or run with "
+        "--depth-press, which takes an open box's lid off" % up_mm
     )
 
 
@@ -2756,10 +2760,16 @@ def main():
             got, preplanned, planned_for = reach.got, reach.preplanned, scene_fix.pose
             at_staging = got is not None
             open_already = refuse_open_box(reach.button_up_mm)
+            # the depth press opens an open box (it feels the lid beside the
+            # knob, depth_press._feel_the_lid); no other press may touch it
+            opens_it = args.depth_press and at_staging and reach.pressed is None
             if open_already is not None:
-                runner.note("open_box", button_above_lid_mm=round(reach.button_up_mm, 1))
-                try_home(ctx, runner, args.execute, "STOP: " + open_already)
-                sys.exit(1)
+                runner.note("open_box", button_above_lid_mm=round(reach.button_up_mm, 1), opened=opens_it)
+                if not opens_it:
+                    try_home(ctx, runner, args.execute, "STOP: " + open_already)
+                    sys.exit(1)
+                print("[press_demo] the button stands %.0f mm above its lid: this box is already OPEN — not pressing "
+                      "it; the depth press takes the lid off" % reach.button_up_mm)
             if at_staging and not reach.in_flight:
                 # a move over the button leaves the pre-planned descent
                 # behind the arm: it is re-fitted from where it stands
@@ -2962,7 +2972,8 @@ def main():
             # torques (tasks/depth_press)
             from rammp_box_opening.tasks import depth_press
 
-            result = depth_press.press_down_from_here(node, ctx, cfg, runner, watcher, depth_press.DOWN_CONTACT_TOOL)
+            result = depth_press.press_down_from_here(node, ctx, cfg, runner, watcher, depth_press.DOWN_CONTACT_TOOL,
+                                                      knob_up_mm=reach.button_up_mm)
             result = depth_press.after_scene_check(ctx, runner, result, scene_fix, locator)
             if not args.press_only:
                 result = depth_press.knob_up_after(node, ctx, watcher, runner, result)

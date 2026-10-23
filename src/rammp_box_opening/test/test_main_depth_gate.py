@@ -153,7 +153,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, table_extent, depth=None, pu
         ctx.cpose = scene_fix.pose
         return approach(ctx)
 
-    def no_centre(node, ctx, cfg, runner, watcher, execute, got, max_moves=None):
+    def no_centre(node, ctx, cfg, runner, watcher, execute, got, max_moves=None, **k):
         ctx.cpose = watcher.to_container_pose(got)
         return got, 0, 0.0
 
@@ -200,7 +200,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, table_extent, depth=None, pu
     return e.value.code, rows
 
 
-def _approach(pressed=None):
+def _approach(pressed=None, button_up_mm=0.0):
     def approach(ctx):
         from rammp_box_opening.models.container import from_container
         from rammp_box_opening.tasks.press_demo import SceneApproach
@@ -208,7 +208,7 @@ def _approach(pressed=None):
         b = from_container(ctx.cpose, ctx.model.button_offset)
         return SceneApproach(
             got=((b[0], b[1], b[2]), 0.0), preplanned=None, pressed=pressed,
-            press_leg=None, status="3/3", button_up_mm=0.0,
+            press_leg=None, status="3/3", button_up_mm=button_up_mm,
         )
 
     return approach
@@ -220,7 +220,7 @@ def test_the_depth_press_is_not_refused_over_a_lid_spot_it_never_uses(monkeypatc
     result = DepthPress(free=True, contact=True, felt=True, popped=True)
     called = []
 
-    def depth(node, ctx, cfg, runner, watcher, tool):
+    def depth(node, ctx, cfg, runner, watcher, tool, **k):
         called.append(ctx.lid_drop)
         return result
 
@@ -258,6 +258,36 @@ def test_a_popped_depth_press_goes_on_to_take_the_lid_off(monkeypatch, tmp_path,
     code, _rows = run_main(monkeypatch, tmp_path, ["--execute", "--depth-press"], _approach(), ROOMY,
                            depth=lambda *a, **k: result)
     assert code == 0 and len(taken) == 1 and taken[0][0] is not None and taken[0][1] is result
+
+
+def test_an_open_box_the_aim_at_staging_sees_is_opened_by_the_depth_press_not_stopped_for(monkeypatch, tmp_path, capsys):
+    """17:27: the aim at staging read the knob 10 mm up and the run stopped
+    ("already OPEN ... Pushing it would shut it"). With the depth press the
+    run goes on: the depth press is told what the aim read (it feels the lid
+    beside the knob instead of pressing it), and the lid comes off."""
+    from rammp_box_opening.tasks import press_demo
+    from rammp_box_opening.tasks.depth_press import DepthPress
+
+    result = DepthPress(free=True, contact=True, popped=True, knob_mm=10.0)
+    told, taken = [], []
+
+    def depth(node, ctx, cfg, runner, watcher, tool, knob_up_mm=None):
+        told.append(knob_up_mm)
+        return result
+
+    monkeypatch.setattr(press_demo, "lid_off_after_depth_press", lambda ctx, cfg, runner, execute, res: (
+        taken.append(res), 0)[1])
+    code, rows = run_main(monkeypatch, tmp_path, ["--execute", "--depth-press"], _approach(button_up_mm=10.0), ROOMY,
+                          depth=depth)
+    out = capsys.readouterr().out
+    assert code == 0 and told == [10.0] and taken == [result]
+    assert "already OPEN" in out and "returning home" not in out
+    assert [(r["button_above_lid_mm"], r["opened"]) for r in rows if r["leg"] == "open_box"] == [(10.0, True)]
+    # ... and without the depth press, an open box still stops the run, nothing pressed
+    code, rows = run_main(monkeypatch, tmp_path / "plain", ["--execute"], _approach(button_up_mm=10.0), ROOMY)
+    out = capsys.readouterr().out
+    assert code == 1 and "already OPEN" in out and "--depth-press" in out
+    assert [(r["button_above_lid_mm"], r["opened"]) for r in rows if r["leg"] == "open_box"] == [(10.0, False)]
 
 
 def test_a_depth_press_run_that_falls_through_to_grip_and_place_still_needs_a_lid_spot(

@@ -500,6 +500,145 @@ def _rise(ctx, runner, quat, top_z, ref):
     return True
 
 
+def _touch_lid(ctx, cfg, runner, quat, top_z, over, depth, lens):
+    """TOUCH: straight down from where the hand stands, fast to TOUCH_SLOW_M
+    short of where the camera's `depth` and TF's `lens` put the lid, then
+    slowly, until the torques feel it — checked against where these
+    fingertips can meet it. Returns (the leg that met it, for the recoil; the
+    pads' point by the arm's own kinematics; None), or (None, None, the
+    DepthPress to stop with)."""
+    from rammp_box_opening.models.container import from_container
+    from rammp_box_opening.runtime import approach
+
+    m = ctx.model
+    reach = float(depth) + float(cfg.travel_m)
+    # fast to TOUCH_SLOW_M short of where the depth and TF's mount put the lid
+    fast_m = max(0.0, float(depth) - (float(DOWN_CONTACT_TOOL[2]) - float(lens[2])) - TOUCH_SLOW_M)
+    touched = []
+    if fast_m > 0.0:
+        fast, why = _hand_line(ctx, 0.0, 0.0, -fast_m, quat)
+        if not fast:
+            return None, None, DepthPress(free=True, why="the stroke down is not a straight line the arm can fly (%s)" % (
+                why or "no length"))
+        print("[press_demo] TOUCH: straight down, %.0f mm fast, then slowly, at most %.0f mm in all, until the torques "
+              "feel it" % (1000 * fast_m, 1000 * reach))
+        touch = touch_leg(ctx, cfg, fast, quat, over, name="depth:approach", arrive_ok=True)
+        touched = runner.run([touch], execute=True)
+        if any(not r.ok for r in touched):
+            return None, None, DepthPress(free=_rise(ctx, runner, quat, top_z, over), why=touched[-1].detail)
+    else:
+        print("[press_demo] TOUCH: straight down, slowly, at most %.0f mm, until the torques feel it" % (1000 * reach))
+    if not touched or touched[-1].outcome != "touch":
+        stroke, why = _hand_line(ctx, 0.0, 0.0, -(reach - fast_m), quat)
+        if not stroke:
+            return None, None, DepthPress(free=_rise(ctx, runner, quat, top_z, over),
+                                          why="the stroke down is not a straight line the arm can fly (%s)" % (
+                                              why or "no length"))
+        touch = touch_leg(ctx, cfg, stroke, quat, over, speed=TOUCH_SPEED)  # the leg that meets the lid, for the recoil
+        touched = runner.run([touch], execute=True)
+    if touched[-1].outcome == "touch":
+        ctx.contact_pad = CONTACT_SHIFT_PAD_M
+    if any(not r.ok for r in touched):
+        return None, None, DepthPress(free=_rise(ctx, runner, quat, top_z, over), why=touched[-1].detail)
+    R1, t1 = approach._chain().fk(ctx.client.joints())
+    down = top_z - float(t1[2])
+    ahead = float(depth) - down
+    ahead_tf = float(DOWN_CONTACT_TOOL[2]) - float(lens[2])  # where TF's mount puts the pads before the lens
+    pad = np.asarray(t1, float) + np.asarray(R1, float) @ np.asarray(DOWN_CONTACT_TOOL)
+    world_dz = float(pad[2]) - float(from_container(ctx.cpose, m.button_offset)[2])
+    runner.note("depth_touch", down_mm=round(1000 * down, 1), lid_depth_mm=round(1000 * depth, 1),
+                fingertips_ahead_of_lens_mm=round(1000 * ahead, 1), tf_says_mm=round(1000 * ahead_tf, 1),
+                pad_xyz=[round(float(v), 4) for v in pad], world_dz_mm=round(1000 * world_dz, 1))
+    print("[press_demo] TOUCHED after %.0f mm down: the fingertips are %.0f mm in front of the wrist lens (the camera's "
+          "mount in TF says %.0f)" % (1000 * down, 1000 * ahead, 1000 * ahead_tf))
+    if ahead > LENS_AHEAD_MAX_M or ahead < -float(cfg.travel_m):
+        return None, None, DepthPress(free=_rise(ctx, runner, quat, top_z, over), contact=True,
+                                      why="the contact %.0f mm down is not where this hand's fingertips can meet the "
+                                          "lid" % (1000 * down))
+    if abs(ahead - ahead_tf) > AHEAD_TOL_M:  # the mount is wrong after all, or the touch met something else
+        return None, None, DepthPress(free=_rise(ctx, runner, quat, top_z, over), contact=True,
+                                      why="the touch met something %.0f mm from where the camera saw the lid — not "
+                                          "pushing" % (1000 * abs(ahead - ahead_tf)))
+    return touch, pad, None
+
+
+# An OPEN box (the knob already up) is never pressed: pressing shuts it. The
+# grip needs the lid's height to a few mm — the knob stands only 5-10 mm — and
+# the wrist camera's is 7-9 mm off the arm's own through TF's mount (touches
+# 2026-10-23: the fingertips 122.7 and 124.6 mm in front of the lens, TF says
+# 116). So the closed pads feel the lid beside the knob, halfway across its
+# ring round the button, along the hand's x: the fingers close along it, so
+# the pads' narrow side lies across the ring. The closed pads' footprint, half
+# of it along the hand's x and y (robotiq_description's fingertip collision
+# mesh), and what it must keep clear of the knob and of the lid's edge.
+PAD_HALF_M = (0.0065, 0.0105)
+LID_TOUCH_CLEAR_M = 0.004
+
+
+def lid_touch_offset_m(model):
+    """How far beside the button's centre, along the hand's x, the closed pads
+    feel an open box's lid: halfway across the ring between the button and
+    the lid's nearest edge — or None when that ring cannot take the pads'
+    footprint with LID_TOUCH_CLEAR_M to spare on both sides (Ankou: 37 mm,
+    8.8 mm clear of the knob and 7.5 mm of the edge)."""
+    r_in = 0.5 * float(model.button_diameter_m)
+    r_out = 0.5 * min(float(model.dims[0]), float(model.dims[1])) - math.hypot(
+        float(model.button_offset[0]), float(model.button_offset[1]))
+    d = 0.5 * (r_in + r_out)
+    if (d - PAD_HALF_M[0] - r_in < LID_TOUCH_CLEAR_M
+            or r_out - math.hypot(d + PAD_HALF_M[0], PAD_HALF_M[1]) < LID_TOUCH_CLEAR_M):
+        return None
+    return d
+
+
+def _feel_the_lid(ctx, cfg, runner, quat, top_z, over, depth, lens, seen, up_mm):
+    """An open box, its knob `up_mm` above the lid, the fingers over the
+    button: the closed pads go lid_touch_offset_m along the hand's x (the
+    other way when that line does not fly), feel the lid there as the press
+    feels the button (_touch_lid), and come back up. The box is then where
+    the pads put it — the button's centre at the lid's felt height — and
+    the knob up: what the grip goes down to (lid_ready, then
+    press_demo.lid_off_after_depth_press). Nothing presses the knob."""
+    from rammp_box_opening.runtime import approach
+
+    m = ctx.model
+    d = lid_touch_offset_m(m)
+    if d is None:
+        return DepthPress(free=True, why="the box is already OPEN (the knob %.0f mm above its lid), and its lid has no "
+                                         "ring round the button wide enough for the pads to feel it on — not pressing "
+                                         "the knob down, which would shut it" % up_mm)
+    print("[press_demo] ALREADY OPEN: the knob stands %.0f mm above its lid — not pressing it, which would shut the "
+          "box; the pads feel the lid %.0f mm beside it for the grip" % (up_mm, 1000 * d))
+    R, _t = approach._chain().fk(ctx.client.joints())
+    whys = []
+    for sign in (1.0, -1.0):
+        pts, why = _hand_line(ctx, sign * d, 0.0, 0.0, quat)  # level, along the hand's x
+        if pts:
+            break
+        whys.append(why or "no length")
+    else:
+        return DepthPress(free=True, why="the box is already OPEN, and neither move beside the knob is a straight line "
+                                         "the arm can fly (%s)" % "; ".join(whys))
+    shift = np.asarray(R, float)[:, 0] * sign * d  # the move, in the world
+    res = runner.run([rp.line_leg(ctx, "depth:beside", pts, quat, CENTRE_SPEED, rp.drag_guard(over),
+                                  _full_world(ctx))], execute=True)
+    if any(not r.ok for r in res):
+        return DepthPress(free=False, why="the move beside the knob met something — the arm holds")
+    _touch, pad, stop = _touch_lid(ctx, cfg, runner, quat, top_z, over, depth, lens)
+    if stop is not None:
+        return stop
+    button = (float(pad[0] - shift[0]), float(pad[1] - shift[1]), float(pad[2]))
+    seen["touch_xyz"] = tuple(round(v, 5) for v in button)
+    ctx.cpose = rp.cpose_for_button(list(button), ctx.cpose.yaw, m.button_offset)
+    runner.note("depth_lid_felt", knob_up_mm=round(float(up_mm), 1), beside_mm=round(1000 * sign * d, 1),
+                lid_xyz=[round(float(v), 4) for v in pad])
+    print("[press_demo] the lid felt %.0f mm beside the knob: the box is put there, the knob gripped from its height"
+          % (1000 * d))
+    if not _rise(ctx, runner, quat, top_z, over):
+        return DepthPress(free=False, contact=True, popped=True, why="the way up stopped")
+    return DepthPress(free=True, contact=True, popped=True, knob_mm=float(up_mm))
+
+
 @dataclass
 class DepthPress:
     """What the depth press came back with."""
@@ -519,22 +658,24 @@ class DepthPress:
     seen_at: tuple = None  # where the after-look saw the button (where_seen), for a look again from there
 
 
-def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=None, turned=None):
+def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None):
     """TURN, DEPTH, TOUCH, PUSH, RISE, LOOK from where the hand stands over
     the button (`contact_tool`: the fingertip's point in tool_frame at the
     hand's current attitude). `here`: the caller's at-rest reading where the
     arm stands now, nothing flown since; `turned`: the hand already points
-    down at this quat (the reach-out slid in turning), no TURN. Never goes
-    home itself: DepthPress.free says whether the arm may."""
+    down at this quat (the reach-out slid in turning), no TURN. An open box
+    — the knob KNOB_UP_MM up by any look here or by `knob_up_mm`, the
+    caller's aim — is never pressed: the pads feel its lid beside the knob
+    instead (_feel_the_lid). Never goes home itself: DepthPress.free says
+    whether the arm may."""
     seen = {}
-    result = _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here, turned)
+    result = _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here, turned, knob_up_mm)
     return dataclasses.replace(result, ref=seen.get("ref"), touch_xyz=seen.get("touch_xyz"))
 
 
-def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, turned=None):
+def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, turned=None, knob_up_mm=None):
     from rammp_box_opening.models.container import from_container
     from rammp_box_opening.runtime import approach
-    from rammp_box_opening.tasks.press_demo import refuse_open_box
 
     m = ctx.model
     if here is None:
@@ -576,10 +717,8 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
     if s is None:
         return DepthPress(free=True, why="the wrist camera does not see the button from over the box (%s) — not "
                                          "pressing blind" % status)
-    if np.isfinite(s.up_mm):
-        open_already = refuse_open_box(s.up_mm)
-        if open_already is not None:
-            return DepthPress(free=True, why=open_already)
+    # how far the knob stands above its lid, by every look that read it
+    ups = [float(v) for v in (knob_up_mm, s.up_mm) if v is not None and np.isfinite(v)]
 
     # CENTRE: the fingertip's vertical through the button the camera sees,
     # in world xy — the stroke is vertical whatever the hand's lean
@@ -610,6 +749,8 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
         lens, r_hc = lens2 or (lens, r_hc)
         if s is None:
             return DepthPress(free=True, why="the wrist camera lost the button after moving over it (%s)" % status)
+        if np.isfinite(s.up_mm):
+            ups.append(float(s.up_mm))
         off = _off_in_world(ctx, s, lens, r_hc)
         if math.hypot(*off) > 0.5 * miss:
             return DepthPress(free=True, why="moving over the button did not bring it under the fingers (%.0f -> %.0f mm)"
@@ -621,51 +762,13 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
           "the fingers' line: %s)" % (1000 * math.hypot(*off), "" if not moves else " after %d move(s)" % moves,
                                       1000 * depth, "n/a" if z_under is None else "%.0f mm" % (1000 * z_under)))
 
-    reach = float(depth) + float(cfg.travel_m)
-    # fast to TOUCH_SLOW_M short of where the depth and TF's mount put the lid
-    fast_m = max(0.0, float(depth) - (float(DOWN_CONTACT_TOOL[2]) - float(lens[2])) - TOUCH_SLOW_M)
-    touched = []
-    if fast_m > 0.0:
-        fast, why = _hand_line(ctx, 0.0, 0.0, -fast_m, quat)
-        if not fast:
-            return DepthPress(free=True, why="the stroke down is not a straight line the arm can fly (%s)" % (why or "no length"))
-        print("[press_demo] TOUCH: straight down, %.0f mm fast, then slowly, at most %.0f mm in all, until the torques "
-              "feel it" % (1000 * fast_m, 1000 * reach))
-        touch = touch_leg(ctx, cfg, fast, quat, over, name="depth:approach", arrive_ok=True)
-        touched = runner.run([touch], execute=True)
-        if any(not r.ok for r in touched):
-            return DepthPress(free=_rise(ctx, runner, quat, top_z, over), why=touched[-1].detail)
-    else:
-        print("[press_demo] TOUCH: straight down, slowly, at most %.0f mm, until the torques feel it" % (1000 * reach))
-    if not touched or touched[-1].outcome != "touch":
-        stroke, why = _hand_line(ctx, 0.0, 0.0, -(reach - fast_m), quat)
-        if not stroke:
-            return DepthPress(free=_rise(ctx, runner, quat, top_z, over),
-                              why="the stroke down is not a straight line the arm can fly (%s)" % (why or "no length"))
-        touch = touch_leg(ctx, cfg, stroke, quat, over, speed=TOUCH_SPEED)  # the leg that meets the lid, for the recoil
-        touched = runner.run([touch], execute=True)
-    if touched[-1].outcome == "touch":
-        ctx.contact_pad = CONTACT_SHIFT_PAD_M
-    if any(not r.ok for r in touched):
-        return DepthPress(free=_rise(ctx, runner, quat, top_z, over), why=touched[-1].detail)
-    R1, t1 = approach._chain().fk(ctx.client.joints())
-    down = top_z - float(t1[2])
-    ahead = float(depth) - down
-    ahead_tf = float(DOWN_CONTACT_TOOL[2]) - float(lens[2])  # where TF's mount puts the pads before the lens
-    pad = np.asarray(t1, float) + np.asarray(R1, float) @ np.asarray(DOWN_CONTACT_TOOL)
+    up = max(ups) if ups else float("nan")
+    if np.isfinite(up) and up >= KNOB_UP_MM:
+        return _feel_the_lid(ctx, cfg, runner, quat, top_z, over, depth, lens, seen, up)
+    touch, pad, stop = _touch_lid(ctx, cfg, runner, quat, top_z, over, depth, lens)
+    if stop is not None:
+        return stop
     world_dz = float(pad[2]) - float(from_container(ctx.cpose, m.button_offset)[2])
-    runner.note("depth_touch", down_mm=round(1000 * down, 1), lid_depth_mm=round(1000 * depth, 1),
-                fingertips_ahead_of_lens_mm=round(1000 * ahead, 1), tf_says_mm=round(1000 * ahead_tf, 1),
-                pad_xyz=[round(float(v), 4) for v in pad], world_dz_mm=round(1000 * world_dz, 1))
-    print("[press_demo] TOUCHED after %.0f mm down: the fingertips are %.0f mm in front of the wrist lens (the camera's "
-          "mount in TF says %.0f)" % (1000 * down, 1000 * ahead, 1000 * ahead_tf))
-    if ahead > LENS_AHEAD_MAX_M or ahead < -float(cfg.travel_m):
-        return DepthPress(free=_rise(ctx, runner, quat, top_z, over), contact=True,
-                          why="the contact %.0f mm down is not where this hand's fingertips can meet the lid" % (1000 * down))
-    if abs(ahead - ahead_tf) > AHEAD_TOL_M:  # the mount is wrong after all, or the touch met something else
-        return DepthPress(free=_rise(ctx, runner, quat, top_z, over), contact=True,
-                          why="the touch met something %.0f mm from where the camera saw the lid — not pushing" % (
-                              1000 * abs(ahead - ahead_tf)))
     # the box is where the fingertips met its button, flush before the push:
     # every world from here on (the home's too) holds it there, not where TF
     # put it (76 mm high on 20:04, so every home started "inside" it). The

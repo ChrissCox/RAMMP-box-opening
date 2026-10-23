@@ -211,7 +211,7 @@ def _seen(hand_off=(0.0, 0.0), depth=0.27, lens=LENS, r_hc=EYE, up=0.4):
 
 
 def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="touch", refuse_turn=False,
-           lens=LENS, r_hc=EYE, measured=LENS, refuse_first=0, here=None, turned=None):
+           lens=LENS, r_hc=EYE, measured=LENS, refuse_first=0, here=None, turned=None, knob_up_mm=None):
     """press_down_from_here with the hand `tilt` deg over BUTTON (at the
     reach-out's stroke start, 6 cm above TF's lid at 0.40), the wrist camera
     scripted by `looks` (a (sighting, z, status) or a _seen) with TF's lens
@@ -287,7 +287,8 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="
     runner = R(ctx.client, log_dir=tmp_path)
     contact = rp.CONTACT_TOOL if tilt else dp.DOWN_CONTACT_TOOL
     watcher = SimpleNamespace(grab=SimpleNamespace(wrist_lens_in_hand_m=None if measured is None else list(measured)))
-    result = dp.press_down_from_here(None, ctx, cfg, runner, watcher, contact, here=here, turned=turned)
+    result = dp.press_down_from_here(None, ctx, cfg, runner, watcher, contact, here=here, turned=turned,
+                                     knob_up_mm=knob_up_mm)
     return result, events, arm, legs, start
 
 
@@ -536,9 +537,61 @@ def test_no_wrist_frame_at_all_presses_nothing(ctx, monkeypatch, tmp_path):
     assert result.free and "not pressing blind" in result.why and "depth:touch" not in events
 
 
-def test_an_open_box_is_not_pressed(ctx, monkeypatch, tmp_path):
-    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, [(_sighting(up=14.0), 0.26, "2/2")])
-    assert result.free and "OPEN" in result.why and "depth:touch" not in events
+def test_an_open_box_is_never_pressed_the_pads_feel_its_lid_beside_the_knob(ctx, monkeypatch, tmp_path):
+    """17:27: the knob already 10 mm up, and the run stopped — pressing it
+    would shut the box. Now nothing presses it: the closed pads go halfway
+    across the lid's ring along the hand's x, feel the lid there, and come
+    back up; the box is put at the button's centre, at the felt lid's height,
+    the knob up — what the grip goes down to."""
+    from rammp_box_opening.models.container import from_container
+
+    result, events, arm, legs, start = _press(ctx, monkeypatch, tmp_path, [(_sighting(up=14.0), 0.27, "2/2")])
+    assert events == ["depth:turn", "look:depth-look", "depth:beside", "depth:approach", "depth:touch", "depth:unload",
+                      "depth:rise"]
+    assert "press:push" not in events
+    assert result.free and result.contact and result.popped and not result.felt and result.why is None
+    assert dp.lid_ready(result) and dp.exit_code(result) == 0
+    goal, quat = arm.turns[0]
+    R = rp._rot(quat)
+    d = dp.lid_touch_offset_m(ctx.model)
+    beside = np.asarray(goal) + R[:, 0] * d  # along the hand's x: the pads' narrow side across the ring
+    assert arm.lines[0] == pytest.approx(list(beside))
+    assert legs["depth:beside"].guard.trip == "obstruction" and legs["depth:beside"].plan_free
+    assert arm.lines[1][:2] == pytest.approx(list(beside[:2]))  # the touch straight down from there
+    assert legs["depth:touch"].guard.trip == "touch"
+    # the box: the button's centre — where the fingers stood before the move — at the lid's felt height
+    lid_z = goal[2] - TOUCH_AT + dp.DOWN_CONTACT_TOOL[2] * R[2, 2]
+    button = from_container(ctx.cpose, ctx.model.button_offset)
+    assert button[:2] == pytest.approx(list(goal[:2]), abs=1e-6) and button[2] == pytest.approx(lid_z, abs=1e-6)
+    assert result.touch_xyz == pytest.approx(tuple(button), abs=1e-4)
+    # back up where the touch began, judged for a pull at the fingertip, as after a press
+    assert arm.lines[-1][2] == pytest.approx(goal[2]) and legs["depth:rise"].guard.hang is not None
+
+
+def test_the_aim_before_the_depth_press_saw_the_knob_up_and_that_is_enough(ctx, monkeypatch, tmp_path):
+    """Either reading is enough: pressing an open box shuts it, while feeling
+    the lid of a shut one costs a grip that closes on air and stops."""
+    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, [(_sighting(up=1.0), 0.27, "2/2")], knob_up_mm=10.0)
+    assert "depth:beside" in events and "press:push" not in events and result.popped
+    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, [(_sighting(up=1.0), 0.27, "2/2"),
+                                                                     (_sighting(up=0.5), None, "2/2")], knob_up_mm=2.0)
+    assert "depth:beside" not in events and "press:push" in events
+
+
+def test_the_pads_feel_an_open_lid_halfway_across_its_ring_clear_of_the_knob_and_the_edge(pink):
+    d = dp.lid_touch_offset_m(pink)
+    assert d == pytest.approx(0.5 * (0.022 + 0.0525))  # Ankou: halfway between the button's edge and the lid's
+    assert d - dp.PAD_HALF_M[0] - 0.022 >= dp.LID_TOUCH_CLEAR_M
+    assert 0.0525 - np.hypot(d + dp.PAD_HALF_M[0], dp.PAD_HALF_M[1]) >= dp.LID_TOUCH_CLEAR_M
+    # a lid with no ring round its button to speak of: not felt, not pressed
+    narrow = SimpleNamespace(button_diameter_m=0.044, dims=(0.07, 0.07, 0.12), button_offset=(0.0, 0.0, 0.12))
+    assert dp.lid_touch_offset_m(narrow) is None
+
+
+def test_an_open_box_with_no_lid_ring_to_feel_is_not_pressed(ctx, monkeypatch, tmp_path):
+    monkeypatch.setattr(dp, "lid_touch_offset_m", lambda model: None)
+    result, events, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, [(_sighting(up=14.0), 0.27, "2/2")])
+    assert result.free and "OPEN" in result.why and "depth:touch" not in events and "depth:beside" not in events
 
 
 def test_no_contact_all_the_way_down_rises_and_says_so(ctx, monkeypatch, tmp_path):
