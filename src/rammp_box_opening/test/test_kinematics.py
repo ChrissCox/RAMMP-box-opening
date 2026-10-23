@@ -95,13 +95,15 @@ def test_the_folded_wrist_is_solved_once(chain, monkeypatch):
     # joint_5 and joint_7 are continuous: the four half-turn seeds differ by
     # whole turns and converge together, so one solve is all equivalents pays
     calls = []
-    solve = ArmChain.solve_pose
+    solve = chain.solve_pose
 
-    def counting(self, *a, **kw):
+    def counting(*a, **kw):
         calls.append(1)
-        return solve(self, *a, **kw)
+        return solve(*a, **kw)
 
-    monkeypatch.setattr(ArmChain, "solve_pose", counting)
+    # on the instance: a test that patched the shared chain's instance
+    # attribute leaves it behind, and that would hide a class patch
+    monkeypatch.setattr(chain, "solve_pose", counting)
     q = np.array(HOME, float) + np.array([0.05, -0.05, 0.03, 0.05, -0.04, 0.06, 0.02])
     cands = chain.equivalents(HOME, q)
     assert len(calls) == 1
