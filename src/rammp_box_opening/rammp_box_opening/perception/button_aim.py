@@ -73,6 +73,11 @@ DISC_MIN_FILL = 0.5  # of the disc's rectified cells with valid depth
 ANNULUS_MIN_FILL = 0.3  # of the annulus' cells; a popped knob hides its far side
 KNOB_NOISE_M = 0.0025  # disc and ring medians closer than this are one height
 KNOB_SPLIT_M = 0.006  # disc this far above its lid: two circles the centroid tells apart
+# a first frame is still when the camera's pose this long before its stamp
+# is its pose at it: over two of the wrist camera's frame intervals (the
+# OAK's ~75-90 ms, run logs 2026-10-22), so a stricter test than two
+# consecutive frames — and the reach-out aims after a 0.46 s at-rest read
+FIRST_LOOKBACK_S = 0.2
 OBLIQUE_WINDOW = 3.0  # of the circle's rectified radius: the cells a candidate's gates read
 
 
@@ -593,34 +598,57 @@ class ButtonAimer:
         self.points = []
         self.above_lid = []
         self._last_stamp = None
+        self._last_depth_stamp = None  # the depth that last voted (depth_paired)
         self._last_cam = None
         self.last_sighting = None
+        self.pair_dt_ms = []  # each hit's depth-minus-colour stamp (ms), when known
 
     def tick(self):
         """One frame if there is a new one: True when a fix is ready."""
-        from rammp_box_opening.perception.depth_source import camera_is_still, camera_pose_at
+        from rammp_box_opening.perception.d405 import frame_snapshot
+        from rammp_box_opening.perception.depth_source import (
+            camera_is_still, camera_pose_at, depth_key, depth_paired, pair_dt_ms,
+        )
 
         g = self.grab
-        if g.color is None or g.depth is None or g.k is None or g.color_stamp is None:
+        # one read of the frame: the dedup key, the pose's stamp and the
+        # pixels judged all belong to it even if a newer one lands meanwhile
+        f = frame_snapshot(g)
+        if f.color is None or f.depth is None or f.k is None or f.color_stamp is None:
             self.last_why = "no wrist frame yet"
             return False
-        stamp = (g.color_stamp.sec, g.color_stamp.nanosec)
+        stamp = (f.color_stamp.sec, f.color_stamp.nanosec)
         if stamp == self._last_stamp:
             return False
+        paired, why = depth_paired(f, self._last_depth_stamp)
+        if not paired:
+            # not consumed: its depth may not have landed yet, and the next
+            # tick tries this colour frame again; a stalled depth never aims
+            self.last_why = why
+            return False
         self._last_stamp = stamp
+        self._last_depth_stamp = depth_key(f)
         self.frames += 1
-        cam = camera_pose_at(g)
+        cam = camera_pose_at(g, stamp=f.color_stamp)
         if cam is None:
             self.last_why = "no camera pose for the frame"
             return False
-        still = camera_is_still(self._last_cam, cam)
+        prev = self._last_cam
+        if prev is None:
+            # the first frame has no frame before it: the camera's pose
+            # FIRST_LOOKBACK_S before its stamp stands in for one (TF keeps
+            # the history) — the same still test, over at least one frame
+            # interval, so a parked arm's first frame votes
+            off = float(getattr(g, "stamp_offset_s", 0.0) or 0.0)
+            prev = camera_pose_at(g, offset_s=off - FIRST_LOOKBACK_S, stamp=f.color_stamp)
+        still = camera_is_still(prev, cam)
         self._last_cam = cam
         if not still:
             self.last_why = "camera moving"
             return False
         rot, trans = cam
         s, why = find_button(
-            g.color, g.depth, g.k, rot, trans, self.table_z, self.model, dist=getattr(g, "dist", None),
+            f.color, f.depth, f.k, rot, trans, self.table_z, self.model, dist=f.dist,
             lid_z=self.lid_z, prior_xy=self.prior_xy,
         )
         if s is None:
@@ -630,6 +658,9 @@ class ButtonAimer:
         self.last_sighting = s
         self.points.append(s.xyz)
         self.above_lid.append(s.above_lid_m)
+        dt = pair_dt_ms(f)
+        if dt is not None:
+            self.pair_dt_ms.append(dt)
         return agreeing_median(self.points) is not None
 
     def button_above_lid_m(self):
