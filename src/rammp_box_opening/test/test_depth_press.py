@@ -574,6 +574,15 @@ def test_a_box_the_bench_camera_sees_moved_is_moved_the_way_it_went(ctx, monkeyp
     assert from_container(ctx.cpose, ctx.model.button_offset)[:2] == pytest.approx(list(want))
 
 
+def test_the_home_after_a_depth_press_that_stopped_says_why_first():
+    """17:30: a depth press stopped over the box went home announcing "DEPTH
+    PRESS done" and told why only after the home."""
+    stopped = dp.DepthPress(free=True, why="moving over the button did not bring it under the fingers (21 -> 288 mm)")
+    assert dp.home_why(stopped) == "STOP: " + stopped.why
+    assert "MOVED" in dp.home_why(dp.DepthPress(free=True, contact=True, moved=True))
+    assert dp.home_why(dp.DepthPress(free=True, contact=True, felt=True, popped=True)) == ""
+
+
 def test_a_box_the_press_moved_stops_the_run(ctx, monkeypatch, tmp_path):
     looks = [(_sighting(), 0.27, "2/2"), (_sighting(x=0.012, up=12.0), None, "2/2")]
     result, _e, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks)

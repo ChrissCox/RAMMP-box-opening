@@ -793,8 +793,11 @@ def after_scene_check(ctx, runner, result, scene_fix, locator):
 
 
 def home_why(result):
-    """What the home after a depth press says first: a moved box is a STOP
-    before the arm goes anywhere."""
+    """What the home after a depth press says first: why it stopped short,
+    when it did (2026-10-23 17:30 went home "DEPTH PRESS done" and told why
+    only after), and a moved box is a STOP before the arm goes anywhere."""
+    if result.why is not None:
+        return "STOP: %s" % result.why
     return "STOP: the press MOVED the box — check it is still standing on the table" if result.moved else ""
 
 
