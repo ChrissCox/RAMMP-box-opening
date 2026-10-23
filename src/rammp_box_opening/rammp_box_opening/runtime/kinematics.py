@@ -101,6 +101,8 @@ class ArmChain:
         chain = []
         link = tip
         while link != root:
+            if link not in by_child:  # walked off the top: this URDF has no `root`
+                raise RuntimeError("URDF %s has no chain from %s to root %s" % (path or urdf_path(), tip, root))
             name, typ, parent, t, R, axis, lim = by_child[link]
             chain.append((name, typ, t, R, axis, lim))
             link = parent

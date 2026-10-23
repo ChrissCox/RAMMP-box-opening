@@ -821,42 +821,6 @@ RECENTRE_TOL_M = 0.025
 RECENTRE_MAX = 2  # moves over the button before pressing from the last aim (detect.recentre_max_moves)
 
 
-def _arm_urdf_path(node, base_frame):
-    """Return a temp-file path to the arm's URDF, or None for the bench default.
-
-    On flatbot the nightly arm_state_publisher renders the URDF with arm_mount
-    as root (incorporating the adapter plate tilt) and publishes it latched on
-    /arm/robot_description. The FK chain must use THAT URDF so its root matches
-    the planning frame. On the bench the installed kinova_gen3.urdf is correct."""
-    if base_frame == "base_link":
-        return None
-    import tempfile
-    from std_msgs.msg import String
-
-    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-    latched = QoSProfile(
-        depth=1,
-        reliability=ReliabilityPolicy.RELIABLE,
-        durability=DurabilityPolicy.TRANSIENT_LOCAL,
-    )
-    got = []
-    sub = node.create_subscription(String, "/arm/robot_description", got.append, latched)
-    t0 = time.monotonic()
-    while not got and time.monotonic() - t0 < 5.0:
-        rclpy.spin_once(node, timeout_sec=0.1)
-    node.destroy_subscription(sub)
-    if not got:
-        node.get_logger().error(
-            "/arm/robot_description not received in 5 s — ArmChain will use the "
-            "bench URDF (base_link root). FK in arm_mount frame will be wrong."
-        )
-        return None
-    f = tempfile.NamedTemporaryFile(suffix=".urdf", delete=False, mode="w")
-    f.write(got[0].data)
-    f.close()
-    return f.name
-
-
 def tool_xy(ctx):
     """Where the tool stands (base xy), from the arm's own kinematics."""
     from rammp_box_opening.runtime.approach import _chain
@@ -1995,7 +1959,7 @@ def home_first(ctx, runner, execute, rest):
         print(
             "[press_demo] not starting: the move home was refused in the bench world (%s) — the arm is "
             "probably down at the table. Clear the bench and recover by hand:\n"
-            "    ros2 run rammp_box_opening home_arm --execute    (add --lift-first 0.08 if that is refused too)" % e
+            "    scripts/sheppy_task.sh home_arm --execute    (add --lift-first 0.08 if that is refused too)" % e
         )
         return False
     res = runner.run([leg], execute=execute)
@@ -2077,8 +2041,16 @@ def main():
     node, client = cli_common.init_runtime(args.execute)
     worlds = WorldStore(bench)
     client._base_frame = worlds.base_frame
-    from rammp_box_opening.runtime.approach import set_chain_root
-    set_chain_root(worlds.base_frame, urdf_path=_arm_urdf_path(node, worlds.base_frame))
+    from rammp_box_opening.runtime.approach import chain_ready, set_chain_root
+    set_chain_root(worlds.base_frame, urdf_path=cli_common._arm_urdf_path(node, worlds.base_frame))
+    ok, why = chain_ready()
+    if not ok:
+        # every aim, press and reach check needs the chain: without it the
+        # run flew to staging and died there on a KeyError (review 2026-10-22)
+        sys.exit(
+            "[press_demo] not starting: /arm/robot_description not heard in 5 s (arm_state_publisher down?) — "
+            "the arm kinematics for %s are unavailable (%s). Nothing moved." % (worlds.base_frame, why)
+        )
     runner = Runner(client)
     cli_common.apply_speed_scale(runner, args)
     # The persistent owl_detector node owns the OWL model; there is no
