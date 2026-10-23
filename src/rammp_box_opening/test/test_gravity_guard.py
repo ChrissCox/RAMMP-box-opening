@@ -65,6 +65,42 @@ def test_a_pull_down_at_the_fingertip_reads_mostly_on_joint_4(model):
     assert abs(k[0]) > 0.3 and abs(k[3]) < 0.05  # joint_7 turns about the hand's own axis
 
 
+def _installed_model(**kw):
+    try:
+        return GravityModel(root="base_link", **kw)
+    except Exception as e:  # noqa: BLE001 - no installed description on this machine
+        pytest.skip("no installed URDF: %s" % e)
+
+
+def _assert_lumps_match_the_tree(model, n=200, seed=0):
+    rng = np.random.default_rng(seed)
+    for _ in range(n):
+        q = rng.uniform(-3.0, 3.0, 7)
+        pt = rng.uniform(-0.1, 0.1, 3)
+        assert np.abs(model.holding(q) - model._holding_tree(q)).max() < 1e-9
+        assert np.abs(model.holding(q, first=3) - model._holding_tree(q, first=3)).max() < 1e-9
+        extra = [(0.3, pt)]
+        assert np.abs(model.holding(q, extra=extra) - model._holding_tree(q, extra=extra)).max() < 1e-9
+        tree_tip = model._holding_tree(q, extra=[(1.0 / 9.81, pt)], first=3) - model._holding_tree(q, first=3)
+        assert np.abs(model.tip_load(q, pt) - tree_tip).max() < 1e-9
+
+
+def test_the_lumped_model_matches_the_link_tree_walk(model):
+    _assert_lumps_match_the_tree(model)  # flatbot, arm_mount
+    _assert_lumps_match_the_tree(_installed_model(), seed=1)  # the bench chain, base_link
+
+
+def test_the_lumps_follow_the_gripper_angle_they_were_built_at():
+    open_ = GravityModel(path=URDF, root="arm_mount", gripper_rad=0.0)
+    _assert_lumps_match_the_tree(open_, seed=2)
+    _assert_lumps_match_the_tree(_installed_model(gripper_rad=0.0), seed=3)
+
+
+def test_gripper_rad_is_fixed_at_construction(model):
+    with pytest.raises(AttributeError):
+        model.gripper_rad = 0.0
+
+
 def _feed(guard, samples):
     """Readings into the guard until it trips (the client cancels there)."""
     guard.on_progress(0.5)
