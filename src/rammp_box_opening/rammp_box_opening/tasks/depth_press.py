@@ -567,9 +567,12 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen):
         1000 * shift, 1000 * (after.lid_depth - s.lid_depth)))
     if moved:
         # home is planned around the box where the camera sees it now: the
-        # sighting's shift is along the hand's own x and y
+        # sighting's shift, turned from the camera's axes into the hand's
+        # (R_hand_cam: 180 deg on the bench's D405), then into the world
         R2, _t2 = approach._chain().fk(ctx.client.joints())
-        d = np.asarray(R2, float)[:, 0] * (after.x - s.x) + np.asarray(R2, float)[:, 1] * (after.y - s.y)
+        dh = _in_hand(after, lens, r_hc) - _in_hand(s, lens, r_hc)
+        dh[2] = 0.0  # the lid's depth change is not a shift
+        d = np.asarray(R2, float) @ dh
         c = ctx.cpose
         ctx.cpose = ContainerPose(xyz=(float(c.xyz[0] + d[0]), float(c.xyz[1] + d[1]), float(c.xyz[2])), yaw=c.yaw)
     return DepthPress(free=True, contact=True, felt=felt, popped=popped, moved=moved)

@@ -357,6 +357,21 @@ def test_a_push_the_torques_never_felt_bottom_out_is_not_a_press(ctx, monkeypatc
     assert not result.felt and not result.popped and dp.exit_code(result) == 1
 
 
+def test_a_box_the_bench_camera_sees_moved_is_moved_the_way_it_went(ctx, monkeypatch, tmp_path):
+    """The bench D405 is turned 180 deg about its lens axis: a button seen
+    12 mm further along the camera's x moved 12 mm along the hand's -x."""
+    from rammp_box_opening.models.container import from_container
+
+    bench = (0.0, 0.075, -0.125)
+    looks = [(_sighting(y=bench[1]), 0.27, "2/2"), (_sighting(x=0.012, y=bench[1], up=12.0), None, "2/2")]
+    result, _e, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, lens=bench, r_hc=RZ180, measured=bench,
+                                     touch_at=0.27 - (dp.DOWN_CONTACT_TOOL[2] - bench[2]))
+    assert result.moved
+    R = rp._rot(arm.turns[0][1])
+    want = np.r_[BUTTON[0], BUTTON[1]] - R[:2, 0] * 0.012  # along the hand's -x
+    assert from_container(ctx.cpose, ctx.model.button_offset)[:2] == pytest.approx(list(want))
+
+
 def test_a_box_the_press_moved_stops_the_run(ctx, monkeypatch, tmp_path):
     looks = [(_sighting(), 0.27, "2/2"), (_sighting(x=0.012, up=12.0), None, "2/2")]
     result, _e, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks)
