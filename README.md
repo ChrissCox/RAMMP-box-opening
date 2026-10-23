@@ -37,9 +37,12 @@ source install/setup.zsh
 python3 -m pytest src/rammp_box_opening/test -q -p no:launch_testing -p no:launch_ros
 ```
 
-Python files are COPIED into `build/` at build time (the egg-link points
-there, not at `src/`), so rebuild before any `ros2 run` or e2e after
-editing code. YAMLs are symlinked and update in place.
+With `--symlink-install` Python runs live from `src/` (`build/` links to
+it). The robot's install is built WITHOUT it — `colcon build
+--packages-select rammp_box_opening` copies Python into `install/` — so a
+code edit is not what `ros2 run` flies until rebuilt, and
+`scripts/sheppy_task.sh` refuses `--execute` while `install/` differs from
+`src/`. YAMLs are symlinked under `--symlink-install` and update in place.
 
 ## Runtime sourcing chain (execution shells)
 
@@ -181,12 +184,15 @@ Flow (`tasks/press_demo.py`, one log line per state):
    (only once the wrist camera's timestamp lag has been measured, see
    `config/camera_d405_wrist.yaml`) the approach and the guarded descent
    are ONE goal and the wrist confirms on the way: the arm never stops
-   above the box. No scene fix, or no button found at staging, and the
-   OWL-gated search below runs from wherever the arm is. `--no-scene`
-   forces it. `config/containers/ankou_pink.yaml` is the pink canister
+   above the box. The scene camera alone finds the box (owner,
+   2026-10-22): no scene fix, or no button found at staging, and the run
+   stops and homes. `--no-scene` runs the OWL-gated wrist search below
+   instead (the stub harness, A/B runs). On a robot whose TF carries the
+   scene camera's mount (world `external_static_tf`: flatbot) it is placed
+   by TF, not by `camera_scene.yaml`. `config/containers/ankou_pink.yaml` is the pink canister
    (the default); `oxo_pop.yaml` the 4.1-inch OXO, `oxo_pop_small.yaml` the
    2.9-inch one (`--container`).
-1. **LOOK** — the arm's own rest pose with the hand lifted and the wrist
+1. **LOOK** (`--no-scene` only) — the arm's own rest pose with the hand lifted and the wrist
    pitched down (`primitives/look.py`): 3.42 s, where flying to a fixed
    bench pose measured 3.89 s. Seeing nothing, the
    base SWEEPS `scan.search_arc_rad` each way at `SEARCH_SPEED`, and the
@@ -236,8 +242,10 @@ Flow (`tasks/press_demo.py`, one log line per state):
 
 Each next phase is planned as a Runner lookahead while the previous
 phase's last unguarded motion flies. `--press-only` stops after the
-press (retreat to staging, home); `--detect-only` reports fixes for
-15 s and homes (the wrist-mount calibration observation). All knobs live
+press (retreat to staging, home); `--detect-only` reports the scene
+camera's fixes for 15 s with nothing moving, and `--detect-only
+--no-scene` is the wrist-mount calibration observation (15 s of wrist
+fixes at the look pose, then home). All knobs live
 in the container's YAML (`config/containers/ankou_pink.yaml` by default).
 
 Containers are YAML models in `config/containers/`, chosen with `--container`:

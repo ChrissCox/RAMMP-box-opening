@@ -38,8 +38,9 @@ Spec: `docs/superpowers/specs/2026-08-14-box-opening-design.md` (§6, §8).
 
 All measurements are from base_link: +x forward, +z up, tape measure,
 metres. Record into the two config files (`colcon build
---symlink-install` symlinks the YAMLs, so they update in place; python
-is copied at build, so rebuild after code edits).
+--symlink-install` runs the YAMLs and the python from `src/`, so they
+update in place; the robot's copy install needs a rebuild after any edit,
+and `scripts/sheppy_task.sh` refuses `--execute` until it has one).
 
 ### 2a. Bench world — `src/rammp_box_opening/config/world_bench.yaml`
 
@@ -91,16 +92,16 @@ With the container at its bench spot, lid on:
    that refusal is the worksheet's completion gate.
 10. Wrist-mount check (needs the camera AT the look pose, so this comes
     after the flip): run §4 steps 2–3, then `press_demo --execute
-    --detect-only` with the container placed at a tape-measured spot. The
+    --detect-only --no-scene` with the container placed at a tape-measured spot. The
     arm turns its wrist down — a joint move into free air, no flight —
     reports every fix for 15 s and homes; the printed top-face centre vs
     the tape solves the wrist-mount error. If it reports no fix, check
     `ros2 topic hz /wrist_camera/aligned_depth_to_color/image_raw`
     (sheppy's wrist_camera node up, aligned depth on?), then the status
     line's last reject reason, then where the box is standing — from the
-    look the camera sees 0.58 × 0.33 m of table around (0.36, 0). The full
-    mission sweeps the base to cover more; `--detect-only` does not. A
-    failed detect always returns the arm home.
+    look the camera sees 0.58 × 0.33 m of table around (0.36, 0). The
+    `--no-scene` mission sweeps the base to cover more; the observation
+    does not. A failed detect always returns the arm home.
 11. Scene camera calibration (once, and again whenever the camera or the
     cabinet tag is moved). With the launch up and the arm at HOME:
     `python3 scripts/calibrate_scene_camera.py`. It moves nothing: the wrist
@@ -329,7 +330,7 @@ run for grip and place.
   sweep found "clear", "jar", "canister" and "container" alone at 0.00 and
   every "... pink lid" phrase at 0.36-0.67 — the lid is the anchor; the
   OXO's own prompts score the OXO 0.08-0.13 on real wrist frames).
-  `press_demo --detect-only --execute --container <yaml>` measures the
+  `press_demo --detect-only --no-scene --execute --container <yaml>` measures the
   top's footprint and height from the wrist as a cross-check — the one
   `--execute` an unmeasured container allows (it flies the look pose and
   home only, never near the box).
