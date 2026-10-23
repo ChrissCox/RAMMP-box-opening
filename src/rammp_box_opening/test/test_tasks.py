@@ -1581,6 +1581,54 @@ def test_a_home_that_was_refused_or_did_not_arrive_says_so(ctx, tmp_path):
     assert press_demo.try_home(ctx, make_runner(ctx.client, tmp_path), True, "STOP: test") is False
 
 
+def test_a_stop_with_a_joint_on_its_limit_steps_off_it_and_gets_home(ctx, tmp_path, capsys):
+    """Flatbot 2026-10-23: a staging at the reach limit left arm_joint_6
+    0.100 rad from its limit. The planner refuses a start inside its margin,
+    so the recovery home AND the rise over the box were refused and the arm
+    held. It now steps plan-free along the joint line toward the rest pose
+    first, as home_arm does, and plans home from where the step ends."""
+    import pytest
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import PLANNER_LIMIT_MARGIN_RAD
+    from rammp_box_opening.primitives.core import CLEAR_MARGIN_FIRST_RAD
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks import press_demo
+
+    c = ctx
+    cfg = _demo_cfg()
+    c.press_cfg = cfg
+    rest = press_demo.rest_joints(cfg)
+    lo, hi = approach._chain().limits[5]
+    start = list(rest)
+    start[5] = lo + 0.0999  # arm_joint_6 a hair inside the planner's margin, as it was
+    c.client.live = list(start)
+
+    class InMargin:
+        success = False
+        message = "START_IN_LIMIT_MARGIN: start: arm_joint_6 is 0.100 rad from its position limit"
+        trajectory = None
+
+    def planner(real):  # refuses any start inside its margin, as rammp-curobo does
+        def plan(*a, **kw):
+            q = kw.get("start_joints", a[-1])
+            return InMargin() if min(q[5] - lo, hi - q[5]) < PLANNER_LIMIT_MARGIN_RAD else real(*a, **kw)
+        return plan
+
+    c.client.plan_to_joints = planner(c.client.plan_to_joints)
+    c.client.plan_to_pose = planner(c.client.plan_to_pose)
+    assert press_demo.try_home(c, make_runner(c.client, tmp_path), True, "STOP: test") is True
+    said = capsys.readouterr().out
+    assert "joint_6 is 0.100 rad from its limit" in said and "a plan-free step" in said
+    assert "arm holds" not in said
+    # nothing was planned from the refused start: home from the step's end
+    end = c.client.joint_starts[0]
+    assert min(end[5] - lo, hi - end[5]) == pytest.approx(CLEAR_MARGIN_FIRST_RAD, abs=1e-6)
+    # the guarded plan-free step and the planned home fly apart, and it got home
+    assert len(c.client.executed) == 2
+    assert c.client.live == pytest.approx(rest)
+
+
 def test_the_mission_record_keeps_the_table_the_scene_camera_measured(ctx, tmp_path):
     """Flatbot (no survey): the record was built before the scene measured
     the table, and every truth.json said table_z NaN."""

@@ -105,7 +105,9 @@ from rammp_box_opening.perception.depth_source import BoxTopWatcher
 from rammp_box_opening.primitives.look import look_joints, sweep_targets
 from rammp_box_opening.perception.vlm_source import resolve_roi
 from rammp_box_opening.primitives.core import (
+    CLEAR_MARGIN_MAX_STEP_RAD,
     SETDOWN_OVERDRIVE_M,
+    ClearMarginFree,
     Ctx,
     Home,
     Lift,
@@ -792,13 +794,13 @@ def search_for_box(node, ctx, cfg, runner, watcher, execute, accept_coarse=False
     return None, None
 
 
-def build_home_leg(ctx, start_joints, joints=None):
+def build_home_leg(ctx, start_joints, joints=None, chain=0):
     """The no-box / recovery exit: back to the rest pose in the bench world,
     above the band where an unlocated container may be standing."""
     world = ctx.worlds.push_name("bench", model=ctx.model)
     leg, _ = _plan_motion(
         ctx,
-        _state(start_joints),
+        _state(start_joints, chain),
         "home",
         ("joints", list(HOME if joints is None else joints)),
         world,
@@ -2024,6 +2026,20 @@ def depth_press_refusal(depth_press, cfg, scene, cfg_path=None):
     return None
 
 
+def _home_legs(ctx, cfg, rest, st, say=print):
+    """Home to `rest` from the PlanState `st`: the bench world, else, with a
+    located box, rising over it first. Raises the last refusal."""
+    try:
+        return [build_home_leg(ctx, st.joints, rest, chain=st.chain)]
+    except RuntimeError as e:
+        if cfg is None or getattr(ctx, "cpose", None) is None:
+            raise
+        say("[press_demo] home refused from here (%s) — rising over the box first" % e)
+    _world, rise, after = _rise_over_button(ctx, cfg, st, "retreat:rise")
+    home, _ = _plan_motion(ctx, after, "home", ("joints", list(HOME if rest is None else rest)), _full_world(ctx), TRANSIT_SPEED)
+    return [rise, home]
+
+
 def try_home(ctx, runner, execute, why):
     """Recovery home that cannot crash the exit path: a refused home plan
     leaves the arm holding with an honest line (2026-08-25 review). Goes
@@ -2038,28 +2054,56 @@ def try_home(ctx, runner, execute, why):
     staging height above the button (_rise_over_button: planned against the
     button's interaction world), and goes home from there.
 
+    A joint too near its limit for the planner to start from gets home_arm's
+    plan-free step along the joint line toward the rest pose first, the
+    shortest one home plans from (primitives.ClearMarginFree): a staging at
+    the reach limit left arm_joint_6 0.100 rad from it and both plans were
+    refused (flatbot 2026-10-23).
+
     True when the home was planned and every leg of it flew; False — the
     arm holds — otherwise."""
     print("[press_demo] %s — returning home" % why)
     cfg = getattr(ctx, "press_cfg", None)
     rest = None if cfg is None else rest_joints(cfg)
+    live = _state(ctx.client.joints())
+    clear = ClearMarginFree(HOME if rest is None else rest)
     try:
-        legs = [build_home_leg(ctx, ctx.client.joints(), rest)]
+        near = clear.near(ctx, live.joints)
+        if not near:
+            legs = _home_legs(ctx, cfg, rest, live)
+        else:
+            print(
+                "[press_demo] %s: too near for the planner to start from — trying plan-free steps along the "
+                "joint line toward the rest pose, shortest first" % ", ".join("%s is %.3f rad from its limit" % jr for jr in near)
+            )
+            legs, last = None, None
+            for step, at, info in clear.steps(ctx, live):
+                notes = []
+                try:
+                    legs = step + _home_legs(ctx, cfg, rest, at, say=notes.append)
+                except RuntimeError as e:
+                    last = e
+                    continue
+                for note in notes:
+                    print(note)
+                if step:
+                    d = info["tool_move"]
+                    print(
+                        "[press_demo] a plan-free step %.0f%% of the way to the rest pose first (the largest joint "
+                        "%.3f rad, the tool %+.0f mm up and %.0f mm across; obstruction-guarded)"
+                        % (100 * info["fraction"], info["largest_rad"], 1000 * d[2], 1000 * (d[0] ** 2 + d[1] ** 2) ** 0.5)
+                    )
+                break
+            if legs is None:
+                raise RuntimeError(
+                    "no plan-free step toward the rest pose of up to %.2f rad per joint lets the planner plan "
+                    "home (last: %s) — jog the arm clear by hand" % (CLEAR_MARGIN_MAX_STEP_RAD, last)
+                )
     except RuntimeError as e:
-        if cfg is None or getattr(ctx, "cpose", None) is None:
-            print("[press_demo] home plan refused (%s) — arm holds" % e)
-            return False
-        print("[press_demo] home refused from here (%s) — rising over the box first" % e)
-        try:
-            _world, rise, st = _rise_over_button(ctx, cfg, _state(ctx.client.joints()), "retreat:rise")
-            home, _ = _plan_motion(ctx, st, "home", ("joints", list(HOME if rest is None else rest)), _full_world(ctx), TRANSIT_SPEED)
-        except RuntimeError as e2:
-            print("[press_demo] home plan refused (%s) — arm holds" % e2)
-            return False
-        legs = [rise, home]
+        print("[press_demo] home plan refused (%s) — arm holds" % e)
+        return False
     res = runner.run(legs, execute=execute)
     return all(r.ok for r in res)
-
 
 DETECT_REPORT_S = 15.0
 
