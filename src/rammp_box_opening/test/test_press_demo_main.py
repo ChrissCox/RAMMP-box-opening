@@ -161,7 +161,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
     monkeypatch.setattr(press_demo, "residuals_path_for", lambda p: tmp_path / "residuals.jsonl")
     monkeypatch.setattr(press_demo, "dump_wrist_frame", lambda w, t: None)
 
-    def fake_approach(node, ctx, cfg, runner, watcher, execute, scene_fix):
+    def fake_approach(node, ctx, cfg, runner, watcher, execute, scene_fix, lookahead=True):
         ctx.cpose = scene_fix.pose
         return approach(ctx)
 
