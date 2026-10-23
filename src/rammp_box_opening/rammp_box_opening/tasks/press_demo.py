@@ -468,6 +468,8 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
                     diameter_mm=round(1000 * s.diameter_m, 1), press_xyz=[round(v, 4) for v in xyz],
                     button_above_lid_mm=None if up_mm is None else round(up_mm, 1),
                     hits=aimer.hits, frames=aimer.frames, aim_s=round(time.monotonic() - t0, 2),
+                    # the wrist's depth-vs-colour stamp offsets: what PAIR_TOL_S rests on
+                    pair_dt_ms=[round(v, 1) for v in aimer.pair_dt_ms] or None,
                     capture=None if folder is None else str(folder),
                 )
             return (xyz, yaw), aimer.status()
