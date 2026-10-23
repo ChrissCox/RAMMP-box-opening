@@ -2147,8 +2147,9 @@ def main():
                 tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
                 scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
             )
-            # enable its OWL NOW: the first bbox takes ~1.2 s (tick + inference)
-            # and the readiness checks below are that long — by the time
+            # enable its OWL NOW: the first bbox takes ~0.7 s (the node
+            # infers on the enable edge: one inference, no tick wait) and
+            # the readiness checks below are about that long — by the time
             # locate() asks, the box is already on the topic
             locator.owl.enable()
     # camera on from here to exit
