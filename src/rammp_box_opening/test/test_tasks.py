@@ -38,6 +38,72 @@ def test_home_arm_plans_home_in_the_bench_world(ctx):
     assert legs[0].target == ("joints", list(HOME))
 
 
+def test_home_arm_with_a_known_table_plans_guarded_without_a_caution(ctx, capsys):
+    from rammp_box_opening.tasks import home_arm
+
+    legs = home_arm.build_legs(ctx)
+    assert legs[0].world == "bench"
+    assert "CAUTION" not in capsys.readouterr().out
+
+
+class _PlanCounter:
+    """Wraps a FakeClient's plan_to_joints: counts the plans, and records
+    whether anything had been printed before each one."""
+
+    def __init__(self, client, capsys, succeed=True):
+        self.n = 0
+        self.out = ""
+        self.printed_first = []
+        inner = client.plan_to_joints
+
+        def plan(q7, start_joints):
+            self.n += 1
+            self.out += capsys.readouterr().out
+            self.printed_first.append(bool(self.out))
+            if not succeed:
+                class Bad:
+                    success = False
+                    message = "INVALID_START_STATE_WORLD_COLLISION"
+
+                return Bad()
+            return inner(q7, start_joints)
+
+        client.plan_to_joints = plan
+
+
+def test_home_arm_on_a_tableless_world_cautions_first_and_plans_once(ctx, capsys):
+    """Flatbot 2026-10-22: world_flatbot.yaml has no table and home_arm
+    measures none, so the 'guarded' bench world was the floor alone, the
+    same as the bare one — a recovery home planned blind with no caution,
+    and a refused plan re-planned in the identical world."""
+    from rammp_box_opening.constants import HOME
+    from rammp_box_opening.tasks import home_arm
+
+    c = ctx
+    c.worlds.table_top_z = None
+    plans = _PlanCounter(c.client, capsys)
+    legs = home_arm.build_legs(c)
+    assert names(legs) == ["home"] and legs[0].world == "bench_bare"
+    assert legs[0].target == ("joints", list(HOME))
+    assert [kw.get("model") for kind, kw in c.worlds.pushes if kind == "bench"] == [None]
+    assert plans.n == 1 and plans.printed_first == [True]  # the caution came BEFORE the plan
+    out = plans.out + capsys.readouterr().out
+    assert "CAUTION" in out and "neither the table nor the box" in out and "--lift-first" in out
+
+
+def test_home_arm_on_a_tableless_world_refused_raises_without_a_second_plan(ctx, capsys):
+    import pytest
+
+    from rammp_box_opening.tasks import home_arm
+
+    c = ctx
+    c.worlds.table_top_z = None
+    plans = _PlanCounter(c.client, capsys, succeed=False)
+    with pytest.raises(RuntimeError):
+        home_arm.build_legs(c)
+    assert plans.n == 1
+
+
 def _demo_cfg():
     from rammp_box_opening.models.container import load_press_demo
 
