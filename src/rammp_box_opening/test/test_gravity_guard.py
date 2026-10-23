@@ -146,6 +146,37 @@ def test_leaving_the_button_never_trips_the_pull_check_and_a_box_coming_along_do
     assert 2.5 < g.down_n < 2.9
 
 
+def test_the_ringing_after_a_recoil_is_not_a_box_on_the_hand_and_a_steady_pull_still_is():
+    """Field 2026-10-23 17:18 (run-20261023-171812): 0.1 s into the depth
+    press's unload, 23 ms after the recoil stopped, joint_4 rang reading to
+    reading and its last reading alone read as 3.26 N of pull: the arm
+    stopped over the pressed box with nothing on the hand. The trip report's
+    run-up, judged on the mean of HANG_SAMPLES readings."""
+    from rammp_box_opening.runtime.guards import HANG_SAMPLES
+
+    ref = ([7.645, 0.246, 0.581, -0.154], [0.0] * 7)
+    q = [1.0] + [0.0] * 6
+    grav = lambda q: [0.096 * q[0], 0.0, 0.0, 0.0]  # noqa: E731 - the 0.096 Nm the report's dev_nm took out
+    k = [0.297, 0.0, 0.0, 0.0]  # what reads the report's 0.968 Nm on joint_4 as its 3.26 N
+    ringing = [
+        [7.706, 0.127, 0.098, -0.158], [8.37, -0.107, 0.583, -0.131], [7.768, -0.151, 0.572, -0.145],
+        [6.597, 0.15, 0.32, -0.164], [8.192, 0.269, 0.916, -0.179], [7.289, -0.156, 0.443, -0.147],
+        [8.709, 0.211, 0.729, -0.144],
+    ]
+    g = CompensatedGuard(10.0, grav, reference=ref, hang=(k, 2.5))
+    assert not any(_feed(g, [(e, q) for e in ringing for _repeat in range(12)]))  # each message handed in 12 times
+    assert abs(g.down_n) < 0.5
+    one = CompensatedGuard(10.0, grav, reference=ref, hang=(k, 2.5))
+    one.on_progress(0.5)
+    one.on_efforts(ringing[-1], q)
+    assert one.down_n == pytest.approx(3.26, abs=0.01)  # the reading that stopped the arm
+    # a 0.3 kg canister coming along on top of the same ringing still trips it
+    held = [[e[0] + 2.94 * k[0]] + e[1:] for e in ringing]
+    g = CompensatedGuard(10.0, grav, reference=ref, hang=(k, 2.5))
+    tripped = _feed(g, [(e, q) for e in ringing + held])
+    assert tripped[-1] and len(tripped) <= len(ringing) + HANG_SAMPLES and g.trip_report()["why"] == "hang"
+
+
 def test_a_reference_baseline_is_not_retaken_by_a_rebaseline():
     g = CompensatedGuard(1.0, lambda q: [0.0] * 4, reference=([5.0, 0.0, 0.0, 0.0], [0.0] * 7), rebaseline_after=0.2)
     g.on_progress(0.5)
