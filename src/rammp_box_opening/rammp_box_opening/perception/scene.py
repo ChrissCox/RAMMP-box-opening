@@ -190,17 +190,21 @@ def median_depth(depths):
     than any single frame. None for no frames."""
     if not depths:
         return None
-    import warnings
-
     stack = np.stack(depths)
-    stack = np.where(stack > 0, stack, np.nan)
-    # pixels with no depth in any frame are all-NaN columns: nanmedian
-    # warns once per such column (83k warnings, 50 ms, and the noise at
-    # every mission start) — they are simply holes
-    with np.errstate(all="ignore"), warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        med = np.nanmedian(stack, axis=0)
-    return np.nan_to_num(med, nan=0.0)
+    dt = stack.dtype if np.issubdtype(stack.dtype, np.floating) else np.dtype(np.float64)
+    stack = stack.astype(dt, copy=False)
+    valid = stack > 0
+    n = valid.sum(axis=0)
+    # holes sort to the end as +inf, so each pixel's n valid depths come
+    # first and its median is the middle one (or two) of those — exactly
+    # nanmedian's answer at a fifth of its cost (82 ms on 3 OAK frames)
+    s = np.where(valid, stack, np.inf)
+    s.sort(axis=0)
+    lo = np.take_along_axis(s, np.maximum((n - 1) // 2, 0)[None], 0)[0]
+    hi = np.take_along_axis(s, np.minimum(n // 2, len(depths) - 1)[None], 0)[0]
+    med = (lo + hi) * dt.type(0.5)
+    # pixels with no depth in any frame are simply holes
+    return np.where(n > 0, med, dt.type(0)).astype(dt, copy=False)
 
 
 def color_cloud(depth, kd, k, dist, T_color_depth, stride=1):
@@ -209,16 +213,21 @@ def color_cloud(depth, kd, k, dist, T_color_depth, stride=1):
     the colour camera by `T_color_depth` and projected with its `k` and
     `dist`. The live grabber and an offline replay of recorded arrays both
     compute it here."""
-    import cv2
-
     pts, _u, _v = cloud_from_depth(depth, kd, stride=stride)
     T = np.asarray(T_color_depth, float)
     pc = pts @ T[:3, :3].T + T[:3, 3]
-    uv, _ = cv2.projectPoints(
-        pc.reshape(-1, 1, 3).astype(np.float64), np.zeros(3), np.zeros(3), np.asarray(k, float),
-        None if dist is None or not len(np.atleast_1d(dist)) else np.asarray(dist, float),
-    )
-    return pc, uv.reshape(-1, 2)
+    d = None if dist is None else np.asarray(dist, float).ravel()
+    if d is not None and d.size and np.any(d != 0):
+        import cv2
+
+        uv, _ = cv2.projectPoints(
+            pc.reshape(-1, 1, 3).astype(np.float64), np.zeros(3), np.zeros(3), np.asarray(k, float), d,
+        )
+        return pc, uv.reshape(-1, 2)
+    # projectPoints with zero distortion is this pinhole, and costs 44 ms on the OAK
+    K = np.asarray(k, float)
+    uv = np.stack([K[0, 0] * pc[:, 0] / pc[:, 2] + K[0, 2], K[1, 1] * pc[:, 1] / pc[:, 2] + K[1, 2]], axis=1)
+    return pc, uv
 
 
 def load_scene_calibration(path=None):
