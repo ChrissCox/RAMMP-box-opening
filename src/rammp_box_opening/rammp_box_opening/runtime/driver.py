@@ -134,8 +134,10 @@ class GripperWait:
     # A 2F-85 closed on air stops short of the 0.8 knuckle target: 0.987 and
     # 0.991 of full travel on 2026-09-16, i.e. 0.7896 and 0.7928 rad. At 0.01
     # a gripper already shut read as not-at-target, nothing moved, and "never
-    # moved" failed the close. 0.02 rad is 2.5 % of travel.
-    AT_TARGET_TOL = 0.02
+    # moved" failed the close. On flatbot 2026-10-23 it shut at 0.7696 (0.962),
+    # and 0.02 failed a close the same way ("gripper at 0.770 (overlapped)"),
+    # stopping the run's home. 0.035 rad is 4.4 % of travel.
+    AT_TARGET_TOL = 0.035
     MOVED_MIN = 0.01
     SETTLE_TOL = 0.003
     SETTLE_S = 0.15

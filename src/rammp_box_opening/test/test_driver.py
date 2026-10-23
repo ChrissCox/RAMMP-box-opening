@@ -117,14 +117,15 @@ def test_gripper_already_at_its_target_is_done_at_once():
     assert w.update(0.002, 0.02, fresh=True) == (True, 0.002, False)
 
 
-@pytest.mark.parametrize("closed", [0.7896, 0.790, 0.7928])
+@pytest.mark.parametrize("closed", [0.7696, 0.7896, 0.790, 0.7928])
 def test_a_gripper_already_closed_on_air_is_done_not_failed(closed):
     """Field 2026-09-16: `press:close -> failed (gripper at 0.790)` with the
     fingers already shut from an earlier run. A 2F-85 closed on air never
     reaches the 0.8 knuckle target — preflight read 0.987 and 0.991 of full
     travel that morning, 0.7896 and 0.7928 rad — so the at-target check
     missed, nothing needed to move, and "never moved" called a closed
-    gripper a failure."""
+    gripper a failure. Flatbot 2026-10-23: shut at 0.7696, the same failure
+    at the 0.02 tolerance ("gripper at 0.770 (overlapped)")."""
     from rammp_box_opening.constants import GRIPPER_CMD_CLOSED
 
     w = GripperWait(target=GRIPPER_CMD_CLOSED, start=closed, t0=0.0)
