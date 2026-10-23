@@ -70,6 +70,28 @@ def test_api_failure_is_a_fallback_never_a_stop(cfg):
     assert "falling back to plain depth" in why
 
 
+def test_no_parsed_output_falls_back(cfg):
+    """A refusal or a max_tokens stop with no text block leaves the SDK's
+    parsed_output None: that is the plain-depth fallback, not a traceback
+    at the search pose (review 2026-10-22)."""
+    c = _FakeClient(loc=None)
+    roi, why = fetch_box_roi(FRAME, cfg, client=c)
+    assert roi is None
+    assert "falling back to plain depth" in why
+    assert len(c.calls) == 1
+
+
+def test_refusal_names_the_stop_reason(cfg):
+    class _Refused(_FakeClient):
+        def parse(self, **kw):
+            resp = super().parse(**kw)
+            resp.stop_reason = "refusal"
+            return resp
+
+    roi, why = fetch_box_roi(FRAME, cfg, client=_Refused(loc=None))
+    assert roi is None and "refusal" in why
+
+
 def test_shipped_config_uses_the_measured_model(cfg):
     """Field 2026-09-01: haiku boxed the robot's own base; opus was
     dead-on at +0.4 s. The shipped default is the one that works."""

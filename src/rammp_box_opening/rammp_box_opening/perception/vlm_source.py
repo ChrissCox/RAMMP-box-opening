@@ -104,6 +104,12 @@ def fetch_box_roi(color_bgr, cfg, client=None, budget_s=None):
         return None, "VLM call failed (%s) — falling back to plain depth" % (
             str(exc).split("\n")[0][:120]
         )
+    # a refusal or max_tokens stop with no text block: parsed_output is None
+    if loc is None:
+        return None, (
+            "VLM returned no box (stop_reason %s) — falling back to plain depth"
+            % getattr(resp, "stop_reason", "?")
+        )
     if not loc.found:
         return None, "VLM reports the container is not visible"
     if loc.x1 <= loc.x0 or loc.y1 <= loc.y0:
