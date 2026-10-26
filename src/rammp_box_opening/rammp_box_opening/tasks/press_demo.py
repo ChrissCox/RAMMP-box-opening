@@ -93,7 +93,7 @@ from rammp_box_opening.constants import (
     TRANSIT_SPEED,
     state_dir,
 )
-from rammp_box_opening.geometry import ang_diff
+from rammp_box_opening.geometry import ang_diff, yaw_about_world_z
 from rammp_box_opening.models.container import (
     ContainerModel,
     ContainerPose,
@@ -104,7 +104,9 @@ from rammp_box_opening.detection_set import MISSIONS_SET, MissionFrames, scene_f
 from rammp_box_opening.perception.depth_source import BoxTopWatcher
 from rammp_box_opening.primitives.look import look_joints, sweep_targets
 from rammp_box_opening.perception.vlm_source import resolve_roi
+from rammp_box_opening.perception import clear_table
 from rammp_box_opening.primitives.core import (
+    CARRY_CLEAR_M,
     CLEAR_MARGIN_MAX_STEP_RAD,
     SETDOWN_OVERDRIVE_M,
     ClearMarginFree,
@@ -1647,6 +1649,73 @@ def box_relative_lid_drop(m, cpose, table_z, prefer_xy=None, zone=None):
     return spots[0] if spots else (None, None)
 
 
+CLEAR_SPOTS_Y_M = 0.45  # the map is searched for a drop spot this far either side of the box
+
+
+def clear_lid_drops(m, cpose, tmap, table_z):
+    """(drops, spots, why): where the lid may go among what the cameras see
+    standing on the table (perception/clear_table), best first: as
+    ContainerPoses on the table at `table_z` — each one's yaw the turn the
+    hand comes down with, the lid turning with it — and as the Spots that
+    say how much room each has; and, when there is none, why.
+
+    The spot used to be derived from the box alone (lid_drop_candidates):
+    flatbot 2026-10-23 17:57 put it on the front edge of the microwave
+    standing 14 cm in front of the box, and the wrist camera came down on
+    it. The search spans the reach band in x and CLEAR_SPOTS_Y_M either side
+    of the box; the planner then says what the arm reaches
+    (build_place_legs falls through the rest)."""
+    lid_h = float(m.lid_dims[2])
+    bx, by = float(cpose.xyz[0]), float(cpose.xyz[1])
+    spots, why = clear_table.clear_spots(
+        tmap,
+        (bx, by),
+        (DROP_X_M[0], DROP_X_M[1], by - CLEAR_SPOTS_Y_M, by + CLEAR_SPOTS_Y_M),
+        lid_place_min_clear(m),
+        lambda xy: m.press_quat((xy[0], xy[1], float(table_z))),
+        0.5 * max(float(m.lid_dims[0]), float(m.lid_dims[1])),
+        lid_h,  # the fingertips at the release: the lid's height up, at the least
+        float(m.dims[2]) + lid_h + CARRY_CLEAR_M,  # ... and on the carry (Place.hover_for's floor)
+        lid_h,
+    )
+    return [ContainerPose(xyz=(s.xy[0], s.xy[1], float(table_z)), yaw=s.turn) for s in spots], spots, why
+
+
+def wrist_points(watcher):
+    """The wrist camera's newest frame as points in the base frame, or None."""
+    from rammp_box_opening.perception.depth_source import camera_pose_at
+
+    g = getattr(watcher, "grab", None)
+    if g is None or g.depth is None or g.k is None or g.color_stamp is None:
+        return None
+    pose = camera_pose_at(g)
+    return None if pose is None else clear_table.depth_points(g.depth, g.k, *pose)
+
+
+def room_map(watcher, scene_fix, cpose, at_staging):
+    """The table map the lid's spot is chosen on (clear_lid_drops): the
+    scene camera's points around the box, moved by its error at the box
+    (the wrist measured where the box is), and, at staging, the wrist's own
+    frame looking straight down at the table around it. None without the
+    scene's points."""
+    import numpy as np
+
+    pts = getattr(scene_fix, "table_points", None)
+    if pts is None or math.isnan(scene_fix.table_z_scene):
+        return None
+    shift = [float(cpose.xyz[0]) - scene_fix.pose.xyz[0], float(cpose.xyz[1]) - scene_fix.pose.xyz[1], 0.0]
+    clouds = [(np.asarray(pts, float) + shift, scene_fix.table_z_scene)]
+    if at_staging:
+        clouds.append((wrist_points(watcher), scene_fix.table_z_scene))
+    return clear_table.table_map(clouds, cpose.xyz[:2])
+
+
+def place_quat(m, lid):
+    """The hand's attitude setting the lid down at `lid`: the press
+    attitude, turned by the lid's yaw (clear_lid_drops)."""
+    return yaw_about_world_z(m.press_quat(lid.xyz), float(lid.yaw))
+
+
 def build_place_legs(ctx, cfg, start_joints=None, chain=0):
     """Carry the lid to the drop spot, guarded set-down, release, retreat,
     home — the placed lid joins the collision world.
@@ -1683,7 +1752,12 @@ def build_place_legs(ctx, cfg, start_joints=None, chain=0):
             if "planning failed for place:lid:" not in str(e) or ctx.cpose is None:
                 raise
             refused.append("[%.2f, %.2f] (%s)" % (lid.xyz[0], lid.xyz[1], str(e).split(": ", 1)[-1][:60]))
-            if k == 1:
+            if k == 1 and ctx.lid_drops is not None:
+                # the other spots the cameras saw room at, on this table
+                for d in ctx.lid_drops:
+                    if math.hypot(d.xyz[0] - first.xyz[0], d.xyz[1] - first.xyz[1]) > 1e-3:
+                        spots.append(ContainerPose(xyz=(d.xyz[0], d.xyz[1], first.xyz[2]), yaw=d.yaw))
+            elif k == 1:
                 # only now pay for the alternatives: the first spot
                 # plans on almost every run
                 prefer = load_lid_place(ctx.config_path).xyz
@@ -1728,7 +1802,7 @@ def _place_lid_at(ctx, cfg, lid, st):
     """The carry and set-down onto one drop spot: (legs, state, target,
     hover). Raises the planner's RuntimeError when it refuses either."""
     m = ctx.model
-    quat = m.press_quat(lid.xyz)
+    quat = place_quat(m, lid)
     # the fingers grip the knob grip_clear_m ABOVE the lid plane, so the
     # lid touches down when the TOOL is that much above lid-top height —
     # without this the stroke over-travels by grip_clear_m past contact
@@ -2921,46 +2995,65 @@ def main():
         depth_here = args.depth_press and at_staging and reach.pressed is None
         if not args.press_only:
             # the box lands wherever it lands: resolve the drop spot NOW,
-            # before any container-directed motion — configured lid_place
-            # when clear, slid away from the box when crowded, refusal
-            # only when nothing in the set-down zone clears
+            # before any container-directed motion — where the cameras see
+            # room for the lid and the hand (clear_lid_drops), refusing
+            # before the press when they see none; without the scene's
+            # points, beside the box on the side lid_place prefers
             lid = load_lid_place(ctx.config_path)
             zone = drop_zone(model, worlds)
-            drop, _side = box_relative_lid_drop(
-                model, ctx.cpose, watcher.table_z, lid.xyz, zone=zone
-            )
-            if drop is None:
-                try_home(
-                    ctx,
-                    runner,
-                    args.execute,
-                    "no lid drop spot beside the box at [%.2f, %.2f] falls "
-                    "inside the set-down zone (need %.0f mm clear, x %s y %s%s) "
-                    "— move the box"
-                    % (
-                        ctx.cpose.xyz[0],
-                        ctx.cpose.xyz[1],
-                        lid_place_min_clear(model) * 1000,
-                        [round(v, 2) for v in zone[:2]],
-                        [round(v, 2) for v in zone[2:]],
-                        ": the table the scene camera saw" if worlds.table_extent is not None else "",
-                    ),
+            tmap = room_map(watcher, scene_seen, ctx.cpose, at_staging) if scene_seen is not None else None
+            if tmap is not None:
+                drops, spots, why = clear_lid_drops(model, ctx.cpose, tmap, watcher.table_z)
+                if not drops:
+                    try_home(ctx, runner, args.execute, "nowhere to set the lid down: %s — move the box, or clear "
+                             "the table around it" % why)
+                    sys.exit(4)
+                best = spots[0]
+                runner.note("lid_spot", xyz=[round(v, 4) for v in drops[0].xyz], turn_deg=round(math.degrees(best.turn)),
+                            room_mm=round(1000 * best.room_m, 1), nearest=best.what, spots=len(spots),
+                            wrist=at_staging)
+                print("[press_demo] lid goes to [%.2f, %.2f, %.3f] — %.0f mm from the box, where the cameras see room "
+                      "for it and the hand (%.0f mm to spare%s)%s" % (
+                          *drops[0].xyz, 1000 * math.hypot(best.xy[0] - ctx.cpose.xyz[0], best.xy[1] - ctx.cpose.xyz[1]),
+                          1000 * best.room_m, "" if best.what == "nothing" else ", %s nearest anything" % best.what,
+                          "; the hand turns %+.0f deg to set it down" % math.degrees(best.turn) if best.turn else ""))
+                ctx.lid_drops, ctx.lid_drop = drops, drops[0]
+            else:
+                drop, _side = box_relative_lid_drop(
+                    model, ctx.cpose, watcher.table_z, lid.xyz, zone=zone
                 )
-                sys.exit(4)
-            print(
-                "[press_demo] lid goes to [%.2f, %.2f, %.3f] — %.0f mm from "
-                "the box, on the side the config prefers"
-                % (
-                    drop[0],
-                    drop[1],
-                    drop[2],
-                    math.hypot(
-                        drop[0] - ctx.cpose.xyz[0], drop[1] - ctx.cpose.xyz[1]
+                if drop is None:
+                    try_home(
+                        ctx,
+                        runner,
+                        args.execute,
+                        "no lid drop spot beside the box at [%.2f, %.2f] falls "
+                        "inside the set-down zone (need %.0f mm clear, x %s y %s%s) "
+                        "— move the box"
+                        % (
+                            ctx.cpose.xyz[0],
+                            ctx.cpose.xyz[1],
+                            lid_place_min_clear(model) * 1000,
+                            [round(v, 2) for v in zone[:2]],
+                            [round(v, 2) for v in zone[2:]],
+                            ": the table the scene camera saw" if worlds.table_extent is not None else "",
+                        ),
                     )
-                    * 1000,
+                    sys.exit(4)
+                print(
+                    "[press_demo] lid goes to [%.2f, %.2f, %.3f] — %.0f mm from "
+                    "the box, on the side the config prefers"
+                    % (
+                        drop[0],
+                        drop[1],
+                        drop[2],
+                        math.hypot(
+                            drop[0] - ctx.cpose.xyz[0], drop[1] - ctx.cpose.xyz[1]
+                        )
+                        * 1000,
+                    )
                 )
-            )
-            ctx.lid_drop = ContainerPose(xyz=tuple(drop), yaw=lid.yaw)
+                ctx.lid_drop = ContainerPose(xyz=tuple(drop), yaw=lid.yaw)
 
         print(
             "[press_demo] PRESS target origin [%.3f, %.3f, %.3f] yaw %.1f deg"

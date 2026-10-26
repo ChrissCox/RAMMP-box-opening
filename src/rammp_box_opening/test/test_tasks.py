@@ -577,6 +577,66 @@ def test_a_drop_spot_the_planner_refuses_falls_through_to_the_next(ctx):
     assert c.lid_at is c.lid_drop  # the placed-lid world follows the switch
 
 
+def test_the_hand_comes_down_turned_as_the_spot_says_and_falls_through_the_cameras_spots(ctx):
+    """A spot the cameras saw room at may need the hand turned about its
+    axis (the lid's yaw, clear_lid_drops): the carry and the set-down fly
+    that attitude. Refused there, the next spot tried is the next one the
+    cameras saw room at, with its own turn, not a spot derived from the box
+    alone."""
+    import math
+
+    import pytest
+
+    from rammp_box_opening.geometry import yaw_about_world_z
+    from rammp_box_opening.tasks import press_demo
+
+    c = ctx
+    bx, by = c.cpose.xyz[0], c.cpose.xyz[1]
+    turned = ContainerPose(xyz=(bx, by - 0.21, -0.027), yaw=math.pi / 2)
+    other = ContainerPose(xyz=(bx - 0.05, by + 0.22, -0.027), yaw=-math.pi / 2)
+    c.lid_drops, c.lid_drop = [turned, other], turned
+    legs = press_demo.build_place_legs(c, _demo_cfg())
+    want = yaw_about_world_z(c.model.press_quat(turned.xyz), math.pi / 2)
+    for name in ("place:lid:transit", "place:lid:down"):
+        leg = next(x for x in legs if x.name == name)
+        assert list(leg.target[2]) == pytest.approx(want)
+    c.client = _RefusesPlacesAt(c.client, [turned.xyz[:2]])
+    legs = press_demo.build_place_legs(c, _demo_cfg())
+    transit = next(x for x in legs if x.name == "place:lid:transit")
+    assert transit.target[1][:2] == pytest.approx(other.xyz[:2])
+    assert list(transit.target[2]) == pytest.approx(yaw_about_world_z(c.model.press_quat(other.xyz), -math.pi / 2))
+    assert c.lid_drop.yaw == pytest.approx(-math.pi / 2)
+
+
+def test_the_lid_goes_where_the_cameras_saw_room_not_onto_the_microwave(monkeypatch):
+    """Flatbot 2026-10-23 17:57 (test/data/table_room_flatbot_20261023_1757
+    .npz): with the scene camera's points moved by its error at the box and
+    the wrist's frame from staging, the drops are on the open table beyond
+    the box, on the table the box stands on — and the 17:57 spot, on the
+    microwave's front edge, is none of them."""
+    import math
+
+    import numpy as np
+    from types import SimpleNamespace
+
+    from rammp_box_opening.models.container import ContainerModel
+    from rammp_box_opening.tasks import press_demo
+
+    f = np.load("src/rammp_box_opening/test/data/table_room_flatbot_20261023_1757.npz")
+    pink = ContainerModel.load("src/rammp_box_opening/config/containers/ankou_pink.yaml")
+    table_z = float(f["table_z"])
+    scene_fix = SimpleNamespace(table_points=f["scene_mm"] / 1000.0, table_z_scene=table_z,
+                                pose=ContainerPose(xyz=(*f["scene_box"], table_z), yaw=0.0))
+    cpose = ContainerPose(xyz=(*f["wrist_box"], table_z), yaw=0.0)
+    monkeypatch.setattr(press_demo, "wrist_points", lambda watcher: f["wrist_mm"] / 1000.0)
+    tmap = press_demo.room_map(None, scene_fix, cpose, at_staging=True)
+    drops, spots, why = press_demo.clear_lid_drops(pink, cpose, tmap, table_z)
+    assert drops and why is None
+    assert all(d.xyz[2] == table_z for d in drops)
+    assert [d.yaw for d in drops] == [s.turn for s in spots]
+    assert all(math.hypot(d.xyz[0] - 0.56, d.xyz[1] + 0.37) > 0.15 for d in drops)
+
+
 def test_no_plannable_drop_spot_is_one_clear_refusal(ctx):
     import pytest
 

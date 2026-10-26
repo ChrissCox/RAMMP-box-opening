@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from rammp_box_opening.perception.clear_table import MAP_R_M
 from rammp_box_opening.perception.depth_source import container_pose_from_top
 from rammp_box_opening.perception.planes import fit_plane
 
@@ -53,6 +54,9 @@ class SceneFix:
     table_z_scene: float  # the table height the scene depth itself shows, or nan
     table_extent: object = None  # (x0, x1, y0, y1) where it shows that table, when no survey says
     partial: str = ""  # how the frame cut the box when it was finished from the part in view, else ""
+    # the scene's points around the box (float32, base frame): what stands on
+    # the table there, for where the lid may go (perception/clear_table)
+    table_points: object = None
 
 
 def robust_yaw(xy):
@@ -691,7 +695,8 @@ class SceneLocator:
             if got.partial:
                 partial = "cut off by the frame toward %s %s" % (
                     self.base_frame or "base_link", " and ".join(off_frame_ways(got.partial, T_base_color[:3, :3])))
+            near = np.hypot(pts_base[:, 0] - top[0], pts_base[:, 1] - top[1]) < MAP_R_M
             return SceneFix(pose=pose, top_xyz=top, n_points=n, score=float(bbox[4]), table_z_scene=table_seen,
-                            table_extent=extent, partial=partial)
+                            table_extent=extent, partial=partial, table_points=pts_base[near].astype(np.float32))
         finally:
             self.owl.disable()

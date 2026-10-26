@@ -64,6 +64,7 @@ class Ctx:
     worlds: object
     lid_at: object = None  # set after Place(lid): later worlds carry the lid
     lid_drop: object = None  # runtime-resolved drop spot (adapts to the box)
+    lid_drops: list = None  # every spot the cameras saw room at, best first (press_demo.clear_lid_drops)
     config_path: str = None
     last_pose: tuple = None  # (xyz, quat_xyzw) of the last commanded pose
     last_world: tuple = None  # (name, path) of the last interaction world

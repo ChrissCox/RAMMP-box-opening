@@ -1,0 +1,198 @@
+"""Where on the table there is room for the lid: what the scene camera (and
+the wrist, at staging) see standing around the box, and the spots the lid
+and the hand that carries it fit."""
+
+import math
+
+import numpy as np
+import pytest
+
+from rammp_box_opening.geometry import yaw_about_world_z
+from rammp_box_opening.models.container import ContainerModel
+from rammp_box_opening.perception import clear_table as ct
+
+PINK = "src/rammp_box_opening/config/containers/ankou_pink.yaml"
+DATA = "src/rammp_box_opening/test/data/"
+TABLE_Z = 0.187
+
+
+@pytest.fixture(scope="module")
+def pink():
+    return ContainerModel.load(PINK)
+
+
+def _flat(x0, x1, y0, y1, z, step=0.006):
+    xs, ys = np.meshgrid(np.arange(x0, x1, step), np.arange(y0, y1, step), indexing="ij")
+    return np.c_[xs.ravel(), ys.ravel(), np.full(xs.size, float(z))]
+
+
+def _block(x0, x1, y0, y1, top, step=0.006):
+    """A thing standing on the table: its top, and its four sides."""
+    pts = [_flat(x0, x1, y0, y1, top, step)]
+    for z in np.arange(TABLE_Z + 0.02, top, step):
+        pts += [_flat(x0, x1, y0, y0 + step, z, step), _flat(x0, x1, y1 - step, y1, z, step),
+                _flat(x0, x0 + step, y0, y1, z, step), _flat(x1 - step, x1, y0, y1, z, step)]
+    return np.concatenate(pts)
+
+
+def _table(x0=0.25, x1=0.75, y0=-0.70, y1=0.20, holes=(), step=0.006):
+    """The table's points, minus where things stand on it."""
+    t = _flat(x0, x1, y0, y1, TABLE_Z, step)
+    for hx0, hx1, hy0, hy1 in holes:
+        t = t[~((t[:, 0] > hx0) & (t[:, 0] < hx1) & (t[:, 1] > hy0) & (t[:, 1] < hy1))]
+    return t
+
+
+def _spots(pink, tmap, box_xy, **kw):
+    lid_h = pink.lid_dims[2]
+    zone = kw.pop("zone", (0.28, 0.65, box_xy[1] - 0.45, box_xy[1] + 0.45))
+    return ct.clear_spots(tmap, box_xy, zone, kw.pop("min_from_box", 0.198),
+                          lambda xy: pink.press_quat((xy[0], xy[1], TABLE_Z)),
+                          0.5 * pink.lid_dims[0], lid_h, pink.dims[2] + lid_h + 0.04, lid_h)
+
+
+BOX = (0.39, -0.20)
+BOX_AT = (BOX[0] - 0.06, BOX[0] + 0.06, BOX[1] - 0.06, BOX[1] + 0.06)
+
+
+def test_what_stands_is_measured_from_the_table_the_points_show_not_the_base_frames_z():
+    """Through TF's mount the flatbot scene camera's table leans 6 deg: its
+    far side read 3-4 cm "below" the table, and a plain z band called the
+    whole far half off its edge. Heights are measured from the plane the
+    same points show, so a leaning table is all table and what stands on it
+    still stands."""
+    lean = math.radians(6.0)
+    t = _table(holes=[BOX_AT])
+    pts = np.concatenate([t, _block(*BOX_AT, TABLE_Z + 0.121)])
+    pts[:, 2] += (pts[:, 0] - BOX[0]) * math.tan(lean)  # the far side lower, as through a tilted mount
+    pts[:, 2] -= 2 * (pts[:, 0] - BOX[0]) * math.tan(lean)
+    tmap = ct.table_map([(pts, TABLE_Z)], BOX)
+    X, Y = tmap.centres()
+    on_table = (X > 0.55) & (X < 0.70) & (Y > -0.6) & (Y < 0.1)
+    assert not np.isfinite(tmap.tall[on_table]).any() and not tmap.off[on_table].any()
+    at_box = (np.abs(X - BOX[0]) < 0.04) & (np.abs(Y - BOX[1]) < 0.04)
+    assert np.nanmin(tmap.tall[at_box]) == pytest.approx(0.121, abs=0.02)
+
+
+def test_speckle_is_not_a_thing_and_a_thing_is():
+    """A few flying pixels in a cell of table are not something standing
+    there (17:57: two "13 cm" cells off the microwave's dark door); a thing
+    a few cells across is."""
+    rng = np.random.default_rng(3)
+    t = _table()
+    speck = np.c_[rng.uniform(0.45, 0.47, 6), rng.uniform(-0.50, -0.48, 6), np.full(6, TABLE_Z + 0.13)]
+    can = _block(0.55, 0.61, 0.0, 0.06, TABLE_Z + 0.10)
+    tmap = ct.table_map([(np.concatenate([t, speck, can]), TABLE_Z)], BOX)
+    st = tmap.standing()
+    assert not ((np.abs(st[:, 0] - 0.46) < 0.03) & (np.abs(st[:, 1] + 0.49) < 0.03)).any()
+    assert ((st[:, 0] > 0.54) & (st[:, 0] < 0.62) & (st[:, 1] > -0.01) & (st[:, 1] < 0.07)).sum() >= 4
+
+
+def test_the_1757_spot_had_no_room_and_the_spot_it_finds_does(pink):
+    """Flatbot 2026-10-23 17:57, the scene camera's and the wrist's points
+    (test/data/table_room_flatbot_20261023_1757.npz): the box at [0.394,
+    -0.206] with a microwave standing 14 cm in front of it and a bin beside
+    it. The lid went to [0.56, -0.37], on the microwave's front edge, and
+    the wrist camera came down on the microwave. The map says that spot has
+    no room, and finds one on the open table beyond the box, the hand turned
+    so the wrist camera faces the open table."""
+    f = np.load(DATA + "table_room_flatbot_20261023_1757.npz")
+    shift = np.r_[f["wrist_box"] - f["scene_box"], 0.0]
+    scene = f["scene_mm"] / 1000.0 + shift
+    wrist = f["wrist_mm"] / 1000.0
+    box = tuple(f["wrist_box"])
+    tmap = ct.table_map([(scene, float(f["table_z"])), (wrist, float(f["table_z"]))], box)
+    q = pink.press_quat((0.56, -0.37, TABLE_Z))
+    room, _what = ct.clearance(tmap, (0.56, -0.37), q, 0.5 * pink.lid_dims[0], pink.lid_dims[2])
+    assert room < -0.03
+    spots, why = _spots(pink, tmap, box)
+    assert spots and why is None, why
+    best = spots[0]
+    assert best.room_m >= 0.0
+    assert math.hypot(best.xy[0] - 0.56, best.xy[1] + 0.37) > 0.25  # nowhere near the microwave
+    assert best.xy[1] > box[1]  # the open side of the box
+    # the scene camera alone cannot see that side (the box is at its frame's
+    # edge), and edge-on it cannot vouch for the narrow band before the
+    # microwave: no spot, and it says why
+    alone = ct.table_map([(scene, float(f["table_z"]))], box)
+    spots, why = _spots(pink, alone, box)
+    assert not spots and "short of the room it needs" in why
+
+
+def test_the_hand_turns_so_the_wrist_camera_faces_the_room(pink):
+    """A band of table between the near edge of what the camera saw and a
+    20 cm wall standing across it: at the press attitude the wrist camera
+    (65 mm out along the hand's y, world +x there) reaches over toward the
+    wall, and turned half round it reaches past the near edge; turned a
+    quarter it lies along the band, and the lid fits."""
+    wall = (0.53, 0.60, -0.70, 0.20)
+    t = _table(x0=0.30, holes=[BOX_AT, wall])
+    pts = np.concatenate([t, _block(*BOX_AT, TABLE_Z + 0.121), _block(*wall, TABLE_Z + 0.20)])
+    tmap = ct.table_map([(pts, TABLE_Z)], BOX)
+    xy = (0.42, -0.45)
+
+    def room(turn):
+        q = yaw_about_world_z(pink.press_quat((xy[0], xy[1], TABLE_Z)), turn)
+        return ct.clearance(tmap, xy, q, 0.5 * pink.lid_dims[0], pink.lid_dims[2])
+
+    assert room(0.0)[0] < 0 and room(0.0)[1] == "the wrist camera"
+    assert room(math.pi)[0] < 0
+    assert room(math.pi / 2)[0] >= 0 and room(-math.pi / 2)[0] >= 0
+    spots, why = _spots(pink, tmap, BOX)
+    assert any(abs(s.turn) == pytest.approx(math.pi / 2) and s.xy[0] >= 0.41 for s in spots), (spots, why)
+
+
+def test_no_lid_goes_past_the_tables_edge_or_where_the_camera_could_not_see(pink):
+    """Past the table's far edge the camera sees the floor: no lid goes
+    down there, and none where it saw nothing at all."""
+    t = _table(x1=0.50, holes=[BOX_AT])
+    floor = _flat(0.50, 0.80, -0.70, 0.20, TABLE_Z - 0.70)
+    pts = np.concatenate([t, floor, _block(*BOX_AT, TABLE_Z + 0.121)])
+    tmap = ct.table_map([(pts, TABLE_Z)], BOX)
+    spots, _why = _spots(pink, tmap, BOX)
+    lid_r = 0.5 * pink.lid_dims[0]
+    assert spots and all(s.xy[0] + lid_r <= 0.50 for s in spots)
+    unseen = ct.table_map([(np.concatenate([_table(y0=-0.70, y1=-0.10, holes=[BOX_AT]),
+                                            _block(*BOX_AT, TABLE_Z + 0.121)]), TABLE_Z)], BOX)
+    spots, _why = _spots(pink, unseen, BOX)
+    assert spots and all(s.xy[1] + lid_r <= -0.10 for s in spots)
+
+
+def test_the_carry_clears_what_stands_between_the_box_and_the_spot(pink):
+    """The hand flies the lid over at the carry's height, the wrist camera
+    ~29 cm up: a tall thing between the box and a spot that is clear itself
+    rules that spot out; a short one does not."""
+    lid_h = pink.lid_dims[2]
+    carry_tips = pink.dims[2] + lid_h + 0.04
+    post = (0.37, 0.41, -0.06, -0.02)
+    t = _table(holes=[BOX_AT, post])
+    for top, blocked in ((TABLE_Z + 0.40, True), (TABLE_Z + 0.08, False)):
+        pts = np.concatenate([t, _block(*BOX_AT, TABLE_Z + 0.121), _block(*post, top)])
+        tmap = ct.table_map([(pts, TABLE_Z)], BOX)
+        room, what, _at = ct.carry_clearance(tmap, BOX, (0.39, 0.10), 0.5 * pink.lid_dims[0], carry_tips, lid_h)
+        assert (room < 0) == blocked, (room, what)
+
+
+def test_the_wrist_seeing_a_cell_bare_outvotes_the_scene_cameras_speckle_there():
+    """Edge-on, the scene camera speckles a patch of table with points
+    standing a few cm up; the wrist, looking straight down, saw it bare.
+    Their points pool, and the bare table wins."""
+    rng = np.random.default_rng(5)
+    patch = np.c_[rng.uniform(0.44, 0.50, 60), rng.uniform(-0.46, -0.40, 60), TABLE_Z + rng.uniform(0.03, 0.08, 60)]
+    scene = np.concatenate([_table(step=0.012), patch])
+    wrist = _flat(0.30, 0.60, -0.55, -0.30, TABLE_Z, step=0.004)
+    for clouds, stands in (([(scene, TABLE_Z)], True), ([(scene, TABLE_Z), (wrist, TABLE_Z)], False)):
+        tmap = ct.table_map(clouds, BOX)
+        X, Y = tmap.centres()
+        at = (np.abs(X - 0.47) < 0.03) & (np.abs(Y + 0.43) < 0.03)
+        assert np.isfinite(tmap.tall[at]).any() == stands
+
+
+def test_the_wrist_frame_is_points_in_the_base_frame():
+    """A frame straight down from 0.35 m over a table: every point lands on it."""
+    k = np.array([[400.0, 0, 320], [0, 400.0, 200], [0, 0, 1]])
+    depth = np.full((400, 640), 0.35, np.float32)
+    rot = np.diag([1.0, -1.0, -1.0])  # looking down
+    pts = ct.depth_points(depth, k, rot, [0.45, -0.2, TABLE_Z + 0.35])
+    assert np.allclose(pts[:, 2], TABLE_Z, atol=1e-6)
+    assert pts[:, 0].min() == pytest.approx(0.45 - 320 / 400 * 0.35, abs=0.01)
