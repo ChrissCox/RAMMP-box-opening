@@ -963,6 +963,7 @@ class Runner:
                     gripper_pos=g_pos if g_ok else None,
                     progress=info.get("progress"),
                     torque_peak=info.get("torque_peak"),
+                    contact_xyz=contact,
                 )
             )
         return LegResult(

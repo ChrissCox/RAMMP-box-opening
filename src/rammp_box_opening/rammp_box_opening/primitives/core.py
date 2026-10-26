@@ -36,6 +36,15 @@ from rammp_box_opening.runtime.legs import Kind, Leg
 # modeling can otherwise leave an exact-height target arriving untouched)
 SETDOWN_OVERDRIVE_M = 0.005
 
+# a set-down trip with the fingertips more than this above where the lid
+# meets the table struck something on the way down. The descent's progress
+# cannot say so once it flies merged behind the carry: the guard reads the
+# whole group's, and flatbot 2026-10-23 17:57 tripped at 70 % of it — the
+# wrist camera on the microwave beside the drop spot, 134 mm up — and let
+# the lid go there. The slack covers the table under the spot differing
+# from the one measured at the box and the lid thickness's estimate.
+SETDOWN_HIGH_M = 0.04
+
 # clearance between the CARRIED lid's underside and the container top
 # during the place transit — the planner cannot model a held object
 CARRY_CLEAR_M = 0.04
@@ -334,6 +343,17 @@ class Place:
                 and not in_band(v.gripper_pos, self.band)
             )
             if v.outcome == "touch":
+                high = (
+                    None
+                    if v.contact_xyz is None
+                    else float(v.contact_xyz[2]) - TIP_TO_TOOL_M - self.target_xyz[2]
+                )
+                if high is not None and high > SETDOWN_HIGH_M:
+                    return False, (
+                        "struck something %.0f mm above where the lid meets "
+                        "the table — set-down NOT confirmed, the lid is held"
+                        % (high * 1000)
+                    )
                 if v.progress is not None and v.progress < 0.5:
                     return False, (
                         "guard tripped at %.0f%% of the descent — struck "

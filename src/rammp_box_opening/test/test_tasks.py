@@ -648,6 +648,13 @@ def test_after_a_popped_depth_press_the_fingers_open_and_the_lid_comes_off(ctx, 
     # grip:down arrives around the knob; the lift-carry-set-down execution
     # ends on the table (the set-down's trip is its success)
     ctx.client.exec_script = [("arrived", {}), ("touch", {"message": "torque guard trip", "progress": 0.95, "torque_peak": 4.1})]
+    # ... with the fingertips where the lid meets the table
+    from rammp_box_opening.constants import TIP_TO_TOOL_M
+    from rammp_box_opening.primitives.core import tcp_z
+
+    lid = ctx.lid_drop or press_demo.load_lid_place(ctx.config_path)
+    lands = tcp_z(lid.xyz[2] + ctx.model.lid_dims[2] + press_demo.DEPTH_GRIP_CLEAR_M)
+    ctx.client.contact_at = [lid.xyz[0], lid.xyz[1], lands + TIP_TO_TOOL_M]
     result = DepthPress(free=True, contact=True, felt=True, popped=True, touch_xyz=(0.45, 0.0, 0.085))
     code = press_demo.lid_off_after_depth_press(ctx, _demo_cfg(), make_runner(ctx.client, tmp_path), True, result)
     out = capsys.readouterr().out
@@ -893,6 +900,32 @@ def test_setdown_verify_rejects_early_trips_and_no_touch(ctx):
     assert ok
     ok, why = v("arrived", 1.0)
     assert not ok and "never felt the surface" in why
+
+
+def test_a_set_down_felt_high_above_the_table_struck_something_and_holds_the_lid(ctx):
+    """Flatbot 2026-10-23 17:57: the set-down flew merged behind the carry
+    and its guard tripped at 70 % of the group — the wrist camera on the
+    microwave beside the drop spot, the fingertips 134 mm above where the
+    lid meets the table — and that read as "surface felt — set down": the
+    fingers opened there. Where the fingertips were at the trip says what
+    it was."""
+    from rammp_box_opening.constants import TIP_TO_TOOL_M
+    from rammp_box_opening.primitives.core import SETDOWN_HIGH_M
+    from rammp_box_opening.runtime.legs import VerifyCtx
+    from rammp_box_opening.tasks import press_demo
+
+    legs = press_demo.build_place_legs(ctx, _demo_cfg())
+    down = next(x for x in legs if x.name == "place:lid:down")
+    lands = down.target[1][2] + press_demo.SETDOWN_OVERDRIVE_M  # the tool where the lid meets the table
+
+    def v(tool_z):
+        tip = [0.5627, -0.3747, tool_z + TIP_TO_TOOL_M]
+        return down.verify(VerifyCtx(outcome="touch", progress=0.70, torque_peak=4.1, contact_xyz=tip))
+
+    ok, why = v(lands + 0.134)
+    assert not ok and "134 mm above" in why and "the lid is held" in why
+    assert v(lands)[0] and v(lands - 0.004)[0]
+    assert v(lands + SETDOWN_HIGH_M - 0.005)[0]  # a table a little higher there, a thicker lid
 
 
 def test_park_tool_down_rests_at_the_look_pose(ctx):

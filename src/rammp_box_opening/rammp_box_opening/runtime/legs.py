@@ -21,6 +21,7 @@ class VerifyCtx:
     gripper_pos: float = None
     progress: float = None
     torque_peak: float = None
+    contact_xyz: list = None  # the fingertip links' midpoint at a trip (client.contact_xyz)
 
 
 @dataclass
