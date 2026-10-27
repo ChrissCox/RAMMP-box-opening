@@ -629,3 +629,54 @@ def test_settled_efforts_defaults_keep_the_settle():
     params = inspect.signature(client_mod.PlannerClient.settled_efforts).parameters
     assert params["settle_s"].default == 0.15
     assert params["duration_s"].default == 0.15
+
+
+def _compliant_run(monkeypatch, guard, fresh=True, gains=None):
+    """A compliant client flying one guarded leg; the result settles after a
+    dozen spins. `fresh`: each spin serves a /joint_states."""
+    h = _ScriptedHandle(_cresp(CancelGoal.Response.ERROR_NONE), _ended(5, -6))
+    d = _ScriptedDriver(h)
+    c = _client(d)
+    c.compliant = True
+    spins = {"n": 0}
+
+    def spin(node, timeout_sec=0.0):
+        spins["n"] += 1
+        if fresh:
+            c._eff_at = time.monotonic()
+        if spins["n"] == 12:
+            h.result_fut.settle(_ended(4, 0))
+        time.sleep(0.03 if not fresh else 0.0)
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    outcome, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, guard=guard, gains=gains)
+    return outcome, info, h, d
+
+
+def test_a_compliant_leg_flies_in_impedance_under_its_gains(monkeypatch):
+    outcome, _info, h, d = _compliant_run(monkeypatch, None, gains=client_mod.GAINS_STIFF)
+    goal, = d.goals
+    assert outcome == "arrived" and goal.control_mode == client_mod.IMPEDANCE
+    assert goal.gains.profile == client_mod.GAINS_STIFF
+    outcome, _info, h, d = _compliant_run(monkeypatch, None)
+    assert d.goals[0].gains.profile == 0  # the session default
+
+
+def test_a_position_leg_sends_no_gains():
+    d = _Driver()
+    c = _client(d)
+    c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, gains=client_mod.GAINS_STIFF)
+    assert d.goals[0].control_mode == client_mod.POSITION and d.goals[0].gains.profile == 0
+
+
+def test_a_compliant_guard_watches_and_never_stops_the_leg(monkeypatch):
+    """Owner 2026-10-27: nothing it reads stops the arm. A trip is noted,
+    the leg flies to its end."""
+    outcome, info, h, _d = _compliant_run(monkeypatch, _TripGuard())
+    assert outcome == "arrived" and h.cancels == 0 and "would_trip" in info
+    assert "would have stopped it" in info["message"]
+
+
+def test_a_compliant_leg_flies_on_through_a_silent_stream(monkeypatch):
+    outcome, _info, h, _d = _compliant_run(monkeypatch, _Guard(), fresh=False)
+    assert outcome == "arrived" and h.cancels == 0

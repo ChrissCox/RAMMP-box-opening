@@ -104,6 +104,10 @@ class Leg:
     # straight_line), built from live joints. Never re-planned: a planner
     # path is not that line, and its guard was set for the line
     plan_free: bool = False
+    # MOTION legs of a compliant run (PlannerClient.compliant): the driver's
+    # ImpedanceGains profile they fly under; None is the session default
+    # (MEDIUM). A position run never sends one.
+    gains: int = None
 
 
 def can_merge(a, b):

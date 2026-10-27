@@ -82,6 +82,7 @@ import rclpy
 
 
 from rammp_box_opening.constants import (
+    COMPLIANT_DEFAULT,
     FINGERTIP_FRAMES,
     TCP_OFFSET_M,
     TIP_TO_TOOL_M,
@@ -2615,6 +2616,13 @@ def main():
         "it and judge the press (tasks/depth_press)",
     )
     ap.add_argument(
+        "--guarded",
+        action="store_true",
+        help="a --depth-press reach-out with its torque guards and checks, position-controlled, as before "
+        "2026-10-27; without it that press runs COMPLIANT (constants.COMPLIANT_DEFAULT): joint impedance, "
+        "nothing it reads stops the arm",
+    )
+    ap.add_argument(
         "--detect-only",
         action="store_true",
         help="report the scene camera's fixes for 15 s and exit; nothing moves. "
@@ -2635,6 +2643,7 @@ def main():
         "config/camera_scene.yaml; the stub harness passes its own)",
     )
     args = ap.parse_args()
+    args.compliant = COMPLIANT_DEFAULT and not args.guarded
     cfg_path = args.container or cli_common.default_container_yaml()
     bench = args.bench_world or cli_common.default_bench_yaml()
     model = ContainerModel.load(cfg_path)

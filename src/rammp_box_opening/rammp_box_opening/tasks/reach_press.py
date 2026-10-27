@@ -364,6 +364,17 @@ def unload_guard(model, reference, hang_k):
     )
 
 
+def compliant(ctx):
+    """A compliant run (PlannerClient.compliant): impedance, nothing stops it."""
+    return bool(getattr(ctx.client, "compliant", False))
+
+
+def free_guard(ctx, reference, hang_k=None):
+    """drag_guard for a free-air leg — none in a compliant run, which stops
+    for nothing it reads."""
+    return None if compliant(ctx) else drag_guard(reference, hang_k)
+
+
 def residual(gravity, ref, now):
     """What gravity does not explain between two (efforts, joints) readings."""
     return [
@@ -519,14 +530,15 @@ def _back_off(ctx, runner, ref=None):
     if pts is None:
         print("[press_demo] the way back off toward the arm is not a straight line the arm can fly (%s)" % why)
         return False
-    ref = ref or _settled(ctx, "where the arm stands")
-    if ref is None:
-        return False
+    if not compliant(ctx):
+        ref = ref or _settled(ctx, "where the arm stands")
+        if ref is None:
+            return False
     print("[press_demo] the planner sees the arm inside the box's padded volume — backing %.0f cm straight off toward "
           "the arm first" % (100 * REACH_PULLBACK_M))
     # from free air only (_go_home's callers), level and away from the box
-    res = runner.run([line_leg(ctx, "reach:back-off", pts, quat, FREE_LINE_SPEED, drag_guard(ref), _full_world(ctx))],
-                     execute=True)
+    res = runner.run([line_leg(ctx, "reach:back-off", pts, quat, FREE_LINE_SPEED, free_guard(ctx, ref),
+                               _full_world(ctx))], execute=True)
     return all(r.ok for r in res)
 
 
@@ -582,7 +594,7 @@ def _clear_over_box(ctx, runner, ref):
     if not pts:
         return True
     print("[press_demo] up %.0f mm, clear of the box's padded volume, before home" % (1000 * (want - float(t[2]))))
-    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, CONTACT_SPEED, drag_guard(ref, tip_load_at(pts[0])),
+    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, CONTACT_SPEED, free_guard(ctx, ref, tip_load_at(pts[0])),
                                _full_world(ctx))], execute=True)
     if any(not r.ok for r in res):
         print("[press_demo] STOP: the way up from over the box %s — the arm holds; check the box" % _stopped_by(res))
@@ -594,8 +606,8 @@ def _home_from_over_box(ctx, cfg, runner, result):
     """Home after a free depth press (DepthPress.free): clear of the box's
     padded volume first, then planned once, the back-off left as the
     fallback. False — the arm holds — when it did not get there."""
-    ref = result.ref or _settled(ctx, "over the box")
-    if ref is not None:
+    ref = result.ref or (None if compliant(ctx) else _settled(ctx, "over the box"))
+    if ref is not None or compliant(ctx):
         clear = _clear_over_box(ctx, runner, ref)
         if clear is False:
             return False
@@ -777,7 +789,28 @@ def _predicted_drift(plan):
 def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     """The whole reach-out press from the scene camera's fix. Returns the
     process exit code: 0 pressed and the knob popped, 1 a failure, the box
-    moved or the knob not up, 2 no button."""
+    moved or the knob not up, 2 no button.
+
+    COMPLIANT (args.compliant with --depth-press, press_demo's default
+    since 2026-10-27): every leg in the driver's joint impedance, and
+    nothing the run reads stops the arm — no torque guard, no at-rest read
+    or check, no look after the press (depth_press.press_compliant). The
+    box's height is the higher of the aim's and the scene camera's (15:19:
+    the touch met the button at 0.312, the scene said 0.311, the wrist
+    camera's aim 0.288). 0 then means pressed, by the spring's hold."""
+    on = bool(getattr(args, "compliant", False)) and bool(getattr(args, "depth_press", False))
+    was = getattr(ctx.client, "compliant", False)
+    if on:
+        ctx.client.compliant = True
+        print("[press_demo] COMPLIANT: every move in the arm's joint impedance, and nothing the run reads stops it — "
+              "no torque guard, no at-rest check, no look after the press. The e-stop and Ctrl+C stop it")
+    try:
+        return _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator)
+    finally:
+        ctx.client.compliant = was
+
+
+def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     from rammp_box_opening.models.container import from_container
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.tasks.press_demo import dump_wrist_frame, refuse_open_box, touch_verdict
@@ -814,22 +847,25 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         runner.run([plan.look_leg], execute=False)
         print("[press_demo] preview ends at the look pose: the aim, the slide, the press and the checks need --execute")
         return 0
-    at_rest = _settled(ctx, "the rest pose")
-    if at_rest is None:
+    soft = compliant(ctx)  # no guard references to read, no checks to make
+    at_rest = None if soft else _settled(ctx, "the rest pose")
+    if at_rest is None and not soft:
         return 1
     res = runner.run([plan.look_leg], execute=True)
     if any(not r.ok for r in res):
         return 1
-    at_look = _settled(ctx, "the look pose")
-    if at_look is None:
-        return 1
-    mismatch = gravity_mismatch(_wrist_gravity(), at_rest, at_look)
-    runner.note("reach_gravity_check", residual_nm=[round(v, 3) for v in residual(_wrist_gravity(), at_rest, at_look)],
-                ok=mismatch is None)
-    if mismatch is not None:
-        _go_home(ctx, cfg, runner, "STOP: %s — the reach-out's guards would be judging the wrong arm; nothing was "
-                                   "pressed" % mismatch)
-        return 1
+    at_look = None
+    if not soft:
+        at_look = _settled(ctx, "the look pose")
+        if at_look is None:
+            return 1
+        mismatch = gravity_mismatch(_wrist_gravity(), at_rest, at_look)
+        runner.note("reach_gravity_check", ok=mismatch is None,
+                    residual_nm=[round(v, 3) for v in residual(_wrist_gravity(), at_rest, at_look)])
+        if mismatch is not None:
+            _go_home(ctx, cfg, runner, "STOP: %s — the reach-out's guards would be judging the wrong arm; "
+                                       "nothing was pressed" % mismatch)
+            return 1
 
     got, status, up_mm = _aim(node, watcher, yaw, prior_button[2], prior_button[:2], runner, "reach-aim")
     if got is None:
@@ -847,6 +883,11 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         "[press_demo] AIMED from the look pose: button at [%.3f, %.3f, %.3f], %.0f mm from the scene camera's"
         % (button[0], button[1], button[2], 1000 * judge_box_moved(prior_button, button))
     )
+    if soft and float(prior_button[2]) > button[2]:
+        # the press goes by the higher top, the stroke reaching on past it
+        print("[press_demo] the scene camera puts the lid %.0f mm higher than the wrist's aim: pressing from that "
+              "height" % (1000 * (float(prior_button[2]) - button[2])))
+        button = (button[0], button[1], float(prior_button[2]))
     # the box is where its button is, not where the scene camera put it: every
     # world from here on holds its cuboid there
     ctx.cpose = cpose_for_button(button, yaw, m.button_offset)
@@ -865,8 +906,8 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     move, plan2, why_line = reach_from_here(ctx, cfg, button, plan.tilt_deg, need_stroke=not depth)
     if plan2 is not None:
         if move:
-            res = runner.run([line_leg(ctx, "reach:re-aim", move, plan2.quat, CONTACT_SPEED, drag_guard(at_look), world)],
-                             execute=True)
+            res = runner.run([line_leg(ctx, "reach:re-aim", move, plan2.quat, CONTACT_SPEED, free_guard(ctx, at_look),
+                                       world)], execute=True)
             if any(not r.ok for r in res):
                 print("[press_demo] STOP: the move to the aimed button's look pose %s — the arm holds; "
                       "nothing was pressed" % _stopped_by(res))
@@ -880,9 +921,10 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         res = runner.run([plan2.look_leg], execute=True)
         if any(not r.ok for r in res):
             return 1
-    at_look = _settled(ctx, "the look pose")
-    if at_look is None:
-        return 1
+    if not soft:
+        at_look = _settled(ctx, "the look pose")
+        if at_look is None:
+            return 1
     # With the depth press the slide in also turns the hand straight down,
     # its pads ending where the tilted fingertip would: one walk, as slow
     # and as guarded as the slide, never lower than it (tasks/depth_press
@@ -902,16 +944,18 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             _go_home(ctx, cfg, runner, "STOP: the slide in to the button is not a straight line the arm can fly (%s)" % (why or "no length"))
             return 1
         quat_in = plan2.quat
-    res = runner.run([line_leg(ctx, "reach:slide-in", slide, quat_in, CONTACT_SPEED, drag_guard(at_look), world)], execute=True)
+    res = runner.run([line_leg(ctx, "reach:slide-in", slide, quat_in, CONTACT_SPEED, free_guard(ctx, at_look), world)],
+                     execute=True)
     if any(not r.ok for r in res):
         print("[press_demo] STOP: the slide in %s before the button — the arm holds; nothing was pressed"
               % _stopped_by(res))
         return 1
-    at_start = _settled(ctx, "the stroke's start" if walk is None else "over the button, pointing down")
-    if at_start is None:
+    at_start = None if soft else _settled(ctx, "the stroke's start" if walk is None
+                                          else "over the button, pointing down")
+    if at_start is None and not soft:
         return 1
-    runner.note("reach_slid_in", residual_nm=[round(v, 3) for v in residual(_wrist_gravity(), at_look, at_start)],
-                turned_down=walk is not None)
+    runner.note("reach_slid_in", turned_down=walk is not None, residual_nm=None if soft else [
+        round(v, 3) for v in residual(_wrist_gravity(), at_look, at_start)])
     if depth:
         # over the box: from here the height is the wrist camera's depth and
         # the press the torques' (tasks/depth_press), not TF's lid — the
@@ -919,7 +963,8 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         from rammp_box_opening.tasks import depth_press
 
         result = depth_press.press_down_from_here(node, ctx, cfg, runner, watcher, CONTACT_TOOL, here=at_start,
-                                                  turned=turned, knob_up_mm=up_mm, aimed=button)
+                                                  turned=turned, knob_up_mm=up_mm, aimed=button, compliant=soft,
+                                                  top_z=button[2])
         result = depth_press.after_scene_check(ctx, runner, result, scene_fix, locator)
         homed = result.free and _home_from_over_box(ctx, cfg, runner, result)
         runner.finish()

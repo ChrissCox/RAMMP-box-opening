@@ -936,6 +936,8 @@ class Runner:
             )
 
         guard = make_guard()
+        # a compliant run's impedance tuning: the group's, when a leg names one
+        gains = next((g.gains for g in group if getattr(g, "gains", None) is not None), None)
         t0 = time.monotonic()
         outcome, info = self.client.execute(
             traj,
@@ -943,6 +945,7 @@ class Runner:
             guard=guard,
             while_running=while_running,
             stop_when=lead.stop_when,
+            **({} if gains is None else {"gains": gains}),
         )
         if guard is not None:
             info.setdefault("torque_peak", guard.peak)

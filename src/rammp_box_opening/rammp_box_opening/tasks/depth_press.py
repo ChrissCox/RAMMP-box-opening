@@ -126,6 +126,25 @@ KNOB_RECHECK_S = 2.0
 # LID_MOVED_M), is gripped where the camera sees it now; farther is a STOP
 SLIDE_OK_M = 0.015
 
+# A COMPLIANT press (press_down_from_here's `compliant`; owner 2026-10-27:
+# "with impedance mode, lets remove the safety check for now that stops the
+# arm when there's a bad reading or it thinks it hit or is going to hit
+# something"): one stroke straight down, in the driver's joint impedance,
+# to where its spring pushes COMPLIANT_PRESS_N through the button's bottom,
+# held push_hold_s, and straight back up. No close-up look, no stop at
+# contact, no check: the arm yields. 15:19's touch tripped at 3.4 Nm on
+# joint 4, ~13.5 N at the pads, and the button went.
+COMPLIANT_PRESS_N = 15.0
+COMPLIANT_GAINS = 3  # ImpedanceGains.PROFILE_STIFF: ~440 N/m at the pads over 15:19's box
+# The driver's joint stiffness under that profile, N·m/rad (kinova-gen3-driver
+# interface/gains.cpp kStiff): the robot's, not the scene's
+COMPLIANT_KQ = (160.0, 160.0, 160.0, 160.0, 60.0, 60.0, 60.0)
+# how far the stroke's end lies below the button's bottom, whatever the
+# stiffness: never a graze, never a ram
+COMPLIANT_OVERSHOOT_M = (0.015, 0.06)
+# the spring held at least this much off the stroke's end: something pushed back
+COMPLIANT_FELT_N = 5.0
+
 
 @dataclass
 class LensSighting:
@@ -469,8 +488,8 @@ def turn_down(ctx, runner, contact_tool, ref):
     if short:
         print("[press_demo] TURN: %.0f deg short of straight down (exactly down does not fly here)" % short)
     # in place, the fingertip the pivot: free air, nothing nearer the lid
-    res = runner.run([rp.line_leg(ctx, "depth:turn", pts, quat, FREE_LINE_SPEED, rp.drag_guard(ref), _full_world(ctx))],
-                     execute=True)
+    res = runner.run([rp.line_leg(ctx, "depth:turn", pts, quat, FREE_LINE_SPEED, rp.free_guard(ctx, ref),
+                                  _full_world(ctx))], execute=True)
     if any(not r.ok for r in res):
         return None, False, "the turn met something (%s)" % res[-1].detail
     return quat, True, None
@@ -692,6 +711,103 @@ def _feel_the_lid(ctx, cfg, runner, quat, top_z, over, depth, lens, seen, up_mm)
     return DepthPress(free=True, contact=True, popped=True, knob_mm=float(up_mm))
 
 
+def fingertip_stiffness_z(chain, q, kq=COMPLIANT_KQ):
+    """How stiff the pads are straight down (N/m) under joint stiffness `kq`
+    with the arm at `q`: 1 / (J K^-1 J^T)_zz, J the pads' translation
+    Jacobian (central differences of the arm's own kinematics)."""
+    q = np.asarray(q, float)
+    J = np.zeros((3, len(q)))
+    for i in range(len(q)):
+        dq = np.zeros(len(q))
+        dq[i] = 1e-5
+        pads = []
+        for sgn in (1.0, -1.0):
+            R, t = chain.fk(list(q + sgn * dq))
+            pads.append(np.asarray(t, float) + np.asarray(R, float) @ np.asarray(DOWN_CONTACT_TOOL, float))
+        J[:, i] = (pads[0] - pads[1]) / 2e-5
+    c = float((J @ np.diag(1.0 / np.asarray(kq, float)[: len(q)]) @ J.T)[2, 2])
+    return float("inf") if c <= 0.0 else 1.0 / c
+
+
+def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=None):
+    """The COMPLIANT press (COMPLIANT_PRESS_N): from where the hand stands
+    over the button, turned down (`turned`, else TURN here), straight down
+    at press_speed to TOUCH_SLOW_M above the button's top `top_z`, then at
+    TOUCH_SPEED to the stroke's end below its bottom — one execution — held
+    push_hold_s, and back up to where it began. What it pressed with is
+    where the spring held the pads: the pads' height off the stroke's end,
+    times the stiffness there. Nothing it reads stops it."""
+    from rammp_box_opening.runtime import approach
+
+    if top_z is None:
+        return DepthPress(free=True, why="a compliant press needs the button's height (the aim or the scene camera)")
+    if turned is not None:
+        quat = list(turned)
+    else:
+        quat, _moved, why = turn_down(ctx, runner, contact_tool, None)
+        if quat is None:
+            return DepthPress(free=why.startswith("no straight-down"), why=why)
+    chain = approach._chain()
+    q0 = [float(v) for v in ctx.client.joints()]
+    R0, t0 = chain.fk(q0)
+    R0, t0 = np.asarray(R0, float), np.asarray(t0, float)
+    pad0 = t0 + R0 @ np.asarray(DOWN_CONTACT_TOOL, float)
+    k = fingertip_stiffness_z(chain, q0)
+    over = min(max(COMPLIANT_PRESS_N / k, COMPLIANT_OVERSHOOT_M[0]), COMPLIANT_OVERSHOOT_M[1])
+    end_z = float(top_z) - float(cfg.button_travel_m) - over
+    slow_from = float(top_z) + TOUCH_SLOW_M
+    if pad0[2] <= end_z:
+        return DepthPress(free=True, why="the pads already stand %.0f mm below where the press would end" % (
+            1000 * (end_z - pad0[2])))
+    world = _full_world(ctx)
+    legs, q = [], q0
+    for name, z, speed in (("depth:approach", slow_from, cfg.press_speed), ("depth:press", end_z, TOUCH_SPEED)):
+        _R, t = chain.fk(q)
+        tool_z = float(t0[2]) + (z - float(pad0[2]))  # the attitude held: the tool drops as the pads do
+        if float(t[2]) - tool_z < 0.005:
+            continue  # already this low
+        pts, why = chain.straight_line(q, [float(t0[0]), float(t0[1]), tool_z], quat)
+        if pts is None:
+            return DepthPress(free=True, why="the press stroke is not a straight line the arm can fly (%s)" % why)
+        leg = rp.line_leg(ctx, name, pts, quat, speed, None, world)
+        leg.gains = COMPLIANT_GAINS
+        legs.append(leg)
+        q = pts[-1]
+    print("[press_demo] PRESS (compliant): straight down %.0f mm to %.0f mm below the button's bottom — the spring "
+          "pushes ~%.0f N there (%.0f N/m at the pads); held %.1f s, then back up. Nothing stops it but the e-stop"
+          % (1000 * (pad0[2] - end_z), 1000 * over, k * over, k, cfg.push_hold_s))
+    res = runner.run(legs, execute=True)
+    if any(not r.ok for r in res):
+        return DepthPress(free=False, why="the press stroke stopped (%s) — the arm holds" % res[-1].detail)
+    # held where the spring left it, pressing: the hold IS the reading
+    held = ctx.client.settled_efforts(duration_s=0.15, settle_s=max(0.0, float(cfg.push_hold_s) - 0.15))
+    qh = held[1] if held is not None else ctx.client.joints()
+    Rh, th = chain.fk(qh)
+    pad = np.asarray(th, float) + np.asarray(Rh, float) @ np.asarray(DOWN_CONTACT_TOOL, float)
+    force = k * max(0.0, float(pad[2]) - end_z)
+    felt = force >= COMPLIANT_FELT_N
+    if felt:
+        seen["touch_xyz"] = tuple(round(float(v), 5) for v in pad)  # where the pads were held, pressing
+    runner.note("depth_compliant_press", top_z=round(float(top_z), 4), end_z=round(end_z, 4),
+                held_pad_xyz=[round(float(v), 4) for v in pad], stiffness_n_per_m=round(k, 1),
+                press_n=round(force, 1), felt=felt)
+    print("[press_demo] %s: the pads held %.0f mm above the stroke's end, %.0f mm %s the button's top" % (
+        "PRESSED with ~%.0f N" % force if felt else "NOTHING PRESSED (%.0f N)" % force, 1000 * (pad[2] - end_z),
+        1000 * abs(float(top_z) - pad[2]), "below" if pad[2] < float(top_z) else "above"))
+    up, why = rp._line(ctx, [float(t0[0]), float(t0[1]), float(t0[2])], quat)
+    if up is None:
+        return DepthPress(free=False, contact=felt, felt=felt, judged=False, press_n=force,
+                          why="the way up is not a straight line the arm can fly (%s) — the arm holds" % why)
+    if up:
+        leg = rp.line_leg(ctx, "depth:rise", up, quat, FREE_LINE_SPEED, None, world)
+        leg.gains = COMPLIANT_GAINS
+        res = runner.run([leg], execute=True)
+        if any(not r.ok for r in res):
+            return DepthPress(free=False, contact=felt, felt=felt, judged=False, press_n=force,
+                              why="the way up stopped (%s) — the arm holds" % res[-1].detail)
+    return DepthPress(free=True, contact=felt, felt=felt, judged=False, press_n=force)
+
+
 @dataclass
 class DepthPress:
     """What the depth press came back with."""
@@ -709,10 +825,12 @@ class DepthPress:
     touch_xyz: tuple = None  # where the pads met the button (the arm's own kinematics)
     ref: object = None  # the free-air (efforts, joints) reading the press was judged against
     seen_at: tuple = None  # where the after-look saw the button (where_seen), for a look again from there
+    judged: bool = True  # a look judged the knob after (a compliant press does not look)
+    press_n: float = float("nan")  # a compliant press: what its spring held on the button
 
 
 def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None,
-                         aimed=None):
+                         aimed=None, compliant=False, top_z=None):
     """TURN, DEPTH, TOUCH, PUSH, RISE, LOOK from where the hand stands over
     the button (`contact_tool`: the fingertip's point in tool_frame at the
     hand's current attitude). `here`: the caller's at-rest reading where the
@@ -722,9 +840,14 @@ def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=Non
     caller's aim — is never pressed: the pads feel its lid beside the knob
     instead (_feel_the_lid). `aimed`: the button's top in the world by the
     caller's aim — the first look takes no circle far from it, and stands
-    in for a look that does not confirm the button (aim_disagrees). Never
-    goes home itself: DepthPress.free says whether the arm may."""
+    in for a look that does not confirm the button (aim_disagrees).
+    `compliant`: press_compliant instead, down to the button's top at
+    `top_z`. Never goes home itself: DepthPress.free says whether the arm
+    may."""
     seen = {}
+    if compliant:
+        result = press_compliant(ctx, cfg, runner, contact_tool, seen, turned, top_z)
+        return dataclasses.replace(result, touch_xyz=seen.get("touch_xyz"))
     result = _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here, turned, knob_up_mm, aimed)
     return dataclasses.replace(result, ref=seen.get("ref"), touch_xyz=seen.get("touch_xyz"))
 
@@ -996,6 +1119,14 @@ def exit_code(result):
     if result.moved:
         print("[press_demo] STOP: the press MOVED the box — check it is still standing on the table")
         return 1
+    if not result.judged:
+        # a compliant press: no look after it, the press itself is the verdict
+        if result.felt:
+            print("[press_demo] PRESSED: ~%.0f N held on the button (a compliant run does not look at the knob)"
+                  % result.press_n)
+            return 0
+        print("[press_demo] STOP: the stroke pressed nothing (%.0f N at its end)" % result.press_n)
+        return 1
     if result.popped:
         print("[press_demo] the box is open")
         return 0
@@ -1009,7 +1140,7 @@ def finish(ctx, result, homed):
     success. What the press established goes into the mission's record."""
     frames = getattr(ctx, "mission_frames", None)
     if frames is not None:
-        facts = dict(popped=None if not result.contact or result.lost else bool(result.popped),
+        facts = dict(popped=None if not result.contact or result.lost or not result.judged else bool(result.popped),
                      touch_xyz=None if result.touch_xyz is None else list(result.touch_xyz))
         if result.felt:
             facts["stage"] = "pressed"

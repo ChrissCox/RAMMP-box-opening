@@ -57,7 +57,11 @@ _GRIPPER_JOINT_HINTS = ("robotiq", "knuckle", "finger")
 
 # ExecuteJointTrajectory.Goal.control_mode / .preemption (rammp_arm_interfaces)
 POSITION = 0
+IMPEDANCE = 1
 QUEUE = 0
+# ImpedanceGains.profile: the driver's named joint-impedance tunings
+# (kinova-gen3-driver interface/gains.cpp; MEDIUM is the session default)
+GAINS_SOFT, GAINS_MEDIUM, GAINS_STIFF = 1, 2, 3
 
 # a gripper command in flight: knuckle-radian target, the knuckle at send, when
 GripperHandle = namedtuple("GripperHandle", "target start t0")
@@ -106,6 +110,7 @@ class PlannerClient:
         self._gripper_pos = None
         self._gripper_target = None  # driver setpoint (0..1) re-sent while pending
         self.world_held = None  # path of the world the planner holds
+        self.compliant = False  # joint impedance, nothing read stops a leg (execute); a run sets it
         # the driver publishes /joint_states best-effort (SensorDataQoS): a
         # reliable subscription would match nothing and hear nothing
         node.create_subscription(
@@ -468,8 +473,15 @@ class PlannerClient:
             return True
         return getattr(cresp, "return_code", None) in self._CANCEL_TAKEN
 
-    def execute(self, traj, speed, guard=None, while_running=None, stop_when=None):
+    def execute(self, traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
         """Run one trajectory on the driver; outcome 'arrived' | 'touch' | 'failed'.
+
+        A COMPLIANT client (self.compliant, press_demo's default since
+        2026-10-27) flies it in the driver's joint impedance, under `gains`
+        (an ImpedanceGains profile; None: the session default), and nothing
+        it reads stops it: a guard only watches — its would-be trip is in
+        info["would_trip"], a silent stream is skipped — and the leg runs to
+        its end. The arm yields instead; the e-stop and Ctrl+C remain.
 
         `speed` dilates the trajectory's time base (the driver has no speed
         scale of its own); 1.0 flies it as planned or re-timed. Nothing is
@@ -508,7 +520,8 @@ class PlannerClient:
         # one merely flowing (EFFORT_STALE_S): flatbot 2026-10-27 15:34, the
         # re-aim after the aim's computing started on a 0.3 s old one and its
         # guard called the stream lost 10 ms in, the arm never having moved
-        live = self._fresh_joints(max_age=None if guard is None else 0.5 * self.GUARD_STALE_S)
+        compliant = bool(getattr(self, "compliant", False))
+        live = self._fresh_joints(max_age=None if guard is None or compliant else 0.5 * self.GUARD_STALE_S)
         if live is None:
             info["message"] = "no fresh /joint_states — refusing to send a trajectory"
             return "failed", info
@@ -518,7 +531,9 @@ class PlannerClient:
             return "failed", info
         goal = ExecuteJointTrajectory.Goal()
         goal.trajectory = flown
-        goal.control_mode = POSITION
+        goal.control_mode = IMPEDANCE if compliant else POSITION
+        if compliant and gains is not None:
+            goal.gains.profile = int(gains)
         goal.preemption = QUEUE  # never displace a goal that is still settling
         goal.sender_id = "rammp_box_opening"
 
@@ -577,7 +592,9 @@ class PlannerClient:
                         while eff is None and time.monotonic() - t_drain < self.GUARD_DRAIN_S:
                             rclpy.spin_once(self.node, timeout_sec=0.0)
                             eff = self.wrist_efforts(max_age=self.GUARD_STALE_S)
-                        if eff is None:
+                        if eff is None and compliant:
+                            pass  # it only watches: a silent stream stops nothing
+                        elif eff is None:
                             # a guard that has lost its senses is no guard:
                             # stop the stroke instead of pressing blind
                             ok = self._stop_confirmed(send, result_future)
@@ -587,13 +604,18 @@ class PlannerClient:
                                 % (self.GUARD_STALE_S, "" if ok else " (stop unconfirmed)")
                             )
                             return "failed", info
-                        if getattr(guard, "wants_joints", False):
+                        if eff is None:
+                            tripped = False
+                        elif getattr(guard, "wants_joints", False):
                             # the same /joint_states message as the efforts:
                             # the guard takes gravity out at these joints
                             tripped = guard.on_efforts(eff, list(self._q))
                         else:
                             tripped = guard.on_efforts(eff)
-                        if tripped:
+                        if tripped and compliant:
+                            # watched, not obeyed: the leg flies on
+                            info.setdefault("would_trip", round(float(guard.peak or 0.0), 2))
+                        elif tripped:
                             if not self._stop_confirmed(send, result_future):
                                 # never a contact height off an arm that may
                                 # have flown on, nor a push on top of it
@@ -649,6 +671,8 @@ class PlannerClient:
         result = wrapped.result
         if result.error_code == driver.SUCCESSFUL:
             info["message"] = "arrived"
+            if "would_trip" in info:
+                info["message"] = "arrived (compliant: the guard would have stopped it at %.1f Nm)" % info["would_trip"]
             return "arrived", info
         info["message"] = driver.result_message(result.error_code, result.error_string)
         return "failed", info

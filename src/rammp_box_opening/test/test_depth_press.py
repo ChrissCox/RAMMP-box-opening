@@ -212,7 +212,8 @@ def _seen(hand_off=(0.0, 0.0), depth=0.27, lens=LENS, r_hc=EYE, up=0.4):
 
 
 def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="touch", refuse_turn=False,
-           lens=LENS, r_hc=EYE, measured=LENS, refuse_first=0, here=None, turned=None, knob_up_mm=None, aimed=None):
+           lens=LENS, r_hc=EYE, measured=LENS, refuse_first=0, here=None, turned=None, knob_up_mm=None, aimed=None,
+           compliant=False, top_z=None, held_up_m=0.0):
     """press_down_from_here with the hand `tilt` deg over BUTTON (at the
     reach-out's stroke start, 6 cm above TF's lid at 0.40), the wrist camera
     scripted by `looks` (a (sighting, z, status) or a _seen) with TF's lens
@@ -238,7 +239,10 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="
     arm.reads = []
 
     def settled(*a, **k):
-        got = ([0.001 * (len(arm.reads) + 1), 0.0, 0.0, 0.0], list(ctx.client.live))
+        live = list(ctx.client.live)
+        if held_up_m and events and events[-1] == "depth:press":
+            live[2] += held_up_m  # the spring held the pads this far above the stroke's end
+        got = ([0.001 * (len(arm.reads) + 1), 0.0, 0.0, 0.0], live)
         arm.reads.append(got)
         return got
 
@@ -290,7 +294,7 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="
     contact = rp.CONTACT_TOOL if tilt else dp.DOWN_CONTACT_TOOL
     watcher = SimpleNamespace(grab=SimpleNamespace(wrist_lens_in_hand_m=None if measured is None else list(measured)))
     result = dp.press_down_from_here(None, ctx, cfg, runner, watcher, contact, here=here, turned=turned,
-                                     knob_up_mm=knob_up_mm, aimed=aimed)
+                                     knob_up_mm=knob_up_mm, aimed=aimed, compliant=compliant, top_z=top_z)
     return result, events, arm, legs, start
 
 
@@ -759,23 +763,27 @@ def test_a_box_the_press_moved_stops_the_run(ctx, monkeypatch, tmp_path):
 ARRIVED = ("arrived", {"message": "ok", "progress": 1.0})
 
 
-def _depth_flow(ctx, monkeypatch, tmp_path, press, **kw):
+def _depth_flow(ctx, monkeypatch, tmp_path, press, compliant=False, **kw):
     """test_reach_press._flow with --depth-press: `press` stands in for
     press_down_from_here (called with the reach's ctx). The fake chain's fk
     stands at z 0.45 over the aimed button at 0.40."""
     from test_reach_press import _flow
 
     got = {}
+    compliant_run = compliant
 
-    def fake(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None):
-        got.update(contact=contact_tool, knob_up_mm=knob_up_mm, aimed=aimed)
+    def fake(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None,
+             compliant=False, top_z=None):
+        got.update(contact=contact_tool, knob_up_mm=knob_up_mm, aimed=aimed, compliant=compliant, top_z=top_z,
+                   client_compliant=getattr(ctx_.client, "compliant", False))
         return press(ctx_)
 
     monkeypatch.setattr(dp, "press_down_from_here", fake)
     real = rp.run_reach_press
 
     def with_flag(node, ctx_, cfg, runner, watcher, args, scene_fix, locator):
-        return real(node, ctx_, cfg, runner, watcher, SimpleNamespace(execute=True, press_only=True, depth_press=True),
+        return real(node, ctx_, cfg, runner, watcher, SimpleNamespace(execute=True, press_only=True, depth_press=True,
+                                                                      compliant=compliant_run),
                     scene_fix, locator)
 
     monkeypatch.setattr(rp, "run_reach_press", with_flag)
@@ -1069,7 +1077,8 @@ def test_the_reach_out_slides_in_turning_down_in_one_leg(ctx, monkeypatch, tmp_p
 
     got = {}
 
-    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None):
+    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None,
+              compliant=False, top_z=None):
         got.update(here=here, turned=turned)
         # as the real press does: the free-air reading it was handed is the one home is judged against
         return dp.DepthPress(free=True, contact=True, felt=True, popped=True, ref=here)
@@ -1113,7 +1122,8 @@ def test_where_no_walk_turns_down_on_the_way_it_slides_then_turns(ctx, monkeypat
 
     got = {}
 
-    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None):
+    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None,
+              compliant=False, top_z=None):
         got.update(here=here, turned=turned)
         return dp.DepthPress(free=True, contact=True, felt=True, popped=True)
 
@@ -1275,3 +1285,84 @@ def test_at_rest_the_lens_is_placed_even_when_tf_lags_the_newest_frame(monkeypat
     assert lens == pytest.approx([0.0, 0.065, -0.105])
     # ... but never from before the arm stopped
     assert dp.lens_in_hand(ctx, grab, still_since_ns=stamp_ns - 20_000_000) is None
+
+
+# ---- the compliant press: impedance, one stroke, nothing it reads stops it --------
+
+COMPLIANT_TOP = 0.40  # the button's top under the harness's pads (TF's lid)
+
+
+def _compliant(ctx, monkeypatch, tmp_path, held_up_m):
+    import json
+
+    ctx.client.compliant = True
+    result, events, arm, legs, start = _press(ctx, monkeypatch, tmp_path, [], touch_at=None, compliant=True,
+                                              top_z=COMPLIANT_TOP, held_up_m=held_up_m)
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    note, = [r for r in rows if r.get("leg") == "depth_compliant_press"]
+    return result, events, arm, legs, note
+
+
+def test_a_compliant_press_is_one_stroke_held_and_back_up_with_no_look_and_no_guard(ctx, monkeypatch, tmp_path):
+    """Owner 2026-10-27: impedance, and nothing that stops the arm on a bad
+    reading or a hit. The stroke flies as one execution to below the
+    button's bottom — as far as the spring needs to push COMPLIANT_PRESS_N
+    there — under the STIFF tuning, is held, and comes back up to where it
+    began. No look (the harness has none to give), no guard on any leg."""
+    cfg = load_press_demo(PINK)
+    result, events, arm, legs, note = _compliant(ctx, monkeypatch, tmp_path, held_up_m=0.0)
+    assert events == ["depth:turn", "depth:approach", "depth:press", "depth:rise"]
+    assert len(ctx.client.executed) == 3  # the turn, the stroke (approach and press merged), the rise
+    assert all(g is None for g in ctx.client.guards)
+    assert ctx.client.gains_sent == [None, dp.COMPLIANT_GAINS, dp.COMPLIANT_GAINS]
+    assert legs["depth:press"].speed == dp.TOUCH_SPEED and legs["depth:approach"].speed == cfg.press_speed
+    k = note["stiffness_n_per_m"]
+    over = min(max(dp.COMPLIANT_PRESS_N / k, dp.COMPLIANT_OVERSHOOT_M[0]), dp.COMPLIANT_OVERSHOOT_M[1])
+    assert note["end_z"] == pytest.approx(COMPLIANT_TOP - cfg.button_travel_m - over, abs=1e-4)
+    (goal, quat), = arm.turns
+    assert arm.lines[-1] == pytest.approx(list(goal))  # back up to where the stroke began
+    # the pads reached the stroke's end: nothing pushed back, nothing pressed
+    assert not result.felt and not result.judged and dp.exit_code(result) == 1
+
+
+def test_a_compliant_press_held_short_of_its_end_pressed_with_the_spring(ctx, monkeypatch, tmp_path):
+    """The button's bottom held the pads short of the stroke's end: the
+    spring pushed stiffness x that, and the run says so — 0, the knob not
+    looked at."""
+    result, _e, _a, _l, note = _compliant(ctx, monkeypatch, tmp_path, held_up_m=0.05)
+    assert result.felt and result.press_n == pytest.approx(note["stiffness_n_per_m"] * 0.05, rel=0.02)
+    assert result.free and dp.exit_code(result) == 0
+    assert result.touch_xyz is not None
+
+
+def test_the_stiffness_at_the_pads_is_the_joint_springs_seen_through_the_arm():
+    """A chain whose joints ARE the pads' position: straight down it is just
+    joint 3's spring."""
+    class Cartesian:
+        def fk(self, q):
+            return np.eye(3), np.asarray(q[:3], float) - np.asarray(dp.DOWN_CONTACT_TOOL, float)
+
+    assert dp.fingertip_stiffness_z(Cartesian(), [0.5, -0.1, 0.4]) == pytest.approx(dp.COMPLIANT_KQ[2])
+
+
+def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx, monkeypatch, tmp_path):
+    """The reach-out of a compliant run: no at-rest read, no weight check at
+    the look, no stopping guard on the re-aim, the slide in or the way up,
+    and the press told the higher top — the scene camera's, as at 15:19
+    when the wrist's aim stood 24 mm low and the touch met the scene's."""
+    import test_reach_press as trp
+
+    low = (trp.BUTTON[0], trp.BUTTON[1], trp.BUTTON[2] - 0.024)
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, first=(low, 0.4))
+    assert code == 0 and rec.reads == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
+    assert all(rec.legs[n].guard is None for n in ("reach:re-aim", "reach:slide-in", "depth:clear"))
+    assert got["compliant"] and got["client_compliant"] and got["top_z"] == pytest.approx(trp.BUTTON[2])
+    assert not ctx.client.compliant  # the client is as it was once the run is over
+
+
+def test_a_guarded_reach_out_is_as_before(ctx, monkeypatch, tmp_path):
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped)
+    # at rest, at the look, at the look again, over the button, and over the box for the home
+    assert code == 0 and not got["compliant"] and rec.reads == 5
+    assert rec.legs["reach:slide-in"].guard is not None

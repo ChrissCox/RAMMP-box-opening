@@ -91,8 +91,9 @@ class FakeClient:
             return self.plans.pop(0)
         return self._plan(list(q7), start_joints)
 
-    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None):
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
         self.executed.append((len(traj_.points), speed))
+        self.gains_sent = getattr(self, "gains_sent", []) + [gains]
         self.exec_starts.append(list(traj_.points[0].positions))
         self.guards.append(guard)
         info_extra = {}
