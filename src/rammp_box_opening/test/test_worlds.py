@@ -314,3 +314,26 @@ def test_flatbot_guarded_bench_world_exists_only_with_a_measured_table(tmp_path)
     bare = _written(store.push_name("bench", model=None, tag="bare")[1])
     assert {"table", "unseen_container_band"} <= set(guarded)
     assert "unseen_container_band" not in bare and guarded != bare
+
+
+def test_what_the_cameras_see_standing_is_in_every_world_and_whole_at_a_contact(tmp_path):
+    """Owner 2026-10-27: nothing in the environment is hard coded — what
+    stands on the table comes from the cameras, each run (WorldStore.seen,
+    press_demo.adopt_seen). A contact's world cuts the table to the plane
+    below the contact; what stands beside the contact stays whole (17:57:
+    the set-down's descent is where the wrist camera met the microwave)."""
+    from rammp_box_opening.worlds import SEEN_PREFIX
+
+    m = ContainerModel.load(CFG)
+    store = WorldStore(FLATBOT, out_dir=tmp_path)
+    cp = ContainerPose(xyz=(0.39, -0.21, 0.187), yaw=0.0)
+    store.table_top_z, store.table_extent = 0.187, (0.30, 0.75, -0.70, 0.20)
+    assert not any(n.startswith(SEEN_PREFIX) for n in _written(store.push_name("full", model=m, cpose=cp)[1]))
+    microwave = {"name": SEEN_PREFIX + "00", "position": [0.60, -0.42, 0.187 + 0.155], "dims": [0.16, 0.50, 0.31]}
+    store.seen = [microwave]
+    for kind, kw in (("full", dict(model=m, cpose=cp)), ("bench", dict(model=m)),
+                     ("interaction", dict(model=m, cpose=cp, contact_z=0.227, depth_max=0.01))):
+        w = _written(store.push_name(kind, **kw)[1])
+        assert w[microwave["name"]] == microwave, kind
+    w = _written(store.push_name("interaction", model=m, cpose=cp, contact_z=0.227, depth_max=0.01)[1])
+    assert w["table"]["position"][2] + w["table"]["dims"][2] / 2 < 0.187 - 0.03  # the table under it IS cut

@@ -85,12 +85,14 @@ def test_the_1757_table_from_the_scene_camera_alone_has_no_room_and_it_says_why(
     view = lrv.room_view(pink, fix, "scene OWL")
     assert not view.drops and "short of the room it needs" in view.why
     line = lrv.status_line(view)
-    assert line.startswith("box at [0.39, -0.21] (scene OWL): nowhere to set the lid down")
+    assert line.startswith("box at [0.39, -0.21] (scene OWL), %d planner cuboid(s): nowhere to set the lid down"
+                           % len(view.boxes))
     ma = lrv.view_markers(view, pink, "arm_mount", Time())
     assert not _by_ns(ma, "lid")
     tall = [m for m in _by_ns(ma, "standing") if m.color.r > 0.8 and m.color.g < 0.3]
     assert any(m.pose.position.x > 0.5 and m.pose.position.y < -0.25 for m in tall)  # the microwave reaches the camera
     assert _by_ns(ma, "unseen") and _by_ns(ma, "room at each spot")
+    assert len(_by_ns(ma, "planner cuboids")) == len(view.boxes) > 0
 
 
 def test_its_point_cloud_carries_each_points_height_above_the_table(pink):

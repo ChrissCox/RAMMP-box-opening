@@ -7,7 +7,8 @@ down on (clear_lid_drops), rebuilt every few seconds and drawn for Foxglove
 
 then add to Foxglove's 3D panel:
 
-    /rammp_box_opening/lid_room/markers   the map, the spots, the lid and the hand
+    /rammp_box_opening/lid_room/markers   the map, the spots, the lid and the hand, and the
+                                          cuboids the planner's worlds get from the map
     /rammp_box_opening/lid_room/points    the scene camera's points, field h = height above its table
     /rammp_box_opening/lid_room/status    one line: where the lid goes, or why nowhere
 
@@ -53,6 +54,7 @@ CLEAR_RGBA = (0.20, 0.75, 0.35, 0.35)
 EDGE_RGBA = (0.55, 0.35, 0.85, 0.6)
 UNSEEN_RGBA = (0.5, 0.5, 0.5, 0.15)
 LID_RGBA = (0.95, 0.40, 0.70, 0.9)
+PLANNER_RGBA = (0.30, 0.55, 1.00, 0.25)
 
 
 @dataclass
@@ -64,6 +66,7 @@ class RoomView:
     spots: list = None
     judged: list = None
     why: str = None
+    boxes: list = None  # what the planner's worlds get from the same map (press_demo.adopt_seen)
 
 
 def fix_around(pts_base, box_xy, model):
@@ -91,7 +94,7 @@ def fix_around(pts_base, box_xy, model):
 def room_view(model, fix, source):
     """The room map round `fix` and the spots on it, exactly as press_demo
     makes them from the scene camera alone (room_map, clear_lid_drops)."""
-    from rammp_box_opening.tasks.press_demo import clear_lid_drops, room_map
+    from rammp_box_opening.tasks.press_demo import clear_lid_drops, container_half, room_map
 
     view = RoomView(fix=fix, source=source)
     view.tmap = room_map(None, fix, fix.pose, at_staging=False)
@@ -101,6 +104,9 @@ def room_view(model, fix, source):
     view.judged = []
     view.drops, view.spots, view.why = clear_lid_drops(model, fix.pose, view.tmap, fix.table_z_scene,
                                                        judged_out=view.judged)
+    # the arm is left out of nothing here: this view does not know where it is
+    view.boxes, _note = ct.obstacle_boxes(view.tmap, fix.table_z_scene, fix.pose.xyz[:2], container_half(model),
+                                          keep_clear=[d.xyz[:2] for d in view.drops])
     return view
 
 
@@ -108,6 +114,8 @@ def status_line(view):
     """One line saying what the view found, in press_demo's words."""
     bx, by = view.fix.pose.xyz[0], view.fix.pose.xyz[1]
     head = "box at [%.2f, %.2f] (%s)" % (bx, by, view.source)
+    if view.boxes:
+        head += ", %d planner cuboid(s)" % len(view.boxes)
     if not view.drops:
         return "%s: nowhere to set the lid down: %s" % (head, view.why)
     best, lid = view.spots[0], view.drops[0]
@@ -186,6 +194,9 @@ def view_markers(view, model, frame, stamp):
         m = marker(ns, Marker.CUBE_LIST, rgba, (0.9 * c, 0.9 * c, 0.002))
         m.points = [Point(x=float(x), y=float(y), z=tz) for x, y in zip(X[mask], Y[mask])]
 
+    for b in view.boxes or ():  # what the planner keeps the arm clear of
+        m = marker("planner cuboids", Marker.CUBE, PLANNER_RGBA, b["dims"])
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = b["position"]
     tiles("clear table", near & tm.seen & ~stands & ~tm.off, CLEAR_RGBA)
     tiles("past the edge", near & tm.off, EDGE_RGBA)
     tiles("unseen", near & ~tm.seen, UNSEEN_RGBA)

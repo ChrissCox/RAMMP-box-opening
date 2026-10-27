@@ -10,9 +10,12 @@
 # The planner gets that table only from the scene fix: press_demo copies
 # SceneFix.table_z_scene/table_extent into WorldStore.table_top_z/table_extent,
 # and WorldStore._planning_bench adds a TABLE_THICKNESS_M slab under it, over
-# where it was seen. Until a scene fix, and in any CLI that never makes one
-# (home_arm, preflight, record_detection_set ...), the planner sees only the
-# floor keep-out below. There is no depth/voxel collision world.
+# where it was seen. What stands on that table comes from the cameras too,
+# every run: the scene camera's points (and the wrist's look from staging) as
+# cuboids in every world (press_demo.adopt_seen -> WorldStore.seen). Nothing
+# on the table is surveyed or named here (owner, 2026-10-27). Until a scene
+# fix, and in any CLI that never makes one (home_arm, preflight,
+# record_detection_set ...), the planner sees only the floor keep-out below.
 #
 # TODO: Confirm the floor keepout clears the wheelchair seat (tape measure).
 #

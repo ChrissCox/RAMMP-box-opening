@@ -30,6 +30,7 @@ import numpy as np
 from rammp_box_opening.geometry import yaw_about_world_z
 from rammp_box_opening.perception.d405 import quat_to_mat
 from rammp_box_opening.perception.planes import fit_plane
+from rammp_box_opening.worlds import SEEN_PREFIX
 
 CELL_M = 0.02
 MAP_R_M = 0.6  # the map holds what the scene camera sees this far around the box
@@ -357,3 +358,171 @@ def depth_points(depth, k, rot_cam, trans_cam, stride=2):
     x = (u * stride - kk[0, 2]) / kk[0, 0] * z
     y = (v * stride - kk[1, 2]) / kk[1, 1] * z
     return np.stack([x, y, z], -1) @ np.asarray(rot_cam, float).T + np.asarray(trans_cam, float)
+
+
+# What stands on the table, for the PLANNER. The spot search above checks
+# the hand at the set-down and the carry's straight line; the planner plans
+# every motion of the whole arm, and knew nothing the cameras saw (17:57:
+# the microwave was in no world it was given). Here the map's standing
+# squares become cuboids for its collision world (worlds.WorldStore.seen):
+# each square's column from the table up to the tallest point standing in
+# it. Nothing is surveyed or named: whatever the cameras see standing this
+# run, and only that, is in it.
+# rammp-curobo holds 60 cuboids a world (collision_cache_obb); the floor
+# keep-out, the table, the box and the placed lid take 4 of them
+PLANNER_BOXES = 40
+BOX_CLEAR_M = 0.03  # what stands this close to the box's cuboid is the box: its holder, its edges' flying pixels
+ARM_CLEAR_M = 0.10  # ... and this close to the arm's centre line when the world is made, the arm (or touching it)
+KEEP_CLEAR_M = 0.10  # no merged cuboid covers free table this close to a lid spot: HAND_PARTS reach 0.099 m out
+MERGE_GAP = 10  # squares: only cuboids this close are merged while any such pair may be
+
+
+def _grow(mask, i, j, order):
+    """The rectangle of `mask` squares grown from (i, j), a side at a time
+    in `order` (0: +y, 1: -y, 2: +x, 3: -x), as (i0, i1, j0, j1)."""
+    nx, ny = mask.shape
+    i0, i1, j0, j1 = i, i, j, j
+    grew = True
+    while grew:
+        grew = False
+        for side in order:
+            if side == 0 and j1 + 1 < ny and mask[i0:i1 + 1, j1 + 1].all():
+                j1, grew = j1 + 1, True
+            elif side == 1 and j0 > 0 and mask[i0:i1 + 1, j0 - 1].all():
+                j0, grew = j0 - 1, True
+            elif side == 2 and i1 + 1 < nx and mask[i1 + 1, j0:j1 + 1].all():
+                i1, grew = i1 + 1, True
+            elif side == 3 and i0 > 0 and mask[i0 - 1, j0:j1 + 1].all():
+                i0, grew = i0 - 1, True
+    return i0, i1, j0, j1
+
+
+def _cover(mask):
+    """Rectangles of `mask` squares that cover all of them: each time, of
+    the rectangles grown from every square (along y first, and along x
+    first), the one covering the most squares not covered yet."""
+    cands = np.array(sorted({_grow(mask, i, j, o) for i, j in zip(*np.nonzero(mask))
+                             for o in ((0, 1, 2, 3), (2, 3, 0, 1))}), int).reshape(-1, 4)
+    a, b, c, d = cands.T
+    todo = mask.copy()
+    out = []
+    while todo.any():
+        P = np.pad(todo.astype(np.int32), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+        gain = P[b + 1, d + 1] - P[a, d + 1] - P[b + 1, c] + P[a, c]
+        k = int(np.argmax(gain))
+        todo[a[k]:b[k] + 1, c[k]:d[k] + 1] = False
+        out.append(tuple(int(v) for v in cands[k]))
+    return out
+
+
+def _merge(rects, blocked, forbid, budget):
+    """Merge rectangles [i0, i1, j0, j1, height] pairwise until at most
+    `budget` remain: each time the pair whose enclosing rectangle, at the
+    taller one's height, blocks the least volume not blocked yet. No merge
+    may raise `blocked` (the height blocked per square, 0 where free) where
+    `forbid` is set. Returns the rectangles (over budget when nothing may
+    merge). A pair's cost changes only where a merge blocked more, so only
+    the pairs over it are judged again."""
+    live = {k: list(r) for k, r in enumerate(rects)}
+    nxt = len(live)
+
+    def judge(rp, rq, gap):
+        if max(max(rp[0], rq[0]) - min(rp[1], rq[1]), max(rp[2], rq[2]) - min(rp[3], rq[3])) > gap:
+            return None
+        a, b, c, d = min(rp[0], rq[0]), max(rp[1], rq[1]), min(rp[2], rq[2]), max(rp[3], rq[3])
+        h = max(rp[4], rq[4])
+        up = h - blocked[a:b + 1, c:d + 1]
+        if (forbid[a:b + 1, c:d + 1] & (up > 1e-9)).any():
+            return None
+        return float(np.clip(up, 0.0, None).sum()), [a, b, c, d, h]
+
+    for gap in (MERGE_GAP, max(blocked.shape)):
+        keys = sorted(live)
+        pairs = {}
+        for x, p in enumerate(keys):
+            for q in keys[x + 1:]:
+                got = judge(live[p], live[q], gap)
+                if got is not None:
+                    pairs[(p, q)] = got
+        while len(live) > budget and pairs:
+            (p, q), (_cost, r) = min(pairs.items(), key=lambda kv: (kv[1][0], kv[0]))
+            del live[p], live[q]
+            a, b, c, d, h = r
+            blocked[a:b + 1, c:d + 1] = np.maximum(blocked[a:b + 1, c:d + 1], h)
+            pairs = {k: v for k, v in pairs.items() if p not in k and q not in k}
+            for k, (_c, u) in list(pairs.items()):  # their volume changed only where this one blocks
+                if u[0] <= b and a <= u[1] and u[2] <= d and c <= u[3]:
+                    got = judge(live[k[0]], live[k[1]], gap)
+                    if got is None:
+                        del pairs[k]
+                    else:
+                        pairs[k] = got
+            for s_ in live:
+                got = judge(live[s_], r, gap)
+                if got is not None:
+                    pairs[(s_, nxt)] = got
+            live[nxt] = r
+            nxt += 1
+        if len(live) <= budget:
+            break
+    return [live[k] for k in sorted(live)]
+
+
+def obstacle_boxes(tmap, table_z, box_xy, box_half, arm_points=None, keep_clear=(), budget=PLANNER_BOXES):
+    """(cuboids, note): what `tmap` knows stands on the table, as at most
+    `budget` cuboid dicts (name, position, dims) for the planner's world,
+    standing on the table at `table_z` (heights are the map's, above the
+    plane the points showed), and what was made of them.
+
+    Left out: what stands within BOX_CLEAR_M of the box's cuboid (centred
+    on `box_xy`, `box_half` its half-width: the world's container cuboid is
+    the box), and what reaches within ARM_CLEAR_M of `arm_points` (the
+    arm's centre line, kinematics.ArmChain.points: the arm itself, which
+    would put every start in collision). The squares are covered by
+    rectangles, merged where that blocks the least table not standing
+    (conservative: a merged cuboid is the taller one's height), never over
+    the box, the arm, or free table within KEEP_CLEAR_M of a `keep_clear`
+    (x, y): the lid spots. When even then there are too many, the smallest
+    are left out, and the note says so."""
+    c = tmap.cell
+    X, Y = tmap.centres()
+    tz = float(table_z)
+    stands = np.isfinite(tmap.tall)
+    H = np.where(stands, tmap.tall, 0.0)
+    near_box = ((np.abs(X - float(box_xy[0])) - 0.5 * c < float(box_half) + BOX_CLEAR_M)
+                & (np.abs(Y - float(box_xy[1])) - 0.5 * c < float(box_half) + BOX_CLEAR_M))
+    forbid = near_box.copy()
+    under_arm = np.zeros_like(stands)
+    if arm_points is not None and len(arm_points) > 1:
+        pts = np.asarray(arm_points, float)
+        for a, b in zip(pts[:-1], pts[1:]):
+            for t in np.linspace(0.0, 1.0, max(2, int(np.ceil(np.linalg.norm(b - a) / c)) + 1)):
+                s = a + t * (b - a)
+                near = np.hypot(_to_square(X - s[0], 0.5 * c), _to_square(Y - s[1], 0.5 * c)) <= ARM_CLEAR_M
+                forbid |= near
+                under_arm |= near & stands & (H >= s[2] - tz - ARM_CLEAR_M)
+    for x, y in keep_clear:
+        forbid |= ~stands & (np.hypot(_to_square(X - x, 0.5 * c), _to_square(Y - y, 0.5 * c)) <= KEEP_CLEAR_M)
+    mask = stands & ~near_box & ~under_arm
+    mask &= ~_small_things(mask, MIN_THING_CELLS)  # what is left of the box's or the arm's surroundings is not a thing
+    rects = [[a, b, cc, d, float(H[a:b + 1, cc:d + 1][mask[a:b + 1, cc:d + 1]].max())] for a, b, cc, d in _cover(mask)]
+    blocked = np.where(mask, H, 0.0)
+    rects = _merge(rects, blocked, forbid, budget)
+    left_out = 0
+    if len(rects) > budget:
+        rects.sort(key=lambda r: -(r[1] - r[0] + 1) * (r[3] - r[2] + 1) * r[4])
+        left_out, rects = len(rects) - budget, rects[:budget]
+    boxes = []
+    for k, (a, b, cc, d, h) in enumerate(sorted(rects)):
+        boxes.append({
+            "name": "%s%02d" % (SEEN_PREFIX, k),
+            "position": [float(tmap.x0 + 0.5 * (a + b + 1) * c), float(tmap.y0 + 0.5 * (cc + d + 1) * c), tz + 0.5 * h],
+            "dims": [float((b - a + 1) * c), float((d - cc + 1) * c), float(h)],
+        })
+    covered = np.zeros_like(stands)
+    for a, b, cc, d, _h in rects:
+        covered[a:b + 1, cc:d + 1] = True
+    note = dict(boxes=len(boxes), squares=int(mask.sum()), free_blocked=int((covered & ~mask).sum()),
+                under_arm=int(under_arm.sum()), left_out=left_out,
+                tallest_m=round(max((r[4] for r in rects), default=0.0), 3))
+    return boxes, note

@@ -29,6 +29,10 @@ PLANE_MARGIN_M = 0.08
 # builders below, and table_top_z, keep the true geometry.
 PLANNER_PADDING_M = 0.02
 PADDED_TRUE_SURFACES = ("table",)
+# What the cameras saw standing on the table this run (WorldStore.seen,
+# perception/clear_table.obstacle_boxes) goes in every world under names
+# with this prefix: nothing on the table is surveyed or named in advance.
+SEEN_PREFIX = "seen_"
 
 
 def _as_planned(world):
@@ -194,7 +198,13 @@ def interaction_world(bench, model, cpose, contact_z, depth_max, lid_at=None):
     # spec §6 rule as the container body (field 2026-08-26: IK_FAIL at a
     # set-down goal 25 mm over the solid table). For button-height
     # contacts the plane sits below every bench top — a no-op.
-    obstacles = [c for c in (_cap_top(o, plane) for o in _bench_obstacles(bench)) if c]
+    # What the cameras saw standing stays WHOLE: it is beside the contact,
+    # never under it (obstacle_boxes leaves the box's surroundings out and
+    # the lid spot's clear; the spot search keeps the lid and the fingers
+    # off all of it), and the set-down's descent is exactly where a
+    # neighbour gets hit (flatbot 2026-10-23 17:57: the microwave).
+    obstacles = [c for c in (o if o["name"].startswith(SEEN_PREFIX) else _cap_top(o, plane)
+                             for o in _bench_obstacles(bench)) if c]
     if plane > cpose.xyz[2]:  # body below the plane stays solid
         obstacles.append(
             _container_cuboid(model, cpose, name="container_body", top_z=plane)
@@ -221,6 +231,10 @@ class WorldStore:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._surface_z = None  # runtime-measured surface; overrides YAML when set
         self._surface_xy = None  # (x0, x1, y0, y1): where the scene camera saw that surface
+        # what the cameras see standing on the table this run, as cuboids
+        # (clear_table.obstacle_boxes, named SEEN_PREFIX...): in every world
+        # from when press_demo sets it
+        self.seen = []
         self._warned_unplanned = False  # the "height but no extent" line, said once
 
     @property
@@ -248,11 +262,18 @@ class WorldStore:
         self._surface_xy = None if value is None else tuple(float(v) for v in value)
 
     def _planning_bench(self):
-        """The bench YAML, plus the table the scene camera measured when the
-        YAML has none — flatbot's table changes with every place the chair
-        goes: a slab under the measured top over where it was seen, and that
-        area as the unseen container's band. Without it the planner plans as
-        if there were no table at all."""
+        """The bench YAML, plus what the cameras saw this run: the table the
+        scene camera measured when the YAML has none — flatbot's table
+        changes with every place the chair goes: a slab under the measured
+        top over where it was seen, and that area as the unseen container's
+        band; without it the planner plans as if there were no table at all
+        — and whatever they saw standing on it (`seen`)."""
+        bench = self._bench_and_table()
+        if not self.seen:
+            return bench
+        return dict(bench, obstacles=list(bench["obstacles"]) + [dict(o) for o in self.seen])
+
+    def _bench_and_table(self):
         if _table_top_z(self._bench) is not None or self._surface_z is None:
             return self._bench
         if self._surface_xy is None:

@@ -196,3 +196,84 @@ def test_the_wrist_frame_is_points_in_the_base_frame():
     pts = ct.depth_points(depth, k, rot, [0.45, -0.2, TABLE_Z + 0.35])
     assert np.allclose(pts[:, 2], TABLE_Z, atol=1e-6)
     assert pts[:, 0].min() == pytest.approx(0.45 - 320 / 400 * 0.35, abs=0.01)
+
+
+def _covered(boxes, x, y, z=None):
+    """Is (x, y) — up to height z, when given — inside one of the cuboids?"""
+    for b in boxes:
+        (bx, by, bz), (dx, dy, dz) = b["position"], b["dims"]
+        if abs(x - bx) <= dx / 2 + 1e-9 and abs(y - by) <= dy / 2 + 1e-9 and (z is None or z <= bz + dz / 2 + 1e-9):
+            return True
+    return False
+
+
+def _1757_map():
+    f = np.load(DATA + "table_room_flatbot_20261023_1757.npz")
+    scene = f["scene_mm"] / 1000.0 + np.r_[f["wrist_box"] - f["scene_box"], 0.0]
+    box, tz = tuple(f["wrist_box"]), float(f["table_z"])
+    return ct.table_map([(scene, tz), (f["wrist_mm"] / 1000.0, tz)], box), box, tz
+
+
+def test_what_stands_becomes_the_planners_cuboids_never_over_the_box_or_the_lid_spot(pink):
+    """17:57's map as the planner's world (press_demo.adopt_seen): what
+    stands is inside cuboids at least as tall — the microwave the wrist
+    camera came down on among them — none covers the box (its own cuboid
+    does) or free table where the hand comes down at the lid's spot, and
+    they fit in the planner's cache."""
+    tm, box, tz = _1757_map()
+    spots, _why = _spots(pink, tm, box)
+    boxes, note = ct.obstacle_boxes(tm, tz, box, 0.0525, keep_clear=[s.xy for s in spots])
+    assert 0 < len(boxes) <= ct.PLANNER_BOXES and note["left_out"] == 0
+    assert all(b["name"].startswith("seen_") for b in boxes)
+    assert all(b["position"][2] - b["dims"][2] / 2 == pytest.approx(tz) for b in boxes)  # standing on the table
+    X, Y = tm.centres()
+    stands = np.isfinite(tm.tall)
+    reach = 0.0525 + ct.BOX_CLEAR_M
+    by_box = (np.abs(X - box[0]) - 0.01 < reach) & (np.abs(Y - box[1]) - 0.01 < reach)
+    kept = [_covered(boxes, X[i, j], Y[i, j], tz + tm.tall[i, j]) for i, j in zip(*np.nonzero(stands & ~by_box))]
+    assert np.mean(kept) > 0.97  # all but the box's remnants
+    assert not any(_covered(boxes, X[i, j], Y[i, j]) for i, j in zip(*np.nonzero(by_box)))
+    for s in spots:
+        gap = np.hypot(ct._to_square(X - s.xy[0], 0.01), ct._to_square(Y - s.xy[1], 0.01))
+        near = ~stands & (gap <= ct.KEEP_CLEAR_M)
+        assert not any(_covered(boxes, X[i, j], Y[i, j]) for i, j in zip(*np.nonzero(near)))
+    assert _covered(boxes, 0.56, -0.37, tz + 0.13)  # where the lid went at 17:57, as high as the camera hit
+
+
+def test_what_stands_against_the_arm_is_the_arm(pink):
+    """A frame with the arm in it: what reaches within ARM_CLEAR_M of the
+    arm's centre line is left out — in the planner's world it would put
+    every start in collision — and nothing merged covers the arm's place."""
+    post = (0.53, 0.57, -0.02, 0.02)
+    pts = np.concatenate([_table(holes=[BOX_AT, post]), _block(*BOX_AT, TABLE_Z + 0.121),
+                          _block(*post, TABLE_Z + 0.30)])
+    tm = ct.table_map([(pts, TABLE_Z)], BOX)
+    low_arm = [(0.40, 0.0, TABLE_Z + 0.35), (0.70, 0.0, TABLE_Z + 0.35)]  # 5 cm over the post
+    boxes, note = ct.obstacle_boxes(tm, TABLE_Z, BOX, 0.0525, arm_points=low_arm)
+    assert note["under_arm"] > 0 and not _covered(boxes, 0.55, 0.0)
+    high_arm = [(0.40, 0.0, TABLE_Z + 0.60), (0.70, 0.0, TABLE_Z + 0.60)]
+    boxes, note = ct.obstacle_boxes(tm, TABLE_Z, BOX, 0.0525, arm_points=high_arm)
+    assert note["under_arm"] == 0 and _covered(boxes, 0.55, 0.0, TABLE_Z + 0.29)
+
+
+def test_more_things_than_the_planner_holds_merge_into_fewer_cuboids_around_the_lid_spot():
+    """55 posts are more cuboids than the planner's cache takes: they
+    merge, each still inside a cuboid as tall, none over the box or the
+    free table by the lid's spot."""
+    box, spot = (0.48, -0.20), (0.48, 0.06)
+    posts = [(x - 0.02, x + 0.02, y - 0.02, y + 0.02)
+             for x in np.arange(0.24, 0.73, 0.08) for y in np.arange(-0.56, 0.17, 0.08)
+             if math.hypot(x - box[0], y - box[1]) >= 0.14 and math.hypot(x - spot[0], y - spot[1]) >= 0.12]
+    pts = np.concatenate([_table(x0=0.20, x1=0.80, y0=-0.62, y1=0.22, holes=posts)]
+                         + [_block(*p, TABLE_Z + 0.05 + 0.002 * k) for k, p in enumerate(posts)])
+    tm = ct.table_map([(pts, TABLE_Z)], box)
+    assert len(posts) > ct.PLANNER_BOXES
+    boxes, note = ct.obstacle_boxes(tm, TABLE_Z, box, 0.0525, keep_clear=[spot])
+    assert len(boxes) == ct.PLANNER_BOXES and note["left_out"] == 0 and note["free_blocked"] > 0
+    for k, (x0, x1, y0, y1) in enumerate(posts):
+        assert _covered(boxes, 0.5 * (x0 + x1), 0.5 * (y0 + y1), TABLE_Z + 0.05 + 0.002 * k - 0.01)
+    X, Y = tm.centres()
+    near = ~np.isfinite(tm.tall) & (np.hypot(ct._to_square(X - spot[0], 0.01), ct._to_square(Y - spot[1], 0.01))
+                                    <= ct.KEEP_CLEAR_M)
+    assert near.any() and not any(_covered(boxes, X[i, j], Y[i, j]) for i, j in zip(*np.nonzero(near)))
+    assert not _covered(boxes, *box)

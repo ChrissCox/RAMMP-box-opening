@@ -1711,6 +1711,45 @@ def room_map(watcher, scene_fix, cpose, at_staging):
     return clear_table.table_map(clouds, cpose.xyz[:2])
 
 
+def container_half(m):
+    """The half-width of the box's footprint about its centre, whatever its
+    yaw: a round one's radius, a square one's half-diagonal."""
+    return 0.5 * (max(m.dims[0], m.dims[1]) if m.round else math.hypot(m.dims[0], m.dims[1]))
+
+
+def adopt_seen(ctx, runner, tmap, box_xy, table_z, keep_clear=(), when=""):
+    """What the cameras see standing on the table (`tmap`, room_map) into
+    every world from here on (WorldStore.seen): the planner keeps the WHOLE
+    arm clear of it on every motion it plans, not only the hand at the
+    set-down, which is all the spot search checks. Nothing on a table is
+    surveyed or named (owner, 2026-10-27: "nothing in the environment
+    should be hard coded"): this run's map, and only it, is what stands.
+
+    What stands beside the box is the box (obstacle_boxes), what stands
+    against the arm where it is now is the arm, and no merged cuboid covers
+    free table by the lid's spots (`keep_clear`). Without a map (no scene
+    points) the worlds keep what they had."""
+    if tmap is None:
+        return
+    arm = None
+    try:
+        from rammp_box_opening.runtime.approach import _chain
+
+        arm = _chain().points(ctx.client.joints())
+    except Exception as e:  # no kinematics: nothing is left out as the arm, and the planner says if it is in it
+        print("[press_demo] the arm's own place unknown (%s): what stands against it is not left out" % e)
+    boxes, note = clear_table.obstacle_boxes(tmap, table_z, box_xy, container_half(ctx.model), arm_points=arm,
+                                             keep_clear=[tuple(xy[:2]) for xy in keep_clear])
+    ctx.worlds.seen = boxes
+    runner.note("seen_obstacles", when=when, **note)
+    print("[press_demo] the planner keeps the arm clear of what the cameras see standing on the table (%s): "
+          "%d cuboid(s) over %d squares, tallest %.0f cm%s%s" % (
+              when, note["boxes"], note["squares"], 100 * note["tallest_m"],
+              "; %d squares against the arm left out" % note["under_arm"] if note["under_arm"] else "",
+              "; the %d smallest left out (over %d cuboids)" % (note["left_out"], clear_table.PLANNER_BOXES)
+              if note["left_out"] else ""))
+
+
 def place_quat(m, lid):
     """The hand's attitude setting the lid down at `lid`: the press
     attitude, turned by the lid's yaw (clear_lid_drops)."""
@@ -2793,6 +2832,10 @@ def main():
                     )
             sp = scene_fix.pose
             adopt_scene_table(ctx, worlds, watcher, scene_fix)
+            # ... and what stands on it, before the first motion toward the box
+            adopt_seen(ctx, runner, room_map(watcher, scene_fix, sp, at_staging=False), sp.xyz[:2],
+                       worlds.table_top_z if worlds.table_top_z is not None else scene_fix.table_z_scene,
+                       when="scene camera")
             surveyed = watcher.table_z
             print(
                 "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points%s "
@@ -3005,6 +3048,10 @@ def main():
             tmap = room_map(watcher, scene_seen, ctx.cpose, at_staging) if scene_seen is not None else None
             if tmap is not None:
                 drops, spots, why = clear_lid_drops(model, ctx.cpose, tmap, watcher.table_z)
+                # the planner's worlds from the same map (the wrist's look
+                # outvotes the scene camera's speckle), the lid's spots clear
+                adopt_seen(ctx, runner, tmap, ctx.cpose.xyz[:2], watcher.table_z, keep_clear=[d.xyz for d in drops],
+                           when="scene camera and wrist" if at_staging else "scene camera")
                 if not drops:
                     try_home(ctx, runner, args.execute, "nowhere to set the lid down: %s — move the box, or clear "
                              "the table around it" % why)

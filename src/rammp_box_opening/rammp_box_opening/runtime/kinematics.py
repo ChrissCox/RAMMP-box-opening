@@ -151,6 +151,13 @@ class ArmChain:
         R, t, _zs, _ps = self._fk_axes(q)
         return R, t
 
+    def points(self, q):
+        """(n, 3): the arm's centre line at q — each moving joint's origin,
+        then the tool frame — for keeping what the cameras see off the arm
+        itself (perception/clear_table.obstacle_boxes)."""
+        _R, t, _zs, ps = self._fk_axes(q)
+        return np.array([*ps, t], float)
+
     def _fk_jac(self, q):
         """fk()'s (R, t) and the geometric Jacobian, from one pass: column k
         is (z_k x (t - p_k), z_k) — d(tool position)/dq_k and the angular
