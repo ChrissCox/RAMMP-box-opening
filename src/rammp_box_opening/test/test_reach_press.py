@@ -55,7 +55,10 @@ def test_the_fingertip_lands_where_it_is_aimed_and_is_read_back_from_the_tips(mo
 
 
 class _Chain:
-    """Straight lines that always fly, through two waypoints."""
+    """Straight lines that always fly, through two waypoints; no joint
+    limits (ClearMarginFree finds none near)."""
+
+    limits = [(None, None)] * 7
 
     def __init__(self, refuse=()):
         self.refuse = refuse
@@ -518,6 +521,50 @@ def test_a_home_refused_from_inside_the_boxs_padded_volume_backs_off_toward_the_
     xyz, _q = chain.lines[-1]
     b = np.asarray(ctx.cpose.xyz[:2]) / np.hypot(*ctx.cpose.xyz[:2])
     assert np.subtract([0.5, -0.4], xyz[:2]) == pytest.approx(reach_press.REACH_PULLBACK_M * b) and xyz[2] == pytest.approx(0.45)
+
+
+def test_a_home_refused_for_a_joint_on_its_limit_steps_off_it_first(ctx, tmp_path, capsys):
+    """Flatbot 2026-10-27 14:33: the depth press ended over the box with
+    arm_joint_6 0.043 rad from its limit, home was refused
+    START_IN_LIMIT_MARGIN, and the arm held until home_arm stepped it off.
+    The reach-out's own home steps off first, as home_arm and try_home do:
+    plan-free along the joint line toward the rest pose, the shortest step
+    home plans from, and home planned from where it ends."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import PLANNER_LIMIT_MARGIN_RAD
+    from rammp_box_opening.primitives.core import CLEAR_MARGIN_FIRST_RAD
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks import press_demo
+
+    cfg = load_press_demo(PINK)
+    ctx.press_cfg = cfg
+    rest = press_demo.rest_joints(cfg)
+    lo, hi = approach._chain().limits[5]
+    start = list(rest)
+    start[5] = hi - 0.043  # arm_joint_6 where 14:33 left it
+    ctx.client.live = list(start)
+
+    class InMargin:
+        success = False
+        message = "START_IN_LIMIT_MARGIN: start: arm_joint_6 is 0.043 rad from its position limit"
+        trajectory = None
+
+    real = ctx.client.plan_to_joints
+
+    def plan(q7, start_joints):  # refuses any start inside its margin, as rammp-curobo does
+        if min(start_joints[5] - lo, hi - start_joints[5]) < PLANNER_LIMIT_MARGIN_RAD:
+            return InMargin()
+        return real(q7, start_joints)
+
+    ctx.client.plan_to_joints = plan
+    assert reach_press._go_home(ctx, cfg, make_runner(ctx.client, tmp_path), "STOP: test") is True
+    said = capsys.readouterr().out
+    assert "joint_6 is 0.043 rad from its limit" in said and "a plan-free step" in said and "holds" not in said
+    # nothing planned from the refused start: home from the step's end, just clear of the margin
+    end = ctx.client.joint_starts[0]
+    assert hi - end[5] == pytest.approx(CLEAR_MARGIN_FIRST_RAD, abs=1e-6)
+    assert len(ctx.client.executed) == 2 and ctx.client.live == pytest.approx(rest)
 
 
 def test_an_open_box_is_not_reached_for(ctx, monkeypatch, tmp_path):

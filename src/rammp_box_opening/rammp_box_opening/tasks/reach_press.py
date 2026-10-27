@@ -64,7 +64,9 @@ from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED, TIP_TO_T
 from rammp_box_opening.geometry import rotate_about_world_axis
 from rammp_box_opening.models.container import ContainerPose, attitude_quat
 from rammp_box_opening.primitives.core import (
+    CLEAR_MARGIN_MAX_STEP_RAD,
     CONTACT_SHIFT_PAD_M,
+    ClearMarginFree,
     PlanState,
     _full_world,
     _interaction_world,
@@ -451,12 +453,39 @@ def _line_from(ctx, pts, xyz, quat):
 
 
 def _home_legs(ctx, cfg):
+    """Home to the rest pose from where the arm stands, in the full world.
+    A joint too near its limit for the planner to start from gets home_arm's
+    plan-free step along the joint line toward the rest pose first, the
+    shortest one home plans from (primitives.ClearMarginFree): flatbot
+    2026-10-27 14:33, the depth press ended with arm_joint_6 0.043 rad from
+    its limit, home was refused START_IN_LIMIT_MARGIN, and the arm held over
+    the box until home_arm stepped it clear. Raises the last refusal."""
     from rammp_box_opening.tasks.press_demo import rest_joints
 
-    leg, _ = _plan_motion(
-        ctx, PlanState(joints=list(ctx.client.joints()), chain=0), "home", ("joints", list(rest_joints(cfg))), _full_world(ctx), TRANSIT_SPEED
-    )
-    return [leg]
+    rest = list(rest_joints(cfg))
+    state = PlanState(joints=list(ctx.client.joints()), chain=0)
+    clear = ClearMarginFree(rest)
+    near = clear.near(ctx, state.joints)
+    if not near:
+        leg, _ = _plan_motion(ctx, state, "home", ("joints", rest), _full_world(ctx), TRANSIT_SPEED)
+        return [leg]
+    print("[press_demo] %s: too near for the planner to start from — trying plan-free steps along the joint line "
+          "toward the rest pose, shortest first" % ", ".join("%s is %.3f rad from its limit" % jr for jr in near))
+    last = None
+    for step, at, info in clear.steps(ctx, state):
+        try:
+            leg, _ = _plan_motion(ctx, at, "home", ("joints", rest), _full_world(ctx), TRANSIT_SPEED)
+        except RuntimeError as e:
+            last = e
+            continue
+        if step:
+            d = info["tool_move"]
+            print("[press_demo] a plan-free step %.0f%% of the way to the rest pose first (the largest joint %.3f rad, "
+                  "the tool %+.0f mm up and %.0f mm across; obstruction-guarded)" % (
+                      100 * info["fraction"], info["largest_rad"], 1000 * d[2], 1000 * math.hypot(d[0], d[1])))
+        return step + [leg]
+    raise RuntimeError("no plan-free step toward the rest pose of up to %.2f rad per joint lets the planner plan home "
+                       "(last: %s) — jog the arm clear by hand" % (CLEAR_MARGIN_MAX_STEP_RAD, last))
 
 
 def _back_off(ctx, runner, ref=None):
