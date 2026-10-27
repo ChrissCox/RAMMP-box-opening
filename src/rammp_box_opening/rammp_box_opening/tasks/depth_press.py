@@ -72,6 +72,10 @@ LOOK_AGREE_M = 0.003
 # the wrist camera, and the scene camera is asked (after_scene_check).
 LOOK_EXPECT_M = 0.03
 LOOK_EXPECT_DEPTH_M = 0.03
+# The caller's aim (press_down_from_here's `aimed`: the reach-out's tilted
+# look) is where the first look expects the button too. Flatbot 2026-10-27
+# 14:33: the fingers stood over the aimed button, the first close-up took a
+# circle on the lid's edge 64 mm off it, and CENTRE flew the hand off the box.
 LENS_AHEAD_MAX_M = 0.25  # the fingertips are at most this far in front of the lens
 # CENTRE: from over the box the fingers are put over the button the wrist
 # camera sees — TF's aim from the tilted look landed the press 45 mm off its
@@ -268,7 +272,9 @@ def look(node, watcher, model, tag, runner=None, ctx=None, settled=False, expect
     the median of the agreeing sightings. Without `ctx` there is no offset,
     and no depth under the fingers. `settled`: an at-rest read (rp._settled,
     0.45 s still) came just before, so frames count from now, without
-    LOOK_SETTLE_S more. `expect`: where the button must be (find_in_camera)."""
+    LOOK_SETTLE_S more. `expect`: where the button must be (find_in_camera),
+    or a function of the lens pair giving that — frames then count once the
+    lens is placed."""
     from rammp_box_opening.tasks.press_demo import _spin_detect, save_aim_frame
 
     g = watcher.grab
@@ -292,7 +298,13 @@ def look(node, watcher, model, tag, runner=None, ctx=None, settled=False, expect
         z = None if lens is None else depth_under_fingers(g.depth, g.k, lens[0], lens[1])
         if z is not None:
             under.append(z)
-        s, why = find_in_camera(g.color, g.depth, g.k, model, dist=getattr(g, "dist", None), expect=expect)
+        want = expect
+        if callable(expect):
+            if lens is None:
+                why = "no camera pose to place the aimed button by"
+                continue
+            want = expect(lens)
+        s, why = find_in_camera(g.color, g.depth, g.k, model, dist=getattr(g, "dist", None), expect=want)
         if s is None:
             continue
         seen.append(s)
@@ -345,6 +357,24 @@ def expect_after_move(s, lens, R_hand_cam, R, d_world):
 def where_seen(s):
     """look(expect=) for a look from where `s` was seen: (x, y, lid depth)."""
     return float(s.x), float(s.y), float(s.lid_depth)
+
+
+def aim_seen(ctx, aimed, lens_pair, up_mm=None):
+    """The button the caller aimed at `aimed` (its top, in the world) as the
+    wrist camera must see it from where the hand stands now: a LensSighting
+    in the camera's own frame, from the lens at `lens_pair` (lens_in_hand's),
+    its lid `up_mm` (the aim's knob reading) below its top. raw is None: no
+    frame here saw it."""
+    from rammp_box_opening.runtime import approach
+
+    lens, r_hc = lens_pair
+    r = np.eye(3) if r_hc is None else np.asarray(r_hc, float)
+    R, t = approach._chain().fk(ctx.client.joints())
+    b = np.asarray(R, float).T @ (np.asarray(aimed, float) - np.asarray(t, float))  # from the tool frame, in the hand
+    c = r.T @ (b - np.asarray(lens, float)[:3])
+    up = float(up_mm) if up_mm is not None and np.isfinite(up_mm) else float("nan")
+    return LensSighting(x=float(c[0]), y=float(c[1]), lid_depth=float(c[2]) + (up / 1000.0 if np.isfinite(up) else 0.0),
+                        button_depth=float(c[2]), up_mm=up, raw=None)
 
 
 def under_fingers(s, lens, R_hand_cam=None):
@@ -658,7 +688,8 @@ class DepthPress:
     seen_at: tuple = None  # where the after-look saw the button (where_seen), for a look again from there
 
 
-def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None):
+def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None,
+                         aimed=None):
     """TURN, DEPTH, TOUCH, PUSH, RISE, LOOK from where the hand stands over
     the button (`contact_tool`: the fingertip's point in tool_frame at the
     hand's current attitude). `here`: the caller's at-rest reading where the
@@ -666,14 +697,16 @@ def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=Non
     down at this quat (the reach-out slid in turning), no TURN. An open box
     — the knob KNOB_UP_MM up by any look here or by `knob_up_mm`, the
     caller's aim — is never pressed: the pads feel its lid beside the knob
-    instead (_feel_the_lid). Never goes home itself: DepthPress.free says
-    whether the arm may."""
+    instead (_feel_the_lid). `aimed`: the button's top in the world by the
+    caller's aim — the first look takes no circle far from it. Never goes
+    home itself: DepthPress.free says whether the arm may."""
     seen = {}
-    result = _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here, turned, knob_up_mm)
+    result = _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here, turned, knob_up_mm, aimed)
     return dataclasses.replace(result, ref=seen.get("ref"), touch_xyz=seen.get("touch_xyz"))
 
 
-def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, turned=None, knob_up_mm=None):
+def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, turned=None, knob_up_mm=None,
+                aimed=None):
     from rammp_box_opening.models.container import from_container
     from rammp_box_opening.runtime import approach
 
@@ -696,7 +729,8 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
     _R, t0 = approach._chain().fk(ctx.client.joints())
     top_z = float(t0[2])
 
-    s, z_under, lens_pair, status = look(node, watcher, m, "depth-look", runner, ctx, settled=True)
+    first = None if aimed is None else (lambda pair: where_seen(aim_seen(ctx, aimed, pair, knob_up_mm)))
+    s, z_under, lens_pair, status = look(node, watcher, m, "depth-look", runner, ctx, settled=True, expect=first)
     if lens_pair is None:
         return DepthPress(free=True, why="no camera pose for the wrist's frames: where the lens sits from the fingers "
                                          "is unknown (%s)" % status)

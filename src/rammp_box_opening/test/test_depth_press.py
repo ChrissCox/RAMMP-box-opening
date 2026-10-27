@@ -1,6 +1,7 @@
 """The depth press (tasks/depth_press): once the hand is over the box, the
 height from the wrist camera's own depth, the press from the arm's torques."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -211,14 +212,15 @@ def _seen(hand_off=(0.0, 0.0), depth=0.27, lens=LENS, r_hc=EYE, up=0.4):
 
 
 def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="touch", refuse_turn=False,
-           lens=LENS, r_hc=EYE, measured=LENS, refuse_first=0, here=None, turned=None, knob_up_mm=None):
+           lens=LENS, r_hc=EYE, measured=LENS, refuse_first=0, here=None, turned=None, knob_up_mm=None, aimed=None):
     """press_down_from_here with the hand `tilt` deg over BUTTON (at the
     reach-out's stroke start, 6 cm above TF's lid at 0.40), the wrist camera
     scripted by `looks` (a (sighting, z, status) or a _seen) with TF's lens
     at `lens`, turned `r_hc`, against the `measured` one in the camera
-    config, and the fingertips meeting the lid `touch_at` down the stroke.
-    Every at-rest read is a distinct reading, ("rest", n, where) in
-    arm.trace. Returns (DepthPress, events, arm, legs, start tool pose)."""
+    config, and the fingertips meeting the lid `touch_at` down the stroke;
+    `aimed`, the caller's aim. Every at-rest read is a distinct reading,
+    ("rest", n, where) in arm.trace. Returns (DepthPress, events, arm,
+    legs, start tool pose)."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.runner import Runner
 
@@ -244,12 +246,12 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="
     real_settled = rp._settled
     monkeypatch.setattr(rp, "_settled", lambda ctx_, where: (arm.trace.append("rest:" + where), real_settled(ctx_, where))[1])
 
-    arm.expects = []  # each look's `expect`, in order
+    arm.expects = []  # each look's `expect`, in order — one given as a function of the lens, at the look
 
     def look(node, watcher, model, tag, runner=None, ctx=None, settled=False, expect=None):
         events.append("look:" + tag)
         arm.trace.append("look:%s%s" % (tag, " (settled)" if settled else ""))
-        arm.expects.append(expect)
+        arm.expects.append(expect((list(lens), np.asarray(r_hc, float))) if callable(expect) else expect)
         item = seq.pop(0)
         s, z, status = item(ctx) if callable(item) else item[:3]
         return s, z, (list(lens), np.asarray(r_hc, float)), status
@@ -288,7 +290,7 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="
     contact = rp.CONTACT_TOOL if tilt else dp.DOWN_CONTACT_TOOL
     watcher = SimpleNamespace(grab=SimpleNamespace(wrist_lens_in_hand_m=None if measured is None else list(measured)))
     result = dp.press_down_from_here(None, ctx, cfg, runner, watcher, contact, here=here, turned=turned,
-                                     knob_up_mm=knob_up_mm)
+                                     knob_up_mm=knob_up_mm, aimed=aimed)
     return result, events, arm, legs, start
 
 
@@ -458,6 +460,52 @@ def test_without_the_button_in_view_it_does_not_press_blind(ctx, monkeypatch, tm
     result, events, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, [(None, 0.31, "the button in none")])
     assert result.free and "not pressing blind" in result.why and "depth:touch" not in events
     assert arm.lines == [] and dp.exit_code(result) == 1
+
+
+# ---- the caller's aim: where the first look expects the button, and where no look confirms it -----
+
+AIMED = (BUTTON[0], BUTTON[1], 0.46 - TOUCH_AT + 0.0004)  # under the turned-down pads, 0.4 mm up off its lid
+DEPTH_1433 = Path(__file__).parent / "data" / "wrist_depth_look_flatbot_20261027_1433.npz"
+
+
+def test_the_first_look_expects_the_button_where_the_callers_aim_put_it(ctx, monkeypatch, tmp_path):
+    """Flatbot 2026-10-27 14:33: the fingers stood over the tilted look's
+    button, and the first close-up, told nothing, took a circle on the
+    lid's edge 64 mm off it. Handed the aim, the first look is told where
+    that button must be seen from where the hand stands."""
+    looks = [(_sighting(), 0.27, "2/2"), (_sighting(up=12.0), 0.255, "2/2")]
+    result, _e, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, aimed=AIMED, knob_up_mm=0.4)
+    assert dp.exit_code(result) == 0
+    assert arm.expects[0] == pytest.approx((0.0, -LENS[1], 0.27), abs=1e-6)  # under the fingers, its lid 0.27 down
+
+
+def test_the_1433_close_up_takes_the_lids_edge_unless_told_where_the_aim_put_the_button(ctx, monkeypatch, pink):
+    """The 14:33 first close-up itself (flatbot 2026-10-27), the hand turned
+    down over the tilted look's button, the lid 0.18 m below the lens. Told
+    nothing, the finder takes a circle more than LOOK_EXPECT_M from where
+    the aim puts the button (the run took one 64 mm off, and flew there).
+    Told the aim, it takes none of them."""
+    import cv2
+
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
+
+    f = np.load(DEPTH_1433)
+    color = cv2.imdecode(f["color_png"], cv2.IMREAD_COLOR)
+    depth = f["depth_mm"].astype(np.float32) / 1000.0
+    rot, cam = np.asarray(f["rot_cam"], float), np.asarray(f["trans_cam"], float)
+    # the hand where the frame was shot: flatbot's OAK keeps the hand's axes, its lens LENS from the tool frame
+    arm = _Arm()
+    monkeypatch.setattr(approach, "_chain", lambda: arm)
+    ctx.client.live = list(cam - rot @ np.asarray(LENS)) + list(mat_to_quat_xyzw(rot))
+    pair = (list(LENS), EYE)
+    aim = dp.aim_seen(ctx, f["aimed"], pair, float(f["up_mm"]))
+    assert (aim.x, aim.y) == pytest.approx((0.0, -LENS[1]), abs=0.001)  # right under the fingers
+    assert aim.lid_depth == pytest.approx(0.176, abs=0.002)
+    s, why = dp.find_in_camera(color, depth, f["k"], pink, dist=f["dist"])
+    assert s is not None and np.hypot(s.x - aim.x, s.y - aim.y) > dp.LOOK_EXPECT_M
+    s, why = dp.find_in_camera(color, depth, f["k"], pink, dist=f["dist"], expect=dp.where_seen(aim))
+    assert s is None and "37 mm from where the box is" in why
 
 
 def test_from_over_the_box_the_fingers_are_moved_over_the_button_the_camera_sees(ctx, monkeypatch, tmp_path):
@@ -653,8 +701,8 @@ def _depth_flow(ctx, monkeypatch, tmp_path, press, **kw):
 
     got = {}
 
-    def fake(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None):
-        got["contact"] = contact_tool
+    def fake(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None):
+        got.update(contact=contact_tool, knob_up_mm=knob_up_mm, aimed=aimed)
         return press(ctx_)
 
     monkeypatch.setattr(dp, "press_down_from_here", fake)
@@ -694,8 +742,12 @@ def test_the_reach_out_hands_over_to_the_depth_press_once_over_the_box(ctx, monk
     straight up clear of it before home is planned — once."""
     from rammp_box_opening.worlds import planned_top_z
 
+    import test_reach_press as trp
+
     code, rec, chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped)
     assert code == 0 and got["contact"] == rp.CONTACT_TOOL
+    # the look's aim goes with it: where the button is, and its knob
+    assert got["aimed"] == pytest.approx(trp.BUTTON) and got["knob_up_mm"] == pytest.approx(0.4)
     assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
     assert "press:down" not in rec.events
     up = [xyz for xyz, _q in chain.lines][-1]
@@ -951,7 +1003,7 @@ def test_the_reach_out_slides_in_turning_down_in_one_leg(ctx, monkeypatch, tmp_p
 
     got = {}
 
-    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None):
+    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None):
         got.update(here=here, turned=turned)
         # as the real press does: the free-air reading it was handed is the one home is judged against
         return dp.DepthPress(free=True, contact=True, felt=True, popped=True, ref=here)
@@ -995,7 +1047,7 @@ def test_where_no_walk_turns_down_on_the_way_it_slides_then_turns(ctx, monkeypat
 
     got = {}
 
-    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None):
+    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None):
         got.update(here=here, turned=turned)
         return dp.DepthPress(free=True, contact=True, felt=True, popped=True)
 
