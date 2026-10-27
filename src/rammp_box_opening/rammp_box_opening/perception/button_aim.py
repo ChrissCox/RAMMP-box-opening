@@ -76,7 +76,17 @@ PRIOR_MAX_M = 0.15  # a circle farther than this from prior_xy is not the button
 # allowance: the wrist mount's TF, 3.5 cm off sideways until
 # rammp-deployments#128, and the scene camera's own few centimetres.
 DOWN_PRIOR_MAX_M = 0.07
-DISC_MIN_FILL = 0.5  # of the disc's rectified cells with valid depth
+# of the disc's rectified cells with valid depth. Seen at a slant the glossy
+# button holds depth in patches, the lid ring around it more (flatbot
+# 2026-10-27 14:04: the button's circle found at its size and place in 31
+# frames, refused in all for depth on 9-24 % of the disc while the ring held
+# 39 % at one height, and the disc's own patches lay flat on it). Every other
+# gate still has to pass: the disc flat, the ring one lid at the lid's
+# height, the rays meeting it, the size and the place.
+DISC_MIN_FILL = 0.15
+# A tilted view's aim reads the depth of this many still frames at once
+# (scene.median_depth, holes ignored): the patches move frame to frame
+FUSE_FRAMES = 5
 ANNULUS_MIN_FILL = 0.3  # of the annulus' cells; a popped knob hides its far side
 KNOB_NOISE_M = 0.0025  # disc and ring medians closer than this are one height
 KNOB_SPLIT_M = 0.006  # disc this far above its lid: two circles the centroid tells apart
@@ -104,6 +114,7 @@ class ButtonSighting:
     lid_z_m: float = float("nan")  # the lid ring's measured base z (oblique path)
     incidence_deg: float = 0.0  # view ray vs the lid's +z normal at the press point
     oblique: bool = False  # found by find_button_oblique
+    disc_fill: float = float("nan")  # the share of the disc with depth (oblique path)
 
 
 def centre_depth(depth, u, v, r):
@@ -471,7 +482,8 @@ def _oblique_circle(lifted, cu, cv, r, s, c0, g, h0, cam, rb):
     up = h_disc - h_ring
     if up < -TOP_RESIDUAL_MAX_M or up > KNOB_MAX_UP_M:
         return None, "disc %.0f mm from the lid around it" % (1000 * up)
-    return (np.r_[p[:2], h_disc], h_disc, h_ring, (cam[2] - h_circle) / (cam[2] - h0)), None
+    fill = zd.size / max(cells(math.pi * (0.8 * rb) ** 2, h_disc), 1.0)
+    return (np.r_[p[:2], h_disc], h_disc, h_ring, (cam[2] - h_circle) / (cam[2] - h0), fill), None
 
 
 def _prior_miss_m(cu, cv, s, c0, g, h0, cam, prior_xy):
@@ -591,7 +603,7 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
         if hit is None:
             whys.append(why)
             continue
-        p, h_disc, h_ring, f = hit
+        p, h_disc, h_ring, f, fill = hit
         if prior_xy is not None and math.hypot(p[0] - prior_xy[0], p[1] - prior_xy[1]) > PRIOR_MAX_M:
             whys.append("%.0f mm from the prior" % (1000 * math.hypot(p[0] - prior_xy[0], p[1] - prior_xy[1])))
             continue
@@ -605,7 +617,7 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
         return ButtonSighting(
             xyz=(float(p[0]), float(p[1]), h_disc), uv=(float(uv_p[0]), float(uv_p[1])),
             r_px=float(kk[0, 0] * diameter / 2.0 / rng), range_m=rng, diameter_m=float(diameter),
-            above_lid_m=h_disc - h_ring, lid_z_m=h_ring, incidence_deg=inc, oblique=True,
+            above_lid_m=h_disc - h_ring, lid_z_m=h_ring, incidence_deg=inc, oblique=True, disc_fill=min(1.0, fill),
         ), None
     return None, "%d circle(s) on the rectified lid plane, none the button: %s" % (len(cands), "; ".join(whys[:3]))
 
@@ -677,9 +689,37 @@ def lid_in_view(depth, k, rot, trans, model, stride=2):
     return (float(xyz[0]), float(xyz[1]), float(np.median(z[comp]))), {"frac": frac, "cut": cut, "table_z": table_z}
 
 
+class StillDepth:
+    """The depth of the last FUSE_FRAMES still frames taken from one camera
+    pose, fused per pixel (scene.median_depth: holes ignored). A glossy lid
+    seen at a slant holds depth in patches that move from frame to frame
+    (flatbot 2026-10-27 14:04: 9 % and 24 % of the button's disc in two
+    frames of one look); together the frames cover more of it than one."""
+
+    def __init__(self, n=FUSE_FRAMES):
+        self.n = int(n)
+        self.cam = None  # the pose the frames held were taken from
+        self.depths = []
+
+    def add(self, cam, depth):
+        """The fused depth, this still frame's with the ones before it — only
+        while the camera stands where the first of them was taken."""
+        from rammp_box_opening.perception.depth_source import camera_is_still
+        from rammp_box_opening.perception.scene import median_depth
+
+        if self.cam is None or not camera_is_still(self.cam, cam):
+            self.cam, self.depths = cam, []
+        self.depths = (self.depths + [np.asarray(depth, np.float32)])[-self.n:]
+        return self.depths[0] if len(self.depths) == 1 else median_depth(self.depths)
+
+    def reset(self):
+        self.cam, self.depths = None, []
+
+
 class ButtonAimer:
     """Frames from a D405Grabber, still ones only, until MIN_HITS agree.
-    lid_z and prior_xy go to find_button (see there)."""
+    lid_z and prior_xy go to find_button (see there). A tilted view's frame
+    is judged on the depth of the still frames before it too (StillDepth)."""
 
     def __init__(self, grab, model, table_z, lid_z=None, prior_xy=None):
         self.grab = grab
@@ -697,6 +737,7 @@ class ButtonAimer:
         self._last_cam = None
         self.last_sighting = None
         self.pair_dt_ms = []  # each hit's depth-minus-colour stamp (ms), when known
+        self.still_depth = StillDepth()
 
     def tick(self):
         """One frame if there is a new one: True when a fix is ready."""
@@ -739,11 +780,13 @@ class ButtonAimer:
         still = camera_is_still(prev, cam)
         self._last_cam = cam
         if not still:
+            self.still_depth.reset()
             self.last_why = "camera moving"
             return False
         rot, trans = cam
+        depth = self.still_depth.add(cam, f.depth) if view_tilt_deg(rot) > OBLIQUE_MIN_DEG else f.depth
         s, why = find_button(
-            f.color, f.depth, f.k, rot, trans, self.table_z, self.model, dist=f.dist,
+            f.color, depth, f.k, rot, trans, self.table_z, self.model, dist=f.dist,
             lid_z=self.lid_z, prior_xy=self.prior_xy,
         )
         if s is None:

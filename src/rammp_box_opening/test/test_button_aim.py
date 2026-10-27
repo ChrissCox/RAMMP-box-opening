@@ -674,8 +674,8 @@ def _not_a_button(m, case):
     depth = depth.copy()
     if case == "stepped":  # half the disc 15 mm up: a step, not a top
         depth[(rho < BUTTON_R - 0.002) & lid & (p[..., 1] > b[1])] -= 0.020
-    elif case == "disc_holed":  # a quarter of the disc with depth
-        depth[(rho < BUTTON_R - 0.002) & lid & (rnd < 0.75)] = 0.0
+    elif case == "disc_holed":  # a tenth of the disc with depth
+        depth[(rho < BUTTON_R - 0.002) & lid & (rnd < 0.90)] = 0.0
     elif case == "ring_holed":  # an eighth of the ring around it
         depth[(rho > 1.05 * BUTTON_R) & (rho < 1.65 * BUTTON_R) & lid & (rnd < 0.85)] = 0.0
     return color, depth, cam, rot, b
@@ -698,6 +698,68 @@ def test_each_reach_out_gate_refuses_what_is_not_a_button(pink, case, want):
     color, depth, cam, rot, b = _not_a_button(pink, case)
     s, why = find_button(color, depth, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
     assert s is None and want in why, why
+
+
+def test_a_button_with_depth_on_a_quarter_of_it_is_still_the_button(pink):
+    """Flatbot 2026-10-27 14:04: the glossy button seen at a slant held depth
+    on 9-24 % of its disc, the lid ring around it on 39 %, and the aim
+    refused it in all 31 frames. With the ring one lid at its height and the
+    disc's own patches flat on it, a quarter of the disc is enough."""
+    color, depth, cam, rot, b = reach_out_frame(pink, 39)
+    p = _hits(depth, cam, rot)
+    with np.errstate(invalid="ignore"):
+        rho = np.hypot(p[..., 0] - b[0], p[..., 1] - b[1])
+        lid = np.abs(p[..., 2] - b[2]) < 0.005
+    depth = depth.copy()
+    depth[(rho < BUTTON_R - 0.002) & lid & (np.random.default_rng(2).random(depth.shape) < 0.75)] = 0.0
+    s, why = find_button(color, depth, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
+    assert s is not None, why
+    assert np.hypot(s.xyz[0] - b[0], s.xyz[1] - b[1]) < 0.003 and abs(s.xyz[2] - b[2]) < 0.003
+    assert abs(s.above_lid_m) < 0.003 and 0.15 < s.disc_fill < 0.4
+
+
+REACH_1404 = Path(__file__).parent / "data" / "wrist_reach_look_flatbot_20261027_1404.npz"
+
+
+def test_the_button_refused_at_1404_for_too_little_depth_is_aimed(pink):
+    """Flatbot 2026-10-27 14:04, the reach-out look: tilted 30 deg, the
+    camera 0.25 m off the lid, the scene camera placed by its calibration.
+    The button's circle was found in 31 frames and refused in every one for
+    depth on 9-24 % of its disc. This frame (23 %) aims the button's centre
+    in the picture, flush with its lid: the box is shut."""
+    import cv2
+
+    f = np.load(REACH_1404)
+    color = cv2.imdecode(f["color_png"], cv2.IMREAD_COLOR)
+    depth = f["depth_mm"].astype(np.float32) / 1000.0
+    lid_z, prior = float(f["lid_z"]), tuple(float(v) for v in f["prior_xy"])
+    s, why = find_button(color, depth, f["k"], f["rot_cam"], f["trans_cam"], lid_z - pink.dims[2], pink,
+                         dist=f["dist"], lid_z=lid_z, prior_xy=prior)
+    assert s is not None and s.oblique, why
+    assert s.uv == pytest.approx((262.7, 194.1), abs=3.0)
+    assert abs(s.above_lid_m) < 0.003
+    assert 0.15 <= s.disc_fill < 0.5
+    assert np.hypot(s.xyz[0] - prior[0], s.xyz[1] - prior[1]) < 0.05  # the scene camera's box, 3 cm off
+
+
+def test_still_frames_fuse_their_depth_and_a_moved_camera_starts_again():
+    """A tilted view's aim judges each frame on the depth of the still frames
+    before it too: holes in one frame are filled from the others, per pixel,
+    while the camera stands where the first was taken."""
+    from rammp_box_opening.perception.button_aim import StillDepth
+
+    pose = (np.eye(3), np.array([0.5, -0.1, 0.5]))
+    a = np.full((4, 4), 0.30, np.float32)
+    b = a.copy()
+    a[:, :2] = 0.0  # each frame misses a different half
+    b[:, 2:] = 0.0
+    sd = StillDepth()
+    assert np.array_equal(sd.add(pose, a), a)
+    fused = sd.add(pose, b)
+    assert (fused == pytest.approx(0.30)) and fused.min() > 0  # no hole left
+    moved = (np.eye(3), np.array([0.5, -0.1, 0.55]))
+    assert np.array_equal(sd.add(moved, b), b)  # from a new place, only its own frame
+    assert len([sd.add(pose, a) for _ in range(9)]) and len(sd.depths) == sd.n
 
 
 def test_the_window_changes_no_result(pink, monkeypatch):

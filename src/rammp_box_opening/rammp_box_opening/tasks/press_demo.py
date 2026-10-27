@@ -458,9 +458,10 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
                 out["button_up_mm"] = up_mm  # the caller decides (refuse_open_box)
             print(
                 "[press_demo] AIM: button circle at pixel (%.0f, %.0f) r %.0f px, %.0f mm across, %s above its own "
-                "lid; pressing its centre; %d/%d frames agree (%.1f s)" % (
+                "lid%s; pressing its centre; %d/%d frames agree (%.1f s)" % (
                     s.uv[0], s.uv[1], s.r_px, 1000 * s.diameter_m,
                     "height unknown" if up_mm is None else "%+.1f mm" % up_mm,
+                    "" if not s.oblique else ", depth on %.0f%% of it" % (100 * s.disc_fill),
                     aimer.hits, aimer.frames, time.monotonic() - t0)
             )
             folder = save_aim_frame(watcher.grab, s, tag)
@@ -472,6 +473,7 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
                     seam_uv=[round(v, 1) for v in s.uv], r_px=round(s.r_px, 1),
                     diameter_mm=round(1000 * s.diameter_m, 1), press_xyz=[round(v, 4) for v in xyz],
                     button_above_lid_mm=None if up_mm is None else round(up_mm, 1),
+                    disc_fill=round(s.disc_fill, 2) if s.oblique else None,
                     hits=aimer.hits, frames=aimer.frames, aim_s=round(time.monotonic() - t0, 2),
                     # the wrist's depth-vs-colour stamp offsets: what PAIR_TOL_S rests on
                     pair_dt_ms=[round(v, 1) for v in aimer.pair_dt_ms] or None,
