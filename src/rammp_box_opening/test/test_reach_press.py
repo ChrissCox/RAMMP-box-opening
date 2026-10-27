@@ -103,7 +103,8 @@ def test_the_reach_plan_takes_the_smallest_tilt_that_plans(ctx, monkeypatch):
     back = np.subtract(plan.start_xyz[:2], plan.look_xyz[:2])
     assert np.linalg.norm(back) == pytest.approx(reach_press.REACH_PULLBACK_M)  # pulled back toward the arm ...
     assert back @ (np.asarray(button[:2]) / d) == pytest.approx(reach_press.REACH_PULLBACK_M)
-    assert plan.look_xyz[2] == pytest.approx(plan.start_xyz[2])  # ... at the stroke's start height
+    # ... and up from the stroke's start: the wrist camera ~0.30 m off the lid, not ~0.245
+    assert plan.look_xyz[2] == pytest.approx(plan.start_xyz[2] + reach_press.REACH_LOOK_RISE_M)
     # the start and the bottom are straight above/below each other: the stroke is vertical
     assert plan.start_xyz[:2] == pytest.approx(plan.bottom_xyz[:2], abs=1e-12)
     assert plan.start_xyz[2] - plan.bottom_xyz[2] == pytest.approx(reach_press.REACH_START_M + cfg.travel_m)

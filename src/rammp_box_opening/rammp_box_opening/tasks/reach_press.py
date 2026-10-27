@@ -7,13 +7,14 @@ tilted back toward the arm, ONE FINGERTIP coming STRAIGHT DOWN onto the
 button, and only when the arm's own kinematics proves straight down out of
 reach (press_demo.staging_out_of_reach):
 
-  LOOK    the hand pulled back toward the arm (REACH_PULLBACK_M) clear of
-          the box's padded cuboid, already at the press attitude. The wrist
+  LOOK    the hand pulled back toward the arm (REACH_PULLBACK_M) and up
+          (REACH_LOOK_RISE_M) clear of the box's padded cuboid, already at
+          the press attitude. The wrist
           camera looks down at the lid from there and aims (the oblique aim,
           perception/button_aim). The box is put where the aim found it and
           the hand moves to THAT button's look pose along a guarded straight
           line — the scene camera's box can be 8-10 cm off.
-  SLIDE   a plan-free straight line in, holding the attitude, to
+  SLIDE   a plan-free straight line in and down, holding the attitude, to
           REACH_START_M above the aimed button. Guarded at DRAG_NM.
   TOUCH   a plan-free straight line DOWN in world z to travel_m below it,
           guarded at contact_nm like the straight-down touch: the force is
@@ -105,6 +106,13 @@ HOME_CLEAR_M = 0.06
 # plans in the full world at both spots, 10 cm does not — the gripper meets
 # the padded container cuboid (planner probe 2026-10-22).
 REACH_PULLBACK_M = 0.15
+# ... and this far above the stroke's start. Level with it the wrist camera
+# stood ~0.245 m from the lid (flatbot 2026-10-27 14:04, the scene camera
+# placed by its calibration) and the glossy lid and button held depth in
+# patches; the looks that had depth on the lid stood ~0.30 m off it (12:58,
+# when the scene camera put the lid 9 cm high). 6.5 cm up is ~0.30 m, and
+# the slide in, from above the old one, comes no nearer the box.
+REACH_LOOK_RISE_M = 0.065
 # The closed 2F-85's lowest point at these tilts, in tool_frame, with the
 # reach attitude's roll (fingers side by side across the line to the box):
 # one fingertip's end, 11 mm past tool_frame like TCP_OFFSET_M straight down.
@@ -205,13 +213,13 @@ def reach_geometry(model, button, tilt, travel_m):
     hand's attitude, the stroke's start REACH_START_M above the button and
     its bottom travel_m below it (tool_frame, for the fingertip's contact
     point), and the look pose REACH_PULLBACK_M back toward the arm from the
-    start, at its height."""
+    start and REACH_LOOK_RISE_M above it."""
     bx, by, bz = (float(v) for v in button)
     d = math.hypot(bx, by)
     quat = reach_quat(model, (bx, by), tilt)
     start = tool_for_contact((bx, by, bz + REACH_START_M), quat)
     bottom = tool_for_contact((bx, by, bz - travel_m), quat)
-    look = [start[0] - REACH_PULLBACK_M * bx / d, start[1] - REACH_PULLBACK_M * by / d, start[2]]
+    look = [start[0] - REACH_PULLBACK_M * bx / d, start[1] - REACH_PULLBACK_M * by / d, start[2] + REACH_LOOK_RISE_M]
     return quat, start, bottom, look
 
 
