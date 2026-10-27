@@ -678,3 +678,13 @@ def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys)
                                        SimpleNamespace(execute=False, press_only=True), fix, None)
     assert code == 0 and not ctx.client.executed
     assert "gravity alone moves joint_4 0.00 Nm along the slide" in capsys.readouterr().out
+
+
+def test_a_stop_says_what_stopped_the_leg_not_always_something_met():
+    """15:34 2026-10-27: the re-aim's guard lost its stream and the STOP
+    line said the move met something; nothing had been touched."""
+    from rammp_box_opening.runtime.runner import LegResult
+
+    lost = LegResult("reach:re-aim", "failed", False, "effort stream lost during guarded leg — cancelled")
+    assert reach_press._stopped_by([lost]) == "stopped (effort stream lost during guarded leg — cancelled)"
+    assert reach_press._stopped_by([LegResult("reach:re-aim", "touch", False, "torque guard trip")]) == "met something"

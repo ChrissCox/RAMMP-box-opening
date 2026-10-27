@@ -248,14 +248,22 @@ class PlannerClient:
         self.joints()  # ensure at least one message arrived
         return self._eff is not None
 
-    def _fresh_joints(self, timeout_s=1.0):
-        """The live joints while /joint_states is flowing, else None: a
-        start gate judged against a frozen sample is no gate."""
+    # Callbacks already waiting in this node's queue (the cameras' frames)
+    # are served before a guard calls the stream lost: a backlog here is not
+    # a silent arm. Capped in time, so a stream that has really stopped is
+    # still cancelled within GUARD_STALE_S and this.
+    GUARD_DRAIN_S = 0.02
+
+    def _fresh_joints(self, timeout_s=1.0, max_age=None):
+        """The live joints while /joint_states is flowing — the newest sample
+        served within `max_age` (default EFFORT_STALE_S) — else None: a start
+        gate judged against a frozen sample is no gate."""
+        age = self.EFFORT_STALE_S if max_age is None else float(max_age)
         t0 = time.monotonic()
         while True:
             if (
                 self._q is not None
-                and time.monotonic() - self._eff_at <= self.EFFORT_STALE_S
+                and time.monotonic() - self._eff_at <= age
             ):
                 return list(self._q)
             if time.monotonic() - t0 > timeout_s:
@@ -496,7 +504,11 @@ class PlannerClient:
             info["message"] = "execute_joint_trajectory not available — is the arm node up?"
             return "failed", info
         flown = traj if float(speed) == 1.0 else driver.dilate(traj, speed)
-        live = self._fresh_joints()
+        # a guarded leg starts on a sample fresher than its own limit, not
+        # one merely flowing (EFFORT_STALE_S): flatbot 2026-10-27 15:34, the
+        # re-aim after the aim's computing started on a 0.3 s old one and its
+        # guard called the stream lost 10 ms in, the arm never having moved
+        live = self._fresh_joints(max_age=None if guard is None else 0.5 * self.GUARD_STALE_S)
         if live is None:
             info["message"] = "no fresh /joint_states — refusing to send a trajectory"
             return "failed", info
@@ -561,6 +573,10 @@ class PlannerClient:
                     rclpy.spin_once(self.node, timeout_sec=0.05)
                     if guard is not None:
                         eff = self.wrist_efforts(max_age=self.GUARD_STALE_S)
+                        t_drain = time.monotonic()
+                        while eff is None and time.monotonic() - t_drain < self.GUARD_DRAIN_S:
+                            rclpy.spin_once(self.node, timeout_sec=0.0)
+                            eff = self.wrist_efforts(max_age=self.GUARD_STALE_S)
                         if eff is None:
                             # a guard that has lost its senses is no guard:
                             # stop the stroke instead of pressing blind

@@ -494,6 +494,29 @@ def test_a_guarded_stroke_is_cancelled_within_a_fifth_of_a_second_of_the_stream_
 
 
 
+def test_a_guarded_leg_after_some_computing_starts_on_a_fresh_reading(monkeypatch):
+    """Flatbot 2026-10-27 15:34: the re-aim started 0.3 s after the last
+    /joint_states this node had served — still "flowing" for the start gate
+    (EFFORT_STALE_S) — with camera frames queued ahead of the next one. Its
+    guard called the stream lost 10 ms in, the arm never having moved. The
+    gate now waits for a sample its guard would take."""
+    h = _ScriptedHandle(_cresp(CancelGoal.Response.ERROR_NONE), _ended(5, -6))
+    c = _client(_ScriptedDriver(h))
+    c._eff_at = time.monotonic() - 0.3
+    spins = {"n": 0, "sent_at": None}
+
+    def spin(node, timeout_sec=0.0):  # three camera frames, then a /joint_states, over and over
+        spins["n"] += 1
+        if spins["n"] % 4 == 0:
+            c._eff_at = time.monotonic()
+        if spins["n"] == 40:
+            h.result_fut.settle(_ended(4, 0))
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    outcome, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, guard=_Guard())
+    assert outcome == "arrived" and h.cancels == 0, info["message"]
+
+
 def test_a_slow_stop_when_does_not_read_as_a_lost_stream(monkeypatch):
     """An in-flight confirm runs the wrist's depth fix in stop_when on the
     guarded stroke: its own time must not age the stream the guard judges."""

@@ -420,6 +420,16 @@ def _lid_z(button_z, up_mm):
     return None if up_mm is None else float(button_z) - float(up_mm) / 1000.0
 
 
+def _stopped_by(res):
+    """What stopped a guarded free-air leg, for its STOP line: a trip is
+    something met; anything else says itself (15:34 2026-10-27: "met
+    something" printed for a guard that only lost its stream)."""
+    last = res[-1]
+    if last.outcome == "touch":
+        return "met something"
+    return "stopped (%s)" % (last.detail or last.outcome)
+
+
 def _settled(ctx, where):
     got = ctx.client.settled_efforts()
     if got is None:
@@ -575,7 +585,7 @@ def _clear_over_box(ctx, runner, ref):
     res = runner.run([line_leg(ctx, "depth:clear", pts, quat, CONTACT_SPEED, drag_guard(ref, tip_load_at(pts[0])),
                                _full_world(ctx))], execute=True)
     if any(not r.ok for r in res):
-        print("[press_demo] STOP: the way up from over the box met something — the arm holds; check the box")
+        print("[press_demo] STOP: the way up from over the box %s — the arm holds; check the box" % _stopped_by(res))
         return False
     return True
 
@@ -858,8 +868,8 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             res = runner.run([line_leg(ctx, "reach:re-aim", move, plan2.quat, CONTACT_SPEED, drag_guard(at_look), world)],
                              execute=True)
             if any(not r.ok for r in res):
-                print("[press_demo] STOP: the move to the aimed button's look pose met something — the arm holds; "
-                      "nothing was pressed")
+                print("[press_demo] STOP: the move to the aimed button's look pose %s — the arm holds; "
+                      "nothing was pressed" % _stopped_by(res))
                 return 1
     else:
         plan2, why = plan_reach(ctx, cfg, button, ctx.client.joints())
@@ -894,7 +904,8 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         quat_in = plan2.quat
     res = runner.run([line_leg(ctx, "reach:slide-in", slide, quat_in, CONTACT_SPEED, drag_guard(at_look), world)], execute=True)
     if any(not r.ok for r in res):
-        print("[press_demo] STOP: the slide in met something before the button — the arm holds; nothing was pressed")
+        print("[press_demo] STOP: the slide in %s before the button — the arm holds; nothing was pressed"
+              % _stopped_by(res))
         return 1
     at_start = _settled(ctx, "the stroke's start" if walk is None else "over the button, pointing down")
     if at_start is None:
