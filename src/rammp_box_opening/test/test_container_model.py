@@ -1,13 +1,13 @@
 import math
 
 import pytest
+import yaml
 
 from rammp_box_opening.models.container import (
     ContainerModel,
     ContainerPose,
     attitude_quat,
     from_container,
-    load_lid_place,
 )
 
 CFG = "src/rammp_box_opening/config/containers/oxo_pop.yaml"
@@ -35,12 +35,6 @@ def test_attitude_quat_top_down_points_tool_down():
     # z-column of the rotation matrix (tool z axis in world frame)
     tool_z = np.array([2*(x*z + y*w), 2*(y*z - x*w), 1 - 2*(x*x + y*y)])
     assert tool_z[2] == pytest.approx(-1.0, abs=1e-6)  # tool z straight down
-
-
-def test_lid_place_is_a_table_height_pose():
-    lid = load_lid_place(CFG)
-    assert len(lid.xyz) == 3
-    assert lid.xyz[2] == pytest.approx(-0.027)  # the measured table top
 
 
 def test_load_press_demo_cfg():
@@ -147,7 +141,7 @@ def test_every_shipped_container_config_loads_and_validates():
     'canister' alone all scored 0.00)."""
     from pathlib import Path
 
-    from rammp_box_opening.models.container import ContainerModel, load_lid_place, load_press_demo
+    from rammp_box_opening.models.container import ContainerModel, load_press_demo
 
     folder = Path("src/rammp_box_opening/config/containers")
     files = sorted(folder.glob("*.yaml"))
@@ -155,7 +149,9 @@ def test_every_shipped_container_config_loads_and_validates():
     for f in files:
         model = ContainerModel.load(str(f))
         cfg = load_press_demo(str(f))
-        load_lid_place(str(f))
+        # nothing in the environment is configured (owner 2026-10-27): the
+        # lid's spot is the cameras' every run, never a pose in the yaml
+        assert "open_container" not in yaml.safe_load(f.read_text()), f.name
         assert len(model.dims) == 3 and all(v > 0 for v in model.dims), f.name
         assert cfg.owl_queries and cfg.owl_min_score > 0, f.name
     pink = ContainerModel.load(str(folder / "ankou_pink.yaml"))

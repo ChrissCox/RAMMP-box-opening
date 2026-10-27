@@ -184,15 +184,22 @@ def runner(client, tmp_path):
     return r
 
 
+# where the lid goes in the `ctx` fixture: a run resolves its own before the
+# press (press_demo main); nowhere is configured to fall back to
+LID_SPOT = ContainerPose(xyz=(0.45, -0.25, -0.027), yaw=0.0)
+
+
 @pytest.fixture
 def ctx():
-    """A mission context: the shipped container, detected on the bench."""
+    """A mission context: the shipped container, detected on the bench,
+    its lid's spot resolved (LID_SPOT)."""
     return Ctx(
         model=ContainerModel.load(CFG),
         cpose=ContainerPose(xyz=(0.45, 0.0, -0.07), yaw=0.0),
         client=FakeClient(),
         worlds=FakeStore(),
         config_path=CFG,
+        lid_drop=LID_SPOT,
     )
 
 

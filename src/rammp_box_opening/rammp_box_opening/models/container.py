@@ -85,12 +85,6 @@ def attitude_quat(rpy_deg, yaw):
     return list(yaw_about_world_z(euler_deg_to_quat_xyzw(rpy_deg), yaw))
 
 
-def load_lid_place(path):
-    with open(path) as f:
-        raw = yaml.safe_load(f)["open_container"]["lid_place"]
-    return ContainerPose(xyz=tuple(raw["xyz"]), yaw=math.radians(float(raw["yaw_deg"])))
-
-
 @dataclass(frozen=True)
 class PressDemoCfg:
     """Knobs of the camera-driven press flow (owner design 2026-08-24)."""

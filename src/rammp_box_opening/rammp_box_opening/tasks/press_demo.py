@@ -53,8 +53,8 @@ Flow, states logged one line each:
           popped knob (a trip = struck it), band-verified close.
   PLACE   the lift, the carry and the set-down as ONE execution — nothing
           happens between them the arm must be still for. The drop spot is
-          derived from the DETECTED box every run (lid_place says only
-          which side to prefer). The set-down is guarded at
+          where the cameras see room for the lid and the hand, every run
+          (perception/clear_table); no place is configured. The set-down is guarded at
           setdown_touch_nm (the trip IS the success) and re-checks the grip
           band before releasing, then lazy retreat to the carry hover,
           home — or the look pose when park_tool_down.
@@ -97,7 +97,6 @@ from rammp_box_opening.geometry import ang_diff, yaw_about_world_z
 from rammp_box_opening.models.container import (
     ContainerModel,
     ContainerPose,
-    load_lid_place,
     load_press_demo,
 )
 from rammp_box_opening.detection_set import MISSIONS_SET, MissionFrames, scene_frame, wrist_frame, write_frame
@@ -1602,7 +1601,7 @@ def lid_drop_candidates(m, cpose, table_z, prefer_xy=None, zone=None):
     corner than a spot at the same distance on an axis — and the carry pose
     above one 27 deg off the -y axis had no IK in any attitude, while the
     four axis spots around the same box all planned (field 2026-09-17).
-    The configured lid_place (`prefer_xy`) picks which axis side is tried
+    A preferred point (`prefer_xy`), when given, picks which axis side is tried
     first: the one nearest its direction from the box.
 
     The four diagonals come after them, LID_DIAG_EXTRA_M farther out (past
@@ -1642,9 +1641,9 @@ def box_relative_lid_drop(m, cpose, table_z, prefer_xy=None, zone=None):
     This used to be a surveyed base-frame point that only moved when the box
     happened to crowd it. A fixed point assumes a fixed table, which is the
     assumption a wheelchair takes away — so the spot is derived from the box
-    every run: the first of lid_drop_candidates (the configured lid_place
-    chooses only which side is tried first, and its z is not used at all).
-    build_place_legs falls through the rest when the planner refuses one."""
+    every run: the first of lid_drop_candidates (`prefer_xy`, when given,
+    chooses only which side is tried first). build_place_legs falls through
+    the rest when the planner refuses one."""
     spots = lid_drop_candidates(m, cpose, table_z, prefer_xy, zone=zone)
     return spots[0] if spots else (None, None)
 
@@ -1775,7 +1774,12 @@ def build_place_legs(ctx, cfg, start_joints=None, chain=0):
     # thrown away by a no-motion retry) must not leave the transit and
     # set-down planning around a lid that is still in the gripper
     ctx.lid_at = None
-    first = ctx.lid_drop or load_lid_place(ctx.config_path)
+    # no spot resolved is no spot found: nowhere is configured to fall back
+    # to (owner 2026-10-27: nothing in the environment is hard coded; the
+    # yaml's lid_place was a bench point 21 cm under flatbot's table)
+    if ctx.lid_drop is None:
+        raise RuntimeError("planning failed for place:lid: no spot to set the lid down was found this run")
+    first = ctx.lid_drop
     st0 = _state(
         ctx.client.joints() if start_joints is None else start_joints, chain
     )
@@ -1800,8 +1804,7 @@ def build_place_legs(ctx, cfg, start_joints=None, chain=0):
             elif k == 1:
                 # only now pay for the alternatives: the first spot
                 # plans on almost every run
-                prefer = load_lid_place(ctx.config_path).xyz
-                for xyz, _d in lid_drop_candidates(m, ctx.cpose, first.xyz[2], prefer, zone=drop_zone(m, ctx.worlds)):
+                for xyz, _d in lid_drop_candidates(m, ctx.cpose, first.xyz[2], zone=drop_zone(m, ctx.worlds)):
                     if math.hypot(xyz[0] - first.xyz[0], xyz[1] - first.xyz[1]) > 1e-3:
                         spots.append(ContainerPose(xyz=tuple(xyz), yaw=first.yaw))
     else:
@@ -3042,8 +3045,8 @@ def main():
             # before any container-directed motion — where the cameras see
             # room for the lid and the hand (clear_lid_drops), refusing
             # before the press when they see none; without the scene's
-            # points, beside the box on the side lid_place prefers
-            lid = load_lid_place(ctx.config_path)
+            # points, beside the box (nothing in the environment is
+            # configured: no place, no preferred side)
             zone = drop_zone(model, worlds)
             tmap = room_map(watcher, scene_seen, ctx.cpose, at_staging) if scene_seen is not None else None
             if tmap is not None:
@@ -3067,9 +3070,7 @@ def main():
                           "; the hand turns %+.0f deg to set it down" % math.degrees(best.turn) if best.turn else ""))
                 ctx.lid_drops, ctx.lid_drop = drops, drops[0]
             else:
-                drop, _side = box_relative_lid_drop(
-                    model, ctx.cpose, watcher.table_z, lid.xyz, zone=zone
-                )
+                drop, _side = box_relative_lid_drop(model, ctx.cpose, watcher.table_z, zone=zone)
                 if drop is None:
                     try_home(
                         ctx,
@@ -3090,7 +3091,7 @@ def main():
                     sys.exit(4)
                 print(
                     "[press_demo] lid goes to [%.2f, %.2f, %.3f] — %.0f mm from "
-                    "the box, on the side the config prefers"
+                    "the box, beside it (no room map: nothing checked what stands there)"
                     % (
                         drop[0],
                         drop[1],
@@ -3101,7 +3102,7 @@ def main():
                         * 1000,
                     )
                 )
-                ctx.lid_drop = ContainerPose(xyz=tuple(drop), yaw=lid.yaw)
+                ctx.lid_drop = ContainerPose(xyz=tuple(drop), yaw=0.0)  # the hand unturned
 
         print(
             "[press_demo] PRESS target origin [%.3f, %.3f, %.3f] yaw %.1f deg"

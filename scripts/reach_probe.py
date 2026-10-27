@@ -18,7 +18,8 @@ this map is what defines where the container may sit (field lesson 1).
 
 Writes docs/reach_map.json (deterministic path, meant to be committed)
 and prints per-height ASCII maps. Also probes the two configured mission
-poses: the scan pose and the lid_place carry hover, at their own yaw.
+pose: the scan pose, at its own yaw (the lid's spot is the cameras' every
+run; no lid place is configured).
 
 Caveats recorded in the JSON meta: bare-bench world (the container adds
 obstacles that can only shrink the map), start = HOME for every plan
@@ -41,7 +42,6 @@ from rammp_box_opening.constants import HOME  # noqa: E402
 from rammp_box_opening.models.container import (  # noqa: E402
     ContainerModel,
     attitude_quat,
-    load_lid_place,
     load_press_demo,
 )
 from rammp_box_opening.worlds import WorldStore  # noqa: E402
@@ -86,21 +86,12 @@ def ascii_map(rows, xs, ys):
     return "\n".join(lines)
 
 
-def probe_mission_poses(planner, model, scan_xyz, lid):
-    """The configured (not detected) poses the mission commands, at their
-    own yaw: the scan pose and the lid set-down's carry hover."""
+def probe_mission_poses(planner, model, scan_xyz):
+    """The configured (not detected) pose the mission commands, at its own
+    yaw: the scan pose."""
     out = []
     for name, xyz, yaw in [
         ("scan", list(scan_xyz), math.atan2(scan_xyz[1], scan_xyz[0])),
-        (
-            "lid_place:hover",
-            [
-                lid.xyz[0],
-                lid.xyz[1],
-                lid.xyz[2] + model.lid_dims[2] + model.hover_standoff,
-            ],
-            lid.yaw,
-        ),
     ]:
         quat = attitude_quat(list(model.press_attitude_rpy_deg), yaw)
         res = planner.plan_to_pose(list(xyz), quat, start=list(HOME))
@@ -133,7 +124,6 @@ def main():
 
     model = ContainerModel.load(str(CONTAINER_YAML))
     scan_xyz = load_press_demo(str(CONTAINER_YAML)).scan_xyz
-    lid = load_lid_place(str(CONTAINER_YAML))
     top = WorldStore(str(BENCH_YAML)).table_top_z
     z_contact = top + model.button_offset[2]
     z_hover = z_contact + model.hover_standoff
@@ -159,7 +149,7 @@ def main():
     levels = {}
     for label, z in [("contact", z_contact), ("hover", z_hover)]:
         levels[label] = probe_grid(planner, xs, ys, z, label)
-    mission = probe_mission_poses(planner, model, scan_xyz, lid)
+    mission = probe_mission_poses(planner, model, scan_xyz)
 
     for label in levels:
         n_ok = sum(1 for r in levels[label] if r["success"])

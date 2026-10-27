@@ -77,12 +77,11 @@ With the container at its bench spot, lid on:
    travel at which the lid releases, plus ~2 mm margin. The stroke is
    position-controlled with the torque guard as a stop; too-large travel
    means the guard is your only brake.
-7. `open_container.lid_place`: which SIDE of the box the lid should go,
-   inside the reach band (README "Where the container may sit"). The drop
-   spot itself is derived from the DETECTED box every run — the minimum
-   clearance away, at the surveyed table height — so this is a preference,
-   not a position. The run refuses (exit 4) when no direction from the box
-   lands inside the set-down zone.
+7. Where the lid goes: nothing to set. It goes where the cameras see room
+   for it and the hand, every run (`perception/clear_table`), at the
+   measured table height; `open_container.lid_place` is gone (2026-10-27:
+   nothing in the environment is configured). The run refuses (exit 4)
+   when nowhere has room.
 8. `open_box.grip_band`: close the fingers on the POPPED knob by hand and
    record the position feedback the runner prints (0.387 at the bench);
    the band must hold it and exclude 0.8 (closed on air). Also

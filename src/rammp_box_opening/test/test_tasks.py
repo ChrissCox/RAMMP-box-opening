@@ -677,6 +677,22 @@ def test_what_the_cameras_see_standing_goes_into_the_planners_worlds(monkeypatch
     assert ctx.worlds.seen is boxes and len(notes) == 1
 
 
+def test_with_no_spot_found_the_lid_has_nowhere_configured_to_go(ctx):
+    """Owner 2026-10-27: nothing in the environment is hard coded. The
+    yaml's lid_place was the fallback when a run resolved no spot: a bench
+    point, 21 cm under flatbot's table. No spot now is a refusal, before
+    anything is planned."""
+    import pytest
+
+    from rammp_box_opening.tasks import press_demo
+
+    ctx.lid_drop = None
+    with pytest.raises(RuntimeError) as e:
+        press_demo.build_place_legs(ctx, _demo_cfg())
+    assert "no spot to set the lid down was found this run" in str(e.value)
+    assert ctx.client.approach_offsets == [] and ctx.client.joint_targets == []  # nothing was planned
+
+
 def test_no_plannable_drop_spot_is_one_clear_refusal(ctx):
     import pytest
 
@@ -752,7 +768,7 @@ def test_after_a_popped_depth_press_the_fingers_open_and_the_lid_comes_off(ctx, 
     from rammp_box_opening.constants import TIP_TO_TOOL_M
     from rammp_box_opening.primitives.core import tcp_z
 
-    lid = ctx.lid_drop or press_demo.load_lid_place(ctx.config_path)
+    lid = ctx.lid_drop = ContainerPose(xyz=(*ctx.lid_drop.xyz[:2], ctx.cpose.xyz[2]), yaw=0.0)  # the box's table
     lands = tcp_z(lid.xyz[2] + ctx.model.lid_dims[2] + press_demo.DEPTH_GRIP_CLEAR_M)
     ctx.client.contact_at = [lid.xyz[0], lid.xyz[1], lands + TIP_TO_TOOL_M]
     result = DepthPress(free=True, contact=True, felt=True, popped=True, touch_xyz=(0.45, 0.0, 0.085))
@@ -823,7 +839,6 @@ def test_contact_leg_speeds_come_from_config(ctx):
     assert down.warp[1] == pytest.approx(cfg.grip_speed)
     assert lift.speed == pytest.approx(cfg.lift_speed)
 
-    c.lid_drop = None
     place = press_demo.build_place_legs(c, cfg)
     setdown = next(x for x in place if x.name == "place:lid:down")
     assert setdown.speed == pytest.approx(cfg.setdown_speed)
@@ -966,9 +981,7 @@ def test_place_accounts_for_grip_height_and_gentle_touch(ctx):
     legs = press_demo.build_place_legs(c, cfg)
     down = next(x for x in legs if x.name == "place:lid:down")
     from rammp_box_opening.primitives.core import SETDOWN_OVERDRIVE_M
-    from rammp_box_opening.tasks.press_demo import load_lid_place
-
-    lid = load_lid_place(CFG)
+    lid = c.lid_drop
     want = tcp_z(lid.xyz[2] + c.model.lid_dims[2] + cfg.grip_clear_m) - SETDOWN_OVERDRIVE_M
     assert down.target[1][2] == pytest.approx(want)
     assert down.guard.touch_nm == pytest.approx(cfg.setdown_touch_nm)

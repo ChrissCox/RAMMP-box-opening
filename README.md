@@ -233,8 +233,9 @@ Flow (`tasks/press_demo.py`, one log line per state):
    (`open_box.grip_band`; 0.8 = closed on air).
 5. **PLACE** — the lift, the carry and the set-down as ONE execution, since
    nothing happens between them the arm has to be still for. The drop spot
-   is derived from the DETECTED box every run (`lid_place` says only which
-   side to prefer, and the height is the surveyed table). The
+   is where the cameras see room for the lid and the hand, every run
+   (`perception/clear_table`; no lid pose is configured), at the measured
+   table height. The
    set-down is guarded at `setdown_touch_nm` (4.0 Nm — the trip IS the
    success) and re-checks the grip band before releasing, so a lid that
    slipped on the way is caught before the fingers open. Then lazy retreat

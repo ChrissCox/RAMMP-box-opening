@@ -96,10 +96,10 @@ press_yaw_steer: false            # FIXED in the world (above). true = yaw
                                   # keeps flipping" (owner, 2026-09-16)
 hover_standoff: 0.08              # m above the lid set-down spot for the carry
                                   # hover (plus a lid height; Place.hover_for)
-open_container:
-  lid_place:                      # the one non-container-derived pose (spec §5)
-    xyz: [0.45, -0.25, -0.027]
-    yaw_deg: 0.0
+# No lid pose is configured (it was open_container.lid_place, a bench
+# point): the lid goes where the cameras see room for it and the hand,
+# every run (perception/clear_table; owner 2026-10-27: nothing in the
+# environment is hard coded).
 
 # --- open_box (step 2, owner 2026-08-26): pull the lid off ---------------
 open_box:
