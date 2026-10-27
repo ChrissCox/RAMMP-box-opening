@@ -33,6 +33,7 @@ setup(
             "preflight = rammp_box_opening.tasks.preflight:main",
             "owl_detector = rammp_box_opening.perception.owl_node:main",
             "record_detection_set = rammp_box_opening.tasks.record_detection_set:main",
+            "lid_room_view = rammp_box_opening.tasks.lid_room_view:main",
         ],
     },
 )

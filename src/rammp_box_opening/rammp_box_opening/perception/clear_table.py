@@ -277,7 +277,7 @@ class Spot:
 
 
 def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_tips_h, lid_h,
-                step=SPOT_STEP_M):
+                step=SPOT_STEP_M, judged_out=None):
     """(spots, why): every spot in `zone` (x0, x1, y0, y1) at least
     `min_from_box` from the box, and at most SPOT_REACH_M more, where the
     hand comes down, at one of TURNS,
@@ -289,7 +289,8 @@ def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_
     The spots are judged `step` apart, and again half a step around each
     that came within a step of clear: a spot's room changes no faster than
     it moves, and the one clear spot beside the 17:57 box fell between the
-    coarse grid's points."""
+    coarse grid's points. `judged_out`, a list, receives every Spot judged
+    (tasks/lid_room_view draws them)."""
     bx, by = float(box_xy[0]), float(box_xy[1])
     x0, x1, y0, y1 = zone
     judged = {}
@@ -319,6 +320,8 @@ def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_
             for oy in (-half, 0.0, half):
                 judge(s.xy[0] + ox, s.xy[1] + oy)
     every = [s for s in judged.values() if s is not None]
+    if judged_out is not None:
+        judged_out.extend(every)
     found = [s for s in every if s.room_m >= 0.0]
     nearest = max(every, key=lambda s: s.room_m, default=None)
     found.sort(key=lambda s: (-round(min(s.room_m, ENOUGH_M) / ROOM_STEP_M), abs(s.turn),

@@ -1652,7 +1652,7 @@ def box_relative_lid_drop(m, cpose, table_z, prefer_xy=None, zone=None):
 CLEAR_SPOTS_Y_M = 0.45  # the map is searched for a drop spot this far either side of the box
 
 
-def clear_lid_drops(m, cpose, tmap, table_z):
+def clear_lid_drops(m, cpose, tmap, table_z, judged_out=None):
     """(drops, spots, why): where the lid may go among what the cameras see
     standing on the table (perception/clear_table), best first: as
     ContainerPoses on the table at `table_z` — each one's yaw the turn the
@@ -1677,6 +1677,7 @@ def clear_lid_drops(m, cpose, tmap, table_z):
         lid_h,  # the fingertips at the release: the lid's height up, at the least
         float(m.dims[2]) + lid_h + CARRY_CLEAR_M,  # ... and on the carry (Place.hover_for's floor)
         lid_h,
+        judged_out=judged_out,
     )
     return [ContainerPose(xyz=(s.xy[0], s.xy[1], float(table_z)), yaw=s.turn) for s in spots], spots, why
 
