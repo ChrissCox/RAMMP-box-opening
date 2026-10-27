@@ -225,6 +225,11 @@ class _NeverStops:
 # at all: the scene OWL answers at ~2 Hz once enabled, and the depth lift is
 # instant, so this is two or three inference ticks.
 SCENE_LOCATE_S = 5.0  # was 3.0: the first box has come at 2.2-2.7 s — too tight
+# ... and the run's FIRST look, before anything moves, keeps at it longer:
+# flatbot 2026-10-27 15:34:01 refused all three candidates the OWL offered
+# in 5 s (0.12, 26-28 depth points in each) and the run went home; 25 s
+# later the next run had the box 0.83 s in. Looking longer costs only time.
+SCENE_FIRST_LOCATE_S = 15.0
 # How long the wrist camera gets at staging to confirm the box precisely.
 # From 12 cm the lid fills a third of the frame and the hit rate is high;
 # this is generous.
@@ -2812,7 +2817,7 @@ def main():
         planned_for = None  # the pose `preplanned` was planned for
         if locator is not None:
             t_scene = time.monotonic()
-            scene_fix = locator.locate(SCENE_LOCATE_S)
+            scene_fix = locator.locate(SCENE_FIRST_LOCATE_S)
             if ctx.mission_frames is not None:
                 ctx.mission_frames.scene(
                     scene_frame(locator.grab, locator.base_to_link()),

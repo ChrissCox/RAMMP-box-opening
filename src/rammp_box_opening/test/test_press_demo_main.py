@@ -89,6 +89,9 @@ class _Watcher:
         return None
 
 
+LOCATES = []  # every timeout the scene locator was asked for, in order
+
+
 def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
     """press_demo.main() with `approach(ctx)` standing in for
     approach_from_scene (returns a SceneApproach), and `centre` for
@@ -126,6 +129,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
             self.owl = type("O", (), {"enable": lambda s: None})()
 
         def locate(self, timeout):
+            LOCATES.append(timeout)
             return _Fix
 
         def base_to_link(self):
@@ -230,6 +234,19 @@ def test_a_refused_recentre_plan_presses_from_the_last_aim(monkeypatch, tmp_path
     assert "CENTRE: the move over the button was refused" in out and "pressing from the last aim" in out
     assert "approach:recentre" not in _legs(rows)  # nothing was sent
     assert "press:down" in _legs(rows)
+
+
+def test_the_first_look_for_the_box_keeps_at_it_longer_than_a_re_check(monkeypatch, tmp_path):
+    """Flatbot 2026-10-27 15:34:01: the scene camera refused the OWL's three
+    candidates in 5 s and the run went home; the next run had the box at
+    once. The first look, before anything moves, gets SCENE_FIRST_LOCATE_S."""
+    from rammp_box_opening.tasks import press_demo
+
+    LOCATES.clear()
+    client = FakeClient()
+    client.exec_script = [TOUCH]
+    run_main(monkeypatch, tmp_path, ["--execute", "--press-only"], _at_staging(), client=client)
+    assert LOCATES[0] == press_demo.SCENE_FIRST_LOCATE_S > press_demo.SCENE_LOCATE_S
 
 
 def test_an_open_box_seen_by_the_re_aim_over_the_button_is_not_pressed(monkeypatch, tmp_path, capsys):
