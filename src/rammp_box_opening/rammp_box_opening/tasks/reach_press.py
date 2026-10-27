@@ -875,7 +875,7 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     if depth:
         # over the box: from here the height is the wrist camera's depth and
         # the press the torques' (tasks/depth_press), not TF's lid — the
-        # close-up told where the look's aim puts the button
+        # look's aim where the close-up does not confirm the button
         from rammp_box_opening.tasks import depth_press
 
         result = depth_press.press_down_from_here(node, ctx, cfg, runner, watcher, CONTACT_TOOL, here=at_start,

@@ -479,12 +479,75 @@ def test_the_first_look_expects_the_button_where_the_callers_aim_put_it(ctx, mon
     assert arm.expects[0] == pytest.approx((0.0, -LENS[1], 0.27), abs=1e-6)  # under the fingers, its lid 0.27 down
 
 
-def test_the_1433_close_up_takes_the_lids_edge_unless_told_where_the_aim_put_the_button(ctx, monkeypatch, pink):
+@pytest.mark.parametrize("z_under", [0.2804, 0.26])
+def test_where_no_look_confirms_the_button_the_aim_stands_in(ctx, monkeypatch, tmp_path, z_under):
+    """14:33 again: turned down there, the lens 65 mm beside the fingers sees
+    the button under them at the frame's top edge, its ring cut off, and no
+    look confirms it. The aim stands in where the camera's own depth under
+    the fingers backs it (14:33: the button's face 11 mm deeper than the
+    aim's): the press goes straight down there, fast to TOUCH_SLOW_M short
+    of the nearer of the two lids, and the after-look is told where the aim
+    put the button."""
+    import json
+
+    looks = [(None, z_under, "9 frame(s), the button in none"), (_sighting(up=12.0), None, "2/2")]
+    result, events, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, aimed=AIMED, knob_up_mm=0.4)
+    assert dp.exit_code(result) == 0 and result.felt and result.popped and not result.moved
+    assert events == ["depth:turn", "look:depth-look", "depth:approach", "depth:touch", "press:push", "depth:unload",
+                      "depth:rise", "look:depth-after"]
+    (goal, _q), = arm.turns
+    fast = arm.lines[0]
+    ahead_tf = dp.DOWN_CONTACT_TOOL[2] - LENS[2]
+    assert fast[:2] == pytest.approx(list(goal[:2]))  # over the aim already: no centring
+    assert goal[2] - fast[2] == pytest.approx(min(0.27, z_under + 0.0004) - ahead_tf - dp.TOUCH_SLOW_M)
+    assert arm.expects[1] == pytest.approx((0.0, -LENS[1], 0.27), abs=1e-6)
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    note, = [r for r in rows if r.get("leg") == "depth_trusted_aim"]
+    assert note["ok"] and note["under_fingers_mm"] == pytest.approx(1000 * z_under)
+    assert [r for r in rows if r.get("leg") == "depth_centred"][0]["by_aim"] is True
+
+
+@pytest.mark.parametrize("z_under, aimed, why", [
+    (None, AIMED, "the camera reads no depth under the fingers"),
+    (0.32, AIMED, "the surface under the fingers 320 mm below the lens, the aimed button 270"),
+    (0.27, (AIMED[0] + 0.04, AIMED[1], AIMED[2]), "the aimed button is 40 mm from under the fingers"),
+])
+def test_the_aim_does_not_stand_in_where_the_camera_does_not_back_it(ctx, monkeypatch, tmp_path, z_under, aimed, why):
+    looks = [(None, z_under, "9 frame(s), the button in none")]
+    result, events, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, aimed=aimed, knob_up_mm=0.4)
+    assert result.free and why in result.why and "not pressing on the aim" in result.why
+    assert events == ["depth:turn", "look:depth-look"] and arm.lines == [] and dp.exit_code(result) == 1
+
+
+def test_an_aim_a_few_mm_off_is_centred_on_by_the_arms_own_kinematics(ctx, monkeypatch, tmp_path):
+    """No look after the move — none would confirm the button there either:
+    the arm's own kinematics put the aim under the fingers."""
+    off = (AIMED[0] + 0.008, AIMED[1] - 0.006, AIMED[2])
+    looks = [(None, 0.27, "9 frame(s), the button in none"), (_sighting(up=12.0), None, "2/2")]
+    result, events, arm, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, aimed=off, knob_up_mm=0.4)
+    assert dp.exit_code(result) == 0
+    assert events[:5] == ["depth:turn", "look:depth-look", "depth:centre", "depth:approach", "depth:touch"]
+    assert arm.lines[0][:2] == pytest.approx(list(off[:2])) and arm.lines[1][:2] == pytest.approx(list(off[:2]))
+
+
+@pytest.mark.parametrize("miss, moved", [(0.010, False), (0.020, True)])
+def test_after_a_press_by_the_aim_its_own_miss_is_no_move(ctx, monkeypatch, tmp_path, miss, moved):
+    """The after-look's button against the aim's holds the aim's own miss
+    (14:33: ~10 mm): only a box slid farther than SLIDE_OK_M has moved."""
+    looks = [(None, 0.2804, "9 frame(s), the button in none"), (_sighting(y=-LENS[1] - miss, up=12.0), None, "2/2")]
+    result, _e, _a, _l, _s = _press(ctx, monkeypatch, tmp_path, looks, aimed=AIMED, knob_up_mm=0.4)
+    assert result.moved is moved and result.shift_m == pytest.approx(miss, abs=1e-4)
+    assert dp.exit_code(result) == (1 if moved else 0)
+
+
+def test_the_1433_close_up_takes_the_lids_edge_and_backs_the_aim(ctx, monkeypatch, pink):
     """The 14:33 first close-up itself (flatbot 2026-10-27), the hand turned
     down over the tilted look's button, the lid 0.18 m below the lens. Told
     nothing, the finder takes a circle more than LOOK_EXPECT_M from where
     the aim puts the button (the run took one 64 mm off, and flew there).
-    Told the aim, it takes none of them."""
+    Told the aim, no circle: the button's ring runs off the top of the
+    frame. The depth under the fingers backs the aim — the button's face 11
+    mm deeper than the aim's top, its lid ring at the aim's height."""
     import cv2
 
     from rammp_box_opening.runtime import approach
@@ -505,7 +568,10 @@ def test_the_1433_close_up_takes_the_lids_edge_unless_told_where_the_aim_put_the
     s, why = dp.find_in_camera(color, depth, f["k"], pink, dist=f["dist"])
     assert s is not None and np.hypot(s.x - aim.x, s.y - aim.y) > dp.LOOK_EXPECT_M
     s, why = dp.find_in_camera(color, depth, f["k"], pink, dist=f["dist"], expect=dp.where_seen(aim))
-    assert s is None and "37 mm from where the box is" in why
+    assert s is None and "ring around it is not lid" in why
+    z = dp.depth_under_fingers(depth, f["k"], LENS)
+    assert z == pytest.approx(0.187, abs=0.002)
+    assert dp.aim_disagrees(ctx, aim, pair, z) is None
 
 
 def test_from_over_the_box_the_fingers_are_moved_over_the_button_the_camera_sees(ctx, monkeypatch, tmp_path):

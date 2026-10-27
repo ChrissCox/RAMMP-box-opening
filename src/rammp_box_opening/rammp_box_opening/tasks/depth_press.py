@@ -15,8 +15,9 @@ thing it got wrong. So from over the box:
           hand reaches there, it stops.
   DEPTH   the wrist camera, looking down along the tool, measures how far
           below its lens the lid is: the button's own ring if it sees it,
-          else the surface straight under the fingers' line. Its own depth
-          in its own frame, no transform.
+          else where the caller aimed the button (the reach-out's tilted
+          look), backed by the surface straight under the fingers' line.
+          Its own depth in its own frame, no transform.
   TOUCH   straight down, at most that far plus travel_m — the fingertips are
           never behind the lens — stopped by the first contact the joint
           torques feel. Where it stopped says how far in front of the lens
@@ -76,6 +77,11 @@ LOOK_EXPECT_DEPTH_M = 0.03
 # look) is where the first look expects the button too. Flatbot 2026-10-27
 # 14:33: the fingers stood over the aimed button, the first close-up took a
 # circle on the lid's edge 64 mm off it, and CENTRE flew the hand off the box.
+# Turned down there, the lens 65 mm beside the fingers sees the button under
+# them at the frame's top edge, its ring cut off (77 % of it at lid height,
+# 80 % needed): where no look confirms it, the aim stands in, if the camera's
+# own depth under the fingers' line is within LOOK_EXPECT_DEPTH_M of the
+# aimed button and the button within LOOK_EXPECT_M of under the fingers.
 LENS_AHEAD_MAX_M = 0.25  # the fingertips are at most this far in front of the lens
 # CENTRE: from over the box the fingers are put over the button the wrist
 # camera sees — TF's aim from the tilted look landed the press 45 mm off its
@@ -375,6 +381,23 @@ def aim_seen(ctx, aimed, lens_pair, up_mm=None):
     up = float(up_mm) if up_mm is not None and np.isfinite(up_mm) else float("nan")
     return LensSighting(x=float(c[0]), y=float(c[1]), lid_depth=float(c[2]) + (up / 1000.0 if np.isfinite(up) else 0.0),
                         button_depth=float(c[2]), up_mm=up, raw=None)
+
+
+def aim_disagrees(ctx, aim, lens_pair, z_under):
+    """Why the aim (aim_seen) may not stand in for a look that did not
+    confirm it, or None: the camera reads no surface under the fingers'
+    line, or one farther than LOOK_EXPECT_DEPTH_M from the aimed button's
+    depth, or the button is farther than LOOK_EXPECT_M from under the
+    fingers."""
+    if z_under is None:
+        return "the camera reads no depth under the fingers to check the aim by"
+    if abs(float(z_under) - aim.button_depth) > LOOK_EXPECT_DEPTH_M:
+        return "the camera reads the surface under the fingers %.0f mm below the lens, the aimed button %.0f" % (
+            1000 * float(z_under), 1000 * aim.button_depth)
+    miss = math.hypot(*_off_in_world(ctx, aim, lens_pair[0], lens_pair[1]))
+    if miss > LOOK_EXPECT_M:
+        return "the aimed button is %.0f mm from under the fingers" % (1000 * miss)
+    return None
 
 
 def under_fingers(s, lens, R_hand_cam=None):
@@ -698,8 +721,9 @@ def press_down_from_here(node, ctx, cfg, runner, watcher, contact_tool, here=Non
     — the knob KNOB_UP_MM up by any look here or by `knob_up_mm`, the
     caller's aim — is never pressed: the pads feel its lid beside the knob
     instead (_feel_the_lid). `aimed`: the button's top in the world by the
-    caller's aim — the first look takes no circle far from it. Never goes
-    home itself: DepthPress.free says whether the arm may."""
+    caller's aim — the first look takes no circle far from it, and stands
+    in for a look that does not confirm the button (aim_disagrees). Never
+    goes home itself: DepthPress.free says whether the arm may."""
     seen = {}
     result = _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here, turned, knob_up_mm, aimed)
     return dataclasses.replace(result, ref=seen.get("ref"), touch_xyz=seen.get("touch_xyz"))
@@ -748,9 +772,23 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
                                          "the measured wrist_lens_in_hand_m at (%s) mm — fix the mount before centring "
                                          "on it" % (", ".join("%+.0f" % (1000 * v) for v in lens),
                                                     ", ".join("%+.0f" % (1000 * v) for v in measured)))
-    if s is None:
+    trusted = s is None and aimed is not None  # no look confirms the button: the aim stands in
+    if s is None and aimed is None:
         return DepthPress(free=True, why="the wrist camera does not see the button from over the box (%s) — not "
                                          "pressing blind" % status)
+    if trusted:
+        s = aim_seen(ctx, aimed, lens_pair, knob_up_mm)
+        why = aim_disagrees(ctx, s, lens_pair, z_under)
+        runner.note("depth_trusted_aim", ok=why is None, why=why,
+                    lens_xy_mm=[round(1000 * s.x, 1), round(1000 * s.y, 1)],
+                    button_depth_mm=round(1000 * s.button_depth, 1),
+                    under_fingers_mm=None if z_under is None else round(1000 * z_under, 1))
+        if why is not None:
+            return DepthPress(free=True, why="the wrist camera does not see the button from over the box (%s), and %s "
+                                             "— not pressing on the aim" % (status, why))
+        print("[press_demo] DEPTH: the wrist camera does not confirm the button from over the box (%s) — going by "
+              "the aim: its button %.0f mm below the lens, the camera reads %.0f mm under the fingers" % (
+                  status, 1000 * s.button_depth, 1000 * z_under))
     # how far the knob stands above its lid, by every look that read it
     ups = [float(v) for v in (knob_up_mm, s.up_mm) if v is not None and np.isfinite(v)]
 
@@ -778,23 +816,31 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
             if any(not r.ok for r in res):
                 return DepthPress(free=False, why="the move over the button met something — the arm holds")
         moves += 1
-        expect = expect_after_move(s, lens, r_hc, R_move, (off[0], off[1], 0.0))
-        s, z_under, lens2, status = look(node, watcher, m, "depth-look", runner, ctx, expect=expect)
-        lens, r_hc = lens2 or (lens, r_hc)
-        if s is None:
-            return DepthPress(free=True, why="the wrist camera lost the button after moving over it (%s)" % status)
-        if np.isfinite(s.up_mm):
-            ups.append(float(s.up_mm))
+        if trusted:
+            s = aim_seen(ctx, aimed, (lens, r_hc), knob_up_mm)  # no look confirms it: the aim, from here
+        else:
+            expect = expect_after_move(s, lens, r_hc, R_move, (off[0], off[1], 0.0))
+            s, z_under, lens2, status = look(node, watcher, m, "depth-look", runner, ctx, expect=expect)
+            lens, r_hc = lens2 or (lens, r_hc)
+            if s is None:
+                return DepthPress(free=True, why="the wrist camera lost the button after moving over it (%s)" % status)
+            if np.isfinite(s.up_mm):
+                ups.append(float(s.up_mm))
         off = _off_in_world(ctx, s, lens, r_hc)
         if math.hypot(*off) > 0.5 * miss:
             return DepthPress(free=True, why="moving over the button did not bring it under the fingers (%.0f -> %.0f mm)"
                                              " — the camera's axes in TF are wrong?" % (1000 * miss, 1000 * math.hypot(*off)))
     runner.note("depth_centred", moves=moves, off_mm=[round(1000 * v, 1) for v in off],
-                lens_in_hand_mm=[round(1000 * v, 1) for v in lens])
+                lens_in_hand_mm=[round(1000 * v, 1) for v in lens], by_aim=trusted)
     depth = s.lid_depth
-    print("[press_demo] DEPTH: the button %.1f mm from under the fingers%s; the lid %.0f mm below the wrist lens (under "
-          "the fingers' line: %s)" % (1000 * math.hypot(*off), "" if not moves else " after %d move(s)" % moves,
-                                      1000 * depth, "n/a" if z_under is None else "%.0f mm" % (1000 * z_under)))
+    if trusted:
+        # no nearer than the camera's own depth under the fingers puts the
+        # lid either: the fast stretch stops TOUCH_SLOW_M short of both
+        depth = min(depth, float(z_under) + s.lid_depth - s.button_depth)
+    print("[press_demo] DEPTH: the button %.1f mm from under the fingers%s%s; the lid %.0f mm below the wrist lens "
+          "(under the fingers' line: %s)" % (1000 * math.hypot(*off), " by the aim" if trusted else "",
+                                             "" if not moves else " after %d move(s)" % moves,
+                                             1000 * depth, "n/a" if z_under is None else "%.0f mm" % (1000 * z_under)))
 
     up = max(ups) if ups else float("nan")
     if np.isfinite(up) and up >= KNOB_UP_MM:
@@ -843,15 +889,18 @@ def _press_down(node, ctx, cfg, runner, watcher, contact_tool, seen, here=None, 
     if after is None:
         # the reach-out's AFTER rule: a box no camera finds after a contact
         # holds the arm — the caller asks the scene camera (after_scene_check)
-        print("[press_demo] AFTER: the wrist camera does not find the button again (%s)" % status)
+        print("[press_demo] AFTER: the wrist camera does not find the button%s (%s)" % (
+            " (nor did it before the press, which went by the aim)" if trusted else " again", status))
         return DepthPress(free=False, contact=True, felt=felt, lost=True,
                           why="the wrist camera does not find the button after the press — the knob is not judged")
     shift = math.hypot(after.x - s.x, after.y - s.y)
-    moved = shift > BOX_MOVED_M or abs(after.lid_depth - s.lid_depth) > LID_MOVED_M
-    print("[press_demo] AFTER: the knob %s; the button %.0f mm from where it was, the lid %+.0f mm" % (
+    # from the aim, the shift holds the aim's own miss (14:33: ~10 mm), so
+    # only a slide too far to grip by is a move
+    moved = shift > (SLIDE_OK_M if trusted else BOX_MOVED_M) or abs(after.lid_depth - s.lid_depth) > LID_MOVED_M
+    print("[press_demo] AFTER: the knob %s; the button %.0f mm from where %s, the lid %+.0f mm" % (
         "UP %.0f mm — the box is open" % after.up_mm if popped else (
             "%.1f mm above the lid" % after.up_mm if np.isfinite(after.up_mm) else "not judged"),
-        1000 * shift, 1000 * (after.lid_depth - s.lid_depth)))
+        1000 * shift, "the aim put it" if trusted else "it was", 1000 * (after.lid_depth - s.lid_depth)))
     if moved:
         # home is planned around the box where the camera sees it now: the
         # sighting's shift, turned from the camera's axes into the hand's
