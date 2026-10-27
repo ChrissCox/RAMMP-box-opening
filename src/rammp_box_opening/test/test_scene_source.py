@@ -182,13 +182,14 @@ def _table_low_wall_high(rng, n=3000, h=1000):
     return np.vstack([table, wall]), uv
 
 
-def test_the_table_is_read_off_the_top_rows_of_a_camera_hung_upside_down():
-    """Flatbot's scene OAK hangs upside down: the table in front of it is in
-    the image's TOP rows, and its bottom rows are the wall behind the box."""
+def test_the_table_is_read_off_the_lower_rows_of_the_upright_view():
+    """The frames arrive upright (the OAKs rotate on the device since
+    rammp-deployments #133): the table in front of the camera is in the
+    image's lower rows. A view still upside down has the wall there, and
+    no table is read off it."""
     pts, uv = _table_low_wall_high(np.random.default_rng(1))
     assert table_from_scene_points(pts, uv, image_h=1000) == pytest.approx(TABLE_Z, abs=0.004)
     over = np.c_[uv[:, 0], 1000 - uv[:, 1]]  # the same view, the camera turned over
-    assert table_from_scene_points(pts, over, image_h=1000, upside_down=True) == pytest.approx(TABLE_Z, abs=0.004)
     assert np.isnan(table_from_scene_points(pts, over, image_h=1000))  # the wall is not a table
 
 
@@ -415,10 +416,15 @@ def test_a_camera_level_with_the_lid_takes_the_side_lift():
     T = z["T_base_color"]
     pc, uv = color_cloud(z["depth_mm"].astype(float) / 1000.0, z["kd"], z["k"], z["dist"], z["T_color_depth"], stride=2)
     pts = pc @ T[:3, :3].T + T[:3, 3]
+    # recorded before the OAKs rotated on the device: turned upright as they now
+    # are (rammp-deployments #133), the points where they were
+    h, w = z["color"].shape[:2]
+    uv = np.c_[w - 1 - uv[:, 0], h - 1 - uv[:, 1]]
     model = ContainerModel.load(PINK)
-    table_z = table_from_scene_points(pts, uv, z["color"].shape[0], upside_down=True)  # what locate() does unsurveyed
+    table_z = table_from_scene_points(pts, uv, h)  # what locate() does unsurveyed
     assert not np.isnan(table_z)
-    x0, y0, x1, y1 = (float(v) for v in z["lid_box"])
+    bx0, by0, bx1, by1 = (float(v) for v in z["lid_box"])
+    x0, y0, x1, y1 = w - 1 - bx1, h - 1 - by1, w - 1 - bx0, h - 1 - by0
     tops = []
     for dx, dy in itertools.product((0, 2, 4), (0, 3, 6)):  # an OWL box a few pixels looser
         got = scene_fix_from_boxes([(0.6, [x0 - dx, y0 - dy, x1 + dx, y1 + dy])], pts, uv, table_z, model,
@@ -617,3 +623,23 @@ def test_a_short_arc_is_no_circle():
     band = np.c_[0.5 + r * np.cos(wide), r * np.sin(wide), np.full(200, 0.38)] + np.random.default_rng(1).normal(0, 0.002, (200, 3))
     centre, why = lid_circle(band, model, (0.0, 0.0, 0.38))
     assert centre is not None and np.hypot(centre[0] - 0.5, centre[1]) < 0.003
+
+
+def test_a_scene_camera_whose_tf_still_has_its_frames_upside_down_is_refused():
+    """Nothing turns frames for the OWL any more: a camera hung upside down
+    rotates them on the device (rammp-deployments #133). One whose TF still
+    has its image's down pointing up is refused before any box is looked for,
+    and says how to fix it."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import scene_source as ss
+
+    loc = ss.SceneLocator.__new__(ss.SceneLocator)
+    loc.spins = False
+    loc.owl = SimpleNamespace(enable=lambda: None, disable=lambda: None, latest=None)
+    loc.ready = lambda: True
+    hung = np.eye(4)
+    hung[:3, 0], hung[:3, 1], hung[:3, 2] = (0, 1, 0), (0, 0, 1), (1, 0, 0)  # image down points up
+    loc.base_to_color = lambda: hung
+    assert loc.locate(0.5) is None
+    assert "upside down" in loc.last_why and "i_rotation 180" in loc.last_why

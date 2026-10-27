@@ -184,10 +184,10 @@ def test_detection_is_one_function_the_node_and_an_offline_replay_share():
     assert seen["text"] == [["a pink lid", "a round pink lid"]] and seen["threshold"] == 0.15 and seen["device"] == "cpu"
 
 
-def test_an_upside_down_camera_is_shown_upright_and_its_boxes_come_back_in_its_pixels():
-    """Flatbot 2026-10-22: the scene OAK hangs upside down, and OWLv2 scored
-    the pink lid 0.04 on its frame as published, 0.44 turned upright. The
-    depth the box is lifted from stays in the published frame's pixels."""
+def test_owl_is_shown_the_frame_as_it_comes_and_its_boxes_stay_in_its_pixels():
+    """Since rammp-deployments #133 (2026-10-27) the OAKs rotate their frames
+    upright on the device: OWLv2 is shown each frame as published, nothing
+    turned, and its boxes are that frame's own pixels."""
     import torch
 
     from rammp_box_opening.perception.owl_source import owl_detect
@@ -208,8 +208,9 @@ def test_an_upside_down_camera_is_shown_upright_and_its_boxes_come_back_in_its_p
 
     rgb = np.zeros((400, 640, 3), np.uint8)
     rgb[0, 0] = 255  # the published frame's top-left pixel
-    top = owl_detect(Proc(), lambda **kw: "out", rgb, ["a pink lid"], 0.12, device="cpu", upside_down=True)
-    assert seen["image"][-1, -1, 0] == 255  # shown turned over
-    assert top[0][0] == pytest.approx(0.44) and top[0][1] == [580, 320, 630, 380]  # back in the frame's own pixels
     top = owl_detect(Proc(), lambda **kw: "out", rgb, ["a pink lid"], 0.12, device="cpu")
-    assert seen["image"][0, 0, 0] == 255 and top[0][1] == [10, 20, 60, 80]  # a camera the right way up: untouched
+    assert seen["image"][0, 0, 0] == 255  # shown as published
+    assert top[0][0] == pytest.approx(0.44) and top[0][1] == [10, 20, 60, 80]  # in the frame's own pixels
+    import inspect
+
+    assert "upside_down" not in inspect.signature(owl_detect).parameters  # nothing turns frames any more
