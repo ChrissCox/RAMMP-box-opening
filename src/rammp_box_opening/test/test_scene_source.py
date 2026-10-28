@@ -1177,10 +1177,10 @@ def test_a_scene_fix_needs_two_sightings_that_agree():
     assert why is None and top == pytest.approx((0.665, -0.265, 0.310))
 
 
-def test_the_owls_box_of_a_cut_lid_needs_the_segmenter_while_it_is_live():
-    """Detbench 163450: the OWL's circle on the cut lid slid 46 mm in 39 % of
-    its commits. While the segmenter is live it must stand beside an OWL cut
-    box; down, the OWL's cut boxes commit as they always did."""
+def test_the_owls_box_of_a_cut_lid_needs_the_segmenter_once_it_has_seen_the_box():
+    """While the segmenter is live and has seen the container in this look,
+    it must stand beside an OWL cut box; down or blind, the OWL's cut boxes
+    commit on their own."""
     from rammp_box_opening.perception.scene_source import commit_fix
 
     a, b = (0.380, -0.170, 0.305), (0.384, -0.172, 0.305)  # 5 mm apart
@@ -1564,17 +1564,28 @@ def test_when_neither_detector_finds_the_box_both_say_why(monkeypatch):
     assert why.endswith("; scene OWL: the scene OWL saw no box in 3.0 s")
 
 
-def test_the_owls_cut_lid_waits_on_the_segmenter_while_it_is_live(monkeypatch):
-    # the segmenter sees no food container at all; the OWL boxes the cut lid twice
-    world = _World(seg_msgs=_every(0.1, 10.0, []), owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
-    loc, _gated = _locator(monkeypatch, world, {OWL_BOX: {"top": OWL_TOP, "partial": ("left",)}})
-    assert loc.locate(4.0) is None
-    assert loc.last_why.startswith("scene segmenter: saw no food container in ")
-    world = _World(seg_msgs=_every(0.1, 10.0, [("food container", 0.88, _holder())]), owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
-    loc, _gated = _locator(monkeypatch, world, {_band(_holder()): "only 26 depth points inside the box (need 40)",
-                                                OWL_BOX: {"top": OWL_TOP, "partial": ("left",)}})
+def test_the_owls_cut_lid_waits_on_the_segmenter_only_once_it_has_seen_the_box(monkeypatch):
+    """A live segmenter that sees nothing used to hold every cut OWL box back:
+    with it blind, all 15 cut detbench frames got no fix. It confirms one only
+    once it has seen the container in this look."""
+    cut = {"top": OWL_TOP, "partial": ("left",)}
+    refused = "only 26 depth points inside the box (need 40)"
+    # blind: no food container at all, or one whose band is refused every frame; the OWL's two boxes commit
+    for seg_objects, outcomes in (([], {OWL_BOX: cut}),
+                                  ([("food container", 0.88, _holder())], {_band(_holder()): refused, OWL_BOX: cut})):
+        world = _World(seg_msgs=_every(0.1, 10.0, seg_objects), owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+        loc, _gated = _locator(monkeypatch, world, outcomes)
+        fix = loc.locate(4.0)
+        assert fix is not None, loc.last_why
+        assert fix.sources == ("owl", "owl") and fix.top_xyz == pytest.approx(OWL_TOP) and fix.partial
+    # it saw the container once, 30 mm from where the OWL's boxes put it: the OWL's pair waits on it
+    far = (OWL_TOP[0] + 0.030, OWL_TOP[1], OWL_TOP[2])
+    once = [(0.3, [("food container", 0.88, _holder())])] + _every(0.5, 10.0, [("food container", 0.88, _holder(5.0))])
+    world = _World(seg_msgs=once, owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+    loc, _gated = _locator(monkeypatch, world, {_band(_holder()): far, _band(_holder(5.0)): refused, OWL_BOX: cut})
     assert loc.locate(4.0) is None
     assert "the OWL's box of the cut lid is not confirmed by the segmenter's" in loc.last_why
+    assert loc.last_why.endswith("scene OWL: its boxes of the cut lid wait on the segmenter's")
 
 
 def test_the_owl_is_shut_however_the_look_ends(monkeypatch):
