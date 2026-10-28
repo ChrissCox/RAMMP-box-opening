@@ -15,7 +15,8 @@ reach (press_demo.staging_out_of_reach):
           the hand moves to THAT button's look pose along a guarded straight
           line — the scene camera's box can be 8-10 cm off.
   SLIDE   a plan-free straight line in and down, holding the attitude, to
-          REACH_START_M above the aimed button. Guarded at DRAG_NM.
+          REACH_START_M above the aimed button. Guarded at DRAG_NM in a
+          guarded run.
   TOUCH   a plan-free straight line DOWN in world z to travel_m below it,
           guarded at contact_nm like the straight-down touch: the force is
           vertical, nothing shoves the box sideways.
@@ -592,9 +593,10 @@ def _clear_over_box(ctx, runner, ref):
     (worlds.planned_top_z) — the fingers' collision spheres reach 4-6 cm
     below tool_frame, and a start among them is refused (20:04: INVALID_START
     twice, the arm held over the box). Slow, drag- and hang-guarded against
-    the free-air `ref`. True when there (or already clear), None when no
-    straight line up flies from here (the back-off is the fallback), False
-    — the arm holds — when it met something."""
+    the free-air `ref` in a guarded run; unguarded at FREE_LINE_SPEED when
+    compliant. True when there (or already clear), None when no straight
+    line up flies from here (the back-off is the fallback), False — the arm
+    holds — when it met something."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
     from rammp_box_opening.worlds import planned_top_z
@@ -611,7 +613,8 @@ def _clear_over_box(ctx, runner, ref):
     if not pts:
         return True
     print("[press_demo] up %.0f mm, clear of the box's padded volume, before home" % (1000 * (want - float(t[2]))))
-    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, CONTACT_SPEED, free_guard(ctx, ref, tip_load_at(pts[0])),
+    speed = FREE_LINE_SPEED if compliant(ctx) else CONTACT_SPEED
+    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, speed, free_guard(ctx, ref, tip_load_at(pts[0])),
                                _full_world(ctx))], execute=True)
     if any(not r.ok for r in res):
         print("[press_demo] STOP: the way up from over the box %s — the arm holds; check the box" % _stopped_by(res))
@@ -812,7 +815,10 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     since 2026-10-27): every leg in the driver's joint impedance, under the
     client's compliant_gains (STIFF) where a leg names none, and
     nothing the run reads stops the arm — no torque guard, no at-rest read
-    or check, no look after the press (depth_press.press_compliant). The
+    or check, no look after the press (depth_press.press_compliant). Its
+    free-air lines (the re-aim, the slide in, the clear before home) fly at
+    FREE_LINE_SPEED: CONTACT_SPEED is there so a guard can stop a line in
+    time, and these carry none (16:23 crawled 10.5 s of them at 0.15). The
     box's height is the higher of the aim's and the scene camera's (15:19:
     the touch met the button at 0.312, the scene said 0.311, the wrist
     camera's aim 0.288). 0 then means pressed, by the spring's hold."""
@@ -915,18 +921,30 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         # camera's mount in TF, which is known to be off (76 mm high, 20:04)
         ctx.mission_frames.located(button, "fix")
     world = _interaction_world(ctx, button[2], cfg.travel_m, "reach")
+    # A compliant run flies the re-aim and the slide in at FREE_LINE_SPEED:
+    # CONTACT_SPEED is there so a guard can stop a line in time, and these
+    # carry none (16:23 2026-10-27 crawled them 9.9 s at 0.15). Their world
+    # is a label: a plan-free line is never planned, re-planned or
+    # collision-checked against it (line_leg builds it, Runner._replan_group
+    # refuses plan-free legs, push_name only writes a YAML). "full" only
+    # satisfies Runner._refusal's spec §6 rule that an unguarded leg faster
+    # than CONTACT_SPEED be labelled full or bench, as depth:turn, approach,
+    # press and rise already are; the speed without it is refused, and the
+    # arm holds at the look pose with nothing pressed.
+    line_speed, line_world = (FREE_LINE_SPEED, _full_world(ctx)) if soft else (CONTACT_SPEED, world)
     # To the look pose for the AIMED button. Where the scene camera's box was
     # wrong, the arm may already stand inside the padded cuboid of the box
     # where it really is, and the planner refuses every start there
     # (2026-10-22: the box 85 mm nearer the arm). So the arm moves there the
-    # way it slides — a slow, guarded straight line at the tilt it holds —
-    # and only when no such line flies does the planner plan the move.
+    # way it slides — a straight line at the tilt it holds, slow and guarded
+    # in a guarded run — and only when no such line flies does the planner
+    # plan the move.
     depth = bool(getattr(args, "depth_press", False))
     move, plan2, why_line = reach_from_here(ctx, cfg, button, plan.tilt_deg, need_stroke=not depth)
     if plan2 is not None:
         if move:
-            res = runner.run([line_leg(ctx, "reach:re-aim", move, plan2.quat, CONTACT_SPEED, free_guard(ctx, at_look),
-                                       world)], execute=True)
+            res = runner.run([line_leg(ctx, "reach:re-aim", move, plan2.quat, line_speed, free_guard(ctx, at_look),
+                                       line_world)], execute=True)
             if any(not r.ok for r in res):
                 print("[press_demo] STOP: the move to the aimed button's look pose %s — the arm holds; "
                       "nothing was pressed" % _stopped_by(res))
@@ -963,8 +981,8 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             _go_home(ctx, cfg, runner, "STOP: the slide in to the button is not a straight line the arm can fly (%s)" % (why or "no length"))
             return 1
         quat_in = plan2.quat
-    res = runner.run([line_leg(ctx, "reach:slide-in", slide, quat_in, CONTACT_SPEED, free_guard(ctx, at_look), world)],
-                     execute=True)
+    res = runner.run([line_leg(ctx, "reach:slide-in", slide, quat_in, line_speed, free_guard(ctx, at_look),
+                               line_world)], execute=True)
     if any(not r.ok for r in res):
         print("[press_demo] STOP: the slide in %s before the button — the arm holds; nothing was pressed"
               % _stopped_by(res))
