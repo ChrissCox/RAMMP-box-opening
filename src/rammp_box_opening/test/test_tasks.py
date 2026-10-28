@@ -3121,8 +3121,9 @@ def test_the_run_starts_by_going_home_unless_already_there(ctx, tmp_path, capsys
     assert "HOME FIRST" in capsys.readouterr().out
 
 
-# the joint spring's hold after an impedance home: 0.03 rad off at worst
-# (flatbot 2026-10-27 16:24), joint_3 read through the driver's wrap
+# the joint spring's hold after an impedance home: 0.03 rad off at worst, as
+# flatbot 2026-10-27 16:24 printed it (the other joints' offsets are made up),
+# joint_3 read through the driver's wrap
 _HOLD = [0.0, 0.03, -0.006, -0.02, 0.0, 0.012, 0.0]
 
 
@@ -3155,7 +3156,7 @@ def test_a_compliant_run_starts_from_the_impedance_hold_it_finds(ctx, tmp_path, 
     assert ctx.client.executed == [] and ctx.client.joint_targets == [] and ctx.worlds.pushes == []
     out = capsys.readouterr().out
     assert "HOME FIRST" not in out
-    assert "0.03 rad from its rest pose — the joint spring's hold after an impedance run; starting from there" in out
+    assert "0.030 rad from its rest pose — the joint spring's hold after an impedance run; starting from there" in out
     (note,) = _rows(tmp_path)
     assert note["leg"] == "start_offset" and note["kind"] == "note"
     assert note["rad"] == pytest.approx(0.03, abs=1e-4)
@@ -3196,6 +3197,22 @@ def test_a_start_beyond_the_compliant_tolerance_goes_home_first_either_way(ctx, 
         out = capsys.readouterr().out
         assert "HOME FIRST: the arm is 0.06 rad" in out and "spring's hold" not in out, tol
         assert [r["leg"] for r in _rows(log_dir)] == ["home"], tol
+
+
+def test_the_start_line_tells_a_stiff_hold_from_the_rest_pose(ctx, tmp_path, capsys):
+    """STIFF doubles MEDIUM's Kq, so its hold should sit about 0.015 rad off
+    HOME: past AT_REST_RAD, and printed so — two decimals made it "0.01",
+    AT_REST_RAD's own value, on a start that is not at rest."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import HOME, REST_TOL_RAD
+    from rammp_box_opening.tasks import press_demo
+
+    ctx.client.live = list(HOME)
+    ctx.client.live[1] += 0.015
+    assert press_demo.home_first(ctx, make_runner(ctx.client, tmp_path), True, list(HOME), tol=REST_TOL_RAD)
+    assert ctx.client.executed == []
+    assert "the arm rests 0.015 rad from its rest pose" in capsys.readouterr().out
 
 
 def test_a_home_the_bench_world_refuses_moves_nothing_and_names_the_recovery(ctx, tmp_path, capsys):

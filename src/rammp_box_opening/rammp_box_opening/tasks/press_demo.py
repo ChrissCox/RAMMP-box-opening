@@ -2559,8 +2559,10 @@ def home_first(ctx, runner, execute, rest, tol=AT_REST_RAD):
     if off <= AT_REST_RAD:
         return True
     if off <= tol:
+        # three decimals: two would print STIFF's hold (about 0.015) as
+        # "0.01", AT_REST_RAD's own value, on a start that is not at rest
         print(
-            "[press_demo] the arm rests %.2f rad from its rest pose — the joint spring's hold after an "
+            "[press_demo] the arm rests %.3f rad from its rest pose — the joint spring's hold after an "
             "impedance run; starting from there" % off
         )
         per_joint = [round(ang_diff(a, b), 4) for a, b in zip(live, rest)]  # live − rest, as the spring holds it
