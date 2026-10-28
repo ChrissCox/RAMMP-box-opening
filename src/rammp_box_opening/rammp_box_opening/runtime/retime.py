@@ -69,7 +69,13 @@ class RetimeParams:
     # that would otherwise become nanosecond intervals on the wire
     min_ds: float = 2e-4
     # uniform time dilation applied AFTER profiling (1.0 = as profiled): the
-    # operator's whole-run slow mode (--speed-scale), not a per-leg speed
+    # operator's whole-run slow mode (--speed-scale), not a per-leg speed.
+    # Positions are untouched; the intervals stretch by 1/time_scale, so the
+    # velocities annotating them scale by time_scale and the accelerations
+    # by time_scale**2 (driver.dilate's rule). The driver's quintic fits
+    # through all three: full-speed velocities on stretched intervals made
+    # its reference wobble and run backwards, up to 174 ms of a run at 0.5
+    # and 36-51% of it at 0.3 and below (review 2026-10-27)
     time_scale: float = 1.0
 
 
@@ -259,6 +265,13 @@ def speed_profile(positions, cruise, vmax, params, v_start=0.0, v_end=0.0):
     return v, ds
 
 
+def _time_scale(params):
+    """The slow-mode factor with the one clamp both of its uses share: the
+    intervals stretch by 1/ts and the wire velocities shrink by ts, and a
+    clamp on only one of them would put the two out of step."""
+    return max(float(params.time_scale), 1e-3)
+
+
 def times_from_profile(v, ds, params, cap=None):
     dt = ds / np.maximum(0.5 * (v[:-1] + v[1:]), params.v_floor)
     # an interval between two rest samples (a 2-point path, the two sides
@@ -277,7 +290,7 @@ def times_from_profile(v, ds, params, cap=None):
             dt[both_rest] = vpk / a + vpk / d + np.maximum(cruise, 0.0)
         else:
             dt[both_rest] = vpk / a + vpk / d
-    dt = dt / max(float(params.time_scale), 1e-3)
+    dt = dt / _time_scale(params)
     t = np.empty(len(v))
     t[0] = params.first_dt
     t[1:] = params.first_dt + np.cumsum(dt)
@@ -361,7 +374,12 @@ def retime_group(trajs, speeds, vmax, params=RetimeParams()):
         # dynamics (runner._run_motion).
         "seg_start_fracs": _segment_start_fracs(seg, t, len(trajs)),
     }
-    return to_message(trajs[0].joint_names, positions, t, v), info
+    # v is the FULL-speed profile and t is stretched by 1/time_scale, so
+    # the wire velocities shrink by the same factor; to_message
+    # differentiates them over t, so the accelerations shrink by its
+    # square. Only this copy is scaled: the report stays on the profile,
+    # and slow mode counts the same junctions as stops as full speed does.
+    return to_message(trajs[0].joint_names, positions, t, v * _time_scale(params)), info
 
 
 def positions_to_traj(joint_names, positions):

@@ -123,6 +123,86 @@ def test_time_scale_is_a_uniform_dilation_after_profiling():
     assert check_like_executor(slow, JOINT_VMAX) == []
 
 
+def _corner_legs():
+    """Two chained legs meeting at a 60 deg corner: a merged group, what
+    runner._run_motion re-times."""
+    p1 = [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    p2 = [0.4 + 0.4 * math.cos(math.radians(60)), 0.4 * math.sin(math.radians(60)), 0, 0, 0, 0, 0]
+    return [_traj(_line([0] * 7, p1, 30)), _traj(_line(p1, p2, 30))]
+
+
+def _runs_backwards(msg, nsub=48):
+    """Samples at which the JTC's quintic moves AGAINST its own interval's
+    chord: the reference stepping back along the path."""
+    from jtc_model import quintic_coeffs
+
+    q, v, t = _arrays(msg)
+    acc = np.asarray([p.accelerations for p in msg.points])
+    back = 0
+    for k in range(len(q) - 1):
+        h = t[k + 1] - t[k]
+        c = quintic_coeffs(q[k], v[k], acc[k], q[k + 1], v[k + 1], acc[k + 1], h)
+        s = np.linspace(0.0, h, nsub)[:, None]
+        qd = c[1] + 2 * c[2] * s + 3 * c[3] * s**2 + 4 * c[4] * s**3 + 5 * c[5] * s**4
+        chord = q[k + 1] - q[k]
+        back += int((qd @ chord < -1e-9 * np.linalg.norm(chord)).sum())
+    return back
+
+
+@pytest.mark.parametrize("ts", [0.5, 0.25, 0.2])
+def test_slow_mode_scales_the_velocities_and_accelerations_too(ts):
+    """--speed-scale stretches the intervals by 1/ts; the velocities
+    annotating them must shrink by ts and the accelerations by ts**2
+    (driver.dilate's rule). The driver's quintic fits through all three:
+    handed full-speed velocities, 2x / 4x / 5x the speed flown at 0.5 /
+    0.25 / 0.2, its reference wobbled through every interval and ran
+    backwards, and check_like_executor passed it (review 2026-10-27)."""
+    from jtc_model import peak_accel
+
+    legs = _corner_legs()
+    fast, i1 = retime_group(legs, [0.75, 0.75], JOINT_VMAX, RetimeParams())
+    slow, i2 = retime_group(legs, [0.75, 0.75], JOINT_VMAX, RetimeParams(time_scale=ts))
+    q, v, t = _arrays(slow)
+    # the annotated speed is the speed the samples are flown at
+    flown = np.linalg.norm(q[2:] - q[:-2], axis=1) / (t[2:] - t[:-2])
+    moving = flown > 1e-3
+    ratio = np.linalg.norm(v[1:-1], axis=1)[moving] / flown[moving]
+    assert np.median(ratio) == pytest.approx(1.0, abs=0.02)
+    # an exact dilation of the full-speed message (first_dt cancels)
+    _q1, v1, _t1 = _arrays(fast)
+    a1 = np.asarray([p.accelerations for p in fast.points])
+    a = np.asarray([p.accelerations for p in slow.points])
+    assert np.allclose(v, v1 * ts, rtol=1e-9, atol=1e-12)
+    assert np.allclose(a, a1 * ts**2, rtol=1e-9, atol=1e-12)
+    # so the spline is the full-speed one, slowed: no sharper kick, no step back
+    assert peak_accel(slow)[0] <= peak_accel(fast)[0] * ts**2 * (1 + 1e-6)
+    assert _runs_backwards(slow) == 0
+    # the report stays on the profile: slow mode miscounts no junction as a stop
+    assert i2["junction_speeds"] == i1["junction_speeds"]
+    assert i2["stops"] == i1["stops"] == 0
+    assert check_like_executor(slow, JOINT_VMAX) == []
+
+
+def test_full_speed_message_is_the_profile_bit_for_bit():
+    """At the default 1.0, which every sheppy task flies, the scaling
+    changes nothing: the message is bit for bit the profile's own speeds
+    on its own times, what it was before the velocities followed the
+    scale."""
+    from rammp_box_opening.runtime import retime as R
+
+    legs, p = _corner_legs(), RetimeParams()
+    out, _ = retime_group(legs, [0.75, 0.75], JOINT_VMAX, RetimeParams(time_scale=1.0))
+    q, seg = R.concat_paths(legs, p.min_ds, p.junction_chord, p.junction_window)
+    v, ds = speed_profile(q, R.cruise_per_sample(seg, [0.75, 0.75]), JOINT_VMAX, p)
+    cap, _ = velocity_caps(q, JOINT_VMAX, p.vmax_margin)
+    ref = R.to_message(legs[0].joint_names, q, R.times_from_profile(v, ds, p, cap), v)
+    assert len(out.points) == len(ref.points)
+    for got, want in zip(_arrays(out), _arrays(ref)):
+        assert np.array_equal(got, want)
+    acc = [list(pt.accelerations) for pt in out.points]
+    assert np.array_equal(acc, [list(pt.accelerations) for pt in ref.points])
+
+
 def test_two_point_path_is_a_triangle_not_a_crawl():
     """An interval between two rest samples is timed accelerate-then-
     decelerate, not at the 0.02 rad/s floor (13 s for 0.26 rad)."""
