@@ -74,8 +74,8 @@ class RetimeParams:
     # velocities annotating them scale by time_scale and the accelerations
     # by time_scale**2 (driver.dilate's rule). The driver's quintic fits
     # through all three: full-speed velocities on stretched intervals made
-    # its reference wobble and run backwards, up to 174 ms of a run at 0.5
-    # and 36-51% of it at 0.3 and below (review 2026-10-27)
+    # its reference wobble and run backwards, for 20-255 ms of a run at 0.5
+    # and over a third of it at 0.3 and below (review 2026-10-27)
     time_scale: float = 1.0
 
 
