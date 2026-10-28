@@ -1629,6 +1629,32 @@ def test_a_bend_is_no_bend_where_the_pads_do_not_move_with_the_joints(monkeypatc
     assert q_end is None and aside == 0.0 and why == stroke.bend_why
 
 
+def test_a_hand_already_at_the_buttons_bottom_flies_straight_and_one_below_the_strokes_end_is_refused():
+    """The bend starts where the press leg's straight part meets the
+    button's bottom. A hand whose pads already stand within 5 mm of it, or
+    below it (a wrong top_z, or the hand already in the button), has no
+    such part: bent from where it stands, the springs' reference would be
+    driven that much deeper still. It flies straight on down as before the
+    bend, and pads already below where that stroke ends are refused, as
+    they were before it."""
+    cfg = load_press_demo(PINK)
+    chain = _Coupled(xz=0.25, zx=0.1)
+    bottom = COMPLIANT_TOP - cfg.button_travel_m
+    x, y = _pads_at(chain, Q_COUPLED)[:2]
+    at = list(np.linalg.solve(chain.A, [x, y, bottom + 0.002])) + [0.0] * 4  # the pads 2 mm above the bottom
+    stroke, why = dp.compliant_stroke(chain, cfg, at, TURNED_DOWN, COMPLIANT_TOP)
+    assert why is None and not stroke.bent and stroke.bend_m == 0.0
+    assert stroke.bend_why == ("the pads already stand 2 mm above the button's bottom, with no stroke down to it to "
+                               "bend from")
+    assert [name for name, _p, _s in stroke.legs] == ["depth:press"]
+    # straight on down, as far below the bottom as the spring needs (158 N/m: the 60 mm bound)
+    assert stroke.over == pytest.approx(dp.COMPLIANT_OVERSHOOT_M[1]) and stroke.end_z == pytest.approx(bottom - 0.06)
+    assert list(_pads_at(chain, stroke.q_end)) == pytest.approx([x, y, bottom - 0.06], abs=1e-9)
+    below = list(np.linalg.solve(chain.A, [x, y, bottom - 0.088])) + [0.0] * 4  # 88 mm below it
+    assert dp.compliant_stroke(chain, cfg, below, TURNED_DOWN, COMPLIANT_TOP) == (
+        None, "the pads already stand 28 mm below where the press would end")
+
+
 def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx, monkeypatch, tmp_path):
     """The reach-out of a compliant run: no at-rest read, no weight check at
     the look, no stopping guard on the re-aim, the slide in, the turn, the
@@ -2651,6 +2677,9 @@ def test_on_flatbot_a_bent_press_pushes_straight_down_where_a_straight_one_shove
     assert stroke.k == pytest.approx(467.0, abs=5.0) and stroke.over == pytest.approx(0.032, abs=0.001)
     assert stroke.bend_m == pytest.approx(0.011, abs=0.001) and notes[True]["bend_mm"] == pytest.approx(11.0, abs=1.0)
     assert float(np.abs(np.asarray(stroke.q_end) - q_b).max()) == pytest.approx(0.046, abs=0.003)
+    assert ("PRESS (compliant): straight down 72 mm to the button's bottom, its reference on 32 mm below it and 11 mm "
+            "aside, where the springs push ~15 N straight down on the pads held there (467 N/m at the pads); held 0.3 s"
+            ) in dp.press_text(stroke, cfg)
 
 
 def _flatbot_1623_hold():

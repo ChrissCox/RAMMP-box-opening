@@ -173,7 +173,7 @@ SLIDE_OK_M = 0.015
 # 15:19's touch tripped at 3.4 Nm on joint 4, ~13.5 N at the pads, and the
 # button went.
 COMPLIANT_PRESS_N = 15.0
-COMPLIANT_GAINS = GAINS_STIFF  # ~440 N/m at the pads over 15:19's box
+COMPLIANT_GAINS = GAINS_STIFF  # ~470 N/m at the pads on 15:19's button's bottom
 # The driver's joint stiffness under that profile, N·m/rad (constants
 # IMPEDANCE_KQ, kinova-gen3-driver interface/gains.cpp): the robot's, not the
 # scene's. Taken from the profile the press legs send, so the stiffness at the
@@ -187,7 +187,8 @@ COMPLIANT_KQ = IMPEDANCE_KQ[COMPLIANT_GAINS]
 # how far the stroke's end lies below the button's bottom, whatever the
 # stiffness: never a graze, never a ram
 COMPLIANT_OVERSHOOT_M = (0.015, 0.06)
-# the spring held at least this much off the stroke's end: something pushed back
+# the springs held pushing at least this much down at the pads (compliant_hold):
+# something pushed back
 COMPLIANT_FELT_N = 5.0
 # The stroke's end BENT (stroke_bend). The driver's spring is a joint spring,
 # tau = g + Kq (q_ref - q) - D (qd - qd_ref), with no Cartesian term
@@ -204,10 +205,16 @@ COMPLIANT_FELT_N = 5.0
 # held at the bottom the arm stands at q_b, and the springs push F straight
 # down there, nothing sideways (offline, both boxes: 15.00 N, 0.00 N). The
 # model is the URDF and the profile's Kq: no friction, no gravity-model
-# error. In free air the pads would end 11 mm (15:19) to 14 mm (16:23) aside
-# and 28-32 mm below the bottom; a bend that would move them more than
-# BEND_MAX_M sideways is near a degenerate compliance, and the stroke flies
-# straight, as before, and says why.
+# error. A button bottoming 5 mm below or 5-10 mm above where top_z puts
+# its bottom leaves the pads 0.7-3.3 N sideways bent, 4.3-14.2 N straight
+# (both boxes). In free air the pads would end 11 mm (15:19) to 14 mm
+# (16:23) aside and 28-32 mm below the bottom, the hand turned ~4 deg off
+# the attitude it held down to there (the bend's waypoints are no IK
+# solutions). Over flatbot's workspace (boxes 0.50-0.82 m out, lids 0.25-
+# 0.38, 0-15 deg short) every one of the 223 strokes its URDF solves bends,
+# 4-23 mm aside; a bend that would move them more than BEND_MAX_M sideways
+# is near a degenerate compliance, and the stroke flies straight, as before,
+# and says why.
 BEND_MAX_M = 0.03
 BEND_STEP_RAD = 0.005  # the bend's waypoints: no joint moves more than this between two
 # a bend dropping the pads less than this has nothing to bend (a chain whose
@@ -960,9 +967,12 @@ def compliant_stroke(chain, cfg, q0, quat, top_z, kq=COMPLIANT_KQ):
     (stroke_bend) on to where the springs under `kq` push COMPLIANT_PRESS_N
     straight down at the pads held at the bottom, as joint waypoints no
     joint moving more than BEND_STEP_RAD between two, in the same leg. No
-    bend: straight on down to as far below the bottom as the spring there
+    bend (stroke_bend's refusals, or pads that already stand within 5 mm of
+    the bottom or below it, with no stroke down to it to bend from):
+    straight on down to as far below the bottom as the spring there
     (fingertip_stiffness_z at q_b) needs to push COMPLIANT_PRESS_N, within
-    COMPLIANT_OVERSHOOT_M. Returns (StrokePlan, None) or (None, why)."""
+    COMPLIANT_OVERSHOOT_M, refused where the pads already stand below that.
+    Returns (StrokePlan, None) or (None, why)."""
     q0 = [float(v) for v in q0]
     R0, t0 = chain.fk(q0)
     R0, t0 = np.asarray(R0, float), np.asarray(t0, float)
@@ -987,10 +997,21 @@ def compliant_stroke(chain, cfg, q0, quat, top_z, kq=COMPLIANT_KQ):
         return None, why
     q_b = np.asarray(press[-1] if press else q_a, float)
     k = fingertip_stiffness_z(chain, q_b, kq)
-    q_end, bend_m, bend_why = stroke_bend(chain, q_b, kq)
+    if press:
+        q_end, bend_m, bend_why = stroke_bend(chain, q_b, kq)
+    else:
+        # The pads already stand within 5 mm of the bottom, or below it: q_b
+        # is where the hand stands, not where the button's bottom holds the
+        # pads, and a bend from there drives the reference that far deeper.
+        # Straight, as before the bend, pads already below where the press
+        # would end are refused.
+        dz = _pads_z(chain, q_b) - bottom
+        q_end, bend_m = None, 0.0
+        bend_why = "the pads already stand %.0f mm %s the button's bottom, with no stroke down to it to bend from" % (
+            1000 * abs(dz), "above" if dz >= 0 else "below")
     if q_end is not None:
         n = max(2, int(math.ceil(float(np.abs(q_end - q_b).max()) / BEND_STEP_RAD)))
-        press = list(press or [list(q_b)]) + [list(q_b + (q_end - q_b) * (i / n)) for i in range(1, n + 1)]
+        press = list(press) + [list(q_b + (q_end - q_b) * (i / n)) for i in range(1, n + 1)]
         end_z = float(_pads(chain, q_end)[2])
         over = bottom - end_z
     else:
