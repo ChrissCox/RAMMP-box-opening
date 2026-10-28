@@ -449,17 +449,31 @@ class SceneApproach:
         self.status = status  # what the aim saw, for the log when got is None
 
 
+def _table_offset_words(off, off_raw):
+    """The AIM line's word on the wrist's table against the scene camera's
+    (button_aim.ButtonAimer.table_offset_m; nan: none)."""
+    if math.isfinite(off):
+        return ", the wrist reads its table %+.0f mm from the scene's%s" % (
+            1000 * off, ", the button's top raised %.0f mm" % (-1000 * off) if off < 0.0 else "")
+    if math.isfinite(off_raw):
+        return ", the wrist reads its table %+.0f mm from the scene's (not taken out)" % (1000 * off_raw)
+    return ""
+
+
 def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=None, tag="aim", out=None,
                           lid_z=None, prior_xy=None):
     """The press aim from staging: the button's circle alone (owner's
     design 2026-09-17 — no OWL and no box-footprint gate here; the scene
     camera already said which thing is the box), the press point its
     centre. Returns (got, status) where got is
-    ((x, y, z), yaw) like the watcher's fix, or None. The aimed frame is
-    saved and the aim logged (`runner`) every time.
+    ((x, y, z), yaw) like the watcher's fix, or None — z raised by the
+    wrist's table offset where its hits agree on one (ButtonAimer.fix). The
+    aimed frame is saved and the aim logged (`runner`) every time.
 
     lid_z / prior_xy: the lid height to expect and where the button should
-    be — what the reach-out press's oblique look aims with (button_aim)."""
+    be — what the reach-out press's oblique look aims with (button_aim).
+    `out` gets button_up_mm and measured_xyz, the press point as the wrist
+    measured it: what the wrist's own later readings are judged against."""
     from rammp_box_opening.perception.button_aim import ButtonAimer
 
     # only what is set: unset, the call is the straight-down aim's own
@@ -469,18 +483,22 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
     while time.monotonic() - t0 < timeout_s:
         _spin_detect(node)
         if aimer.tick():
-            xyz = aimer.fix()
+            xyz = aimer.fix()  # its z raised by the wrist's table offset, where that is agreed
+            measured = aimer.fix(measured=True)
             s = aimer.last_sighting
             up_m = aimer.button_above_lid_m()
             up_mm = None if up_m is None else 1000.0 * up_m
+            off, off_raw = aimer.table_offset_m(), aimer.table_offset_m(raw=True)
             if out is not None:
                 out["button_up_mm"] = up_mm  # the caller decides (refuse_open_box)
+                out["measured_xyz"] = tuple(float(v) for v in measured)
             print(
                 "[press_demo] AIM: button circle at pixel (%.0f, %.0f) r %.0f px, %.0f mm across, %s above its own "
-                "lid%s; pressing its centre; %d/%d frames agree (%.1f s)" % (
+                "lid%s%s; pressing its centre; %d/%d frames agree (%.1f s)" % (
                     s.uv[0], s.uv[1], s.r_px, 1000 * s.diameter_m,
                     "height unknown" if up_mm is None else "%+.1f mm" % up_mm,
                     "" if not s.oblique else ", depth on %.0f%% of it" % (100 * s.disc_fill),
+                    _table_offset_words(off, off_raw),
                     aimer.hits, aimer.frames, time.monotonic() - t0)
             )
             folder = save_aim_frame(watcher.grab, s, tag)
@@ -491,8 +509,14 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
                     tag,
                     seam_uv=[round(v, 1) for v in s.uv], r_px=round(s.r_px, 1),
                     diameter_mm=round(1000 * s.diameter_m, 1), press_xyz=[round(v, 4) for v in xyz],
+                    measured_z=round(measured[2], 4),
                     button_above_lid_mm=None if up_mm is None else round(up_mm, 1),
                     disc_fill=round(s.disc_fill, 2) if s.oblique else None,
+                    # the wrist's table against the scene camera's: taken out (press_xyz's
+                    # z raised by it, never lowered), and as read, taken out or not —
+                    # drift shows here before it fails a run
+                    table_offset_mm=round(1000 * off, 1) if math.isfinite(off) else None,
+                    table_offset_raw_mm=round(1000 * off_raw, 1) if math.isfinite(off_raw) else None,
                     hits=aimer.hits, frames=aimer.frames, aim_s=round(time.monotonic() - t0, 2),
                     # the wrist's depth-vs-colour stamp offsets: what PAIR_TOL_S rests on
                     pair_dt_ms=[round(v, 1) for v in aimer.pair_dt_ms] or None,

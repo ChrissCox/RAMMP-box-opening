@@ -639,11 +639,21 @@ def oblique_aim_available():
 
 
 def _aim(node, watcher, yaw, lid_z, prior_xy, runner, tag):
+    """(got, status, the knob's height above its lid in mm, the press point
+    as the wrist measured it) from aim_button_at_staging. got's z is raised
+    by the wrist's table offset (button_aim.ButtonAimer.fix): the height the
+    arm and the scene camera are compared with. The measured point is the
+    one the wrist's own readings are judged against — the lid after the
+    press, the depth press's depth from over the box — so the wrist's own
+    error cancels, as it did before the raise (flatbot 2026-10-27 15:19:
+    the aim 14 mm off the wrist's depth under the fingers measured, 36 mm
+    raised)."""
     from rammp_box_opening.tasks.press_demo import aim_button_at_staging
 
     seen = {}
     got, status = aim_button_at_staging(node, watcher, yaw, runner=runner, tag=tag, out=seen, lid_z=lid_z, prior_xy=prior_xy)
-    return got, status, seen.get("button_up_mm")
+    measured = seen.get("measured_xyz", None if got is None else got[0])
+    return got, status, seen.get("button_up_mm"), measured
 
 
 def _lid_z(button_z, up_mm):
@@ -1086,13 +1096,15 @@ def _after_check(node, ctx, runner, watcher, scene_fix, locator, button, lid_bef
         # finally. A live segmenter keeps the OWL off (SceneLocator.prime)
         locator.prime()
     try:
-        again, status, up_after = _aim(node, watcher, yaw, button[2], button[:2], runner, "reach-after")
+        again, status, up_after, measured_after = _aim(node, watcher, yaw, button[2], button[:2], runner, "reach-after")
     except BaseException:
         if locator is not None:
             locator.owl.disable()  # never leave the latched enable on
         raise
     moved = None if again is None else judge_box_moved(button, again[0])
-    lid_after = None if again is None else _lid_z(again[0][2], up_after)
+    # the wrist's lid against the wrist's (lid_before too): one of two aims
+    # raised by its table offset and the other not would read a lift
+    lid_after = None if again is None else _lid_z(measured_after[2], up_after)
     lifted = None if lid_before is None or lid_after is None else lid_after - lid_before
     popped = knob_is_up(up_after)
     seen_again = locator.locate(SCENE_LOCATE_S) if locator is not None else None
@@ -1571,7 +1583,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
                                        "nothing was pressed" % mismatch)
             return 1
 
-    got, status, up_mm = _aim(node, watcher, yaw, prior_button[2], prior_button[:2], runner, "reach-aim")
+    got, status, up_mm, measured = _aim(node, watcher, yaw, prior_button[2], prior_button[:2], runner, "reach-aim")
     if got is None:
         dump_wrist_frame(watcher, "reach-look")
         _go_home(ctx, cfg, runner, "STOP: no button from the look pose (%s) — nothing was pressed" % status)
@@ -1606,7 +1618,8 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
               % (closed.leg_name, closed.outcome, closed.detail,
                  " (kept as this gripper's empty close)" if kept else ""))
     button = tuple(float(v) for v in got[0])
-    lid_before = _lid_z(button[2], up_mm)
+    measured = tuple(float(v) for v in measured)  # the wrist's own (_aim)
+    lid_before = _lid_z(measured[2], up_mm)
     print(
         "[press_demo] AIMED from the look pose: button at [%.3f, %.3f, %.3f], %.0f mm from the scene camera's"
         % (button[0], button[1], button[2], 1000 * judge_box_moved(prior_button, button))
@@ -1742,11 +1755,13 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     if depth:
         # over the box: from here the height is the wrist camera's depth and
         # the press the torques' (tasks/depth_press), not TF's lid — the
-        # look's aim where the close-up does not confirm the button
+        # look's aim where the close-up does not confirm the button, as the
+        # wrist measured it: the guarded press checks it against the wrist's
+        # own depth under the fingers (_aim). The compliant one goes by top_z.
         from rammp_box_opening.tasks import depth_press
 
         result = depth_press.press_down_from_here(node, ctx, cfg, runner, watcher, CONTACT_TOOL, here=at_start,
-                                                  turned=turned, knob_up_mm=up_mm, aimed=button, compliant=soft,
+                                                  turned=turned, knob_up_mm=up_mm, aimed=measured, compliant=soft,
                                                   top_z=button[2])
         result = depth_press.after_scene_check(ctx, runner, result, scene_fix, locator)
         homed = result.free and _home_from_over_box(ctx, cfg, runner, result)
