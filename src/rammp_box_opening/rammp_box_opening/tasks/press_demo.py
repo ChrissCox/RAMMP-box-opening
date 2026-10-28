@@ -2517,19 +2517,37 @@ def detect_only_report(node, watcher, ctx, cfg, runner, execute):
 
 
 # This close (every joint, wrap-aware) to the rest pose is AT it; anywhere
-# else, the run's first motion goes there (home_first).
+# else, the run's first motion goes there (home_first). A compliant
+# depth-press run starts from anywhere within REST_TOL_RAD instead: after a
+# compliant run's impedance home the joint spring holds the arm off HOME
+# (flatbot 2026-10-27 16:24: 0.03 rad, and the run flew a POSITION home to
+# take it out).
 AT_REST_RAD = 0.01
 
 
-def home_first(ctx, runner, execute, rest):
+def home_first(ctx, runner, execute, rest, tol=AT_REST_RAD):
     """The mission's first motion: the arm to its exact rest pose (`rest`,
-    HOME) unless it already stands there, so every run starts from the same
-    place (owner, 2026-09-25). Planned like home_arm's move: in the bench
-    world, whose keep-out band keeps it above wherever a box may stand.
-    Returns False — nothing moved — when that is refused, with the
-    recovery named: an arm that far down (holding at the table after an
+    HOME) unless it already stands within `tol` of it, so every run starts
+    from the same place (owner, 2026-09-25). Planned like home_arm's move:
+    in the bench world, whose keep-out band keeps it above wherever a box
+    may stand. Returns False — nothing moved — when that is refused, with
+    the recovery named: an arm that far down (holding at the table after an
     abort) is home_arm's case, whose bare-world and lift-first fallbacks
     want the operator's eye on the bench, not an automatic start.
+
+    main passes tol=REST_TOL_RAD for a compliant depth-press run, which
+    relaxes "the same place" from 0.01 to 0.05 rad for that run alone. An
+    impedance hold cannot stand at exact HOME: the joint spring holds the
+    arm where its pull meets gravity, 0.03 rad off after the 16:23 run's
+    impedance home (flatbot 2026-10-27), and the run's first compliant leg
+    sags by as much anyway. Flying HOME from there cost the 16:24 run a
+    motion and about 0.95 s: a 0.14 s plan, 0.55 s for a 0.30 s profile
+    (0.25 s of it the switch out of impedance), and its first look would
+    have paid the switch back (16:23's paid 0.26 s). Such a start is one
+    line and a start_offset note, each joint's offset in it (the sag the
+    impedance gains are judged by), and nothing after it plans from HOME:
+    the approach and the reach-out plan from the live joints. A start
+    beyond `tol` homes as before.
 
     It used to REFUSE any start more than 1.2 rad from a rest pose and fly
     from wherever it stood inside that; planning from a failure pose had
@@ -2539,6 +2557,14 @@ def home_first(ctx, runner, execute, rest):
     live = ctx.client.joints()
     off = rest_distance(live, rest)
     if off <= AT_REST_RAD:
+        return True
+    if off <= tol:
+        print(
+            "[press_demo] the arm rests %.2f rad from its rest pose — the joint spring's hold after an "
+            "impedance run; starting from there" % off
+        )
+        per_joint = [round(ang_diff(a, b), 4) for a, b in zip(live, rest)]  # live − rest, as the spring holds it
+        runner.note("start_offset", rad=round(off, 4), per_joint=per_joint)
         return True
     print(
         "[press_demo] HOME FIRST: the arm is %.2f rad from its rest pose — going there before anything else" % off
@@ -2770,8 +2796,16 @@ def main():
         if args.detect_only and locator is not None:
             sys.exit(0 if scene_detect_report(locator) else 2)
         # THE FIRST MOTION: the arm to its exact rest pose, when it is not
-        # already there (home_first) — every run starts from the same place
-        if not home_first(ctx, runner, args.execute, rest_joints(cfg)):
+        # already there (home_first) — every run starts from the same place.
+        # A compliant depth-press run starts from the spring's hold it finds
+        # within REST_TOL_RAD. client.compliant is still False here (only
+        # run_reach_press sets it), so this is its condition read from args,
+        # and the reach-out exists only on the scene path; a box within
+        # straight-down reach after all is approached from the live joints
+        # too. --guarded keeps AT_REST_RAD: its reach-out reads an at-rest
+        # reference at the rest pose and checks gravity against it.
+        start_tol = REST_TOL_RAD if (args.compliant and args.depth_press and not args.no_scene) else AT_REST_RAD
+        if not home_first(ctx, runner, args.execute, rest_joints(cfg), tol=start_tol):
             sys.exit(3)
         live = client.joints()
         # The wrist's OWL is enabled where the wrist starts looking (the
