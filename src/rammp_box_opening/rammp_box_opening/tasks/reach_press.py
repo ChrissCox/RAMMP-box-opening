@@ -273,7 +273,9 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     15 deg short of straight down as the compliant press turns
     (depth_press.COMPLIANT_TURN_SHORT_DEG: way_down serves only that
     press); then the press stroke from the hand turned down
-    (depth_press.compliant_stroke). The aimed button's walk or turn and
+    (depth_press.compliant_stroke). Each of those lines is one the runner
+    flies (depth_press.line_refusal): a walk it refuses is no walk, and the
+    slide and the turn are tried. The aimed button's walk or turn and
     stroke fly as solved, in one execution with the move and the slide
     before them (way_in_legs); only where those legs do not make one
     (_not_one_execution) is each solved again from where the arm stands,
@@ -295,6 +297,13 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     stroke, why = dp.compliant_stroke(chain, cfg, way.pts[-1] if way.pts else slide_pts[-1], way.quat, top_z)
     if stroke is None:
         return None, None, why
+    # the walk or the turn passed the runner's gate in turn_walk; the slide
+    # before a turn and the stroke fly as legs of their own too
+    lines = ([] if way.walked else [("the slide in", slide_pts)]) + [(name, p) for name, p, _speed in stroke.legs]
+    for name, line in lines:
+        why = dp.line_refusal(chain, line)
+        if why is not None:
+            return None, None, "%s: %s" % (name, why)
     return way, stroke, None
 
 
@@ -408,12 +417,19 @@ class WayIn:
 def solve_way_in(ctx, cfg, button, tilt, q_from):
     """The aimed button's whole way in at `tilt` from joints `q_from`, before
     the arm moves toward it: reach_from_here's lines (the move to the look
-    pose, the slide), then way_down from the look pose. Returns (WayIn, None,
-    None) or (None, why, kind): kind 'lines' when the lines do not fly (the
-    planner may plan the move instead), 'down' when the way down does not."""
+    pose — one the runner flies, depth_press.line_refusal — and the slide),
+    then way_down from the look pose. Returns (WayIn, None, None) or (None,
+    why, kind): kind 'lines' when the lines do not fly (the planner may plan
+    the move instead), 'down' when the way down does not."""
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks import depth_press as dp
+
     move, plan, why = reach_from_here(ctx, cfg, button, tilt, need_stroke=False, q=q_from)
     if plan is None:
         return None, why, "lines"
+    why = dp.line_refusal(approach._chain(), move)
+    if why is not None:
+        return None, "the move to its look pose (%s)" % why, "lines"
     down, stroke, why = way_down(ctx, cfg, move[-1] if move else q_from, plan.slide_pts, plan.start_xyz, plan.quat,
                                  float(button[2]))
     if down is None:

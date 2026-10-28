@@ -2124,14 +2124,18 @@ def test_a_compliant_press_turns_as_far_as_15_deg_short_where_nearer_down_does_n
 
 
 def _detour(arc):
-    """_Arm.walk flying every turn by way of a detour of one joint, `arc(lean)`
-    rad of joint travel in all."""
+    """_Arm.walk flying every turn by way of a detour of each joint in turn,
+    out and back no further than the runner's sanity gate lets a joint
+    swing (dp.line_refusal), `arc(lean)` rad of joint travel in all."""
 
     def walk(self, q0, xyz, quat, step_m=None, step_rad=None, max_step_rad=None):
         end = [float(v) for v in xyz] + [float(v) for v in quat]
-        h = 0.5 * (arc(_lean_deg(quat)) - float(np.linalg.norm(np.subtract(end, q0))))
+        h = 0.5 * (arc(_lean_deg(quat)) - float(np.linalg.norm(np.subtract(end, q0)))) / len(end)
         self.turns.append((list(xyz), list(quat)))
-        return [list(q0), end, [end[0] + h] + end[1:], end], None
+        pts = [list(q0), end]
+        for j in range(len(end)):
+            pts += [end[:j] + [end[j] + h] + end[j + 1:], end]
+        return pts, None
 
     return walk
 
@@ -2169,6 +2173,91 @@ def test_a_turn_of_more_joint_arc_than_turn_max_arc_rad_is_refused_though_it_fli
     assert events == [] and ctx.client.executed == []
     assert result.free and result.why == "no straight-down hand reaches here (%s)" % "; ".join(
         "%.0f deg short: a turn of 2.70 rad of joint arc" % s for s in dp.COMPLIANT_TURN_SHORT_DEG)
+
+
+def test_a_walk_the_runner_would_refuse_is_no_walk_and_the_next_lean_is_tried(ctx, monkeypatch, tmp_path):
+    """The 2026-10-28 merge review of #53 + #55: a walk the arm's IK solves
+    can swing a joint out and back further than its net change and
+    SANITY_MARGIN_RAD, and the runner refuses that leg before it moves
+    (Runner._refusal). turn_walk takes a lean's walk only where the
+    runner's gate passes the leg it flies as — in the runner's own words
+    where it does not — and tries the next lean."""
+    from rammp_box_opening.constants import FREE_LINE_SPEED, SANITY_MARGIN_RAD
+    from rammp_box_opening.primitives.core import _full_world
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.runner import Runner
+
+    model = ContainerModel.load(PINK)
+    quat = rp.reach_quat(model, BUTTON[:2], 30)
+    start = rp.tool_for_contact((BUTTON[0], BUTTON[1], 0.46), quat)
+    q = list(start) + list(quat)
+    walks = {}
+
+    def walk(self, q0, xyz, quat_, step_m=None, step_rad=None, max_step_rad=None):
+        # joint 1 out past both ends and back: refused exactly down, not 2 deg short
+        end = [float(v) for v in xyz] + [float(v) for v in quat_]
+        lean = round(_lean_deg(quat_))
+        out = list(end)
+        out[0] = max(q0[0], end[0]) + SANITY_MARGIN_RAD + (0.05 if lean == 0 else -0.05)
+        walks[lean] = [list(q0), out, end]
+        return walks[lean], None
+
+    monkeypatch.setattr(_Arm, "walk", walk)
+    arm = _Arm()
+    monkeypatch.setattr(approach, "_chain", lambda: arm)
+    pts, down, short, why = dp.walk_down_path(arm, model, q, start, quat)
+    assert why is None and short == 2.0 and pts == walks[2]
+    runner = Runner(ctx.client, log_dir=tmp_path)
+
+    def refusal(path):
+        return runner._refusal(dp.compliant_line(ctx, "reach:slide-in", path, down, FREE_LINE_SPEED, _full_world(ctx)))
+
+    assert refusal(pts) is None
+    gate = refusal(walks[0])
+    assert gate.startswith("trajectory sanity gate: joint_1 excursion ")
+    tip = np.asarray(start) + rp._rot(quat) @ np.asarray(rp.CONTACT_TOOL)  # walk_down_path's
+    assert dp.turn_walk(arm, model, q, tip, (0.0,)) == (None, None, None, "0 deg short: " + gate)
+
+
+def _swung(q0, end):
+    """A line from `q0` to `end` by way of joint 1 out past both ends and
+    back, 0.05 rad further than the runner's sanity gate allows."""
+    from rammp_box_opening.constants import SANITY_MARGIN_RAD
+
+    out = list(end)
+    out[0] = max(q0[0], end[0]) + SANITY_MARGIN_RAD + 0.05
+    return [list(q0), out, list(end)]
+
+
+def test_a_way_in_whose_slide_stroke_or_move_the_runner_would_refuse_is_no_way_in(ctx, monkeypatch):
+    """The slide before a turn, the stroke and the move to the aimed
+    button's look pose fly as legs of their own too (rp.way_in_legs), each
+    under the runner's sanity gate: the proof takes none it refuses — no
+    way down, or no straight line to the look pose, which the planner may
+    plan instead."""
+    from rammp_box_opening.runtime import approach
+
+    ctx.model = ContainerModel.load(PINK)
+    cfg = load_press_demo(PINK)
+    quat, start, _bottom, look = rp.reach_geometry(ctx.model, BUTTON, 30, cfg.travel_m)
+    q_look, q_start = list(look) + list(quat), list(start) + list(quat)
+
+    def way_down(slide):
+        arm = _Arm(refuse_first=len(dp.TURN_SHORT_DEG))  # no walk in: the slide, then the turn
+        monkeypatch.setattr(approach, "_chain", lambda: arm)
+        return rp.way_down(ctx, cfg, q_look, slide, start, quat, BUTTON[2])
+
+    way, stroke, why = way_down([q_look, q_start])
+    assert why is None and not way.walked and [name for name, _p, _s in stroke.legs] == ["depth:approach", "depth:press"]
+    way, stroke, why = way_down(_swung(q_look, q_start))
+    assert way is None and why.startswith("the slide in: trajectory sanity gate: joint_1 excursion "), why
+    monkeypatch.setattr(_Arm, "straight_line", lambda self, q0, xyz, quat_: (_swung(q0, list(xyz) + list(quat_)), None))
+    way, stroke, why = way_down([q_look, q_start])
+    assert way is None and why.startswith("depth:approach: trajectory sanity gate: joint_1 excursion "), why
+    q_off = [look[0] - 0.02] + list(look[1:]) + list(quat)  # 20 mm off the aimed button's look pose
+    way, why, kind = rp.solve_way_in(ctx, cfg, BUTTON, 30, q_off)
+    assert way is None and kind == "lines"
+    assert why.startswith("the move to its look pose (trajectory sanity gate: joint_1 excursion "), why
 
 
 def _leans_tried(monkeypatch):
