@@ -45,9 +45,12 @@ from rammp_box_opening.constants import (  # noqa: F401 - GAINS_* are re-exporte
     COMPLIANT_RUN_GAINS,
     EXECUTE_ACTION,
     FINGERTIP_FRAMES,
+    GAINS_CUSTOM,
     GAINS_MEDIUM,
+    GAINS_RIGID,
     GAINS_SOFT,
     GAINS_STIFF,
+    CustomGains,
     GRIPPER_FORCE,
     GRIPPER_SETPOINT_TOPIC,
     GRIPPER_SPEED,
@@ -69,10 +72,24 @@ IMPEDANCE = 1
 QUEUE = 0
 LATEST_WINS = 1  # replaces the goal running, and any queued behind it, at once (release only)
 # ImpedanceGains.profile: the driver's named joint-impedance tunings,
-# GAINS_SOFT / GAINS_MEDIUM / GAINS_STIFF (constants.py, with their Kq)
+# GAINS_SOFT / GAINS_MEDIUM / GAINS_STIFF (constants.py, with their Kq), or
+# GAINS_CUSTOM with the spec's own kq / zeta / torque_limit (GAINS_RIGID)
 
 # a gripper command in flight: knuckle-radian target, the knuckle at send, when
 GripperHandle = namedtuple("GripperHandle", "target start t0")
+
+
+def fill_gains(msg, spec):
+    """Write gains `spec` into ImpedanceGains `msg`: a CustomGains as
+    PROFILE_CUSTOM with its kq, zeta and torque_limit, a profile as its
+    number."""
+    if isinstance(spec, CustomGains):
+        msg.profile = GAINS_CUSTOM
+        msg.custom.kq = [float(v) for v in spec.kq]
+        msg.custom.zeta = float(spec.zeta)
+        msg.custom.torque_limit = [float(v) for v in spec.torque_limit]
+    else:
+        msg.profile = int(spec)
 
 
 def spin_until_done(node, future, timeout_s, abort=None):
@@ -119,8 +136,8 @@ class PlannerClient:
         self._gripper_target = None  # driver setpoint (0..1) re-sent while pending
         self.world_held = None  # path of the world the planner holds
         self.compliant = False  # joint impedance, nothing read stops a leg (execute); a run sets it
-        # the ImpedanceGains profile a compliant goal that names none flies
-        # (constants.COMPLIANT_RUN_GAINS, STIFF); the driver's own is MEDIUM
+        # the ImpedanceGains spec a compliant goal that names none flies
+        # (constants.COMPLIANT_RUN_GAINS, RIGID); the driver's own is MEDIUM
         self.compliant_gains = COMPLIANT_RUN_GAINS
         self._primer = None  # prime_compliant's goal, sent and never waited on
         # the last goal sent, as release() needs it: its control_mode and a
@@ -551,7 +568,7 @@ class PlannerClient:
         goal = ExecuteJointTrajectory.Goal()
         goal.trajectory = hold
         goal.control_mode = IMPEDANCE
-        goal.gains.profile = int(getattr(self, "compliant_gains", COMPLIANT_RUN_GAINS))
+        fill_gains(goal.gains, getattr(self, "compliant_gains", COMPLIANT_RUN_GAINS))
         goal.preemption = QUEUE
         goal.sender_id = "rammp_box_opening"
         self._note_sent(goal)
@@ -597,7 +614,7 @@ class PlannerClient:
         not land is displaced at once, where a queued release would be
         promoted after it and pull the arm back to this snapshot. Under the
         last goal's own gains: without them the driver's session default,
-        MEDIUM, would take over from STIFF and double the sag."""
+        MEDIUM, would take over from RIGID and sag 5-7x as far."""
         if not self._armed or getattr(self, "_last_mode", None) != IMPEDANCE or getattr(self, "_released", False):
             return False
         try:
@@ -709,9 +726,9 @@ class PlannerClient:
             # driver's session default, MEDIUM (Kq 80/30), as all six goals of
             # 2026-10-27 16:23 did. A POSITION goal names none: the driver
             # refuses gains it cannot apply
-            spec = int(gains if gains is not None else getattr(self, "compliant_gains", COMPLIANT_RUN_GAINS))
-            goal.gains.profile = spec
-            info["gains"] = spec
+            spec = gains if gains is not None else getattr(self, "compliant_gains", COMPLIANT_RUN_GAINS)
+            fill_gains(goal.gains, spec)
+            info["gains"] = spec if isinstance(spec, CustomGains) else int(spec)
         goal.preemption = QUEUE  # never displace a goal that is still settling
         goal.sender_id = "rammp_box_opening"
         self._note_sent(goal)
@@ -735,7 +752,7 @@ class PlannerClient:
             if send is None or not send.accepted:
                 if compliant:
                     why = "a mode change while moving, or its %s gains refused" % IMPEDANCE_NAMES.get(
-                        info["gains"], "profile %d" % info["gains"])
+                        info["gains"], "profile %s" % (info["gains"],))
                 else:
                     why = "or a mode change while moving"
                 info["message"] = "goal rejected by the driver (a stream session open, %s)" % why

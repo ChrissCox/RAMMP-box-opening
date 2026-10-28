@@ -861,8 +861,9 @@ def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys,
 
 
 def test_a_compliant_run_says_which_gains_every_move_flies(ctx, monkeypatch, capsys):
-    """Owner 2026-10-27: "impedance mode needs to be firmer". The banner
-    names the tuning in force — the client's compliant_gains — and the
+    """Owner 2026-10-27: "impedance mode needs to be firmer"; 2026-10-28:
+    "extreamly rigid". The banner names the tuning in force — the client's
+    compliant_gains, a custom spec (RIGID) or a driver profile — and the
     client is back in position once the run is over; a guarded run has no
     banner."""
     from rammp_box_opening.constants import GAINS_MEDIUM
@@ -872,7 +873,7 @@ def test_a_compliant_run_says_which_gains_every_move_flies(ctx, monkeypatch, cap
     args = SimpleNamespace(compliant=True, depth_press=True, execute=True)
     assert reach_press.run_reach_press(None, ctx, None, None, None, args, None, None) == 0
     out = capsys.readouterr().out
-    assert ("COMPLIANT: every move in the arm's joint impedance, STIFF (Kq 160/60 N·m/rad on joints 1-4/5-7), "
+    assert ("COMPLIANT: every move in the arm's joint impedance, RIGID (Kq 400/200 N·m/rad on joints 1-4/5-7), "
             "and nothing the run reads stops it") in out
     ctx.client.compliant_gains = GAINS_MEDIUM
     reach_press.run_reach_press(None, ctx, None, None, None, args, None, None)
@@ -1343,7 +1344,9 @@ def test_on_flatbot_1623s_scene_button_is_proven_turning_short_after_the_slide(c
     short of straight down (depth_press.COMPLIANT_TURN_SHORT_DEG): 16:23's
     scene button is proven at the first tilt, the slide in and a turn 10
     deg short, 1.77 rad of joint arc — no walk in reaches it — then the
-    stroke from there. 15:19's aimed button, which the guarded leans
+    stroke from there, as under STIFF: RIGID's spring ~1270 N/m at the pads
+    on the button's bottom (STIFF: ~505), the overshoot at its 15 mm least,
+    bent 6 mm aside. 15:19's aimed button, which the guarded leans
     already reached, is as it was: one walk in, exactly down."""
     from rammp_box_opening.tasks import depth_press as dp
 
@@ -1359,7 +1362,9 @@ def test_on_flatbot_1623s_scene_button_is_proven_turning_short_after_the_slide(c
     assert math.degrees(reach_press.hand_lean(np.asarray(R, float))) == pytest.approx(plan.down.short_deg, abs=0.05)
     assert plan.stroke.q0 == pytest.approx([float(v) for v in plan.down.pts[-1]])
     assert [name for name, _pts, _speed in plan.stroke.legs] == ["depth:approach", "depth:press"]
-    assert 400.0 <= plan.stroke.k <= 600.0 and plan.stroke.end_z < SCENE_1623[2] - cfg.button_travel_m
+    assert plan.stroke.k == pytest.approx(1270.0, abs=20.0) and plan.stroke.end_z < SCENE_1623[2] - cfg.button_travel_m
+    assert plan.stroke.over == pytest.approx(dp.COMPLIANT_OVERSHOOT_M[0], abs=0.0005)
+    assert plan.stroke.bent and plan.stroke.bend_m == pytest.approx(0.006, abs=0.001)
     plan, why = reach_press.plan_reach(ctx, cfg, AIMED_1519, home, depth=True)
     assert why is None and plan.tilt_deg == 30 and plan.down.walked and plan.down.short_deg == 0.0
     # a box the guarded leans reached only 30 mm off (r 0.766 m, az -15 deg) is reached as it stands

@@ -52,8 +52,8 @@ import numpy as np
 
 from rammp_box_opening.constants import (
     CONTACT_SPEED,
+    COMPLIANT_RUN_GAINS,
     FREE_LINE_SPEED,
-    GAINS_STIFF,
     IMPEDANCE_KQ,
     SANITY_MARGIN_RAD,
     TCP_OFFSET_M,
@@ -180,12 +180,14 @@ SLIDE_OK_M = 0.015
 # 15:19's touch tripped at 3.4 Nm on joint 4, ~13.5 N at the pads, and the
 # button went.
 COMPLIANT_PRESS_N = 15.0
-COMPLIANT_GAINS = GAINS_STIFF  # ~470 N/m at the pads on 15:19's button's bottom
-# The driver's joint stiffness under that profile, N·m/rad (constants
+# the compliant run's gains (constants.GAINS_RIGID): ~1130 N/m straight down at
+# the pads on 15:19's button's bottom (STIFF's was ~450)
+COMPLIANT_GAINS = COMPLIANT_RUN_GAINS
+# The driver's joint stiffness under that spec, N·m/rad (constants
 # IMPEDANCE_KQ, kinova-gen3-driver interface/gains.cpp): the robot's, not the
 # scene's. Taken from the profile the press legs send, so the stiffness at the
 # pads, the overshoot, the stroke's bend and press_n always model the spring
-# that flies: COMPLIANT_KQ must stay that profile's. The bend's direction is
+# that flies: COMPLIANT_KQ must stay that spec's. The bend's direction is
 # Kq^-1 J_z^T (stroke_bend): a spring stiffer or softer by one factor on every
 # joint still pushes straight down from the same end, only harder or softer;
 # one whose ratio between joints 1-4 and 5-7 is not this one's pushes sideways

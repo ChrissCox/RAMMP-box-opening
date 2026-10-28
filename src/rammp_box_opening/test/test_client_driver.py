@@ -658,16 +658,35 @@ def _compliant_run(monkeypatch, guard, fresh=True, gains=None, client_gains=None
     return outcome, info, h, d
 
 
+def _sent(gains):
+    """What ImpedanceGains `gains` asks the driver for: a named profile's
+    number, or PROFILE_CUSTOM's (4, kq, zeta, torque_limit) — the driver
+    reads `custom` only then."""
+    if gains.profile != 4:
+        return gains.profile
+    return (4, list(gains.custom.kq), gains.custom.zeta, list(gains.custom.torque_limit))
+
+
+# constants.GAINS_RIGID as the driver must receive it, the numbers copied here
+RIGID_SENT = (4, [400.0] * 4 + [200.0] * 3, 0.7, [39.0] * 4 + [9.0] * 3)
+
+
 def test_a_compliant_leg_flies_in_impedance_under_its_gains(monkeypatch):
-    """Owner 2026-10-27: "impedance mode needs to be firmer". A compliant goal
-    that names no gains flies the run's, STIFF — never the driver's session
-    default, MEDIUM, which every goal of 16:23 flew; one that names a
-    profile flies that one, and so does a client told another run default."""
+    """Owner 2026-10-27: "impedance mode needs to be firmer"; 2026-10-28,
+    after 13:43's press under STIFF: "extreamly rigid". A compliant goal that
+    names no gains flies the run's, RIGID — PROFILE_CUSTOM with its own Kq
+    400/200 N·m/rad, zeta 0.7 and torque limits 39/9 N·m — never the
+    driver's session default, MEDIUM, which every goal of 16:23 flew; one
+    that names a profile flies that one, as its number, and so does a
+    client told another run default."""
+    from rammp_arm_interfaces.msg import ImpedanceGains
+
     outcome, info, h, d = _compliant_run(monkeypatch, None)
     goal, = d.goals
     assert outcome == "arrived" and goal.control_mode == client_mod.IMPEDANCE
-    assert client_mod.COMPLIANT_RUN_GAINS == client_mod.GAINS_STIFF == 3
-    assert goal.gains.profile == 3 and info["gains"] == 3
+    assert client_mod.COMPLIANT_RUN_GAINS is client_mod.GAINS_RIGID
+    assert goal.gains.profile == ImpedanceGains.PROFILE_CUSTOM and _sent(goal.gains) == RIGID_SENT
+    assert info["gains"] is client_mod.GAINS_RIGID
     _o, info, _h, d = _compliant_run(monkeypatch, None, gains=client_mod.GAINS_MEDIUM)
     assert d.goals[0].gains.profile == 2 and info["gains"] == 2
     _o, info, _h, d = _compliant_run(monkeypatch, None, client_gains=client_mod.GAINS_MEDIUM)
@@ -676,11 +695,13 @@ def test_a_compliant_leg_flies_in_impedance_under_its_gains(monkeypatch):
         monkeypatch, None, gains=client_mod.GAINS_STIFF, client_gains=client_mod.GAINS_SOFT
     )
     assert d.goals[0].gains.profile == 3 and info["gains"] == 3  # the leg's own wins
+    _o, info, _h, d = _compliant_run(monkeypatch, None, gains=client_mod.GAINS_STIFF)
+    assert _sent(d.goals[0].gains) == 3 and info["gains"] == 3  # STIFF named under the RIGID default: STIFF
 
 
-def test_a_client_built_for_a_run_flies_stiff(monkeypatch):
+def test_a_client_built_for_a_run_flies_rigid(monkeypatch):
     """PlannerClient.__init__ (the rclpy surface stubbed): position until a
-    run sets compliant, STIFF once it does."""
+    run sets compliant, RIGID once it does."""
 
     class _Node:
         def __getattr__(self, name):  # create_subscription, create_client, ...
@@ -689,7 +710,7 @@ def test_a_client_built_for_a_run_flies_stiff(monkeypatch):
     for name in ("ActionClient", "Buffer", "TransformListener"):
         monkeypatch.setattr(client_mod, name, lambda *a, **k: None)
     c = client_mod.PlannerClient(_Node())
-    assert c.compliant is False and c.compliant_gains == client_mod.GAINS_STIFF
+    assert c.compliant is False and c.compliant_gains is client_mod.GAINS_RIGID
 
 
 class _Rejected:
@@ -707,7 +728,7 @@ def test_a_compliant_rejection_names_the_gains_it_sent():
     c = _client(d)
     c.compliant = True
     outcome, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
-    assert outcome == "failed" and "its STIFF gains refused" in info["message"]
+    assert outcome == "failed" and "its RIGID gains refused" in info["message"]
     c.compliant_gains = client_mod.GAINS_MEDIUM
     _o, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
     assert "its MEDIUM gains refused" in info["message"]
@@ -729,18 +750,73 @@ def test_the_gains_named_here_are_the_drivers_own_profiles():
     they must be the profile numbers its interface defines, or a run would
     fly a tuning other than the one its banner and press model name. A goal
     that names none is PROFILE_SESSION_DEFAULT, which the driver resolves
-    to MEDIUM."""
+    to MEDIUM. A custom spec (GAINS_RIGID) goes out as PROFILE_CUSTOM, and
+    the same tables key it as they key a profile: its Kq, its name."""
     from rammp_arm_interfaces.msg import ImpedanceGains
 
     from rammp_box_opening import constants
 
-    assert (constants.GAINS_SOFT, constants.GAINS_MEDIUM, constants.GAINS_STIFF) == (
-        ImpedanceGains.PROFILE_SOFT, ImpedanceGains.PROFILE_MEDIUM, ImpedanceGains.PROFILE_STIFF)
+    assert (constants.GAINS_SOFT, constants.GAINS_MEDIUM, constants.GAINS_STIFF, constants.GAINS_CUSTOM) == (
+        ImpedanceGains.PROFILE_SOFT, ImpedanceGains.PROFILE_MEDIUM, ImpedanceGains.PROFILE_STIFF,
+        ImpedanceGains.PROFILE_CUSTOM)
     assert ExecuteJointTrajectory.Goal().gains.profile == ImpedanceGains.PROFILE_SESSION_DEFAULT
-    assert set(constants.IMPEDANCE_KQ) == set(constants.IMPEDANCE_NAMES) == {1, 2, 3}
+    rigid = constants.GAINS_RIGID
+    assert set(constants.IMPEDANCE_KQ) == set(constants.IMPEDANCE_NAMES) == {1, 2, 3, rigid}
+    assert constants.IMPEDANCE_KQ[rigid] == rigid.kq == (400.0,) * 4 + (200.0,) * 3
+    assert constants.IMPEDANCE_NAMES[rigid] == rigid.name == "RIGID"
     assert all(len(kq) == len(LIVE) for kq in constants.IMPEDANCE_KQ.values())
     assert constants.COMPLIANT_RUN_GAINS in constants.IMPEDANCE_KQ
     assert client_mod.GAINS_STIFF is constants.GAINS_STIFF  # client.GAINS_* still name them
+    assert client_mod.GAINS_RIGID is rigid and client_mod.GAINS_CUSTOM == constants.GAINS_CUSTOM
+
+
+def test_fill_gains_writes_a_custom_spec_as_profile_custom_and_a_profile_as_its_number():
+    """client.fill_gains writes every goal's gains (the primer's, execute's;
+    a release copies the last goal's): GAINS_RIGID as PROFILE_CUSTOM with
+    its own kq, zeta and torque_limit, a named profile as its number with
+    `custom` untouched — the driver reads `custom` only under
+    PROFILE_CUSTOM."""
+    from rammp_arm_interfaces.msg import ImpedanceGains
+
+    msg = ImpedanceGains()
+    client_mod.fill_gains(msg, client_mod.GAINS_RIGID)
+    assert msg.profile == ImpedanceGains.PROFILE_CUSTOM == 4
+    assert list(msg.custom.kq) == [400.0] * 4 + [200.0] * 3 and msg.custom.zeta == 0.7
+    assert list(msg.custom.torque_limit) == [39.0] * 4 + [9.0] * 3
+    for profile in (client_mod.GAINS_SOFT, client_mod.GAINS_MEDIUM, client_mod.GAINS_STIFF):
+        msg = ImpedanceGains()
+        client_mod.fill_gains(msg, profile)
+        assert msg.profile == profile and msg.custom == ImpedanceGains().custom, profile
+        assert list(msg.custom.kq) == [0.0] * 7 and msg.custom.zeta == 0.0, profile
+
+
+# kinova-gen3-driver's PROFILE_CUSTOM bounds, copied: include/kinova_lowlevel/interface/gains.h
+# (kKqMin/kKqMax, kZetaMin/kZetaMax) and src/interface/gains.cpp (kTorqueLimitFloor, the worst-case
+# gravity on either mount x1.05; kTorqueLimitCeil, the URDF's effort limits), which validate_custom
+# checks when the driver accepts a goal
+DRIVER_KQ_RANGE = (1.0, 400.0)
+DRIVER_ZETA_RANGE = (0.05, 2.0)
+DRIVER_TORQUE_FLOOR = (18.8, 37.6, 14.6, 14.5, 3.7, 3.7, 0.5)
+DRIVER_TORQUE_CEIL = (39.0, 39.0, 39.0, 39.0, 9.0, 9.0, 9.0)
+
+
+def test_every_custom_gains_spec_lies_within_the_drivers_profile_custom_bounds():
+    """The driver refuses a PROFILE_CUSTOM goal with any value out of its
+    bounds, with a reason, and never clamps (validate_custom, at accept):
+    under the run's default, every compliant goal of the run, its primer
+    first, would be refused. GAINS_RIGID: Kq at the 400 ceiling on joints
+    1-4 and 200 on 5-7, zeta 0.7, each torque limit at its joint's ceiling,
+    above the floor that holds gravity (joint 2: 39 against 37.6)."""
+    from rammp_box_opening import constants
+
+    custom = [spec for spec in constants.IMPEDANCE_KQ if isinstance(spec, constants.CustomGains)]
+    assert constants.GAINS_RIGID in custom and constants.COMPLIANT_RUN_GAINS in custom
+    for spec in custom:
+        assert len(spec.kq) == len(spec.torque_limit) == len(LIVE), spec.name
+        assert all(DRIVER_KQ_RANGE[0] <= kq <= DRIVER_KQ_RANGE[1] for kq in spec.kq), spec.name
+        assert DRIVER_ZETA_RANGE[0] <= spec.zeta <= DRIVER_ZETA_RANGE[1], spec.name
+        assert all(lo <= t <= hi for t, lo, hi in zip(spec.torque_limit, DRIVER_TORQUE_FLOOR, DRIVER_TORQUE_CEIL)), (
+            spec.name)
 
 
 def test_a_compliant_guard_watches_and_never_stops_the_leg(monkeypatch):
@@ -802,7 +878,7 @@ def test_the_impedance_is_primed_by_a_hold_where_the_arm_stands_and_nothing_wait
     goal, = d.goals
     assert spins == [] and c._primer is d.futures[0] and not d.futures[0].done()
     assert goal.control_mode == client_mod.IMPEDANCE and goal.preemption == client_mod.QUEUE
-    assert goal.gains.profile == client_mod.GAINS_STIFF and goal.sender_id == "rammp_box_opening"
+    assert _sent(goal.gains) == RIGID_SENT and goal.sender_id == "rammp_box_opening"
     hold = goal.trajectory
     assert list(hold.joint_names) == c._active_joints
     assert [_secs(p) for p in hold.points] == pytest.approx(list(client_mod.PlannerClient.PRIME_TIMES_S))
@@ -864,7 +940,7 @@ def test_an_execute_after_the_primer_returns_its_own_result():
     d.answering = True
     end = [v + 0.05 for v in LIVE]
     outcome, info = c.execute(_traj(LIVE, end), 1.0)
-    assert outcome == "arrived" and info["message"] == "arrived" and info["gains"] == client_mod.GAINS_STIFF
+    assert outcome == "arrived" and info["message"] == "arrived" and info["gains"] is client_mod.GAINS_RIGID
     primer, look = d.goals
     assert list(primer.trajectory.points[-1].positions) == pytest.approx(LIVE)
     assert list(look.trajectory.points[-1].positions) == pytest.approx(end)
@@ -910,7 +986,7 @@ def _ctrl_c_mid_goal(monkeypatch, compliant=True, flag=True, fresh=True, gains=N
 
 
 @pytest.mark.parametrize("flag, gains, held_under", [
-    (True, None, client_mod.GAINS_STIFF),  # the client's run default
+    (True, None, RIGID_SENT),  # the client's run default
     (False, client_mod.GAINS_SOFT, client_mod.GAINS_SOFT),  # the backstop's cancel, a leg under its own gains
 ], ids=["abort flag", "backstop"])
 def test_a_compliant_ctrl_c_lets_the_spring_go_where_the_arm_stands(monkeypatch, flag, gains, held_under):
@@ -923,8 +999,8 @@ def test_a_compliant_ctrl_c_lets_the_spring_go_where_the_arm_stands(monkeypatch,
     confirmed, or the backstop's, unconfirmed — exactly one more goal goes
     out: a hold at the joints the arm stands at, at rest, LATEST_WINS (a
     queued one would wait behind a goal whose cancel did not land), under
-    the cancelled goal's own gains (none would be MEDIUM, twice STIFF's
-    sag)."""
+    the cancelled goal's own gains, PROFILE_CUSTOM's values included
+    (none would be MEDIUM, five times RIGID's sag on joints 1-4)."""
     from rammp_box_opening.constants import JOINT_VMAX
 
     c, d, h = _ctrl_c_mid_goal(monkeypatch, flag=flag, gains=gains)
@@ -932,7 +1008,7 @@ def test_a_compliant_ctrl_c_lets_the_spring_go_where_the_arm_stands(monkeypatch,
     leg, rel = d.goals
     assert leg.control_mode == client_mod.IMPEDANCE and leg.preemption == client_mod.QUEUE
     assert rel.control_mode == client_mod.IMPEDANCE == 1 and rel.preemption == client_mod.LATEST_WINS == 1
-    assert rel.gains == leg.gains and rel.gains is not leg.gains and rel.gains.profile == held_under
+    assert rel.gains == leg.gains and rel.gains is not leg.gains and _sent(rel.gains) == held_under
     assert rel.sender_id == "rammp_box_opening" and list(rel.trajectory.joint_names) == NAMES
     points = rel.trajectory.points
     assert [list(p.positions) for p in points] == [MID, MID]  # where the arm stands, not where the leg went

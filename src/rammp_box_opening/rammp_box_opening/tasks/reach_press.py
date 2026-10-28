@@ -71,6 +71,7 @@ from rammp_box_opening.constants import (
     IMPEDANCE_NAMES,
     TIP_TO_TOOL_M,
     TRANSIT_SPEED,
+    CustomGains,
 )
 from rammp_box_opening.geometry import rotate_about_world_axis
 from rammp_box_opening.models.container import ContainerPose, attitude_quat
@@ -613,11 +614,11 @@ def let_go_part_way(ctx, res):
 
 
 def gains_text(profile):
-    """A driver gains profile as the console names it, e.g. "STIFF (Kq 160/60
-    N·m/rad on joints 1-4/5-7)"."""
-    p = int(profile)
+    """A driver gains profile, or a custom spec (constants.CustomGains), as
+    the console names it, e.g. "RIGID (Kq 400/200 N·m/rad on joints 1-4/5-7)"."""
+    p = profile if isinstance(profile, CustomGains) else int(profile)
     kq = IMPEDANCE_KQ.get(p)
-    name = IMPEDANCE_NAMES.get(p, "gains profile %d" % p)
+    name = IMPEDANCE_NAMES.get(p, "gains profile %s" % (p,))
     return name if kq is None else "%s (Kq %g/%g N·m/rad on joints 1-4/5-7)" % (name, kq[0], kq[4])
 
 
@@ -1472,7 +1473,7 @@ def _way_home(ctx, cfg, runner, stroke, held, q_held, ahead, scene_fix, locator)
             leg.traj = approach.on_branch_of(leg.traj, legs[-1].goal_joints)
             leg.goal_joints = [float(v) for v in leg.traj.points[-1].positions]
         if leg.guard is None:
-            leg.gains = dp.COMPLIANT_GAINS  # one gains spec: the home transit merges, and flies STIFF
+            leg.gains = dp.COMPLIANT_GAINS  # one gains spec: the home transit merges, and flies RIGID
         legs.append(leg)
     names = [lg.name for lg in legs]
     groups = merge_groups(legs)
@@ -1519,7 +1520,7 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
 
     COMPLIANT (args.compliant with --depth-press, press_demo's default
     since 2026-10-27): every leg in the driver's joint impedance, under the
-    client's compliant_gains (STIFF) where a leg names none, and
+    client's compliant_gains (RIGID) where a leg names none, and
     nothing the run reads stops the arm — no torque guard, no at-rest read
     or check, no look after the press (depth_press.press_compliant). Its
     free-air lines (the re-aim, the slide in, the clear before home) fly at

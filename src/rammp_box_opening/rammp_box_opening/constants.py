@@ -1,6 +1,7 @@
 """Shared constants: arm facts and runner defaults (spec §3, §6)."""
 
 import os
+from collections import namedtuple
 from pathlib import Path
 
 
@@ -153,12 +154,43 @@ IMPEDANCE_KQ = {
     GAINS_STIFF: (160.0,) * 4 + (60.0,) * 3,
 }
 IMPEDANCE_NAMES = {GAINS_SOFT: "SOFT", GAINS_MEDIUM: "MEDIUM", GAINS_STIFF: "STIFF"}
+# ImpedanceGains.PROFILE_CUSTOM: the goal carries its own kq, zeta and
+# torque_limit, bounds-checked by the driver when it accepts the goal (Kq
+# 1-400 N·m/rad on every joint, zeta 0.05-2.0, each torque limit between the
+# floor that holds gravity and 39/39/39/39/9/9/9 N·m: kinova-gen3-driver
+# interface/gains.cpp validate_custom), refused with a reason, never clamped.
+# Its leash is the session default's, MEDIUM's 0.35 rad.
+GAINS_CUSTOM = 4
+
+
+class CustomGains(namedtuple("CustomGains", "name kq zeta torque_limit")):
+    """A PROFILE_CUSTOM gains spec: tuples, so legs compare it (legs.can_merge)
+    and IMPEDANCE_KQ / IMPEDANCE_NAMES key it as they key a profile."""
+
+    __slots__ = ()
+
+
+# Owner 2026-10-28, after 13:43's press under STIFF held its pads 6.4 mm off
+# the aimed point: "impedance mode is still too loose. can we ramp up the gain
+# when we go to press the button by a lot so it's extreamly rigid and doesn't
+# miss the button". The driver's ceiling on joints 1-4 (2.5x STIFF) and 200 on
+# the wrist (3.3x STIFF). On flatbot's URDF at 15:19's, 16:23's and 13:43's
+# buttons the pads stand 560-890 N/m stiff sideways (STIFF: 210-320) and
+# 1050-1160 N/m straight down (STIFF: 420-460), so 1.5 N·m of friction or
+# model error on each of joints 1-4 and 0.5 on 5-7 puts them 3-4 mm off
+# (STIFF: 8-11). 400 on the wrist too buys only 0.3-0.5 mm more, on the
+# joints with the least inertia, where nothing above 60 has flown. zeta and
+# the torque limits are STIFF's: the driver derives damping from zeta and each
+# joint's inertia, so the damping ratio stays STIFF's.
+GAINS_RIGID = CustomGains("RIGID", (400.0,) * 4 + (200.0,) * 3, 0.7, (39.0,) * 4 + (9.0,) * 3)
+IMPEDANCE_KQ[GAINS_RIGID] = GAINS_RIGID.kq
+IMPEDANCE_NAMES[GAINS_RIGID] = GAINS_RIGID.name
 # Every compliant goal that names no gains flies this (PlannerClient
-# .compliant_gains). Owner 2026-10-27, after 16:23 flew all six of its goals
-# at MEDIUM: "impedance mode needs to be firmer". STIFF and not CUSTOM: STIFF
-# is the driver's own complete set (zeta 0.7, leash 0.25 rad, torque limits at
-# the ceiling), the press model stays as it is (depth_press.COMPLIANT_KQ), and
-# nothing above STIFF has flown on this arm. STIFF itself had not flown on
-# flatbot either (16:23 stopped before the press): the first attended run is
-# its test, and stepping up past it is a decision for an attended run.
-COMPLIANT_RUN_GAINS = GAINS_STIFF
+# .compliant_gains), and so does every leg of the compliant reach-out
+# (depth_press.COMPLIANT_GAINS): one spec, so the one-motion way in and way
+# home still merge, and the press model (depth_press.COMPLIANT_KQ) is the
+# spring that flies. Owner 2026-10-27, after 16:23 flew all six of its goals
+# at MEDIUM: "impedance mode needs to be firmer" (STIFF, first flown 13:43);
+# 2026-10-28: RIGID (above). Nothing above STIFF has flown on this arm: the
+# first attended run is its test.
+COMPLIANT_RUN_GAINS = GAINS_RIGID
