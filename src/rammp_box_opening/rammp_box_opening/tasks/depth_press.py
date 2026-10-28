@@ -1118,21 +1118,26 @@ def compliant_hold(ctx, cfg, runner, stroke, top_z, seen):
 
 
 def compliant_rise(ctx, runner, stroke, held):
-    """From the hold back up to where the stroke began (stroke.t0), the
-    lean held: 'depth:rise', a straight line from where the arm stands, at
-    FREE_LINE_SPEED (compliant_line, labelled with the full world). Returns
-    the hold's verdict `held` (compliant_hold's), free False with why when
-    the way up does not fly — the arm holds, let go (rp.let_go): on the
-    button, its springs would push on toward the stroke's end, and part-way
-    up toward the rise's next point."""
-    t0, quat = stroke.t0, stroke.quat
-    up, why = rp._line(ctx, [float(t0[0]), float(t0[1]), float(t0[2])], quat)
+    """From the hold back up to where the stroke began: 'depth:rise' from
+    where the arm stands back up the stroke (rise_back_up), else a straight
+    line to its start (stroke.t0), the lean held — reach_press._rise_legs,
+    as the one-execution way home rises — at FREE_LINE_SPEED
+    (compliant_line, labelled with the full world). A bent stroke's end is
+    no IK solution: in free air the hand stands there 3-6 deg off the
+    attitude the stroke held, and a straight line's first 2 mm step takes
+    that whole turn (flatbot's URDF: 0.11-0.13 rad at 15:19's and 16:23's
+    boxes, refused past MAX_STEP_RAD 0.76 m out). Returns the hold's
+    verdict `held` (compliant_hold's), free False with why when the way up
+    does not fly — the arm holds, let go (rp.let_go): on the button, its
+    springs would push on toward the stroke's end, and part-way up toward
+    the rise's next point."""
+    up, _on_stroke, why = rp._rise_legs(ctx, stroke, ctx.client.joints(), _full_world(ctx))
     if up is None:
         rp.let_go(ctx)
         return dataclasses.replace(held, free=False,
                                    why="the way up is not a straight line the arm can fly (%s) — the arm holds" % why)
     if up:
-        res = runner.run([compliant_line(ctx, "depth:rise", up, quat, FREE_LINE_SPEED, _full_world(ctx))], execute=True)
+        res = runner.run(up, execute=True)
         if any(not r.ok for r in res):
             rp.let_go(ctx)
             return dataclasses.replace(held, free=False,

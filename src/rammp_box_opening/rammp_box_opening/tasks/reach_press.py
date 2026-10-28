@@ -1342,10 +1342,9 @@ def _rise_legs(ctx, stroke, q, world):
     """The way up from a compliant hold, the arm held at joints `q` by the
     button under `stroke`, as the legs that fly it, labelled `world`:
     'depth:rise' back up the stroke to its start (depth_press.rise_back_up)
-    — else, as compliant_rise flies it, a straight line from where the arm
-    stands to there; none when it stands there. Returns (legs, True where
-    it goes back up the stroke, None), or (None, False, why) where no way
-    up flies."""
+    — else a straight line from where the arm stands to there; none when it
+    stands there. Returns (legs, True where it goes back up the stroke,
+    None), or (None, False, why) where no way up flies."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.tasks import depth_press as dp
 
@@ -1385,8 +1384,8 @@ def _rise_then_home(ctx, cfg, runner, up, held, scene_fix, locator):
 def _way_home(ctx, cfg, runner, stroke, held, q_held, ahead, scene_fix, locator):
     """From a compliant hold to home, the arm held at `q_held` by the
     button under `stroke` (the hold's verdict `held`): the rise back up the
-    stroke to its start (depth_press.rise_back_up; else, as compliant_rise
-    flies it, a straight line from where the arm stands), then the clear and
+    stroke to its start (_rise_legs: depth_press.rise_back_up, else a
+    straight line from where the arm stands), then the clear and
     home that plan_way_out planned while the way in flew (`ahead`, its
     (WayOut, why) as the runner's lookahead result), each home leg written
     on the branch of the end of the leg before it (approach.on_branch_of) —
