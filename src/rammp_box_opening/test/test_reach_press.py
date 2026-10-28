@@ -900,6 +900,31 @@ def test_where_no_straight_line_reaches_the_aimed_look_pose_the_planned_one_brin
     assert way["tilt_deg"] == 30 and way["walked"] is False
 
 
+def test_where_neither_a_line_nor_a_planned_look_brings_the_aimed_button_a_way_down_the_arm_goes_home_from_the_look(
+        ctx, monkeypatch, tmp_path, capsys):
+    """No straight line reaches the aimed button's look pose, and at no
+    tilt the planner offers does the hand turn down and stroke there: the
+    arm goes home from the look pose, in free air. No planned look leg for
+    the aimed button flies, no slide in, nothing pressed; the console says
+    why at every tilt."""
+    import json
+
+    asked = []
+    scene_only = lambda tilt, tip: len(asked) == 1  # noqa: E731 - plan_reach's, for the scene camera's button
+    chain = _Chain(refuse=[lambda xyz, quat: xyz[2] > 0.52])  # the move to the look pose (0.54), not the slide (0.47)
+    code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked, scene_only), chain=chain)
+    assert code == 1 and got == {}
+    assert rec.events == ["reach:look", "aim:reach-aim", "home"]
+    assert [t for t, _xy, _z in asked] == [30] + list(reach_press.REACH_TILTS_DEG)  # the scene's, then each planned
+    out = capsys.readouterr().out
+    assert ("STOP: no press reaches the aimed button (as straight lines: the move to its look pose (IK did not "
+            "converge); planned: 30 deg: the way down (walk in: ") in out
+    assert all("%d deg: the way down (walk in: " % t in out for t in reach_press.REACH_TILTS_DEG)
+    assert "— nothing was pressed — returning home" in out
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    assert not [r for r in rows if r["leg"] in ("reach_way_in", "home_refused")]
+
+
 @pytest.mark.parametrize("depth", [False, True])
 def test_a_guarded_reach_out_asks_for_no_way_down(ctx, monkeypatch, tmp_path, depth):
     """--guarded, with or without the depth press, is planned as before:
@@ -992,7 +1017,7 @@ def test_on_flatbot_1519s_scene_button_walks_in_exactly_down_at_30_deg(ctx, monk
 def test_on_flatbot_a_scene_button_out_of_reach_by_a_little_still_flies_the_look(ctx, monkeypatch, scene, aimed, near):
     """Two boxes found offline (r m, az deg; the lid at 16:23's 0.3125): no
     tilt presses the scene camera's button, but one PROOF_SHIFT_M off it
-    the press reaches — and the aim's, 12-21 mm off as on 10-27, it does."""
+    the press reaches — and the aim's, 12-23 mm off as on 10-27, it does."""
 
     def at(r_az):
         r, az = r_az

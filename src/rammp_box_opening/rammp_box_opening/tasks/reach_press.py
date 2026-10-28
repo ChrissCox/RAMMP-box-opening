@@ -335,12 +335,13 @@ def plan_reach(ctx, cfg, button, q_from, tilts=REACH_TILTS_DEG, depth=False, loo
 # Where the compliant depth press does not reach the scene camera's button,
 # the look still flies when it reaches the button this far off it — toward
 # the arm, or to either side (_shifted_buttons): the aim, not the scene
-# camera, puts the button the press goes to. On 2026-10-27 the scene
-# camera's button stood 12-21 mm from the aim's (16:23, 15:19). Refusing on
-# the scene button alone at the edge of reach refuses boxes the aim brings
-# into reach; two such were found offline (flatbot's URDF): the scene's
-# button at az -22.0 deg, r 0.700 m with the aim's at -23.6, 0.692, and at
-# r 0.766, az -15 with the aim's at 0.757, -16.6.
+# camera, puts the button the press goes to. On 2026-10-27 the four aims
+# put the button 12-23 mm from the scene camera's (14:33, 15:19, 15:34,
+# 16:23), each 11-22 mm to its right and up to 11 mm nearer the arm.
+# Refusing on the scene button alone at the edge of reach refuses boxes the
+# aim brings into reach; two such were found offline (flatbot's URDF): the
+# scene's button at az -22.0 deg, r 0.700 m with the aim's at -23.6, 0.692,
+# and at r 0.766, az -15 with the aim's at 0.757, -16.6.
 PROOF_SHIFT_M = 0.03
 SHIFTED = ("nearer the arm", "to its left", "to its right")  # _shifted_buttons' order, seen from the arm
 
@@ -1220,7 +1221,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
                 # the arm stands where plan_reach proved the way down from (the
                 # leg's end): that proof is the way in. Solved again from the
                 # live joints, an impedance arrival a few mm off the look pose
-                # would only add a re-aim that today's fallback does not fly
+                # would only add a re-aim, which the planned move never had
                 way = WayIn([], plan2, plan2.down, None if plan2.down.walked else plan2.slide_pts, plan2.stroke)
         if way is None:
             # from the look pose, in free air: nothing slid into the box's
