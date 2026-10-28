@@ -140,13 +140,16 @@ def test_a_heartbeat_right_after_a_box_does_not_hide_it():
 def test_each_camera_has_its_own_floor_in_the_container_config():
     """The scene instance's floor (0.12) lived in the launch file, out of
     reach of anything that tunes detection; it is the container's now, next
-    to the prompts it goes with."""
+    to the prompts it goes with. The canister's is 0.05 since 2026-10-27,
+    when its pale lid scored 0.07-0.10 and two runs saw no box in 15 s."""
     from rammp_box_opening.models.container import load_press_demo
     from rammp_box_opening.perception.owl_source import owl_floor
 
     cfg = load_press_demo("src/rammp_box_opening/config/containers/ankou_pink.yaml")
-    assert owl_floor(cfg, "scene") == cfg.owl_min_score_scene == 0.12
+    assert owl_floor(cfg, "scene") == cfg.owl_min_score_scene == 0.05
     assert owl_floor(cfg, "wrist") == cfg.owl_min_score == 0.18
+    oxo = load_press_demo("src/rammp_box_opening/config/containers/oxo_pop.yaml")
+    assert owl_floor(oxo, "scene") == oxo.owl_min_score_scene == 0.12
 
 
 def test_detection_is_one_function_the_node_and_an_offline_replay_share():
