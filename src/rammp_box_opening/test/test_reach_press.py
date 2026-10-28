@@ -395,11 +395,15 @@ class _Rec:
 
 
 def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4), scene_after="same", settled=None,
-          touch=None, contact=BUTTON, home_refusals=0, run_args=None, chain=None):
+          touch=None, contact=BUTTON, home_refusals=0, run_args=None, chain=None, home_turns=0):
     """Run run_reach_press with the arm, the cameras and the planner faked
     (`run_args`: press_demo's args, a guarded TF press by default; `chain`,
-    a _Chain). Returns (exit code, the record, the chain, home plan's cpose
-    and pad)."""
+    a _Chain). Every plan starts at the joints it is handed (PlanState), as
+    the planner's do; each home plan's joint_3 is written `home_turns`
+    whole turns off them, as a plan handed planner_branch(start) can be.
+    Returns (exit code, the record, the chain, home plan's cpose and pad —
+    and its start, the record's length and the live joints when it was
+    planned)."""
     from conftest import leg as make_leg
 
     from rammp_box_opening.models.container import ContainerPose
@@ -422,12 +426,17 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
         if name == "home" and refusals["home"] > 0:
             refusals["home"] -= 1
             raise RuntimeError("planning failed for home: MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION: the start")
+        start = list(state.joints)
+        end = [0.0] * 7 if name == "home" else [0.05] * 7
         if name == "home":
-            home["cpose"], home["pad"] = ctx_.cpose, ctx_.contact_pad
+            home.update(cpose=ctx_.cpose, pad=ctx_.contact_pad, start=list(start), at=len(rec.events),
+                        live=list(ctx_.client.joints()))
+            start[2] += 2.0 * math.pi * home_turns
+            end = list(end)
+            end[2] += 2.0 * math.pi * home_turns
         else:
             home.setdefault("look_cposes", []).append(ctx_.cpose)
-        end = [0.0] * 7 if name == "home" else [0.05] * 7
-        lg = make_leg(name, start=list(ctx_.client.joints()), end=end, speed=speed, world=world[0])
+        lg = make_leg(name, start=start, end=end, speed=speed, world=world[0])
         lg.target = target
         return lg, state
 

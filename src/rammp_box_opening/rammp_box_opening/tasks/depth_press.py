@@ -30,7 +30,10 @@ thing it got wrong. So from over the box:
   PUSH    button_travel_m further: the torques feeling the button bottom
           out is the press. The whole travel without a stop pressed nothing.
   RISE    straight back up to where the touch started, a pull at the
-          fingertip stopping it (the reach-out's unload and its checks),
+          fingertip stopping it (the reach-out's unload and its checks); a
+          compliant reach-out rises back up its own stroke, in one
+          execution with its clear and home (rise_back_up,
+          reach_press._way_home),
   LOOK    and the camera judges the knob and whether the box moved.
 
 What the touch measured is the box from then on: ctx.cpose is put where
@@ -180,6 +183,23 @@ COMPLIANT_KQ = IMPEDANCE_KQ[COMPLIANT_GAINS]
 COMPLIANT_OVERSHOOT_M = (0.015, 0.06)
 # the spring held at least this much off the stroke's end: something pushed back
 COMPLIANT_FELT_N = 5.0
+# A compliant reach-out's way back up from the hold (rise_back_up): the
+# stroke's own samples reversed, joined at the first one whose pads stand
+# this far above where the spring held them, the held arm's step to it no
+# joint longer than RISE_FIRST_STEP_MAX_RAD and nowhere lower than the held
+# pads (RISE_CHECK_POINTS along it). The spring holds the arm 0.040-0.052
+# rad off the stroke's commanded end, mostly on joints 2 and 4 (flatbot's
+# URDF, STIFF, the pads held 32-33 mm above the end in 16:23's and 15:19's
+# geometry, sliding on the button or held where they met it): past the
+# runner's DRIFT_REPLAN_RAD 0.04, so a way up from the commanded end is
+# refused and the arm stays pressing on the button. And the stroke's sample
+# nearest the held arm in joint space lies near its END: a way up joined
+# there (the recoil's reverse_tail) drives the pads 23-30 mm lower first, a
+# second press. Joined 16-17 mm up instead, the step runs 0.14-0.18 rad and
+# the pads only rise.
+RISE_JOIN_ABOVE_M = 0.015
+RISE_FIRST_STEP_MAX_RAD = 0.25
+RISE_CHECK_POINTS = 10
 
 
 @dataclass
@@ -898,14 +918,17 @@ def compliant_hold(ctx, cfg, runner, stroke, top_z, seen):
     push_hold_s where the spring left the pads, pressing — the hold IS the
     reading. What it pressed with is the pads' height off the stroke's end
     times the stiffness there; COMPLIANT_FELT_N or more is a press, and
-    seen["touch_xyz"] is where the pads were held. The run record
-    (depth_compliant_press) and the console say it. Returns the verdict: a
-    DepthPress, free, judged False (a compliant press does not look)."""
+    seen["touch_xyz"] is where the pads were held. seen["held_joints"] is
+    the arm held there, the way back up's start (rise_back_up). The run
+    record (depth_compliant_press) and the console say it. Returns the
+    verdict: a DepthPress, free, judged False (a compliant press does not
+    look)."""
     from rammp_box_opening.runtime import approach
 
     k, end_z = stroke.k, stroke.end_z
     held = ctx.client.settled_efforts(duration_s=0.15, settle_s=max(0.0, float(cfg.push_hold_s) - 0.15))
     qh = held[1] if held is not None else ctx.client.joints()
+    seen["held_joints"] = [float(v) for v in qh]
     Rh, th = approach._chain().fk(qh)
     pad = np.asarray(th, float) + np.asarray(Rh, float) @ np.asarray(DOWN_CONTACT_TOOL, float)
     force = k * max(0.0, float(pad[2]) - end_z)
@@ -941,6 +964,49 @@ def compliant_rise(ctx, runner, stroke, held):
             return dataclasses.replace(held, free=False,
                                        why="the way up stopped (%s) — the arm holds" % res[-1].detail)
     return held
+
+
+def _pads_z(chain, q):
+    R, t = chain.fk(q)
+    return float((np.asarray(t, float) + np.asarray(R, float) @ np.asarray(DOWN_CONTACT_TOOL, float))[2])
+
+
+def rise_back_up(chain, stroke, q_held, join_above_m=RISE_JOIN_ABOVE_M):
+    """The way back up from the hold to where the stroke began, as joint
+    waypoints ending exactly on the stroke's first sample (stroke.q0), or
+    None: from the held arm `q_held` to the first of the stroke's own
+    samples (compliant_stroke's approach then press, reversed: from its
+    end up) whose pads (DOWN_CONTACT_TOOL) stand `join_above_m` or more
+    above the held pads, then up the stroke from there. None when no
+    sample stands that high, or the step to it moves a joint more than
+    RISE_FIRST_STEP_MAX_RAD, or it puts the pads lower than they were held
+    at any of RISE_CHECK_POINTS along it. The held arm is written on the
+    stroke's side of the wrap first (runtime/branches): its reading is
+    wrapped into (-pi, pi], the stroke's samples are not."""
+    from rammp_box_opening.runtime.branches import on_branch
+
+    samples = []
+    for _name, pts, _speed in stroke.legs:
+        for q in pts:
+            q = [float(v) for v in q]
+            if samples and max(abs(a - b) for a, b in zip(q, samples[-1])) < 1e-9:
+                continue  # the press starts where the approach ends
+            samples.append(q)
+    if not samples:
+        return None
+    up = samples[::-1]
+    qh = on_branch(q_held, up[0])
+    floor = _pads_z(chain, qh)
+    join = next((i for i, q in enumerate(up) if _pads_z(chain, q) >= floor + float(join_above_m)), None)
+    if join is None:
+        return None
+    step = np.asarray(up[join], float) - np.asarray(qh, float)
+    if float(np.abs(step).max()) > RISE_FIRST_STEP_MAX_RAD:
+        return None
+    for k in range(1, RISE_CHECK_POINTS + 1):
+        if _pads_z(chain, list(np.asarray(qh, float) + step * (k / RISE_CHECK_POINTS))) < floor:
+            return None
+    return [list(qh)] + up[join:]
 
 
 def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=None):
