@@ -179,10 +179,38 @@ class CustomGains(namedtuple("CustomGains", "name kq zeta torque_limit")):
 # 1050-1160 N/m straight down (STIFF: 420-460), so 1.5 N·m of friction or
 # model error on each of joints 1-4 and 0.5 on 5-7 puts them 3-4 mm off
 # (STIFF: 8-11). 400 on the wrist too buys only 0.3-0.5 mm more, on the
-# joints with the least inertia, where nothing above 60 has flown. zeta and
-# the torque limits are STIFF's: the driver derives damping from zeta and each
-# joint's inertia, so the damping ratio stays STIFF's.
-GAINS_RIGID = CustomGains("RIGID", (400.0,) * 4 + (200.0,) * 3, 0.7, (39.0,) * 4 + (9.0,) * 3)
+# joints with the least inertia, where nothing above 60 has flown. The torque
+# limits are STIFF's.
+# zeta 1.0, above STIFF's 0.7 (owner 2026-10-28: "the impedance mode may be
+# too loose still, it's very bouncy, maybe we can adjust or offset the
+# bounciness through our motions"): the damping is the one gain left to raise.
+# Kq is at the driver's ceiling on joints 1-4, the wrist's 200 already pulls
+# its 9 N·m limit from 31-58 mrad off, so more wrist Kq pulls no harder, and
+# STIFF was worse (13:43: the look 29.6 mm off when its trajectory ran out,
+# the way home 179.7 mm). The driver damps the velocity ERROR, D_i (qd_i -
+# qd_ref_i), D_i = 2 zeta sqrt(Kq_i M_ii(q)) on the URDF's inertia
+# (kinova-gen3-driver joint_impedance_mode.cpp), but the joints move as if
+# 6-11 kg·m² heavier (fitted on 15:45's bag; joint 2 made ~3 rad/s² of the
+# look's 4.2), so the damping ratio D buys them is a fraction of zeta: ~0.2 on
+# joint 2 at 0.7, ~0.3 at 1.0. On 15:45's looks joint 2 fell 101-123 mrad
+# behind, caught up at 1.50-1.62 rad/s against its reference's 1.26, stood
+# 45-47 mrad past the look when the trajectory ran out (the tool 14 mm) and
+# crept back for 0.55 s: 1.0 brakes that spurt with 37-40 N·m·s/rad on
+# joint 2 instead of 26-28. The bounce model (whose look ends short, where the
+# arm's ran past) puts the look 12.2 mm off at its end instead of 16.8,
+# settled within 2 mm no sooner: a guess until the arm flies it.
+# The press: while the pads stand on the lid and the stroke's reference moves
+# on, the damper pushes them down too, c_z v_z at the pads (c_z = 1 / (J_z
+# D^-1 J_z^T), v_z the reference's speed down there): on flatbot's URDF 4.3 N
+# where 16:23's stroke runs straight down at 25 mm/s and 7.2 N on its bend at
+# 41, 1.7 and 6.0 N on 15:45's at 19 and 68 (0.7: 3.0, 5.0, 1.2, 4.2). With
+# the lid rigid, that puts the force 3-4 N above the hold's for the stroke's
+# last 0.10-0.13 s (0.7: 1.5-2.3 N, which 15:45's bag does not show).
+# depth_press's model is Kq's alone: k, the bend and the overshoot are planned
+# on it, and press_n reads the arm at rest, where the damper pushes nothing.
+# 1.3 only if the flown look and home still overshoot (the driver takes
+# 0.05-2.0).
+GAINS_RIGID = CustomGains("RIGID", (400.0,) * 4 + (200.0,) * 3, 1.0, (39.0,) * 4 + (9.0,) * 3)
 IMPEDANCE_KQ[GAINS_RIGID] = GAINS_RIGID.kq
 IMPEDANCE_NAMES[GAINS_RIGID] = GAINS_RIGID.name
 # Every compliant goal that names no gains flies this (PlannerClient
