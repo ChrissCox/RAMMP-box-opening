@@ -108,8 +108,16 @@ def test_pushes_warped_and_late_armed_lines_keep_their_dilated_time_base(tmp_pat
     assert c.executed[0][1] == pytest.approx(CONTACT_SPEED)
 
 
-def test_the_preview_shows_the_time_the_line_will_fly(tmp_path):
+@pytest.mark.parametrize("compliant", [False, True])
+def test_the_preview_shows_the_time_the_line_will_fly(tmp_path, compliant):
+    """A compliant client's runner profiles the line gentler
+    (Runner.retime_params): in its preview as in its flight."""
+    from rammp_box_opening.constants import COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING
+    from rammp_box_opening.runtime.retime import RetimeParams
+    from rammp_box_opening.runtime.runner import line_profile
+
     c = _Rec()
+    c.compliant = compliant
     r = make_runner(c, tmp_path)
     lg = _line(_drag())
     table = r.preview([lg])
@@ -117,3 +125,8 @@ def test_the_preview_shows_the_time_the_line_will_fly(tmp_path):
     flown_s = secs(c.flown[-1].points[-1].time_from_start)
     row = [line for line in table.splitlines() if line.startswith("reach:slide-in")][0]
     assert float(row.split()[5]) == pytest.approx(flown_s, abs=0.006)
+    gentle = RetimeParams(accel=COMPLIANT_ACCEL, decel=COMPLIANT_DECEL, qd_ceiling=COMPLIANT_QD_CEILING)
+    want = line_profile(lg, gentle if compliant else RetimeParams())
+    assert flown_s == pytest.approx(secs(want.points[-1].time_from_start), abs=1e-9)
+    if compliant:
+        assert flown_s > secs(line_profile(lg, RetimeParams()).points[-1].time_from_start) + 0.05

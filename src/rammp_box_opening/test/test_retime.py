@@ -362,3 +362,69 @@ def test_the_group_reports_where_each_leg_begins_in_time():
     at = float(t[-1]) * fracs[1]
     reached = float(np.interp(at, t, np.linalg.norm(_q - _q[0], axis=1)))
     assert abs(reached - 0.5) < 0.02  # the junction is where leg b starts
+
+
+# -- the absolute ceiling (RetimeParams.qd_ceiling): what a compliant arm's wrist follows --
+
+WRIST_CEILING = (math.inf,) * 4 + (0.45,) * 3  # constants.COMPLIANT_QD_CEILING
+# stamps are whole nanoseconds (stamps.set_stamp): an interval at the ceiling reads
+# a few parts in 1e8 over it
+
+
+def _joint_speeds(msg):
+    """Each interval's per-joint speed, as the driver flies the samples."""
+    q, _v, t = _arrays(msg)
+    return np.abs(np.diff(q, axis=0)) / np.diff(t)[:, None]
+
+
+def test_the_ceiling_is_absolute_a_slow_line_it_does_not_bind_flies_as_before():
+    """The ceiling caps what a leg's cruise fraction leaves and no fraction
+    scales it. A 0.3 walk like 16:23's (joint_1 -1.35, joint_3 +1.20,
+    joint_6 -0.63 rad) runs its wrist well under 0.45 rad/s, so it flies
+    exactly as without the ceiling: the shoulder is not slowed. The same
+    0.45 written as a smaller vmax is 0.3 x 0.9 x 0.5 on it, and slows the
+    whole line (16:23's way in 7.25 -> 12.4 s, offline 2026-10-28)."""
+    walk = _traj(_line([0] * 7, [-1.35, 0.37, 1.2, 0.83, 0.1, -0.63, 0.2], 80))
+    free, _ = retime_group([walk], [0.3], JOINT_VMAX, RetimeParams())
+    capped, info = retime_group([walk], [0.3], JOINT_VMAX, RetimeParams(qd_ceiling=WRIST_CEILING))
+    assert _joint_speeds(capped)[:, 4:].max() <= 0.45 * (1 + 1e-6)
+    assert np.abs(_arrays(capped)[1][:, 4:]).max() <= 0.45 * (1 + 1e-6)  # the velocities on the wire too
+    for got, want in zip(_arrays(capped), _arrays(free)):
+        assert np.array_equal(got, want)
+    _, as_vmax = retime_group([walk], [0.3], JOINT_VMAX[:4] + [0.5] * 3, RetimeParams())
+    assert as_vmax["duration_s"] > 1.2 * info["duration_s"]
+
+
+def test_a_full_speed_leg_holds_its_wrist_to_the_ceiling_and_a_shoulder_move_flies_as_before():
+    """At 1.0 the re-timer let joint_6 run 0.9 x 1.222 = 1.10 rad/s; in the
+    driver's joint impedance it made 0.54 (15:45 2026-10-28, its command at
+    the 9 N·m clamp). Under the ceiling a full-speed leg holds the wrist to
+    0.45 and slows its whole path with it, positions untouched; a move of
+    joints 1-4 alone, which the ceiling does not name, flies as before."""
+    look = _traj(_line([0] * 7, [0.1, 1.2, 0.5, 0.7, 0.3, 1.0, 0.1], 60))
+    free, _ = retime_group([look], [1.0], JOINT_VMAX, RetimeParams())
+    capped, info = retime_group([look], [1.0], JOINT_VMAX, RetimeParams(qd_ceiling=WRIST_CEILING))
+    assert _joint_speeds(free)[:, 5].max() > 0.8  # what it asked without
+    assert _joint_speeds(capped)[:, 4:].max() <= 0.45 * (1 + 1e-6)
+    assert np.abs(_arrays(capped)[1][:, 4:]).max() <= 0.45 * (1 + 1e-6)
+    assert np.array_equal(_arrays(capped)[0], _arrays(free)[0])  # positions never touched
+    assert info["duration_s"] > 1.0 / 0.45  # 1 rad of joint_6 under 0.45 rad/s
+    assert check_like_executor(capped, JOINT_VMAX) == []
+    arm = _traj(_line([0] * 7, [0.3, 1.2, 0.5, 0.7, 0.0, 0.0, 0.0], 60))
+    a_free, _ = retime_group([arm], [1.0], JOINT_VMAX, RetimeParams())
+    a_capped, _ = retime_group([arm], [1.0], JOINT_VMAX, RetimeParams(qd_ceiling=WRIST_CEILING))
+    for got, want in zip(_arrays(a_capped), _arrays(a_free)):
+        assert np.array_equal(got, want)
+
+
+def test_a_rest_to_rest_interval_keeps_under_the_ceiling_too():
+    """An interval between two rest samples is timed apart from the profile
+    (times_from_profile's triangle, a trapezoid where the cap binds): its
+    cap is the ceiling's too, so 1 rad of joint_6 there averages under
+    0.45 rad/s, not under the 1.10 the joint limit alone allows."""
+    src = _traj([[0.0] * 7, [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]])
+    out, info = retime_group([src], [1.0], JOINT_VMAX, RetimeParams(qd_ceiling=WRIST_CEILING))
+    _, _, t = _arrays(out)
+    assert 1.0 / (t[-1] - t[0]) < 0.45
+    assert info["duration_s"] > 1.0 / 0.45
+    assert check_like_executor(out, JOINT_VMAX) == []
