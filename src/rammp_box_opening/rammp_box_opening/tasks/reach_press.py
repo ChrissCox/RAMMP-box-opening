@@ -71,6 +71,7 @@ import numpy as np
 from rammp_box_opening.constants import (
     COMPLIANT_RUN_GAINS,
     CONTACT_SPEED,
+    DRIFT_REPLAN_RAD,
     FREE_LINE_SPEED,
     IMPEDANCE_KQ,
     IMPEDANCE_NAMES,
@@ -897,7 +898,30 @@ def _back_off(ctx, runner, ref=None, why=None, lets_go=True):
     return all(r.ok for r in res)
 
 
-def _go_home(ctx, cfg, runner, why, ref=None, lets_go=True):
+def _planned_ahead(ctx, runner, legs):
+    """`legs`, home planned before the arm stood here (_go_home's `ahead`),
+    where the arm stands within DRIFT_REPLAN_RAD of where they start — the
+    gap the short way round, as the driver's start gate measures it
+    (driver.start_gap_rad) — as the runner flies any planned leg from
+    there. Else None, said on the console, and _go_home plans home from
+    where the arm stands: a plan from somewhere else is never flown, and
+    the runner's own re-plan of one would skip _home_legs' clear-margin
+    step and _go_home's back-off. In the run log either way (home_ahead).
+    None for none."""
+    from rammp_box_opening.runtime.driver import start_gap_rad
+
+    if not legs:
+        return None
+    off = start_gap_rad(ctx.client.joints(), legs[0].traj)
+    flown = off <= DRIFT_REPLAN_RAD
+    runner.note("home_ahead", flown=flown, off_rad=round(off, 4))
+    if not flown:
+        print("[press_demo] the arm stands %.3f rad from where home was planned from (gate %.2f) — home is "
+              "planned again from here" % (off, DRIFT_REPLAN_RAD))
+    return legs if flown else None
+
+
+def _go_home(ctx, cfg, runner, why, ref=None, lets_go=True, ahead=None):
     """Home from free air (the look pose, or where the run started), planned
     in the full world around the box where it now is. A start the planner
     refuses INVALID_START — inside the box's padded cuboid (the box not
@@ -908,11 +932,15 @@ def _go_home(ctx, cfg, runner, why, ref=None, lets_go=True):
     False — the arm holds — when the plan is refused or a move fails. A
     compliant run's back-off or home that stopped part-way lets go there
     (let_go_part_way), unless `lets_go` is False: _home_from_over_box's
-    callers let go of a home that did not get there themselves."""
+    callers let go of a home that did not get there themselves. `ahead`:
+    home's legs planned before the arm stood here — the full run's, from
+    the look pose while the way back to it flew (reach_lid_off._stop_home)
+    — flown as planned where the arm stands where they start
+    (_planned_ahead), no planner call at rest; else home is planned here."""
     if why:
         print("[press_demo] %s — returning home" % why)
     try:
-        legs = _home_legs(ctx, cfg)
+        legs = _planned_ahead(ctx, runner, ahead) or _home_legs(ctx, cfg)
     except RuntimeError as e:
         runner.note("home_refused", why=str(e)[:300])
         if "INVALID_START" not in str(e) or not _back_off(ctx, runner, ref, why=str(e), lets_go=lets_go):

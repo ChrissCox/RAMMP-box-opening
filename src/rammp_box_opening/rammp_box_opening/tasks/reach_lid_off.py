@@ -8,7 +8,8 @@ after the press as before (reach_press._fly_way_in).
           depth_press.compliant_hold), as the press-only run flies them.
   BACK    the rise back up the stroke, then the way down backwards — the
           turn and the slide, or the walk, each reversed — to the aimed look
-          pose: ONE execution, every line one the proof flew forward.
+          pose: ONE execution, every line one the proof flew forward, home
+          planned from the look pose while it flies (a STOP there flies it).
   LOOK    from there, where the wrist aimed before the press: the oblique
           aim again (reach_press._aim) reads the knob's height above its lid,
           and once more where the first read says it is not up. Flatbot's
@@ -26,7 +27,7 @@ after the press as before (reach_press._fly_way_in).
           closed pads' reference stands GRIP_BELOW_LID_M under the lid — ONE
           execution, the carry planned while it flies. The fingers close: on
           air (outside the grip band) they open again and the hand backs out
-          the way it came, home.
+          the way it came, home planned while it does.
   LIFT    the close, then the lid straight up off the canister
           (lift_off_m) and up and back toward the arm clear of the box's
           padded volume (as the way home's clear): ONE execution.
@@ -730,8 +731,11 @@ def _started(last):
 
 def _stop_home(ctx, cfg, runner, why):
     """STOP from the look pose, in free air: home (reach_press._go_home,
-    which lets go of a home stopped part-way). Returns 1."""
-    rp._go_home(ctx, cfg, runner, "STOP: %s" % why)
+    which lets go of a home stopped part-way) — the one planned from there
+    while the way back to it, or the back-out, flew (ctx.home_ahead), where
+    the arm stands where it starts; else planned here. Returns 1."""
+    ahead, ctx.home_ahead = ctx.home_ahead, None
+    rp._go_home(ctx, cfg, runner, "STOP: %s" % why, ahead=ahead)
     return 1
 
 
@@ -749,7 +753,8 @@ def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
     look pose, or (the exit code, None) where the run stopped: home from the
     look pose where the way in did not start, the arm let go and held where
     a move stopped part-way, up off the button and home from over the box
-    where the way back did not start."""
+    where the way back did not start. Home is planned from the look pose
+    while the way back flies: ctx.home_ahead, for a stop there (_stop_home)."""
     names = [lg.name for lg in legs]
     if way.down.short_deg:
         print("[press_demo] TURN: %.0f deg short of straight down (no hand nearer straight down flies here)"
@@ -757,6 +762,7 @@ def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
     print("[press_demo] %sONE MOTION from the look pose to below the button: %s" % (
         "PRESS %d of %d: " % (press, PRESSES) if press > 1 else "", ", ".join(names)))
     print("[press_demo] %s" % dp.press_text(way.stroke, cfg))
+    ctx.home_ahead = None  # the arm leaves the look pose: no home planned before is flown from where it comes back
     res = runner.run(legs, execute=True)
     last = res[-1]
     flown = all(r.ok for r in res)
@@ -788,11 +794,20 @@ def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
     groups = merge_groups(back)
     print("[press_demo] %s from the button back to the look pose: %s" % (
         "ONE MOTION" if len(groups) == 1 else "in %d goals" % len(groups), ", ".join(lg.name for lg in back)))
-    res = runner.run(back, execute=True)
+    # Home from the look pose, in the full world, planned while the way back
+    # flies (the runner's lookahead), for a stop there: the full runs of
+    # 2026-10-28 planned it with the arm standing at the look pose, 0.21 and
+    # 0.23 s at 16:15:35 and 16:16:09, where the press-only runs planned
+    # their home while the way in flew, 7 of 7. Nothing else asks the
+    # planner, which takes one goal at a time, in that flight: its legs are
+    # plan-free lines, never re-planned. The lid coming off leaves it unused:
+    # a plan of ~0.17 s (the day's median) under a ~5 s motion.
+    res = runner.run(back, execute=True, lookahead=lambda end: rp._home_legs(ctx, cfg, start=end))
     last = res[-1]
     if len(res) == 1 and last.flown_traj is not None:
         rp._note_flight(runner, "reach_way_back_flight", [lg.name for lg in groups[0]], last)
     if all(r.ok for r in res):
+        ctx.home_ahead = runner.lookahead_result  # None where it failed: a stop plans home where the arm stands
         return None, (float(seen["touch_xyz"][2]) if held.felt and seen.get("touch_xyz") else None)
     if _started(last):
         print("[press_demo] STOP: the way back to the look pose stopped during %s (%s) — the arm holds" % (
@@ -879,7 +894,8 @@ def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
 def _back_out(ctx, cfg, runner, way, why, opened=True):
     """From the knob, the fingers on nothing they keep: open (`opened`
     False: they are open already), the grip's way down backwards to the look
-    pose (_grip_backwards: one execution), then home from there. Returns 1."""
+    pose (_grip_backwards: one execution), home planned from there while it
+    flies, then home. Returns 1."""
     world = _full_world(ctx)
     if opened:
         res = runner.run([_gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:open", GRIPPER_CMD_OPEN, world)],
@@ -890,12 +906,15 @@ def _back_out(ctx, cfg, runner, way, why, opened=True):
             return 1
     back = _grip_backwards(ctx, way, world)
     print("[press_demo] backing out the way the hand came down: %s" % ", ".join(lg.name for lg in back))
-    res = runner.run(back, execute=True)
+    # home from where the back-out ends, planned as it flies, as the way
+    # back's (_press_and_back): 2026-10-28 16:24:21 stood 0.21 s there for it
+    res = runner.run(back, execute=True, lookahead=lambda end: rp._home_legs(ctx, cfg, start=end))
     if not all(r.ok for r in res):
         print("[press_demo] STOP: %s, and the way back out %s (%s) — the arm holds" % (
             why, "stopped" if _started(res[-1]) else "did not start", res[-1].detail or res[-1].outcome))
         rp.let_go(ctx)
         return 1
+    ctx.home_ahead = runner.lookahead_result
     return _stop_home(ctx, cfg, runner, why)
 
 
@@ -924,6 +943,9 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how):
                                              ", the hand %.0f deg short of straight down" % way.down.short_deg
                                              if way.down.short_deg else ""))
     opened = _gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:open", GRIPPER_CMD_OPEN, world, defer_join=True)
+    # the hand leaves the look pose for the knob: the way back's home is not
+    # flown from where it comes back (a back-out plans its own, _back_out)
+    ctx.home_ahead = None
     res = runner.run([opened, *legs], execute=True, lookahead=lambda end: plan_lift(ctx, cfg, end, way.stroke.quat))
     ahead = runner.lookahead_result
     last = res[-1]

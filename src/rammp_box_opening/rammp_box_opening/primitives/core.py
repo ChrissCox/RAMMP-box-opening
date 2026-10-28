@@ -65,6 +65,9 @@ class Ctx:
     last_world: tuple = None  # (name, path) of the last interaction world
     contact_pad: float = 0.0  # container xy padding once contact has happened
     mission_frames: object = None  # this run's detection record (detection_set.MissionFrames), --execute missions
+    # home's legs planned from the look pose while the way back to it flew
+    # (reach_lid_off), for a stop there; dropped once the arm moves on
+    home_ahead: list = None
 
 
 @dataclass
