@@ -458,7 +458,9 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
     aimed frame is saved and the aim logged (`runner`) every time.
 
     lid_z / prior_xy: the lid height to expect and where the button should
-    be — what the reach-out press's oblique look aims with (button_aim)."""
+    be — what the reach-out press's oblique look aims with (button_aim).
+    `out` gets button_up_mm and measured_xyz, the press point as the wrist
+    measured it: what the wrist's own later readings are judged against."""
     from rammp_box_opening.perception.button_aim import ButtonAimer
 
     # only what is set: unset, the call is the straight-down aim's own
@@ -469,12 +471,14 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
         _spin_detect(node)
         if aimer.tick():
             xyz = aimer.fix()  # its z raised by the wrist's table offset, where that is agreed
+            measured = aimer.fix(measured=True)
             s = aimer.last_sighting
             up_m = aimer.button_above_lid_m()
             up_mm = None if up_m is None else 1000.0 * up_m
             off, off_raw = aimer.table_offset_m(), aimer.table_offset_m(raw=True)
             if out is not None:
                 out["button_up_mm"] = up_mm  # the caller decides (refuse_open_box)
+                out["measured_xyz"] = tuple(float(v) for v in measured)
             print(
                 "[press_demo] AIM: button circle at pixel (%.0f, %.0f) r %.0f px, %.0f mm across, %s above its own "
                 "lid%s%s; pressing its centre; %d/%d frames agree (%.1f s)" % (
@@ -492,7 +496,7 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
                     tag,
                     seam_uv=[round(v, 1) for v in s.uv], r_px=round(s.r_px, 1),
                     diameter_mm=round(1000 * s.diameter_m, 1), press_xyz=[round(v, 4) for v in xyz],
-                    measured_z=round(aimer.fix(measured=True)[2], 4),
+                    measured_z=round(measured[2], 4),
                     button_above_lid_mm=None if up_mm is None else round(up_mm, 1),
                     disc_fill=round(s.disc_fill, 2) if s.oblique else None,
                     # the wrist's table against the scene camera's: taken out (press_xyz's

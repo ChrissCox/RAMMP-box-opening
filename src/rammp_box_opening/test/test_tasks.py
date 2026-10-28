@@ -3280,10 +3280,14 @@ def test_the_aim_says_and_keeps_the_wrists_table_offset(monkeypatch, capsys, off
     grab = SimpleNamespace(snapshot=snapshot, color=None, depth=None, k=None, color_stamp=None, stamp_offset_s=0.0)
     w = SimpleNamespace(grab=grab, model=SimpleNamespace(dims=(0.105, 0.105, 0.121), button_diameter_m=0.044),
                         table_z=0.2143)
+    out = {}
     got, _status = press_demo.aim_button_at_staging(None, w, 0.0, timeout_s=5.0, runner=runner, tag="reach-aim",
-                                                    lid_z=0.3111, prior_xy=(0.6754, -0.1812))
+                                                    out=out, lid_z=0.3111, prior_xy=(0.6754, -0.1812))
     assert got is not None and got[0] == pytest.approx((0.661, -0.1969, z), abs=1e-4)
     assert w.last_aim == pytest.approx(got[0])  # the press point the press goes on (aim_source)
+    # ... and the caller is told it as the wrist measured it (reach_press._aim)
+    assert out["measured_xyz"] == pytest.approx((0.661, -0.1969, 0.2885), abs=1e-6)
+    assert out["button_up_mm"] == pytest.approx(1.0)
     assert words in capsys.readouterr().out
     ((leg, kw),) = notes
     assert leg == "reach-aim" and kw["press_xyz"] == [0.661, -0.1969, z] and kw["measured_z"] == 0.2885

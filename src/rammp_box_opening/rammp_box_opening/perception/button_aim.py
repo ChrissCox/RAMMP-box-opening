@@ -98,7 +98,7 @@ FIRST_LOOKBACK_S = 0.2
 OBLIQUE_WINDOW = 3.0  # of the circle's rectified radius: the cells a candidate's gates read
 # The lid's prior height is judged against the table THIS frame sees. Since
 # its repair the wrist reads every height ~20 mm low (flatbot 2026-10-27: its
-# own table 18.0-21.3 mm below the scene camera's in the four reach-out
+# own table 18.1-21.6 mm below the scene camera's in the four reach-out
 # aims, its lid rings 22-32 mm below the scene's lid), and the live aims
 # cleared LID_PRIOR_TOL_M by only 2.7-13.0 mm: a slightly worse day refuses
 # every frame and presses nothing. A common offset moves the wrist's table
@@ -912,7 +912,8 @@ class ButtonAimer:
         press goes by the higher of this and the scene camera's lid
         (reach_press), and a lowered aim would no longer bound the press
         from below should the scene camera's table and lid ever read low.
-        measured: the z as the hits measured it."""
+        measured: the z as the hits measured it — what the wrist's own later
+        readings are judged against (reach_press._aim)."""
         xyz = agreeing_median(self.points)
         if xyz is None or measured:
             return xyz

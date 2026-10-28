@@ -352,9 +352,13 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
     aims = [first, after]
 
     def aim(node, watcher, yaw, lid_z, prior_xy, runner_, tag):
+        # each aim: (press point, knob mm[, the press point as the wrist
+        # measured it, before the raise — by default the same])
         rec.events.append("aim:" + tag)
         got = aims.pop(0)
-        return (None, "no circle", None) if got is None else ((got[0], 0.0), "3/3 frames", got[1])
+        if got is None:
+            return None, "no circle", None, None
+        return (got[0], 0.0), "3/3 frames", got[1], got[2] if len(got) > 2 else got[0]
 
     monkeypatch.setattr(reach_press, "_aim", aim)
     seq = list(FREE if settled is None else settled)
@@ -606,6 +610,27 @@ def test_a_lid_that_came_up_or_went_down_is_a_moved_box(ctx, monkeypatch, tmp_pa
     tipped = (POPPED[0], POPPED[1], POPPED[2] + 0.015)  # the knob reads 12 mm up, its lid 15 mm higher
     code, _rec, _c, _h = _flow(ctx, monkeypatch, tmp_path, after=(tipped, 12.0))
     assert code == 1
+
+
+@pytest.mark.parametrize("first_raise,after_raise", [(0.021, 0.0), (0.0, 0.021), (0.021, 0.019)])
+def test_the_lid_after_the_press_is_judged_by_what_the_wrist_measured(ctx, monkeypatch, tmp_path, first_raise,
+                                                                       after_raise):
+    """Flatbot 2026-10-27: the wrist reads its table and lid ~20 mm low, and
+    the aim's press point is raised by that table offset where its hits
+    agree on one (button_aim.ButtonAimer.fix) — the touch is judged against
+    it. Whether the box lifted is the wrist against itself: an aim raised
+    before the press and one not raised after it (its offset past the xy
+    bound) read no lift, nor two raised by offsets 2 mm apart."""
+    import json
+
+    first = (BUTTON, 0.4, (BUTTON[0], BUTTON[1], BUTTON[2] - first_raise))
+    measured_after = (POPPED[0], POPPED[1], POPPED[2] - first_raise)  # the same box, the knob up
+    after = ((POPPED[0], POPPED[1], measured_after[2] + after_raise), 12.0, measured_after)
+    code, rec, _c, _h = _flow(ctx, monkeypatch, tmp_path, first=first, after=after)
+    assert code == 0 and rec.events[-3:] == ["aim:reach-after", "scene", "home"]
+    rows = {r["leg"]: r for r in map(json.loads, open(next(tmp_path.glob("run-*.jsonl"))))}
+    assert rows["touch"]["verdict"] == "press" and rows["touch"]["offset_mm"] == pytest.approx(0.0, abs=0.1)
+    assert rows["reach_after"]["lid_dz_mm"] == pytest.approx(0.4, abs=0.05)  # the first aim's knob 0.4 mm up
 
 
 def test_a_touch_that_finds_no_surface_backs_out_before_going_home(ctx, monkeypatch, tmp_path):

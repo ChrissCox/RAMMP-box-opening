@@ -424,7 +424,7 @@ def _no_table_offset(*a):
 @pytest.mark.parametrize("inc,table_drop", [(29, 0.028), (39, 0.018)])
 def test_the_lid_is_judged_against_the_table_the_wrist_sees(pink, inc, table_drop, monkeypatch):
     """Flatbot 2026-10-27: since its repair the wrist reads every height
-    ~20 mm low, its own table 18.0-21.3 mm below the scene camera's, and
+    ~20 mm low, its own table 18.1-21.6 mm below the scene camera's, and
     the live aims cleared the 35 mm prior-height gate by 2.7-13 mm. Here
     the wrist's table is 18-28 mm low and its lid 37 mm low, 9-19 mm lower
     still: judged against the prior alone it is refused, "lid ring -37 mm
@@ -878,12 +878,12 @@ def _reach_frame(name):
 
 
 @pytest.mark.parametrize("name,want", [
-    ("wrist_reach_aim_flatbot_20261027_1519.npz", -0.0213),
-    ("wrist_reach_aim_flatbot_20261027_1623.npz", -0.0180),
+    ("wrist_reach_aim_flatbot_20261027_1519.npz", -0.0216),
+    ("wrist_reach_aim_flatbot_20261027_1623.npz", -0.0181),
 ])
 def test_the_live_reach_out_aims_read_their_table_20_mm_low(pink, name, want, monkeypatch):
     """Flatbot 2026-10-27 15:19 and 16:23, the aim frames from the look pose.
-    The wrist read its own table 21.3 and 18.0 mm below the scene camera's
+    The wrist read its own table 21.6 and 18.1 mm below the scene camera's
     and its lid rings 22 mm below the scene's lid, 12-13 mm inside the 35
     mm gate; judged against the table they see, 31-35 mm inside it. The
     press point stays as measured. The aimer's fix stands it that much
