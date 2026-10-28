@@ -736,6 +736,77 @@ F_162417 = "scene_upright_flatbot_20261027_162417.npz"  # the 10-27 16:24 frame 
 F_144302 = "scene_upright_flatbot_20261022_144302.npz"  # P1: something nearer than the canister inside its holder box
 F_133403 = "scene_upright_flatbot_20261023_133403.npz"  # P4: the holder cut by the frame's left edge
 F_172707 = "scene_upright_flatbot_20261023_172707.npz"  # P4: the lid half off the frame's left edge, its arc fit two places
+# P3 (scored difficult, no reference: ref_xyz NaN): the canister ~90 % off the frame's left edge, only its holder's brim
+# tip and a 5 px sliver of its lid in view; cap_gt is the GT box of the lid's cap
+F_133217 = "scene_upright_flatbot_20261023_133217.npz"
+
+
+def _ray_cast_cylinder(depth, k, T, centre_xy, rho, z0, z1):
+    """`depth` (m, the upright colour-aligned image of intrinsics `k`, base <- colour `T`) with a standing cylinder
+    rendered into it, nearest surface kept: what a second object beside or behind the canister would show."""
+    h, w = depth.shape
+    u, v = np.meshgrid(np.arange(w, dtype=float), np.arange(h, dtype=float))
+    ray = np.stack([(u - k[0, 2]) / k[0, 0], (v - k[1, 2]) / k[1, 1], np.ones_like(u)], -1) @ np.asarray(T)[:3, :3].T
+    o = np.asarray(T)[:3, 3]
+    bx, by = o[0] - centre_xy[0], o[1] - centre_xy[1]
+    a = ray[..., 0] ** 2 + ray[..., 1] ** 2
+    b = 2 * (ray[..., 0] * bx + ray[..., 1] * by)
+    disc = b * b - 4 * a * (bx * bx + by * by - rho * rho)
+    t = np.where(disc >= 0, (-b - np.sqrt(np.maximum(disc, 0))) / (2 * a), np.inf)  # optical z, the rays' z being 1
+    zs = o[2] + t * ray[..., 2]
+    t = np.where((t > 0) & (zs >= z0) & (zs <= z1), t, np.inf)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tc = (z1 - o[2]) / ray[..., 2]
+    on_top = (tc > 0) & (np.hypot(o[0] + tc * ray[..., 0] - centre_xy[0], o[1] + tc * ray[..., 1] - centre_xy[1]) <= rho)
+    t = np.where(on_top & (tc < t), tc, t)
+    hit = np.isfinite(t) & ((depth <= 0) | (t < depth))
+    return np.where(hit, t, depth)
+
+
+def _upright_at(name, ox=0, oy=0, lo=0, cylinders=()):
+    """_upright's frame lifted at pixel parity (ox, oy) — the stride-2 cloud from another pixel of each 2 x 2 — and,
+    with `lo`, with the frame's left edge moved `lo` px in (the depth runs up to the new edge, as it does at a
+    right-edge cut); `cylinders` (centre_xy, radius, z0, z1) are rendered into its depth first
+    (_ray_cast_cylinder). (pts_base, uv, table rows z or None, gate kwargs, segmenter objects, the npz)."""
+    from pathlib import Path
+
+    from rammp_box_opening.perception.scene import color_cloud
+
+    z = np.load(Path(__file__).parent / "data" / name)
+    T = z["T_base_color"]
+    k, kd = np.asarray(z["k"], float).copy(), np.asarray(z["kd"], float).copy()
+    full = z["depth_mm"].astype(float) / 1000.0
+    for c in cylinders:
+        full = _ray_cast_cylinder(full, z["k"], T, *c)
+    k[0, 2] -= lo
+    kd[0, 2] -= lo + ox
+    kd[1, 2] -= oy
+    depth = full[oy:, lo + ox:]
+    pc, uv = color_cloud(depth, kd, k, z["dist"], z["T_color_depth"], stride=2)
+    pts = pc @ T[:3, :3].T + T[:3, 3]
+    tz = table_from_scene_points(pts, uv, 400)
+    w = 640 - lo
+    kw = dict(cam_xyz=T[:3, 3], side_table_z=None, image_wh=(w, 400), cam_R=T[:3, :3])
+    objs = []
+    for o in z["seg_objects"]:
+        x0, y0, x1, y1 = (float(v) for v in o[1:])
+        if x1 - lo > 1.0:
+            objs.append(("food container", float(o[0]), (max(x0 - lo, 0.0), y0, x1 - lo, y1)))
+    return pts, uv, None if np.isnan(tz) else float(tz), kw, objs, z
+
+
+def _cylinder_by_the_lid(name, model, clear, rho, height, along):
+    """A standing cylinder (centre_xy, radius, z0, z1) for _upright_at's `cylinders`: `height` m tall on the
+    fixture's table (the lid's reference top less the container's height), `rho` across, `clear` m clear of the lid,
+    image right of it ("beside", into the frame for a left cut), straight behind it from the camera ("behind") or
+    between ("beside_behind")."""
+    _pts, _uv, _tz, kw, _objs, z = _upright_at(name)
+    ref, cam = np.asarray(z["ref_xyz"], float), kw["cam_xyz"]
+    right = kw["cam_R"][:2, 0] / np.linalg.norm(kw["cam_R"][:2, 0])
+    view = (ref[:2] - cam[:2]) / np.linalg.norm(ref[:2] - cam[:2])
+    d = {"beside": right, "behind": view, "beside_behind": (right + view) / np.linalg.norm(right + view)}[along]
+    table = ref[2] - model.dims[2]
+    return ref[:2] + (model.lid_dims[0] / 2 + clear + rho) * d, rho, table, table + height
 
 
 def test_the_band_above_the_segmenters_holder_box_finds_the_canister_the_owl_missed():
@@ -869,11 +940,14 @@ def test_the_lid_half_off_the_frame_is_one_place_inside_its_boxs_uncut_side(monk
     assert two.pose is None and "two places" in two.tried[-1]
 
 
-def test_a_cut_box_looser_or_tighter_than_its_lid_fixes_the_lid_or_nothing():
+def test_at_1727_the_half_off_canisters_box_side_moved_either_way_fixes_its_lid_or_nothing():
     """The uncut side the bound reads is the detector's: it may sit a little
     inside the lid's silhouette or well outside it (a holder's, or a loose
-    box). Moved 40 px either way, the half-off canister is still fixed where
-    it was; moved further, it is refused, never fixed somewhere else."""
+    box). Moved 40 px either way, the half-off canister at 17:27 is still
+    fixed where it was; moved further, it is refused, never fixed somewhere
+    else. One frame's measurement, not a rule: at 15:09, the OWL boxes'
+    uncut side pulled 40 px into the lid fixes it 32 mm off (c693865:
+    13.6 mm)."""
     from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
     from rammp_box_opening.perception.segmenter_source import segmenter_candidates
 
@@ -924,6 +998,144 @@ def test_a_cut_box_that_holds_only_the_holder_under_the_lid_is_refused():
     (c,) = segmenter_candidates(objs, ("food container",), (640, 400))
     grown = scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", **kw)
     assert grown.pose is not None and np.linalg.norm(np.subtract(grown.top, ref)) < 0.020  # measured 13.4 mm
+
+
+def test_the_lid_all_but_out_of_view_settles_no_two_places(monkeypatch):
+    """Flatbot 2026-10-23 13:32 (detbench, scored difficult): the canister ~90 %
+    off the frame's left edge, only its holder's brim tip and a 5 px sliver of
+    its lid in view. The band is the brim tip, and the circles through it are
+    guesses: two places, as c693865 said. The box's side takes one out, and the
+    one it keeps (28-45 points) stands 51 mm past the lid's own silhouette;
+    b2fb875 fixed it, and the stream committed it in 300 of 300 runs. Too few
+    points to settle two places on, at every pixel parity."""
+    from rammp_box_opening.perception import scene_source as ss
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    r = model.lid_dims[0] / 2
+    for ox, oy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        pts, uv, tz, kw, objs, z = _upright_at(F_133217, ox, oy)
+        cands = segmenter_candidates(objs, ("food container",), (640, 400))
+        assert [c.kind for c in cands] == ["grown"]
+        got = ss.scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+        assert got.pose is None and got.partial == () and "fits two places" in got.tried[-1], ((ox, oy), got.tried)
+    assert "too few to settle it (need 100)" in got.tried[-1]
+    # with no floor, (0, 1) and (1, 1) fix the brim tip, the circle a lid's radius past the lid's own silhouette (the
+    # right edge of its cap's GT box)
+    monkeypatch.setattr(ss, "PARTIAL_SETTLE_MIN_POINTS", 0)
+    for ox, oy in ((0, 1), (1, 1)):
+        pts, uv, tz, kw, objs, z = _upright_at(F_133217, ox, oy)
+        cands = segmenter_candidates(objs, ("food container",), (640, 400))
+        bad = ss.scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+        assert bad.pose is not None, ((ox, oy), bad.tried)
+        silhouette = ss.pixel_plane(0, float(z["cap_gt"][2]), pts, uv, kw["cam_xyz"], kw["cam_R"])
+        past = float(ss.past_sides(np.asarray(bad.top[:2]), (silhouette,), kw["cam_xyz"], bad.top[2], r)[0])
+        assert past > 0.045, (ox, oy)  # measured 50.9 and 51.2 mm
+
+
+def test_a_taller_thing_beside_a_cut_box_does_not_refuse_it():
+    """The lid stands on its holder, inside the box's own pixel columns: what
+    stands over a cut box's top is counted there only. A bottle 80 mm taller
+    than the lid 18 cm beside the half-off canister at 17:27 stood over the
+    top inside the band's disc and refused it (b2fb875; at 14:40, with a
+    lid-wide one 27 cm off, c693865 fixed it 11.6 mm from the reference);
+    now it is the fix it is without the bottle. Something taller standing
+    right behind the box, inside its columns, still refuses it."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, z = _upright_at(F_172707)
+    ref = np.asarray(z["ref_xyz"], float)
+    (c,) = segmenter_candidates(objs, ("food container",), (640, 400))
+    alone = scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    tall = model.dims[2] + 0.08
+    bottle = _cylinder_by_the_lid(F_172707, model, 0.18 - model.lid_dims[0] / 2 - 0.035, 0.035, tall, "beside")
+    pts, uv, tz, kw, objs, z = _upright_at(F_172707, cylinders=[bottle])
+    got = scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert got.pose is not None and got.partial == ("left",), got.tried
+    assert np.linalg.norm(np.subtract(got.top, alone.top)) < 0.002  # measured 0.2 mm: the bottle's side in the band
+    assert np.linalg.norm(np.subtract(got.top, ref)) < 0.015  # measured 11.2 mm
+    behind = _cylinder_by_the_lid(F_172707, model, 0.01, 0.035, tall, "behind")
+    pts, uv, tz, kw, objs, z = _upright_at(F_172707, cylinders=[behind])
+    hid = scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert hid.pose is None and "under the lid" in hid.tried[-1], hid.tried
+
+
+def test_a_lids_circle_that_something_taller_stands_inside_is_refused(monkeypatch):
+    """With the over-the-top count kept to the box's columns, a taller thing
+    beside and behind a cut canister puts the side of it into the lid's band
+    unrefused, and the circle slides toward it: a 20 cm cylinder 5 cm clear
+    of the half-off canister at 13:34 (b2fb875 refused it on the whole disc's
+    count, c693865 fixed it 151 mm off). The lid is the container's top:
+    nothing stands 20-50 mm over it where the fitted circle is, and here the
+    cylinder does."""
+    from rammp_box_opening.perception import scene_source as ss
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    cyl = _cylinder_by_the_lid(F_133403, model, 0.05, 0.035, 0.20, "beside_behind")
+    pts, uv, tz, kw, objs, z = _upright_at(F_133403, cylinders=[cyl])
+    ref = np.asarray(z["ref_xyz"], float)
+    cands = segmenter_candidates(objs, ("food container",), (640, 400))
+    got = ss.scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert got.pose is None and "where the lid's circle is" in got.tried[-1], got.tried
+    monkeypatch.setattr(ss, "PARTIAL_OVER_PAD_M", -1.0)  # no circle holds anything: the check is off
+    slid = ss.scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert slid.pose is not None and np.linalg.norm(np.subtract(slid.top, ref)) > 0.04  # measured 55.8 mm
+
+
+def test_known_limit_a_taller_thing_right_behind_a_cut_canister_passes_for_it():
+    """A pinned limit, not a wish (review of b2fb875): a cylinder 16 cm tall
+    1 cm behind the half-off canister at 13:34, with the lid box RF-DETR
+    stacks on the holder there at 13:33 and 15:09. The lid box is refused:
+    the cylinder stands over its top inside its columns. The grown holder
+    band then lifts the cylinder's top, inside the lid band, and fixes the
+    cylinder 118 mm off, with no rival left to flag it; c693865 passed the
+    lid box too and called the message two places, for the OWL to settle.
+    A second cue (free space) would be needed; until then, this fails
+    unsafe."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import SceneCand, segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, z = _upright_at(F_133403)
+    ref = np.asarray(z["ref_xyz"], float)
+    lid = SceneCand(0.29, (0.0, 214.0, 90.0, 277.0), None, (0.0, 214.0, 90.0, 277.0), "lid")
+    cands = [lid] + segmenter_candidates(objs, ("food container",), (640, 400))
+    clean = scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert clean.box == lid.box and np.linalg.norm(np.subtract(clean.top, ref)) < 0.015  # measured 13.3 mm
+    cyl = _cylinder_by_the_lid(F_133403, model, 0.01, 0.04, 0.16, "behind")
+    pts, uv, tz, kw, objs, z = _upright_at(F_133403, cylinders=[cyl])
+    alone = scene_fix_from_boxes([lid], pts, uv, tz, model, src="segmenter", **kw)
+    assert alone.pose is None and "under the lid" in alone.tried[-1], alone.tried
+    got = scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert got.pose is not None and got.box != lid.box and got.rivals == ()
+    assert np.linalg.norm(np.subtract(got.top, ref)) > 0.10  # measured 118 mm: the cylinder
+
+
+def test_a_lid_boxs_circle_refined_past_its_side_falls_back_inside_it():
+    """Where the depth runs to the frame's edge (a right-edge cut: the OAK's
+    no-depth strip is at its left), the smear past the lid's silhouette pulls
+    the refined circle past a lid box's side: the 16:24 frame with its left
+    edge moved through the lid at 35 %, the lid's GT box cut there. b2fb875
+    refused it (refined 20.3 mm past), and on detbench re-cuts like it the
+    gate fell through to the grown holder band, up to 48 mm off. The RANSAC
+    circle it was refined from stands inside the bound: the fix, 21 mm from
+    the reference. A holder's side stands outside the lid's silhouette, and
+    past a grown holder box the refined circle is still refused."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import SceneCand
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, _objs, z = _upright_at(F_162417, lo=201)
+    ref = np.asarray(z["ref_xyz"], float)
+    lid = (0.0, 201.0, 241.0 - 201, 221.0)  # detbench's GT lid box at 16:24, [179, 201, 241, 221], cut at u = 201
+    got = scene_fix_from_boxes([(1.0, list(lid))], pts, uv, tz, model, **kw)
+    assert got.pose is not None and got.partial == ("left",), got.tried
+    assert np.linalg.norm(np.subtract(got.top, ref)) < 0.025  # measured 21.1 mm
+    held = scene_fix_from_boxes([SceneCand(1.0, lid, None, lid, "grown")], pts, uv, tz, model, src="segmenter", **kw)
+    assert held.pose is None and "refined, runs 20.3 mm past its box" in held.tried[-1], held.tried
 
 
 def test_the_gates_reasons_name_the_detector_they_came_from():

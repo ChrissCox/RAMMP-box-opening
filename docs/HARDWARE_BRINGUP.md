@@ -310,6 +310,14 @@ run for grip and place.
   commits. "it watches '', not the scene camera (...); the mock?" →
   the segmenter runs as sheppy's mock. "does not import" → this install does
   not chain `~/ros2_ws/install` (rammp_perception_interfaces).
+- A round box the scene frame cuts at its side is finished from its lid's
+  arc in view ("cut off at the frame's left edge, ..." in the reasons).
+  "... fits two places 35+ mm apart, one past its box: the N points of the
+  other are too few to settle it" → too little of the lid is in view (half
+  of it is plenty): move the box into the frame. "... stand 20-50 mm over
+  its top where the lid's circle is: the arc took in something taller than
+  the lid" → something taller stands right beside or behind the cut box:
+  move it away, or the box into the frame.
 - "lid spot [x, y] refused by the planner — setting the lid down at [x, y]
   instead" → normal: the first drop spot beside the box could not be
   planned and the next side was used. "STOP before the grip — ... no drop
