@@ -680,8 +680,9 @@ def _clear_up_and_back(ctx, runner, R, t):
         runner.note("depth_clear", flown=False, up_mm=round(1000 * up, 1), lean_deg=round(lean, 1), why="; ".join(whys))
         return None
     pts, back = chosen
+    # the console says why a nearer target was passed over, as the run log does
     print("[press_demo] up %.0f mm and %.0f mm back toward the arm (the hand leaning %.0f deg), clear of the box's "
-          "padded volume, before home" % (1000 * up, 1000 * back, lean))
+          "padded volume, before home%s" % (1000 * up, 1000 * back, lean, " (%s)" % "; ".join(whys) if whys else ""))
     # up and away from the box, toward the look pose the hand came in from
     res = runner.run([line_leg(ctx, "depth:clear", pts, quat, FREE_LINE_SPEED, None, _full_world(ctx))], execute=True)
     if any(not r.ok for r in res):

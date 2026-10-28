@@ -1552,12 +1552,13 @@ def test_where_the_first_line_up_and_back_does_not_fly_the_clear_goes_back_as_fa
     ((0.150, 0.170), rp.CLEAR_BACK_M),  # neither does: the first, and home's own clear-margin step after it
 ])
 def test_a_clear_that_would_leave_a_joint_too_near_its_limit_for_home_goes_on_to_the_next_target(
-        ctx, monkeypatch, tmp_path, rooms, flown_back):
+        ctx, monkeypatch, tmp_path, capsys, rooms, flown_back):
     """A line up and back that flies but ends with a joint nearer its limit
     than home plans from (CLEAR_MARGIN_ROOM_RAD, _home_legs) would cost the
     clear-margin step the clear is there to save: the next target is
     tried, the first that leaves room is flown — else the first that
-    flies, and no line is solved past the one flown."""
+    flies, and no line is solved past the one flown. The console says
+    why, as the run log does."""
     import test_reach_press as trp
 
     from rammp_box_opening.primitives.core import CLEAR_MARGIN_ROOM_RAD
@@ -1579,10 +1580,14 @@ def test_a_clear_that_would_leave_a_joint_too_near_its_limit_for_home_goes_on_to
     room = rooms[0 if flown_back == rp.CLEAR_BACK_M else 1]
     assert 2.09 - leg.goal_joints[5] == pytest.approx(room) and note["back_mm"] == pytest.approx(1000 * flown_back)
     assert len(chain.lines) == (1 if rooms[0] >= CLEAR_MARGIN_ROOM_RAD else 2)
+    said = capsys.readouterr().out
+    assert "up 55 mm and %.0f mm back toward the arm (the hand leaning 0 deg)" % (1000 * flown_back) in said
     if rooms[0] < CLEAR_MARGIN_ROOM_RAD:
         assert note["why"].startswith("50 mm back: joint_6 %.3f rad from its limit at its end" % rooms[0])
+        assert "before home (%s)" % note["why"] in said
     else:
         assert note["why"] is None
+        assert "padded volume, before home\n" in said
 
 
 def test_a_hand_already_as_high_as_the_clear_goes_is_not_moved(ctx, monkeypatch, tmp_path):
