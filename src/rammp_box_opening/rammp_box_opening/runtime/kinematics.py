@@ -151,6 +151,24 @@ class ArmChain:
         R, t, _zs, _ps = self._fk_axes(q)
         return R, t
 
+    def tool_positions(self, qs):
+        """(n, 3): fk()'s t for each row of `qs` (n, 7), every row at once —
+        the run record's settle note puts the tool of up to ~150
+        /joint_states readings against its end when the next goal goes out
+        (runtime/runner), where fk() row by row costs ~76 us each on the
+        Jetson."""
+        qs = np.asarray(qs, float)
+        R = np.broadcast_to(self._I3, (len(qs), 3, 3))
+        p = np.zeros((len(qs), 3))
+        for k, (Rf, tf, _a, K, KK) in enumerate(self._segs):
+            th = qs[:, k][:, None, None]
+            p = p + R @ tf
+            R = R @ Rf @ (self._I3 + np.sin(th) * K + (1.0 - np.cos(th)) * KK)
+        Rt, tt = self._tail
+        p = p + R @ tt
+        R = R @ Rt
+        return p + R @ self.tool_from_tip
+
     def points(self, q):
         """(n, 3): the arm's centre line at q — each moving joint's origin,
         then the tool frame — for keeping what the cameras see off the arm

@@ -1639,8 +1639,13 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     why = unsupported(m)
     if why is None and not oblique_aim_available():
         why = "this install's wrist aim cannot look at the lid obliquely (perception/button_aim takes no lid_z/prior_xy)"
+    # Every refusal before the arm moves is noted as well as printed
+    # (reach_refused, here and below): 14:28:12, 14:29:19 and 14:29:54
+    # 2026-10-28 stopped at the proof or the look's plans, and their records
+    # end at the scene fix with no reason
     if why is not None:
         print("[press_demo] STOP: no reach-out press — %s; nothing moved" % why)
+        runner.note("reach_refused", why="no reach-out press — %s" % why)
         return 1
     yaw = scene_fix.pose.yaw
     prior = from_container(scene_fix.pose, m.button_offset)
@@ -1687,9 +1692,11 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     if plan is None and proof and looks:
         near, why_near = shifted_way_down(ctx, cfg, looks[0], prior_button)
         if near is None:
-            print("[press_demo] STOP: no reach-out press for the scene camera's box — no tilt turns the hand down and "
-                  "strokes there, nor with the button %.0f mm nearer the arm or to either side (%s; at %d deg: %s); "
-                  "nothing moved" % (1000 * PROOF_SHIFT_M, why, looks[0].tilt_deg, why_near))
+            stop = ("no reach-out press for the scene camera's box — no tilt turns the hand down and strokes there, "
+                    "nor with the button %.0f mm nearer the arm or to either side (%s; at %d deg: %s)"
+                    % (1000 * PROOF_SHIFT_M, why, looks[0].tilt_deg, why_near))
+            print("[press_demo] STOP: %s; nothing moved" % stop)
+            runner.note("reach_refused", why=stop)
             return 1
         plan, proven = looks[0], "shifted"
         print("[press_demo] REACH-OUT: the press does not reach the scene camera's button itself (%s), but at %d deg "
@@ -1697,6 +1704,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
               "button decides" % (why, plan.tilt_deg, 1000 * PROOF_SHIFT_M, near))
     if plan is None:
         print("[press_demo] STOP: no reach-out press plans for the scene camera's box (%s); nothing moved" % why)
+        runner.note("reach_refused", why="no reach-out press plans for the scene camera's box (%s)" % why)
         return 1
     runner.note("reach_plan", tilt_deg=plan.tilt_deg, look_xyz=[round(v, 4) for v in plan.look_xyz],
                 button=list(prior_button), proof=proven,
@@ -1716,6 +1724,8 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         return 0
     at_rest = None if soft else _settled(ctx, "the rest pose")
     if at_rest is None and not soft:
+        runner.note("reach_refused", why="no steady joint efforts at the rest pose — the reach-out's guards cannot be "
+                                         "referenced")
         return 1
     res = runner.run([plan.look_leg], execute=True)
     if any(not r.ok for r in res):

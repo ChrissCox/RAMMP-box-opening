@@ -38,6 +38,19 @@ def test_fk_matches_the_planner_at_a_press_staging(chain):
     assert np.allclose(_R[:, 2], [0.0, 0.0, -1.0], atol=2e-3)  # tool down
 
 
+def test_the_tools_of_many_readings_at_once_are_fk_row_by_row():
+    """The run record's settle note puts the tool of a window of
+    /joint_states readings against its end (runtime/runner): all at once,
+    the same numbers fk() gives one by one, on both chains."""
+    rng = np.random.default_rng(7)
+    qs = rng.uniform(-3.2, 3.2, size=(40, 7))
+    for arm in (ArmChain(), ArmChain(FLATBOT_URDF, root="arm_mount")):
+        many = arm.tool_positions(qs)
+        assert many.shape == (40, 3)
+        assert np.allclose(many, [arm.fk(q)[1] for q in qs], atol=1e-12)
+        assert arm.tool_positions(np.zeros((0, 7))).shape == (0, 3)
+
+
 def test_the_line_is_straight_and_holds_the_attitude(chain):
     # the planner's waypoint joints 60 mm above the press target for the
     # bearing -15 deg box (live probe 2026-09-16)

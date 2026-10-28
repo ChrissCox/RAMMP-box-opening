@@ -1308,6 +1308,7 @@ def main():
         if locator.moved_note and scene_fix is not None:
             print("[press_demo] scene camera: %s" % locator.moved_note)  # e.g. the tag was not in view
         if scene_fix is None:
+            runner.note("reach_refused", why="NO BOX — scene camera: %s" % locator.last_why)
             try_home(ctx, runner, args.execute, "NO BOX — scene camera: %s" % locator.last_why)
             sys.exit(2)
         if not scene_by_tf:
@@ -1378,7 +1379,9 @@ def main():
             pnode.destroy_node()
         except Exception:
             pass
-        # the run is over and the arm stopped: now its frames are written
+        # the run is over and the arm stopped: now the last arrival's settle
+        # is noted, from what was heard (runner.flush), and its frames written
+        runner.flush()
         keep_mission_frames(getattr(ctx, "mission_frames", None), ending)
 
 

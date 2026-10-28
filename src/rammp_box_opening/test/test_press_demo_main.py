@@ -88,10 +88,10 @@ HOME_FIRSTS = []  # the keywords of every home_first call, in order
 REACH_OUTS = []  # the scene fixes handed to the reach-out
 
 
-def run_main(monkeypatch, tmp_path, argv, approach, client=None):
+def run_main(monkeypatch, tmp_path, argv, approach, client=None, found=True):
     """press_demo.main() with `approach(ctx)` standing in for the reach-out:
-    its result's `failed` decides the exit code. Returns (exit code, client,
-    run-log rows)."""
+    its result's `failed` decides the exit code; `found` False, the scene
+    camera finds no box. Returns (exit code, client, run-log rows)."""
     import faulthandler
 
     import rclpy.executors
@@ -116,7 +116,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None):
         table_extent = None
 
     class _Locator:
-        last_why = None
+        last_why = None if found else "the OWL's 3 candidates refused"
         moved_note = None
         last_timing = {}
         grab = None
@@ -129,7 +129,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None):
 
         def locate(self, timeout):
             LOCATES.append(timeout)
-            return _Fix
+            return _Fix if found else None
 
         def base_to_link(self):
             return None
@@ -215,6 +215,17 @@ def test_the_first_look_for_the_box_keeps_at_it_longer_than_a_re_check(monkeypat
     run_main(monkeypatch, tmp_path, ["--execute", "--press-only"], _at_staging(), client=client)
     assert LOCATES[0] == press_demo.SCENE_FIRST_LOCATE_S > press_demo.SCENE_LOCATE_S
     assert len(REACH_OUTS) == 1  # a box within the straight-down staging reach goes to the reach-out too
+
+
+def test_a_run_whose_scene_camera_finds_no_box_says_so_in_its_record(monkeypatch, tmp_path):
+    """NO BOX is printed and the arm goes home: the record now says why the
+    reach-out never started, before the home it flies (reach_refused)."""
+    REACH_OUTS.clear()
+    code, _c, rows = run_main(monkeypatch, tmp_path, ["--execute"], _at_staging(), found=False)
+    assert code == 2 and not REACH_OUTS
+    refused = [r for r in rows if r["leg"] == "reach_refused"]
+    assert [r["why"] for r in refused] == ["NO BOX — scene camera: the OWL's 3 candidates refused"]
+    assert rows.index(refused[0]) < len(rows) - 1 and rows[-1]["kind"] == "motion"  # then the home
 
 
 def _refused(ctx):

@@ -1116,3 +1116,129 @@ def test_a_release_the_driver_did_not_take_is_tried_again(monkeypatch, capsys):
     assert c.release() is False and c.release() is False
     assert [g.preemption for g in d.goals] == [client_mod.QUEUE, client_mod.LATEST_WINS, client_mod.LATEST_WINS]
     assert capsys.readouterr().out.count("not released: the driver did not take the hold") == 2
+
+
+# -- the flight log: what the arm said, kept at the price of an append ------------
+
+
+def _joint_states(k, velocity=True):
+    """/joint_states message `k` as the flatbot driver sends it: the arm's
+    seven joints and the gripper's knuckle, stamped on its clock at 49 Hz."""
+    from sensor_msgs.msg import JointState
+
+    m = JointState()
+    t = 1793216726.0 + k / 49.0
+    m.header.stamp.sec = int(t)
+    m.header.stamp.nanosec = int(round((t - int(t)) * 1e9))
+    m.name = ["arm_joint_%d" % i for i in range(1, 8)] + ["arm_robotiq_85_left_knuckle_joint"]
+    m.position = [0.001 * k + 0.1 * i for i in range(7)] + [0.8]
+    m.velocity = [0.01 * k] * 7 + [float("nan")] if velocity else []
+    m.effort = [1.0] * 7 + [float("nan")]
+    return m
+
+
+def _listening_client(monkeypatch):
+    """PlannerClient.__init__ with the rclpy surface stubbed, as
+    test_a_client_built_for_a_run_flies_rigid builds it."""
+
+    class _Node:
+        def __getattr__(self, name):  # create_subscription, create_client, ...
+            return lambda *a, **k: None
+
+    for name in ("ActionClient", "Buffer", "TransformListener"):
+        monkeypatch.setattr(client_mod, name, lambda *a, **k: None)
+    return client_mod.PlannerClient(_Node())
+
+
+def test_the_joint_states_history_keeps_the_newest_in_order_and_hands_out_a_copy(monkeypatch):
+    """What the arm does after an arrival is read from what the client heard
+    (runner._note_settle): the newest JOINT_HISTORY_N messages — 3 s and
+    more of a ~98 Hz stream, a state_publish_divisor of 1 — each with its
+    stamp, the arm's joints, velocities and efforts in order, the knuckle
+    left out."""
+    c = _listening_client(monkeypatch)
+    n = client_mod.PlannerClient.JOINT_HISTORY_N
+    assert n >= 3 * 100
+    for k in range(n + 50):
+        c._js_cb(_joint_states(k))
+    kept = c.joint_history()
+    assert len(kept) == n
+    stamps = [s.stamp for s in kept]
+    assert stamps == sorted(stamps) and stamps[0] == pytest.approx(1793216726.0 + 50 / 49.0, abs=1e-6)  # 50 dropped
+    assert all(a.t <= b.t for a, b in zip(kept, kept[1:]))
+    k = n + 49
+    assert kept[-1].q == pytest.approx([0.001 * k + 0.1 * i for i in range(7)]) and kept[-1].q == c.joints()
+    assert kept[-1].qd == pytest.approx([0.01 * k] * 7) and kept[-1].effort == [1.0] * 7
+    # a copy: what is heard after it changes nothing in it
+    c._js_cb(_joint_states(n + 50))
+    assert kept[-1].stamp == stamps[-1] and c.joint_history()[-1].stamp > stamps[-1]
+    # since: only what was heard at or after it; a message without velocities keeps none
+    time.sleep(0.002)
+    mid = time.monotonic()
+    c._js_cb(_joint_states(n + 51, velocity=False))
+    (late,) = c.joint_history(since=mid)
+    assert late.qd is None and late.stamp == pytest.approx(1793216726.0 + (n + 51) / 49.0, abs=1e-6)
+
+
+class _ReportingDriver(_Driver):
+    """Replays `n` feedbacks, each with its fraction and the joints it
+    measured, as the driver's sampler does every tick."""
+
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        self.goals.append(goal)
+        for k in range(self.n):
+            fb = ExecuteJointTrajectory.Feedback(fraction_complete=k / self.n,
+                                                 actual=JointTrajectoryPoint(positions=[k * 1e-3] * 7))
+            feedback_callback(SimpleNamespace(feedback=fb))
+        return _Future(_GoalHandle(0, ""))
+
+
+def test_every_tenth_feedback_is_kept_with_its_fraction_and_when_it_was_heard():
+    """The driver's 1 kHz feedback was heard and deserialized for its
+    fraction alone: every 10th now keeps the joints it measured too, for the
+    run record's side file — and every one still moves the progress."""
+    driver = _ReportingDriver(95)
+    c = _client(driver)
+    t0 = time.monotonic()
+    end = [v + 0.05 for v in LIVE]
+    outcome, info = c.execute(_traj(LIVE, end), 1.0)
+    assert outcome == "arrived"
+    kept = list(info["feedback_q"])
+    assert [round(f * 95) for _t, f, _q in kept] == list(range(0, 95, 10))  # the 1st, the 11th, ... the 91st
+    for (_t, _f, q), k in zip(kept, range(0, 95, 10)):
+        assert q == pytest.approx([k * 1e-3] * 7)
+    assert t0 <= info["sent_at"] <= kept[0][0] <= kept[-1][0] <= time.monotonic()
+    assert list(info["sent_traj"].points[-1].positions) == pytest.approx(end)
+    assert info["progress"] == pytest.approx(94 / 95)
+
+
+def test_the_feedback_kept_is_bounded_to_the_newest(monkeypatch):
+    monkeypatch.setattr(client_mod.PlannerClient, "FEEDBACK_KEEP", 5)
+    _outcome, info = _client(_ReportingDriver(200)).execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert [round(f * 200) for _t, f, _q in info["feedback_q"]] == [150, 160, 170, 180, 190]
+
+
+def test_a_refused_trajectory_reports_nothing_sent():
+    away = [LIVE[0] + 0.1] + LIVE[1:]
+    outcome, info = _client().execute(_traj(away, away), 1.0)
+    assert outcome == "failed" and "sent_at" not in info and "feedback_q" not in info
+
+
+def test_every_goal_that_goes_to_the_driver_is_timed():
+    """An arrival's settle window ends where the next goal begins
+    (runner._note_settle): every execution's send and a release's are
+    kept, oldest first."""
+    from collections import deque
+
+    c = _client(_Driver())
+    c._sent_at = deque(maxlen=client_mod.PlannerClient.GOALS_KEPT)
+    c.compliant = True
+    t0 = time.monotonic()
+    _outcome, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert c.release()
+    sent = c.goals_sent()
+    assert len(sent) == 2 and t0 <= sent[0] <= info["sent_at"] <= sent[1] <= time.monotonic()

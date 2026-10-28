@@ -8,7 +8,9 @@ never auto-continues past a cancel.
 
 import json
 import math
+import re
 import time
+from collections import namedtuple
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -78,6 +80,16 @@ class LegResult:
     end_err_rad: float = None
     end_err_mm: float = None
     end_err_deg: float = None
+    # ... and each joint's (mrad), signed by its travel into the end: + past
+    # it, - short of it (_signed_end_error), and the worst joint's name. The
+    # 15:45 bag (2026-10-28): the look arrived joint_2 +45 mrad PAST, the
+    # home joint_6 -253 SHORT, which end_err_rad reads alike
+    end_err_mrad: list = None
+    end_err_joint: str = None
+    # the execution's side file, from the run record's folder: the trajectory
+    # sent, point by point, and the driver's feedback of what flew
+    # (Runner._keep_flight)
+    flight: str = None
     # a gripper leg's knuckle when it finished (rad, 0.0 open .. 0.8 closed)
     gripper_pos: float = None
     # what tripped the guard (guards.TorqueGuard.trip_report): the joint, its
@@ -123,6 +135,175 @@ def _arrival_error(live, traj):
     except Exception:  # noqa: BLE001 - no chain (no URDF for its root, ...): no tool error
         mm = deg = None
     return tuple(None if v is None or not math.isfinite(v) else float(v) for v in (rad, mm, deg))
+
+
+# -- the flight log: how each execution arrived, and how the arm settled -------
+# "Arrived" is the driver's trajectory clock running out: it reads no
+# goal_tolerance (kinova-gen3-driver issue #17), so in the joint impedance
+# the arm is still moving then. The 15:45 bag (2026-10-28, 49 Hz): the look
+# arrived with joint_2 45-47 mrad PAST its end, the tool 14 mm off, and
+# crept back for 0.55 s; the home arrived with joint_6 0.25 rad SHORT, the
+# tool 86-88 mm off, and came within 2 mm at +1.15 s, 1 mm at +1.70 s. The
+# record kept one unsigned worst joint at the arrival, which reads both
+# alike, and nothing after it. Now each arrival's settle is measured over
+# SETTLE_WINDOW_S after it, per joint and at the tool, from the
+# /joint_states the client keeps (client.joint_history), and noted when the
+# next goal goes out or the run ends (Runner.flush): never waited for.
+SETTLE_WINDOW_S = 1.5
+SETTLE_WITHIN_MM = (5.0, 2.0, 1.0)
+# a joint's travel into the end of what flew is read where it last stood
+# this far from the end: a joint that finished moving early holds there to
+# float noise (cuRobo's float32 samples, an ulp 2.4e-7 rad), whose steps
+# have no sign
+TRAVEL_FROM_RAD = 1e-3
+
+# an arrival whose settle is still to be noted (Runner._keep_flight): its
+# execution's number and legs, when it arrived (time.monotonic(),
+# time.time()), the reading end_err_* measured, the end of what flew and
+# each joint's travel into it (_travel_signs)
+_Settling = namedtuple("_Settling", "seq legs arrived live end signs")
+
+
+def _wrapped(d):
+    """ang_diff's wrap, (-pi, pi], over an array."""
+    d = np.mod(np.asarray(d, float), 2.0 * math.pi)
+    return np.where(d > math.pi, d - 2.0 * math.pi, d)
+
+
+def _travel_signs(traj):
+    """+1 or -1 for each joint: the way it travels into the end of `traj`,
+    from the last sample TRAVEL_FROM_RAD or more off the end — its last
+    step that is not float noise. +1 for a joint that never stands that
+    far off: it does not move, and its error reads along its own axis."""
+    pts = np.asarray([p.positions for p in traj.points], float)
+    to_end = pts[-1] - pts
+    signs = np.ones(pts.shape[1])
+    for j in range(pts.shape[1]):
+        far = np.flatnonzero(np.abs(to_end[:, j]) >= TRAVEL_FROM_RAD)
+        if len(far):
+            signs[j] = 1.0 if to_end[far[-1], j] > 0.0 else -1.0
+    return signs
+
+
+def _signed_end_error(live, traj):
+    """(each joint's error in mrad, the worst joint's name): the arm at
+    `live` against the end of `traj`, the trajectory flown, wrap-aware and
+    signed by each joint's travel into the end (_travel_signs) — + past it,
+    - short of it (LegResult.end_err_mrad). A measurement only: (None,
+    None) when there is nothing to measure against."""
+    try:
+        err = _travel_signs(traj) * _wrapped(np.subtract(np.asarray(live, float), traj.points[-1].positions))
+        worst = int(np.argmax(np.abs(err)))
+        names = list(traj.joint_names)
+    except Exception:  # noqa: BLE001 - nothing to measure against
+        return None, None
+    if not np.isfinite(err).all():
+        return None, None
+    name = names[worst] if len(names) == len(err) else "joint_%d" % (worst + 1)
+    return [round(1000.0 * float(v), 1) for v in err], name
+
+
+def _within(ts, mm, thr):
+    """When the tool, `mm` from its end at the times `ts`, came within `thr`
+    for good: where the line between its last reading outside and the next
+    meets `thr`. 0.0 when it never was outside, None when the last reading
+    still is."""
+    if mm[-1] > thr:
+        return None
+    out = np.flatnonzero(mm > thr)
+    if not len(out):
+        return 0.0
+    k = int(out[-1])
+    return round(float(ts[k] + (ts[k + 1] - ts[k]) * (mm[k] - thr) / (mm[k] - mm[k + 1])), 3)
+
+
+def settle_report(rows, end, signs, window_s, chain=None):
+    """What the arm did over an arrival's settle window, `window_s` long,
+    from `rows` — (s after the arrival, joints, joint velocities or None),
+    in time order, the arrival's own reading first at 0 — against `end`,
+    the joints the trajectory flown ends at. The settle note's fields:
+
+      samples       the readings after the arrival's own; gap_ms, the
+                    longest stretch of the window without one (its
+                    resolution: the aim spins the node once a frame)
+      peak_qd       each joint's fastest |qd| after the arrival (rad/s)
+      past_mrad     each joint's furthest past the end along its travel
+                    (`signs`, _travel_signs): + it went past by so much, -
+                    it stayed short, so much at its closest
+      max_mm        the tool's furthest from where `end` puts it; end_mm,
+                    where the last reading puts it (what is left: a sag)
+      within_Nmm_s  when the tool came within N mm (SETTLE_WITHIN_MM) for
+                    good; None where the window's last reading is outside
+
+    The tool by `chain` (ArmChain.tool_positions, else fk() row by row);
+    without one its fields are None."""
+    ts = np.asarray([r[0] for r in rows], float)
+    qs = np.asarray([r[1] for r in rows], float)
+    qds = [r[2] for r in rows[1:] if r[2] is not None]
+    past = (np.asarray(signs, float) * _wrapped(qs - np.asarray(end, float))).max(axis=0)
+    out = {
+        "samples": len(rows) - 1,
+        "gap_ms": round(1000.0 * float(np.diff(np.append(ts, max(float(window_s), ts[-1]))).max()), 1),
+        "peak_qd": [round(float(v), 3) for v in np.abs(np.asarray(qds, float)).max(axis=0)] if qds else None,
+        "past_mrad": [round(1000.0 * float(v), 1) for v in past],
+    }
+    mm = None
+    if chain is not None:
+        try:
+            at = np.vstack([np.asarray(end, float), qs])
+            many = getattr(chain, "tool_positions", None)
+            p = np.asarray(many(at) if many is not None else [chain.fk(q)[1] for q in at], float)
+            mm = 1000.0 * np.linalg.norm(p[1:] - p[0], axis=1)
+        except Exception:  # noqa: BLE001 - no tool: the joints still say
+            mm = None
+    out["max_mm"] = None if mm is None else round(float(mm.max()), 1)
+    out["end_mm"] = None if mm is None else round(float(mm[-1]), 1)
+    for thr in SETTLE_WITHIN_MM:
+        out["within_%gmm_s" % thr] = None if mm is None else _within(ts, mm, thr)
+    return out
+
+
+def _rounded(rows, places):
+    """`rows`, lists of floats, rounded to `places` and as lists: in one
+    pass where they are all as long (the side file is written between two
+    motions)."""
+    if rows and len({len(r) for r in rows}) == 1:
+        return np.round(np.asarray(rows, float), places).tolist()
+    return [[round(float(v), places) for v in r] for r in rows]
+
+
+def _flight_doc(seq, names, outcome, flew, info, traj, arrived, every):
+    """An execution's side file (Runner._keep_flight): the trajectory sent,
+    point by point — t, q, qd, qdd, as the driver samples it — and every
+    `every`-th of the driver's feedback (client.FEEDBACK_EVERY): s after
+    the goal went out, the driver's fraction of the trajectory's time, and
+    the joints it measured."""
+    sent = info.get("sent_traj") or traj
+    pts = list(sent.points)
+    fb = list(info.get("feedback_q") or ())
+    t0 = float(info["sent_at"])
+    return {
+        "seq": seq,
+        "legs": list(names),
+        "outcome": outcome,
+        "mode": flew.get("mode"),
+        "gains": flew.get("gains"),
+        "joint_names": list(sent.joint_names),
+        "sent_t": round(arrived[1] - (arrived[0] - t0), 3),  # time.time() when the goal went out
+        "ended_s": round(arrived[0] - t0, 4),  # when the client returned its result, s after that
+        "trajectory": {
+            "t": [round(secs(p.time_from_start), 4) for p in pts],
+            "q": _rounded([list(p.positions) for p in pts], 6),
+            "qd": _rounded([list(p.velocities) for p in pts], 5),
+            "qdd": _rounded([list(p.accelerations) for p in pts], 4),
+        },
+        "feedback": {
+            "every": every,
+            "t": [round(float(s[0]) - t0, 4) for s in fb],
+            "fraction": [round(float(s[1]), 5) for s in fb],
+            "q": _rounded([list(s[2]) for s in fb], 6),
+        },
+    }
 
 
 def _path_len(traj):
@@ -290,6 +471,11 @@ class Runner:
         # strokes included — a first attempt at a new placement runs at a
         # fraction of speed without touching any per-leg tuning
         self.time_scale = 1.0
+        # the flight log: the executions sent so far, which number their side
+        # files, and the last arrival, its settle noted when the next goal
+        # goes out (_keep_flight, _note_settle)
+        self._flights = 0
+        self._settling = None
 
     # -- preview -----------------------------------------------------------
     def preview(self, legs):
@@ -778,17 +964,21 @@ class Runner:
             def hook(_end=list(reflex.goal_joints)):
                 return self._replan_group(next_group, next_chain + 1, start=_end)
 
+        self._note_settle()  # the last arrival's, its window cut by this goal
         t0 = time.monotonic()
         outcome, info = self.client.execute(traj, 1.0, guard=None, while_running=hook)
+        arrived = (time.monotonic(), time.time())
         ok = outcome == "arrived"
+        flew = self._how_it_flew(outcome, info, traj)
         rres = LegResult(
             reflex.name,
             outcome,
             ok,
             info.get("message", ""),
             progress=info.get("progress"),
-            t_wall=time.monotonic() - t0,
-            **self._how_it_flew(outcome, info, traj),
+            t_wall=arrived[0] - t0,
+            flight=self._keep_flight([reflex.name], outcome, flew, info, traj, arrived),
+            **flew,
         )
         planned = False
         if ok and next_group is not None:
@@ -1020,6 +1210,7 @@ class Runner:
         # (legs.can_merge merges only legs under the same one), sent when it
         # names a profile; with None the client flies its run default
         gains = group[0].gains
+        self._note_settle()  # the last arrival's, its window cut by this goal
         t0 = time.monotonic()
         outcome, info = self.client.execute(
             traj,
@@ -1029,6 +1220,7 @@ class Runner:
             stop_when=lead.stop_when,
             **({} if gains is None else {"gains": gains}),
         )
+        arrived = (time.monotonic(), time.time())
         flew = self._how_it_flew(outcome, info, traj)
         if guard is not None:
             info.setdefault("torque_peak", guard.peak)
@@ -1052,6 +1244,7 @@ class Runner:
                     contact_xyz=contact,
                 )
             )
+        t_wall = time.monotonic() - t0
         return LegResult(
             group[-1].name if len(group) > 1 else lead.name,
             outcome,
@@ -1059,11 +1252,12 @@ class Runner:
             detail,
             torque_peak=info.get("torque_peak"),
             progress=info.get("progress"),
-            t_wall=time.monotonic() - t0,
+            t_wall=t_wall,
             contact_xyz=contact,
             trip=guard.trip_report() if guard is not None else None,
             lookahead=info.get("while_running"),
             flown_traj=traj,
+            flight=self._keep_flight([g.name for g in group], outcome, flew, info, traj, arrived),
             **flew,
         )
 
@@ -1072,9 +1266,13 @@ class Runner:
         a motion's or the recoil's. On an arrival: where the arm is the
         moment the driver called it arrived, against the end of what flew —
         the cached sample, no wait and no settle, since a wait would hide
-        what the spring had not caught up. Logged, never a gate (a compliant
-        run stops for nothing it reads)."""
-        rad, mm, deg = _arrival_error(self.client.joints(), traj) if outcome == "arrived" else (None, None, None)
+        what the spring had not caught up; each joint's error signed by its
+        travel into the end (_signed_end_error). What it did after is the
+        settle note's (_note_settle). Logged, never a gate (a compliant run
+        stops for nothing it reads)."""
+        live = self.client.joints() if outcome == "arrived" else None
+        rad, mm, deg = _arrival_error(live, traj) if live is not None else (None, None, None)
+        mrad, worst = _signed_end_error(live, traj) if live is not None else (None, None)
         gains = info.get("gains")
         return {
             "mode": "impedance" if getattr(self.client, "compliant", False) else "position",
@@ -1083,7 +1281,88 @@ class Runner:
             "end_err_rad": rad,
             "end_err_mm": mm,
             "end_err_deg": deg,
+            "end_err_mrad": mrad,
+            "end_err_joint": worst,
         }
+
+    def _keep_flight(self, names, outcome, flew, info, traj, arrived):
+        """After an execution of the legs `names` (`traj`, what flew, as
+        _how_it_flew's `flew`) the client returned at `arrived`
+        (time.monotonic(), time.time()): its number, its side file next to
+        the run record — <record>.flights/<number>-<first leg>.json, what
+        went to the driver point by point and its feedback of what flew
+        (_flight_doc) — and, an arrival, its settle, noted when the next goal
+        goes out (_note_settle). Written now, the motion over: never while it
+        flies. Returns the side file's path from the record's folder
+        (LegResult.flight); None where nothing went to the driver (the
+        client's own gates refused it: no info["sent_at"]) or nothing could
+        be written. A measurement only: nothing here may cost the run."""
+        if "sent_at" not in info:
+            return None
+        self._flights += 1
+        seq = self._flights
+        if outcome == "arrived":
+            try:
+                self._settling = _Settling(seq, list(names), arrived, [float(v) for v in self.client.joints()],
+                                           [float(v) for v in traj.points[-1].positions], _travel_signs(traj))
+            except Exception:  # noqa: BLE001 - no settle to note
+                self._settling = None
+        try:
+            path = self._record().with_suffix(".flights") / ("%02d-%s.json" % (seq, re.sub(r"[^\w.-]+", "_", names[0])))
+            path.parent.mkdir(exist_ok=True)
+            doc = _flight_doc(seq, names, outcome, flew, info, traj, arrived, getattr(self.client, "FEEDBACK_EVERY", None))
+            path.write_text(json.dumps(doc))
+            return str(path.relative_to(self._log_dir))
+        except Exception as e:  # noqa: BLE001 - a side file must never cost the run
+            print("[runner] the flight of %s is not kept (%s)" % (names[0], e))
+            return None
+
+    def _note_settle(self, ending=False):
+        """The last arrival's settle (_keep_flight kept it), noted now: the
+        next goal is about to go out, or the run is over (`ending`, flush).
+        Its window runs from the arrival to SETTLE_WINDOW_S after it, the
+        first goal sent to the driver since (client.goals_sent: an
+        execution, the hold that primes the impedance, a release) or now,
+        whichever comes first — `cut` names which, None the whole window.
+        In it the /joint_states the client heard (joint_history), each
+        placed by its stamp: the arm's settle per joint and at the tool
+        (settle_report), against the end of what flew. Nothing waits for it
+        and nothing gates on it; a client that keeps no history notes none."""
+        pend, self._settling = self._settling, None
+        history = getattr(self.client, "joint_history", None)
+        if pend is None or history is None:
+            return
+        try:
+            t0, w0 = pend.arrived
+            later = [float(t) for t in getattr(self.client, "goals_sent", list)() if float(t) > t0]
+            until = min([t0 + SETTLE_WINDOW_S, time.monotonic()] + later)
+            if until >= t0 + SETTLE_WINDOW_S:
+                cut = None
+            else:
+                cut = "run end" if ending and until not in later else "next goal"
+            # a stamp is the driver's clock, time.time()'s: on this one by
+            # the arrival's two readings; an unstamped message by when heard
+            off = t0 - w0
+            heard = sorted((((s.stamp + off if s.stamp else s.t) - t0, s) for s in history(since=t0)), key=lambda r: r[0])
+            rows = [(0.0, pend.live, None)] + [(dt, s.q, s.qd) for dt, s in heard if 0.0 < dt <= until - t0]
+            try:
+                from rammp_box_opening.runtime import approach
+
+                chain = approach._chain()
+            except Exception:  # noqa: BLE001 - no chain: the joints alone
+                chain = None
+            fields = settle_report(rows, pend.end, pend.signs, until - t0, chain)
+            self.note("settle", seq=pend.seq, legs=pend.legs, arrived_t=round(w0, 3), window_s=round(until - t0, 3),
+                      cut=cut, **fields)
+        except Exception as e:  # noqa: BLE001 - a measurement only: nothing here may cost the run
+            print("[runner] the settle after %s is not measured (%s)" % (pend.legs[0], e))
+
+    def flush(self):
+        """The run is over: the last arrival's settle noted now, its window
+        cut where the run ends. Nothing spins the node after the last motion,
+        so what the client heard by then is all there is (press_demo's
+        exit)."""
+        self._note_settle(ending=True)
 
     @staticmethod
     def _leg_ok(leg, outcome):
@@ -1121,12 +1400,16 @@ class Runner:
             ok, detail = leg.verify(VerifyCtx(outcome=outcome, gripper_pos=pos))
         return LegResult(leg.name, outcome, ok, detail, t_wall=time.monotonic() - t0, gripper_pos=float(pos))
 
-    def _append(self, row):
-        """One row onto this run's jsonl (created on the first row)."""
+    def _record(self):
+        """This run's jsonl, named when its first row or side file is written."""
         self._log_dir.mkdir(parents=True, exist_ok=True)
         if self._log_path is None:
             self._log_path = self._log_dir / time.strftime("run-%Y%m%d-%H%M%S.jsonl")
-        with open(self._log_path, "a") as f:
+        return self._log_path
+
+    def _append(self, row):
+        """One row onto this run's jsonl (created on the first row)."""
+        with open(self._record(), "a") as f:
             f.write(json.dumps(row) + "\n")
 
     def note(self, kind, **fields):
