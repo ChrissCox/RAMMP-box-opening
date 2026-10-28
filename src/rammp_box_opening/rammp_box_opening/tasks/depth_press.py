@@ -654,7 +654,9 @@ def turn_down(ctx, runner, contact_tool, ref, q=None, shorts=TURN_SHORT_DEG):
     """Turn the hand straight down where it stands (`q`, else the arm's
     joints), about its fingertip (`contact_tool`, in tool_frame), guarded:
     `shorts` (turn_down_path's) tried in order. Returns (quat, moved, None)
-    — moved False when it already points down — or (None, False, why)."""
+    — moved False when it already points down — or (None, False, why). A
+    compliant turn stopped part-way, over the button, lets go there
+    (rp.let_go_part_way)."""
     from rammp_box_opening.runtime import approach
 
     q = ctx.client.joints() if q is None else q
@@ -669,6 +671,7 @@ def turn_down(ctx, runner, contact_tool, ref, q=None, shorts=TURN_SHORT_DEG):
     res = runner.run([rp.line_leg(ctx, "depth:turn", pts, quat, FREE_LINE_SPEED, rp.free_guard(ctx, ref),
                                   _full_world(ctx))], execute=True)
     if any(not r.ok for r in res):
+        rp.let_go_part_way(ctx, res)
         return None, False, "the turn met something (%s)" % res[-1].detail
     return quat, True, None
 
@@ -1199,9 +1202,10 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     (reach_press.way_in_legs) and calls this only where that does not
     fly. From the stroke's start until the rise ends a stop lets go
     (rp.let_go): the stroke stopped part-way, the way up refused or
-    stopped (compliant_rise), anything raised. A stroke that did not start
-    moved nothing: the arm stands over the button in free air, free to go
-    home, and nothing is let go."""
+    stopped (compliant_rise), anything raised — and before it, a turn
+    stopped part-way (turn_down's). A turn or a stroke that did not start
+    moved nothing, and nothing is let go: after the stroke's, the arm
+    stands over the button in free air, free to go home."""
     from rammp_box_opening.runtime import approach
 
     if top_z is None:

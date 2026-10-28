@@ -1078,6 +1078,98 @@ def test_a_reach_out_flown_leg_by_leg_lets_go_where_its_home_from_over_the_box_s
     assert rec.events[3:] == ["reach:slide-in", "depth:clear", "home"][:2 if stops == "depth:clear" else 3]
 
 
+STOPPED = ("failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.4})
+REJECTED = ("failed", {"message": "goal rejected by the driver", "progress": 0.0})
+
+
+def _goal_ends(ctx, monkeypatch, ends, drift_after=None):
+    """The fake client with each `n`th goal sent (the look's the first)
+    scripted to end as `ends[n]`; an arrival of goal `drift_after` stands 5
+    mrad short of its end on joint_2, as an impedance arrival can."""
+    real = ctx.client.execute
+
+    def execute(traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        n = len(ctx.client.executed) + 1
+        if n in ends:
+            ctx.client.exec_script.insert(0, (ends[n][0], dict(ends[n][1])))
+        out = real(traj, speed, guard=guard, while_running=while_running, stop_when=stop_when, gains=gains)
+        if n == drift_after and out[0] == "arrived":
+            ctx.client.live[1] -= 0.005
+        return out
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+
+
+@pytest.mark.parametrize("soft, way, nth, end, asked_after, flown", [
+    (True, "planned look", 1, STOPPED, [1], ["reach:look"]),  # the look for the scene camera's button, 40% of the way
+    (True, "planned look", 1, REJECTED, [], ["reach:look"]),  # ... turned down by the driver: at rest where it stood
+    (True, "planned look", 2, STOPPED, [2], ["reach:look", "aim:reach-aim", "reach:look"]),  # the aimed button's
+    (True, "planned look", 2, REJECTED, [], ["reach:look", "aim:reach-aim", "reach:look"]),
+    (True, "planned look", 3, STOPPED, [3], ["reach:look", "aim:reach-aim", "reach:look", "reach:slide-in"]),
+    (True, "planned look", 3, REJECTED, [], ["reach:look", "aim:reach-aim", "reach:look", "reach:slide-in"]),
+    (True, "re-aim", 2, STOPPED, [2], ["reach:look", "aim:reach-aim", "reach:re-aim"]),
+    (True, "re-aim", 2, REJECTED, [], ["reach:look", "aim:reach-aim", "reach:re-aim"]),
+    (True, "re-aim", 3, STOPPED, [3], ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in"]),
+    (False, "re-aim", 1, STOPPED, [], ["reach:look"]),  # --guarded: its POSITION goals hold where they stopped
+    (False, "re-aim", 2, STOPPED, [], ["reach:look", "aim:reach-aim", "reach:re-aim"]),
+    (False, "re-aim", 3, STOPPED, [], ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in"]),
+], ids=["look stopped", "look not started", "planned look stopped", "planned look not started", "slide in stopped",
+        "slide in not started", "re-aim stopped", "re-aim not started", "slide in after the re-aim stopped",
+        "guarded look", "guarded re-aim", "guarded slide in"])
+def test_a_reach_out_flown_leg_by_leg_lets_go_where_a_leg_before_the_press_stopped_part_way(
+        ctx, monkeypatch, tmp_path, soft, way, nth, end, asked_after, flown):
+    """Before the press a compliant run flies the look for the scene
+    camera's button, then — where its way in flies leg by leg (the planned
+    look the arm stands off, or a re-aim that does not make one execution
+    with the rest) — the planned look for the aimed button or the re-aim,
+    then the slide in toward the box: each a goal of its own, unguarded.
+    One stopped part-way leaves the springs pulling toward its next point,
+    its feed-forward on, as the one execution's stop does: the run lets go
+    once, after that goal, and the arm holds there, nothing pressed. One
+    the driver turned down moved nothing: the arm stands at rest at a
+    leg's end, and nothing is let go. A guarded run lets nothing go."""
+    chain = None
+    if way == "planned look":
+        chain = _Chain(refuse=[lambda xyz, quat: xyz[2] > 0.52])  # the planned look, as above
+    elif soft:
+        monkeypatch.setattr(reach_press, "_not_one_execution", lambda ctx_, legs: "its legs do not meet")
+    asked = []
+    ctx.client.release = lambda: asked.append(len(ctx.client.executed)) or True
+    _goal_ends(ctx, monkeypatch, {nth: end}, drift_after=2 if way == "planned look" else None)
+    got, rec, _c, _h, pressed = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down([], lambda tilt, tip: True),
+                                                  compliant=soft, chain=chain)
+    assert got == 1 and asked == asked_after and pressed == {}  # nothing pressed
+    assert rec.events == flown and len(ctx.client.executed) == nth  # the arm holds: no home
+
+
+@pytest.mark.parametrize("soft, refusals, ends, asked_after, flown", [
+    (True, 0, {}, [], ["home"]),  # home: nothing let go
+    (True, 0, {2: STOPPED}, [2], ["home"]),  # home from the look pose stopped 40% of the way
+    (True, 0, {2: REJECTED}, [], ["home"]),  # ... turned down by the driver: at rest at the look pose
+    (True, 1, {2: STOPPED}, [2], ["reach:back-off"]),  # home refused INVALID_START: the back-off stopped
+    (True, 1, {3: STOPPED}, [3], ["reach:back-off", "home"]),  # ... it flew, then home stopped
+    (False, 0, {2: STOPPED}, [], ["home"]),  # --guarded: its home stopped as before, nothing to let go of
+    (False, 1, {2: STOPPED}, [], ["reach:back-off"]),
+], ids=["home", "home stopped", "home not started", "back-off stopped", "home after the back-off stopped",
+        "guarded home", "guarded back-off"])
+def test_a_compliant_home_from_the_look_pose_lets_go_where_it_stopped_part_way(
+        ctx, monkeypatch, tmp_path, soft, refusals, ends, asked_after, flown):
+    """A STOP at the look pose — here an open box, not reached for — sends
+    the arm home from free air (_go_home): home planned, or straight back
+    off toward the arm first where the planner refuses home INVALID_START.
+    Either stopped part-way leaves the springs pulling toward its next
+    point, its feed-forward on: the run lets go once, after that goal.
+    Turned down by the driver, or home, the arm stands at rest at a leg's
+    end, and nothing is let go. A guarded run lets nothing go."""
+    asked = []
+    ctx.client.release = lambda: asked.append(len(ctx.client.executed)) or True
+    _goal_ends(ctx, monkeypatch, ends)
+    got, rec, _c, _h, pressed = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down([], lambda tilt, tip: True),
+                                                  compliant=soft, first=(POPPED, 14.0), home_refusals=refusals)
+    assert got == 1 and asked == asked_after and pressed == {}
+    assert rec.events == ["reach:look", "aim:reach-aim", *flown]
+
+
 def test_where_neither_a_line_nor_a_planned_look_brings_the_aimed_button_a_way_down_the_arm_goes_home_from_the_look(
         ctx, monkeypatch, tmp_path, capsys):
     """No straight line reaches the aimed button's look pose, and at no
