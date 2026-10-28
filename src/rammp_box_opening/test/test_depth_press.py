@@ -1555,7 +1555,7 @@ def _lean_deg(quat):
     return float(np.degrees(np.arccos(np.clip(-rp._rot(quat)[2, 2], -1.0, 1.0))))
 
 
-@pytest.mark.parametrize("refused, lean", [(1, 2.0), (2, 5.0), (5, 12.0)])
+@pytest.mark.parametrize("refused, lean", [(1, 2.0), (2, 5.0), (5, 12.0), (6, 15.0)])
 def test_a_compliant_press_turns_as_far_as_15_deg_short_where_nearer_down_does_not_fly(
         ctx, monkeypatch, tmp_path, capsys, refused, lean):
     """Flatbot 2026-10-27 16:23: the slid-in fingertip 0.78 m out, where no

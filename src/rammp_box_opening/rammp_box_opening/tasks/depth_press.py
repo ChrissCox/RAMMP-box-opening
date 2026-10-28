@@ -69,20 +69,24 @@ TURN_SHORT_DEG = (0.0, 2.0, 5.0)
 # so the turn refused and nothing was pressed; 12 deg short it flies. That
 # press never looks with the wrist, so nothing needs the lens straight down,
 # and its stroke is vertical at any lean. The lean costs sideways push: on
-# pads that do not slide, the spring's per newton down under STIFF is
-# 0.17/0.20/0.28/0.32/0.37/0.42 at 0/5/8/10/12/15 deg over 15:19's box and
-# 0.28/0.40 at 12/15 over 16:23's (flatbot's URDF). TURN_SHORT_DEG's come
-# first: every box they reach keeps its lean. The guarded press
-# (_press_down) keeps TURN_SHORT_DEG: its close-up look and DEPTH assume the
-# lens points down, and 5 deg already costs ~14 mm (_off_in_world).
+# pads that do not slide, the STIFF spring pushes sideways 0.17/0.20/0.28/
+# 0.32/0.37/0.42 N per newton down at 0/5/8/10/12/15 deg over 15:19's box,
+# 0.28/0.40 at 12/15 over 16:23's (flatbot's URDF), mostly along the line
+# to the arm. TURN_SHORT_DEG's come first: every box they reach keeps its
+# lean. The guarded press (_press_down) keeps TURN_SHORT_DEG: its close-up
+# look and DEPTH assume the lens points down, and 5 deg already costs
+# ~14 mm (_off_in_world).
 COMPLIANT_TURN_SHORT_DEG = (0.0, 2.0, 5.0, 8.0, 10.0, 12.0, 15.0)
 # An in-place turn (turn_down_path) whose joint arc — the sum of its steps'
-# lengths in joint space — is longer than this is refused. Flatbot's URDF,
-# boxes 0.64-0.82 m out under a lid at 0.3125: every turn that flies at the
-# 30 deg tilt they plan at runs 0.49-1.91 rad (16:23's 12 deg one 1.46, the
-# 10 deg one at its scene button 1.77); past 2.0 only at 35-45 deg, most of
-# those swinging joint_1 about 1 rad over the box, as the walks in from
-# 16:23's re-aimed look that fly only so do (2.65-3.21 rad).
+# lengths in joint space — is longer than this is refused, and the next lean
+# tried. Flatbot's URDF, boxes 0.64-0.82 m out under a lid at 0.3125: every
+# turn that flies at the 30 deg tilt they plan at runs 0.49-1.91 rad (16:23's
+# 12 deg one 1.46, the 10 deg one at its scene button 1.77); past 2.0 only at
+# 35-45 deg, most of those swinging joint_1 about 1 rad over the box (the
+# walks in from 16:23's re-aimed look at 10-15 deg swing it 1.6-1.9 rad,
+# 2.65-3.21 rad of arc). Under lids at 0.22-0.40, at 30 deg, two turns go
+# past it, both 0.78 m out under 0.22: exactly down, 2.04-2.10 rad with
+# joint_1 swinging ~1.05; they turn 2 deg short instead, 1.84-1.86 rad.
 TURN_MAX_ARC_RAD = 2.0
 # A compliant press leaning this far or more says so, and its run record
 # (depth_compliant_press) keeps the lean
