@@ -1695,6 +1695,63 @@ def test_a_way_in_that_stopped_part_way_holds_the_arm_and_says_in_which_leg(ctx,
     assert [_phase_at(names, starts, p) for p in (0.0, 0.29, 0.3, 0.69, 0.7, 1.0)] == ["a", "a", "b", "b", "c", "c"]
 
 
+def test_a_way_in_the_runner_refuses_goes_home_from_the_look_pose(ctx, monkeypatch, tmp_path, capsys):
+    """The runner's own gates refuse the one execution before anything is
+    sent (its trajectory sanity gate on the turn, say): nothing moved, as
+    when the driver turns the goal down, so home from the look pose with no
+    shove pad — and no flight row, the runner having re-timed nothing for
+    it (its last_retime is still the look's)."""
+    import json
+
+    from rammp_box_opening.runtime.runner import Runner
+
+    real = Runner._refusal
+
+    def refusal(self, leg):
+        if leg.name == "depth:turn":
+            return "trajectory sanity gate: arm_joint_6 inside its limit margin"
+        return real(self, leg)
+
+    monkeypatch.setattr(Runner, "_refusal", refusal)
+    code, rec, _chain, home, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True)
+    assert code == 1 and got == {} and home["pad"] == 0.0
+    way_in = next(run for run in rec.runs if run[0][0] == "reach:re-aim")
+    assert "depth:turn" in way_in[0] and way_in[1] == []  # handed over as one run, nothing sent
+    assert rec.events[-1] == "home" and "depth:clear" not in rec.events and "depth:rise" not in rec.events
+    assert ("STOP: the way in did not start (trajectory sanity gate: arm_joint_6 inside its limit margin) — nothing "
+            "was pressed — returning home") in capsys.readouterr().out
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    assert not [r for r in rows if r["leg"] == "reach_way_in_flight"]
+    refused, = [r for r in rows if r.get("outcome") == "refused"]
+    assert refused["leg"] == "depth:turn"
+
+
+def test_why_a_way_in_is_not_one_execution(ctx, monkeypatch):
+    """The way in flies as one execution only where its legs make one merge
+    group and the first starts where the arm stands (_not_one_execution);
+    anything else is said, and the run flies it leg by leg."""
+    from test_reach_press import _Chain
+
+    from rammp_box_opening.constants import FREE_LINE_SPEED
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks.reach_press import _not_one_execution
+
+    monkeypatch.setattr(approach, "_chain", lambda: _Chain())
+    q = [[0.01 * k] * 7 for k in range(4)]
+    legs = [dp.compliant_line(ctx, name, q[i:i + 2], TURNED_DOWN, FREE_LINE_SPEED, ("full", "full.yaml"))
+            for i, name in enumerate(("reach:re-aim", "reach:slide-in", "depth:press"))]
+    ctx.client.live = list(q[0])
+    assert _not_one_execution(ctx, legs) is None
+    # under the client's run default (None) rather than the spec the others name: a goal of its own
+    legs[2].gains = None
+    assert _not_one_execution(ctx, legs) == "depth:press does not continue reach:slide-in as one goal"
+    legs[2].gains = dp.COMPLIANT_GAINS
+    # the arm 2 mrad from the first leg's start: the driver would jump there
+    ctx.client.live = [0.002] + list(q[0][1:])
+    assert _not_one_execution(ctx, legs) == "the arm stands 0.002 rad from where reach:re-aim starts"
+    assert _not_one_execution(ctx, []) == "no line to fly"
+
+
 def test_the_compliant_stroke_solved_ahead_is_the_one_the_press_flies(ctx, monkeypatch, tmp_path):
     """compliant_stroke from the hand turned down is press_compliant's own
     stroke — its legs, their ends and speeds, its stiffness and its end —

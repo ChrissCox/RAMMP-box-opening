@@ -272,9 +272,12 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     15 deg short of straight down as the compliant press turns
     (depth_press.COMPLIANT_TURN_SHORT_DEG: way_down serves only that
     press); then the press stroke from the hand turned down
-    (depth_press.compliant_stroke). The flight solves each again from where
-    the arm stands, trying the same leans. Returns (WayDown, StrokePlan,
-    None) or (None, None, why)."""
+    (depth_press.compliant_stroke). The aimed button's walk or turn and
+    stroke fly as solved, in one execution with the move and the slide
+    before them (way_in_legs); only where those legs do not make one
+    (_not_one_execution) is each solved again from where the arm stands,
+    trying the same leans. Returns (WayDown, StrokePlan, None) or (None,
+    None, why)."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.tasks import depth_press as dp  # imports this module: not at the top
 
@@ -1083,12 +1086,13 @@ def _predicted_drift(plan):
 def _not_one_execution(ctx, legs):
     """Why the way in's legs (way_in_legs) do not fly as one execution, or
     None: they do not merge into one group (legs.merge_groups — solve_way_in
-    chains them under one gains spec, so it should not happen), or the first
-    does not start where the arm stands (REUSE_RAD, as _line_from reuses a
-    solved line). After the planner's look leg the way in starts at that
-    leg's planned end, which an impedance arrival leaves a few mm off; the
-    driver would jump to it, and the runner refuses it from DRIFT_REPLAN_RAD
-    on. Leg by leg, each is solved again from where the arm stands."""
+    chains them and way_in_legs names one gains spec on every one, so it
+    should not happen), or the first does not start where the arm stands
+    (REUSE_RAD, as _line_from reuses a solved line). After the planner's
+    look leg the way in starts at that leg's planned end, which an
+    impedance arrival leaves a few mm off; the driver would jump to it, and
+    the runner refuses it from DRIFT_REPLAN_RAD on. Leg by leg, each is
+    solved again from where the arm stands."""
     if not legs:
         return "no line to fly"
     if len(merge_groups(legs)) != 1:
@@ -1133,8 +1137,14 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
     res = runner.run(legs, execute=True)
     last = res[-1]
     flown = all(r.ok for r in res)
-    retimed = runner.last_retime or {}  # this execution's unless the runner refused it before re-timing
-    if last.outcome != "refused":
+    # The runner's report of the group it re-timed (last_retime) is this
+    # execution's only where the runner went on to fly it, and so handed
+    # back what flew (LegResult.flown_traj): a refusal before that — its
+    # gates, a plan-free start the arm has left — leaves the report of the
+    # last group that flew, the look's.
+    tried = last.flown_traj is not None
+    retimed = (runner.last_retime or {}) if tried else {}
+    if tried:
         # a merged group logs every leg with the group's t_wall: where each
         # began, as a fraction of the execution's time, keeps them apart
         runner.note("reach_way_in_flight", legs=names, outcome=last.outcome,
@@ -1143,7 +1153,10 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
                     seg_start_fracs=[round(float(v), 4) for v in retimed.get("seg_start_fracs") or []],
                     junction_speeds=[round(float(v), 3) for v in retimed.get("junction_speeds") or []],
                     stops=retimed.get("stops"))
-    moved = flown or (last.outcome != "refused" and bool(last.progress))
+    # nothing moved where the runner refused the execution, nor where the
+    # client reports no progress for it: the driver rejected the goal, or
+    # the client's own gates refused it before sending
+    moved = flown or (tried and bool(last.progress))
     if moved:
         # the stroke meets the box by design: from here every world (home's
         # too) pads it for a shove, as depth_press.press_compliant's does
@@ -1347,10 +1360,13 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
                 res = runner.run([plan2.look_leg], execute=True)
                 if any(not r.ok for r in res):
                     return 1
-                # the arm stands where plan_reach proved the way down from (the
-                # leg's end): that proof is the way in. Solved again from the
-                # live joints, an impedance arrival a few mm off the look pose
-                # would only add a re-aim, which the planned move never had
+                # plan_reach proved the way down from the leg's end: that proof
+                # is the way in. Solved again from the live joints, an
+                # impedance arrival a few mm off the look pose would only add a
+                # re-aim, which the planned move never had. It starts at the
+                # leg's planned end, though, and an impedance arrival read the
+                # moment its goal ends stands mm off it, past REUSE_RAD: this
+                # way in then flies leg by leg (_not_one_execution)
                 way = WayIn([], plan2, plan2.down, None if plan2.down.walked else plan2.slide_pts, plan2.stroke)
         if way is None:
             # from the look pose, in free air: nothing slid into the box's
