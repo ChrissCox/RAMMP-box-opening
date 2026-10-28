@@ -104,6 +104,12 @@ class Leg:
     # per plan, and only these two numbers side by side say which half.
     plan_s: float = field(default=None, compare=False)
     plan_server_s: float = field(default=None, compare=False)
+    # What the run record keeps of the plan this leg flies (runner._log): the
+    # planner's message and solve time, its goal_mismatch_rad, how far the
+    # plan ends from `target` (client.plan_record) and plan_s. None for a
+    # leg no planner planned: a plan-free line, a gripper leg, a lazy leg
+    # until the Runner plans it.
+    plan: dict = field(default=None, compare=False, repr=False)
     # (fast_scale, slow_scale, slow_path_fraction) when a guarded descent
     # was time-warped; display only — leg.speed is 1.0 once it is baked in
     warp: tuple = field(default=None, compare=False)

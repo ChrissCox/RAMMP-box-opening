@@ -20,6 +20,7 @@ from rammp_box_opening.constants import (
     GRIPPER_CMD_OPEN,
     TRANSIT_SPEED,
 )
+from rammp_box_opening.runtime.client import plan_record
 from rammp_box_opening.runtime.guards import (
     GuardSpec,
     in_band,
@@ -208,6 +209,7 @@ def _plan_motion(
         verify=verify,
         plan_s=plan_s,
         plan_server_s=getattr(plan, "planning_time", None),
+        plan=dict(plan_record(plan, target), plan_s=round(plan_s, 3)),
         waypoint=getattr(plan, "waypoint", None),
         guard_from=descent_index(plan),
     )

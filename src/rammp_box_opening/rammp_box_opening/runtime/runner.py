@@ -26,6 +26,7 @@ from rammp_box_opening.constants import (
     SANITY_MARGIN_RAD,
     state_dir,
 )
+from rammp_box_opening.runtime.client import plan_record
 from rammp_box_opening.runtime.guards import (
     ARM_AFTER_CAP,
     GROUP_SETTLE_S,
@@ -870,6 +871,7 @@ class Runner:
                 print("REFUSED replan of %s — set_world failed: %s" % (leg.name, msg))
                 return None, next_chain
             kind, *rest = leg.target
+            t_plan = time.monotonic()
             if kind == "pose":
                 off = float(rest[2]) if len(rest) > 2 else 0.0
                 plan = self.client.plan_to_pose(
@@ -877,6 +879,7 @@ class Runner:
                 )
             else:
                 plan = self.client.plan_to_joints(rest[0], live)
+            plan_s = time.monotonic() - t_plan
             if plan is None or not plan.success:
                 return None, next_chain
             # replanned trajectories pass the SAME sanity gate as pre-built
@@ -886,6 +889,8 @@ class Runner:
                 print("REFUSED replan of %s — %s" % (leg.name, "; ".join(bad)))
                 return None, next_chain
             leg.traj = plan.trajectory
+            # the run record keeps the plan the leg now flies: this one, made at flight
+            leg.plan = dict(plan_record(plan, leg.target), plan_s=round(plan_s, 3), replanned=True)
             leg.chain = next_chain
             leg.goal_joints = list(plan.trajectory.points[-1].positions)
             # indices into the OLD trajectory mean nothing in this one
@@ -1148,4 +1153,6 @@ class Runner:
         row.pop("leg_name", None)
         row.pop("lookahead", None)
         row.pop("flown_traj", None)
+        if getattr(leg, "plan", None) is not None:
+            row["plan"] = leg.plan  # what the planner said of this leg's plan, and how its end met the target
         self._append(row)

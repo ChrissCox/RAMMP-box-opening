@@ -11,10 +11,14 @@ The spec §6 hardening stands: the guard is ARMED by execution feedback
 progress > 0 (never at goal-accept) and efforts come from the /joint_states
 stream. What the driver does not check before it moves — the start state,
 velocity limits, timing — is checked here (runtime/driver.py), and nothing
-moves at all unless this client was armed by --execute.
+moves at all unless this client was armed by --execute. What the planner
+calls a success is checked too: a plan is handed on only when it ends where
+it was asked (PlannerClient.PLAN_END_*), and never as it came when the
+planner says it goes the long way round (LONG_WAY_ROUND).
 """
 
 import copy
+import math
 import sys
 import time
 from collections import namedtuple
@@ -59,9 +63,10 @@ from rammp_box_opening.constants import (  # noqa: F401 - GAINS_* are re-exporte
     JOINTS,
     NODE_NAMESPACE,
 )
+from rammp_box_opening.geometry import ang_diff
 from rammp_box_opening.runtime import driver
 from rammp_box_opening.runtime.approach import plan_with_vertical_approach
-from rammp_box_opening.runtime.branches import joint_time, nearest_branch, planner_branch
+from rammp_box_opening.runtime.branches import CONTINUOUS_JOINTS, joint_time, nearest_branch, planner_branch
 from rammp_box_opening.runtime.stamps import set_stamp
 
 _GRIPPER_JOINT_HINTS = ("robotiq", "knuckle", "finger")
@@ -104,6 +109,143 @@ def spin_until_done(node, future, timeout_s, abort=None):
         if time.monotonic() - t0 > timeout_s:
             return None
     return future.result()
+
+
+# The planner's own words (rammp-curobo 4fa044d, the build flatbot runs):
+# planner_node.py's answer to a goal that arrives while it plans another,
+# and planner.py's warning on a pose plan it hands back as a success
+# although it winds a continuous joint, its replan onto the start's branch
+# having failed — 2026-10-28 15:56:05, word for word: "planned 219 points,
+# 4.38 s at full speed — warning: plan ends on a 2*pi branch away from the
+# start (it goes the long way round) and the replan onto the start's branch
+# failed (MotionGenStatus.DT_EXCEPTION); returning it as planned"
+PLANNER_BUSY = "planner busy"
+LONG_WAY_ROUND = "goes the long way round"
+
+# A plan the planner called a success and the client will not hand on
+# (PlannerClient._checked_joints, _checked_pose, _no_long_way): shaped like
+# the planner's result, so a caller does with it whatever it does with a
+# failed plan. No trajectory: nothing can fly it by mistake.
+Refused = namedtuple("Refused", "success message trajectory planning_time")
+
+
+def _finite(v):
+    """`v` as a float, or None when it is no finite number."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _busy(res):
+    """Whether planner result `res` is its "busy with another plan": not
+    planned at all, only turned away."""
+    return (
+        res is not None
+        and not getattr(res, "success", False)
+        and str(getattr(res, "message", "") or "").startswith(PLANNER_BUSY)
+    )
+
+
+def _long_way(res):
+    """Whether planner result `res` is a success its message says goes the
+    long way round."""
+    return bool(getattr(res, "success", False)) and LONG_WAY_ROUND in str(getattr(res, "message", "") or "")
+
+
+def _refused(res, why):
+    """`res`, a plan the planner called a success, refused because `why`:
+    one console line, and a failed result whose message is `why` and then
+    what the planner said of it."""
+    print("[client] plan refused: %s" % why)
+    said = str(getattr(res, "message", "") or "")
+    return Refused(
+        False,
+        "%s (planner: %s)" % (why, said) if said else why,
+        None,
+        _finite(getattr(res, "planning_time", None)) or 0.0,
+    )
+
+
+def _end(traj):
+    """The joints at the last point of trajectory `traj`, or None with none."""
+    try:
+        end = [float(v) for v in traj.points[-1].positions]
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+    return end or None
+
+
+def joint_end_error(traj, q_goal):
+    """(rad, joint): how far the last point of `traj` is from the joints
+    `q_goal` at its worst joint (0-based) — each continuous joint
+    (branches.CONTINUOUS_JOINTS) the short way round, so a goal written a
+    whole turn from where the plan ends is the same goal; a bounded joint
+    as the numbers are written — or (None, None) with no last point of
+    `q_goal`'s length to measure."""
+    end = _end(traj)
+    try:
+        goal = [float(v) for v in q_goal]
+    except (TypeError, ValueError):
+        return None, None
+    if end is None or len(end) != len(goal):
+        return None, None
+    errs = [abs(ang_diff(e, g)) if j in CONTINUOUS_JOINTS else abs(e - g) for j, (e, g) in enumerate(zip(end, goal))]
+    j = max(range(len(errs)), key=errs.__getitem__)
+    return float(errs[j]), j
+
+
+def pose_end_error(traj, xyz, quat_xyzw):
+    """(m, rad): how far the tool frame at the last point of `traj` stands
+    from `xyz` at the attitude `quat_xyzw` — its offset and its turn, by the
+    arm's own kinematics (approach._chain: the URDF cuRobo plans with, its
+    FK 0.01 mm from the planner's) — or None with no last point, or no
+    chain to measure with. A measurement only: it never raises."""
+    end = _end(traj)
+    if end is None:
+        return None
+    try:
+        import numpy as np
+
+        from rammp_box_opening.perception.d405 import quat_to_mat
+        from rammp_box_opening.runtime.approach import _chain
+        from rammp_box_opening.runtime.kinematics import rotvec
+
+        R, t = _chain().fk(end)
+        off = float(np.linalg.norm(np.asarray(xyz, float) - np.asarray(t, float)))
+        turn = float(np.linalg.norm(rotvec(quat_to_mat(*(float(v) for v in quat_xyzw)) @ np.asarray(R, float).T)))
+    except Exception:  # noqa: BLE001 - no chain (no URDF for its root, ...), no end: nothing measured
+        return None
+    if not (math.isfinite(off) and math.isfinite(turn)):
+        return None
+    return off, turn
+
+
+def plan_record(plan, target):
+    """What the run record keeps of a leg's plan (Leg.plan, runner._log):
+    the planner's message and solve time, its goal_mismatch_rad where it
+    reports one (PlanToJoints), and how far the plan ends from `target`
+    (Leg.target) as the client's checks measure it — end_rad for
+    ("joints", q7), end_mm and end_deg for ("pose", xyz, quat_xyzw, ...).
+    A measurement only."""
+    out = {"message": str(getattr(plan, "message", "") or "")}
+    solve_s = _finite(getattr(plan, "planning_time", None))
+    out["solve_s"] = None if solve_s is None else round(solve_s, 3)
+    # radians to 1e-7: the native solve ends ~5e-7 from its goal
+    mismatch = _finite(getattr(plan, "goal_mismatch_rad", None))
+    if mismatch is not None:
+        out["goal_mismatch_rad"] = round(mismatch, 7)
+    traj = getattr(plan, "trajectory", None)
+    kind = target[0] if target else None
+    if kind == "joints":
+        rad, _j = joint_end_error(traj, target[1])
+        out["end_rad"] = None if rad is None else round(rad, 7)
+    elif kind == "pose":
+        err = pose_end_error(traj, target[1], target[2])
+        out["end_mm"] = None if err is None else round(1000.0 * err[0], 2)
+        out["end_deg"] = None if err is None else round(math.degrees(err[1]), 3)
+    return out
 
 
 class PlannerClient:
@@ -373,9 +515,62 @@ class PlannerClient:
         return sorted({n for n, _ns in self.node.get_node_names_and_namespaces() if n in self.OTHER_ARM_CLIENTS})
 
     # -- planning ----------------------------------------------------------
+    # The planner plans one goal at a time and turns any other away at once,
+    # unplanned: "planner busy — one plan at a time" (planner_node.py
+    # _finish_plan, which leaves no line of it in its own log). Teleop's
+    # home, the microwave engine and the driver's GoTo actions plan on the
+    # same node, 0.14-0.34 s a plan on 2026-10-28 (p10-p90 of 72): a goal
+    # that lands in one of theirs is asked again, BUSY_RETRIES times
+    # BUSY_WAIT_S apart, before it fails as it always did.
+    BUSY_RETRIES = 2
+    BUSY_WAIT_S = 0.2
+
+    # A plan's END is checked against what was asked before anything uses
+    # it: the arm flies what comes back, and the leg after it starts there
+    # (core._plan_motion's goal_joints). A joint plan ends ON its goal — the
+    # native solve to ~5e-7 rad (rammp-curobo CLAUDE.md, 2026-08-11; its
+    # smoke test bounds it at 1e-3). Where that solve fails, PlanToJoints
+    # falls back to planning to the goal's FK pose (3 of 72 plans on
+    # 2026-10-28, 13:32-13:34, another client's joint goals inside the
+    # scene camera's box): the same tool to cuRobo's 5 mm / 5.7 deg,
+    # through whatever joints its IK finds, another elbow or wrist among
+    # them, said only in goal_mismatch_rad, which nothing here read.
+    # cuRobo v0.7.8's finetune can also hand back the previous solve's plan
+    # as a success (rammp-curobo #37: 3-7 of 200 in its probe), which the
+    # start gate catches only when the two starts differ. 0.01 rad is ten
+    # times that smoke test's bound and at most 10.2 mm at the tool (one
+    # joint off, 2000 postures on flatbot's URDF, offline 2026-10-28).
+    PLAN_END_RAD = 0.01
+    # A pose plan meets cuRobo's own success test: the tool within
+    # position_threshold 0.005 m and rotation_threshold 0.05 of its pose —
+    # the error quaternion's vector part, sin(turn/2): 5.73 deg
+    # (motion_gen.py and pose_distance_kernel.cu in the planner's image; the
+    # rammp config sets neither). The arm's FK here agrees with the
+    # planner's to 0.01 mm, so a plan that met the test for THIS pose is
+    # inside these, and one outside them met it for some other.
+    PLAN_END_M = 0.006
+    PLAN_END_DEG = 6.0
+
     def _call(self, client, goal, timeout_s=120.0):
+        """The planner's result for `goal` (None: not taken, or no answer in
+        `timeout_s`), asked again while the planner answers that it is busy
+        with another plan (BUSY_RETRIES): then its last answer, a failed
+        plan as before. A Ctrl+C ends the wait at once."""
         if not client.wait_for_server(timeout_sec=5.0):
             sys.exit("planner not reachable — is sheppy's `planner` node up?")
+        res = self._ask(client, goal, timeout_s)
+        for n in range(1, self.BUSY_RETRIES + 1):
+            if not _busy(res):
+                break
+            print("[client] planner busy (another goal is planning) — asking again in %.1f s (%d/%d)"
+                  % (self.BUSY_WAIT_S, n, self.BUSY_RETRIES))
+            if not self._spin_for(self.BUSY_WAIT_S):
+                break  # aborted: the busy answer stands, a failed plan
+            res = self._ask(client, goal, timeout_s)
+        return res
+
+    def _ask(self, client, goal, timeout_s):
+        """One round trip of `goal` to the planner action `client`."""
         send = spin_until_done(
             self.node, client.send_goal_async(goal), 10.0, abort=self._abort
         )
@@ -385,6 +580,19 @@ class PlannerClient:
             self.node, send.get_result_async(), timeout_s, abort=self._abort
         )
         return None if wrapped is None else wrapped.result
+
+    def _spin_for(self, seconds):
+        """Serve this node for `seconds` — a plan hosted inside an execution
+        (execute's while_running) keeps its feedback flowing — or False at
+        once when an abort is requested."""
+        t_end = time.monotonic() + float(seconds)
+        while True:
+            if self._abort is not None and self._abort.requested:
+                return False
+            left = t_end - time.monotonic()
+            if left <= 0.0:
+                return True
+            rclpy.spin_once(self.node, timeout_sec=min(left, 0.05))
 
     def plan_to_pose(self, xyz, quat_xyzw, start_joints, approach_offset_m=0.0):
         """>0 approach_offset_m: arrive from a waypoint that far straight above
@@ -403,7 +611,8 @@ class PlannerClient:
         handed the pose, it turned the wrist 3.2-3.6 rad on some plans (a
         4.7 s approach to a box on the left, bench 2026-09-25). The planner
         still plans and collision-checks the path; when no solution is found
-        or its plan fails, the pose goes to it as before."""
+        or its plan fails — or is refused, ending elsewhere (_checked_joints)
+        — the pose goes to it as before."""
         if start_joints:
             try:
                 from rammp_box_opening.constants import HOME
@@ -431,9 +640,17 @@ class PlannerClient:
         way round, or the wrist folded the far way (kinematics.equivalents).
         Then it is re-planned to that end (plan_to_joints); the original stands
         if that plan fails. The arm does not turn a joint round when it does
-        not need to (owner, 2026-09-25)."""
+        not need to (owner, 2026-09-25).
+
+        Except a plan the planner itself says goes the long way round
+        (LONG_WAY_ROUND): its own replan onto the start's branch failed, and
+        it handed the winding plan back as a success (15:56:05 2026-10-28,
+        4.38 s). That one is never flown as it is: it is re-planned to the
+        quickest end whatever that saves, and refused when no end is found
+        or that plan fails too."""
         if res is None or not res.success or not start_joints or res.trajectory is None or not res.trajectory.points:
             return res
+        wound = _long_way(res)
         try:
             from rammp_box_opening.runtime.approach import _chain
 
@@ -441,14 +658,20 @@ class PlannerClient:
             end = [float(v) for v in res.trajectory.points[-1].positions]
             alts = _chain().equivalents(start, end)
         except Exception:  # a kinematics problem must never cost the plan
-            return res
+            alts = []
         if not alts:
-            return res
+            return _refused(res, "the plan goes the long way round, and no other way to its end was found — "
+                            "not flown") if wound else res
         best = min(alts, key=lambda q: joint_time(start, q))
-        if joint_time(start, best) > joint_time(start, end) - self.QUICKER_BY_S:
+        if not wound and joint_time(start, best) > joint_time(start, end) - self.QUICKER_BY_S:
             return res
         better = self.plan_to_joints(best, start_joints)
-        return better if better is not None and better.success else res
+        if better is not None and better.success:
+            return better
+        if wound:
+            return _refused(res, "the plan goes the long way round, and its re-plan the short way failed (%s) — "
+                            "not flown" % getattr(better, "message", "no answer"))
+        return res
 
     def _plan_pose_once(self, xyz, quat_xyzw, start_joints):
         g = PlanToPose.Goal()
@@ -464,18 +687,68 @@ class PlannerClient:
         # on HOME's side of the wrap: the planner plans between the numbers
         # it is given, and a start written the other way round is a full turn
         g.start_joints = planner_branch(start_joints) if start_joints else []
-        return self._call(self._plan_pose, g)
+        return self._checked_pose(self._call(self._plan_pose, g), xyz, quat_xyzw)
+
+    def _checked_pose(self, res, xyz, quat_xyzw):
+        """`res`, the planner's plan to the tool pose (xyz, quat_xyzw), when
+        it ends there: within PLAN_END_M and PLAN_END_DEG by the arm's own
+        FK, which every plan that met cuRobo's success test for this pose
+        does. One that ends further off is another goal's plan, and refused.
+        With no chain to measure by, it goes on as it always did (a
+        kinematics problem never costs the plan); how far off it ends is in
+        the run record (plan_record)."""
+        if res is None or not getattr(res, "success", False):
+            return res
+        if _end(getattr(res, "trajectory", None)) is None:
+            return _refused(res, "the plan has no end to check against its pose — not flown")
+        err = pose_end_error(res.trajectory, xyz, quat_xyzw)
+        if err is None:
+            return res
+        off, turn = err
+        if off > self.PLAN_END_M or math.degrees(turn) > self.PLAN_END_DEG:
+            return _refused(res, "the plan ends %.1f mm and %.1f deg from its pose, past cuRobo's own success test "
+                            "(5 mm, 5.7 deg) — another goal's plan; not flown" % (1000.0 * off, math.degrees(turn)))
+        return res
 
     def plan_to_joints(self, q7, start_joints):
         """A joint goal, each continuous joint taken the short way round from
         the start (branches.nearest_branch): the same arm configuration,
         never a winding. The planner does this for itself since 1.0.0
-        (_nearest_branch); done here too, it does not depend on that."""
+        (_nearest_branch); done here too, it does not depend on that.
+
+        The plan comes back only if it ends at `q7` (_checked_joints)."""
         start = planner_branch(start_joints) if start_joints else None
         goal = nearest_branch(q7, start) if start is not None else [float(v) for v in q7]
         g = PlanToJoints.Goal(target_joints=goal)
         g.start_joints = start or []  # on HOME's side of the wrap (plan_to_pose)
-        return self._call(self._plan_joints, g)
+        return self._checked_joints(self._call(self._plan_joints, g), q7)
+
+    def _checked_joints(self, res, q7):
+        """`res`, the planner's plan to the joints `q7`, when it ends there:
+        every joint within PLAN_END_RAD, each continuous joint the short way
+        round — the goal went out on the start's branch, a whole turn from
+        `q7` where that is the short way. A plan that ends elsewhere (the
+        FK-pose fallback's other arm, a previous goal's plan) is refused, and
+        so is one the planner says goes the long way round: the goal it was
+        sent already was the short way, so the long way is all its fallback
+        found. The planner's goal_mismatch_rad is reported with it, not
+        judged: the same gap measured without the wrap (planner.py,
+        np.abs(final - q_goal).max()), it reads 6.28 for a joint a turn
+        from its goal."""
+        if res is None or not getattr(res, "success", False):
+            return res
+        rad, j = joint_end_error(getattr(res, "trajectory", None), q7)
+        if rad is None:
+            return _refused(res, "the plan has no end to check against its joint goal — not flown")
+        if rad > self.PLAN_END_RAD:
+            mismatch = _finite(getattr(res, "goal_mismatch_rad", None))
+            return _refused(res, "the plan ends %.3f rad from its joint goal (joint %d%s) — the planner's FK-pose "
+                            "fallback, another arm at the same tool pose, or another goal's plan; not flown" % (
+                                rad, j + 1, "" if mismatch is None else "; goal_mismatch_rad %.3f" % mismatch))
+        if _long_way(res):
+            return _refused(res, "the plan goes the long way round, where its goal went out the short way — "
+                            "not flown")
+        return res
 
     # -- execution ---------------------------------------------------------
     def _cancel_confirm(self, send, result_future):
