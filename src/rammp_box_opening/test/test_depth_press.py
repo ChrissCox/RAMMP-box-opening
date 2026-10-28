@@ -1398,7 +1398,7 @@ def test_a_compliant_press_is_one_stroke_held_and_back_up_with_no_look_and_no_gu
     over = min(max(dp.COMPLIANT_PRESS_N / k, dp.COMPLIANT_OVERSHOOT_M[0]), dp.COMPLIANT_OVERSHOOT_M[1])
     assert note["end_z"] == pytest.approx(COMPLIANT_TOP - cfg.button_travel_m - over, abs=1e-4)
     (goal, quat), = arm.turns
-    assert arm.lines[-1] == pytest.approx(list(goal))  # back up to where the stroke began
+    assert legs["depth:rise"].goal_joints == pytest.approx(list(goal) + list(quat))  # back up to where the stroke began
     # the pads reached the stroke's end: nothing pushed back, nothing pressed
     assert not result.felt and not result.judged and dp.exit_code(result) == 1
     assert ctx.contact_pad == CONTACT_SHIFT_PAD_M
@@ -2853,6 +2853,81 @@ def test_on_flatbot_the_way_back_up_from_1623s_hold_only_rises(monkeypatch, bent
     assert all(float(pads(np.asarray(rise[0]) + s * step)[2]) >= floor for s in np.linspace(0.0, 1.0, 51))
 
 
+@pytest.mark.parametrize("pinned", [False, True], ids=["free air", "pinned at the bottom"])
+@pytest.mark.parametrize("case", ["15:19", "16:23", "0.76 m out"])
+def test_on_flatbot_a_compliant_press_rises_back_up_its_bent_stroke(ctx, monkeypatch, tmp_path, case, pinned):
+    """press_compliant's own rise (dp.compliant_rise: the reach-out's
+    leg-by-leg press) on flatbot's URDF, the hand turned down after the
+    slide (_flatbot_turned_down) and the stroke bent (dp.stroke_bend). The
+    bend's end is no IK solution: in free air — nothing under the pads, the
+    arm at the stroke's end — the hand stands 3-6 deg off the attitude the
+    stroke held, and a straight line back to its start takes that whole
+    turn in its first 2 mm step: 0.11 rad at 15:19's box, 0.13 at 16:23's,
+    refused past MAX_STEP_RAD 0.76 m out, at (0.75, -0.15) under a lid at
+    0.31 — the arm held over the box, let go, and never went home (the
+    2026-10-28 review of #60). It rises back up its own stroke
+    (rise_back_up), as the one-execution way home does: one goal under
+    COMPLIANT_GAINS from where the arm stands to exactly the stroke's
+    start, through the stroke's own samples, joined 16-19 mm above the
+    pads, its first step under 0.03 rad, the pads never lower than they
+    stood, nothing let go. Pinned by the button's bottom (_held_at), where
+    the straight line flies, it goes the same way, joined 16 mm up, its
+    first step under 0.07 rad."""
+    import test_reach_press as trp
+
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.runner import Runner
+
+    scene, aimed, yaw_deg, first = {
+        "15:19": (trp.SCENE_1519, trp.AIMED_1519, 85.9, 0.114),
+        "16:23": (trp.SCENE_1623, (0.7213, -0.2970, 0.3125), 36.9, 0.134),
+        "0.76 m out": ((0.75, -0.15, 0.31), (0.75, -0.15, 0.31), 0.0, None),  # the straight line refused
+    }[case]
+    chain, model, cfg, turn, down = _flatbot_turned_down(scene, aimed)
+    stroke, why = dp.compliant_stroke(chain, cfg, turn[-1], down, aimed[2])
+    assert why is None and stroke.bent, why
+    if pinned:
+        b = _pads_at(chain, _straight_end(chain, stroke.legs[-1][1], aimed[2] - cfg.button_travel_m))
+        start = [float(v) for v in _held_at(chain, stroke.q_end, b)[0]]
+        held = dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=dp.COMPLIANT_PRESS_N)
+    else:
+        start = [float(v) for v in stroke.q_end]
+        held = dp.DepthPress(free=True, judged=False, press_n=0.0)
+    line, why = chain.straight_line(start, [float(v) for v in stroke.t0], stroke.quat)
+    if pinned:
+        assert line is not None, why  # what the rise flew before: no worse
+    elif first is None:
+        assert line is None and "near a singularity" in why, why
+    else:
+        assert float(np.abs(np.subtract(line[1], line[0])).max()) == pytest.approx(first, abs=0.005)
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    ctx.model = model
+    ctx.cpose = rp.cpose_for_button(aimed, np.radians(yaw_deg), model.button_offset)
+    ctx.client.live = list(start)
+    ctx.client.compliant = True
+    asked = _releases(ctx)
+    sent = []
+    real = ctx.client.execute
+
+    def execute(traj, speed, **kw):
+        sent.append(traj)
+        return real(traj, speed, **kw)
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+    result = dp.compliant_rise(ctx, Runner(ctx.client, log_dir=tmp_path), stroke, held)
+    assert result is held and asked == []
+    (goal,) = sent
+    assert ctx.client.gains_sent == [dp.COMPLIANT_GAINS]
+    path = np.asarray([p.positions for p in goal.points], float)
+    assert np.abs(path[0] - start).max() < 1e-9 and list(path[-1]) == [float(v) for v in stroke.q0]
+    samples = np.asarray([q for _n, pts, _s in stroke.legs for q in pts], float)
+    assert all(float(np.abs(samples - q).max(axis=1).min()) < 1e-9 for q in path[1:])  # the stroke's own
+    floor = float(_pads_at(chain, start)[2])
+    assert dp.RISE_JOIN_ABOVE_M <= float(_pads_at(chain, path[1])[2]) - floor < (0.016 if pinned else 0.02)
+    assert float(np.abs(path[1] - path[0]).max()) < (0.07 if pinned else 0.03)
+    assert min(float(_pads_at(chain, q)[2]) for q in path) >= floor - 1e-9
+
+
 def test_on_flatbot_1623s_way_home_from_the_hold_is_one_goal_the_drivers_gate_takes(ctx, monkeypatch, tmp_path):
     """16:23's press on flatbot's URDF, the arm held by the button
     (_flatbot_1623_hold), its way out planned from the stroke's start
@@ -3251,11 +3326,13 @@ def test_a_ctrl_c_in_the_compliant_hold_lets_go_once_and_still_stops_the_run(ctx
 @pytest.mark.parametrize("way_up", ["no line", "stopped"])
 def test_a_compliant_press_whose_way_up_does_not_fly_lets_go_once(ctx, monkeypatch, tmp_path, way_up):
     """The button held the pads 50 mm above the stroke's end, and no way up
-    flies: no straight line from the held arm (compliant_rise's `up is
-    None`), or the rise stopped part-way. The arm holds, free False, and
-    lets go once: after the hold, or after the rise that stopped."""
+    flies: neither back up the stroke (rise_back_up) nor a straight line
+    from the held arm (compliant_rise's `up is None`), or the rise stopped
+    part-way. The arm holds, free False, and lets go once: after the hold,
+    or after the rise that stopped."""
     asked = _releases(ctx)
     if way_up == "no line":
+        monkeypatch.setattr(dp, "rise_back_up", lambda chain, stroke, q_held: None)
         monkeypatch.setattr(rp, "_line", lambda ctx_, xyz, quat: (None, "IK did not converge 40% of the way"))
         why = "the way up is not a straight line the arm can fly (IK did not converge 40% of the way) — the arm holds"
     else:
