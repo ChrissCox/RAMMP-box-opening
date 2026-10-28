@@ -1359,20 +1359,59 @@ def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx,
     """The reach-out of a compliant run: no at-rest read, no weight check at
     the look, no stopping guard on the re-aim, the slide in or the way up,
     and the press told the higher top — the scene camera's, as at 15:19
-    when the wrist's aim stood 24 mm low and the touch met the scene's."""
+    when the wrist's aim stood 24 mm low and the touch met the scene's.
+    With no guard to stop them in time, those three lines fly at
+    FREE_LINE_SPEED, not the CONTACT_SPEED 16:23 crawled 10.5 s of them at,
+    and each is labelled with the full world: the runner refuses an
+    unguarded leg faster than CONTACT_SPEED in any other (spec §6), and the
+    arm would hold at the look pose with nothing pressed."""
+    import json
+
     import test_reach_press as trp
+
+    from rammp_box_opening.constants import FREE_LINE_SPEED
 
     low = (trp.BUTTON[0], trp.BUTTON[1], trp.BUTTON[2] - 0.024)
     code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, first=(low, 0.4))
     assert code == 0 and rec.reads == 0
     assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
     assert all(rec.legs[n].guard is None for n in ("reach:re-aim", "reach:slide-in", "depth:clear"))
+    for n in ("reach:re-aim", "reach:slide-in", "depth:clear"):
+        assert rec.legs[n].speed == FREE_LINE_SPEED and rec.legs[n].world.startswith("full"), (
+            n, rec.legs[n].speed, rec.legs[n].world)
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    assert not [r for r in rows if r.get("outcome") == "refused"]
     assert got["compliant"] and got["client_compliant"] and got["top_z"] == pytest.approx(trp.BUTTON[2])
     assert not ctx.client.compliant  # the client is as it was once the run is over
 
 
+def test_a_compliant_walk_in_flies_at_the_free_line_speed_too(ctx, monkeypatch, tmp_path):
+    """Where the slide in turns the hand down on the way (the walk, as at
+    20:04), the walk is the compliant run's slide in: unguarded, at
+    FREE_LINE_SPEED, labelled with the full world, and not refused."""
+    import test_reach_press as trp
+
+    from rammp_box_opening.constants import FREE_LINE_SPEED
+
+    monkeypatch.setattr(trp._Chain, "walk", lambda self, q0, xyz, quat, **k: ([list(q0), [v + 0.01 for v in q0]], None),
+                        raising=False)
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True)
+    assert code == 0 and got["compliant"] and rec.reads == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
+    leg = rec.legs["reach:slide-in"]
+    assert rp._rot(leg.target[2])[2, 2] == pytest.approx(-1.0)  # the walk's: the hand turned straight down
+    assert leg.guard is None and leg.speed == FREE_LINE_SPEED and leg.world.startswith("full"), (leg.speed, leg.world)
+
+
 def test_a_guarded_reach_out_is_as_before(ctx, monkeypatch, tmp_path):
+    from rammp_box_opening.constants import CONTACT_SPEED
+
     code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped)
     # at rest, at the look, at the look again, over the button, and over the box for the home
     assert code == 0 and not got["compliant"] and rec.reads == 5
     assert rec.legs["reach:slide-in"].guard is not None
+    # toward the box slow enough for its guard to stop it, in the interaction world
+    for n in ("reach:re-aim", "reach:slide-in"):
+        assert rec.legs[n].speed == CONTACT_SPEED and rec.legs[n].world.startswith("interaction"), (
+            n, rec.legs[n].speed, rec.legs[n].world)
+    assert rec.legs["depth:clear"].speed == CONTACT_SPEED and rec.legs["depth:clear"].guard is not None
