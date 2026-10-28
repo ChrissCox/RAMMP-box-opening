@@ -1,3 +1,4 @@
+import math
 import time
 
 import pytest
@@ -56,6 +57,92 @@ def test_legs_under_different_gains_fly_as_two_executions(tmp_path):
     a.gains = b.gains = GAINS_STIFF
     runner(c, tmp_path).run([a, b], execute=True)
     assert len(c.executed) == 1 and c.gains_sent == [GAINS_STIFF]
+
+
+class _BranchClient(FakeClient):
+    """Plans a joint goal the way PlannerClient hands it to the planner: the
+    start on HOME's branch (planner_branch), the goal the short way round
+    from there (nearest_branch). Keeps every path it flew."""
+
+    def plan_to_joints(self, q7, start_joints):
+        from rammp_box_opening.runtime.branches import nearest_branch, planner_branch
+
+        self.joint_starts.append(list(start_joints))
+        start = planner_branch(start_joints)
+        return self._plan(nearest_branch(q7, start), start)
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        self.flown = getattr(self, "flown", []) + [[list(p.positions) for p in traj_.points]]
+        return super().execute(traj_, speed, guard=guard, while_running=while_running, stop_when=stop_when,
+                               gains=gains)
+
+
+def _turned(path, j):
+    """How far joint `j` turns along a flown path, the numbers as written."""
+    return sum(abs(b[j] - a[j]) for a, b in zip(path, path[1:]))
+
+
+# HOME's joint_3 is -3.137. The client hands the planner joint_3 0.30 as
+# -5.983 and 0.45 as -5.833, but 0.20 as it is: the other way round, -6.083,
+# is past the planner's -6.0. From a start under 0.283 a goal at 0.45 is
+# written +0.45, a whole turn from the -5.833 the next leg starts at
+_OVER = [-1.0, -0.15, 0.20, -1.05, -0.3, -1.0, 1.8]
+_ON = [-1.0, -0.2, 0.20, -1.1, -0.3, -1.0, 1.8]
+_ON_PAST = [-1.0, -0.2, 0.30, -1.1, -0.3, -1.0, 1.8]
+_UP = [-1.0, -0.2, 0.45, -1.1, -0.3, -1.0, 1.8]
+
+
+def test_a_lazy_group_planned_a_whole_turn_apart_flies_as_two_goals(tmp_path):
+    """A lazy group merges before its legs have trajectories, so the merge
+    cannot see where they meet. Planned at flight from live (joint_3 0.20,
+    handed as it is), the retreat ends at +0.45, and the home planned from
+    there starts at -5.833: one angle to the arm, a whole turn as written.
+    Flown as one goal, joint_3 turned 9.23 rad (offline replay 2026-10-28).
+    Two goals, and neither turns it half a turn."""
+    from rammp_box_opening.constants import HOME
+
+    c = _BranchClient()
+    c.live = list(_OVER)
+    g = GuardSpec(touch_nm=4.0, trip="setdown")
+    c.exec_script = [("touch", {"message": "contact", "progress": 0.9, "torque_peak": 4.0})]
+    down = leg("place:lid:down", _OVER, _ON, guard=g, world="interaction_place", chain=0)
+    retreat = leg("retreat", _ON, _UP, chain=1, world="interaction_place")
+    home = leg("home", _UP, HOME, chain=1)
+    for x in (retreat, home):
+        x.traj = x.goal_joints = None  # lazy: planned from live after the touch
+    res = runner(c, tmp_path).run([down, retreat, home], execute=True)
+    assert [r.leg_name for r in res] == ["place:lid:down", "retreat", "home"]
+    assert all(r.ok for r in res)
+    assert c.exec_starts[2][2] == pytest.approx(_UP[2] - 2.0 * math.pi)
+    assert max(_turned(p, 2) for p in c.flown) < math.pi
+
+
+def test_a_group_replanned_under_the_recoil_a_whole_turn_apart_flies_as_two_goals(tmp_path):
+    """The retreat and the home were planned from the press's end, joint_3
+    0.30, handed to the planner as -5.983: they met and merged. The recoil
+    plans them again from its own end, 0.20, handed as it is: the retreat
+    now ends at +0.45, and the home planned from there starts at -5.833.
+    The runner checks a junction again before it flies it, not only when
+    the legs are first planned."""
+    from rammp_box_opening.constants import HOME
+    from rammp_box_opening.runtime.branches import planner_branch
+    from rammp_box_opening.runtime.legs import merge_groups
+
+    c = _BranchClient()
+    c.live = list(_OVER)
+    press = leg("press:down", _OVER, _ON_PAST, guard=GuardSpec(touch_nm=7.0, trip="press"),
+                world="interaction_button", chain=0)
+    up = planner_branch(_UP)
+    retreat = leg("retreat", planner_branch(_ON_PAST), up, chain=1, world="interaction_button")
+    home = leg("home", up, HOME, chain=1)
+    assert [len(g) for g in merge_groups([press, retreat, home])] == [1, 2]  # as planned, they meet
+    c.exec_script = [("touch", {"message": "contact", "progress": 0.8, "torque_peak": 7.1})]
+    res = runner(c, tmp_path).run([press, retreat, home], execute=True)
+    assert [r.leg_name for r in res] == ["press:down", "recoil", "retreat", "home"]
+    assert all(r.ok for r in res)
+    assert len(c.joint_starts) == 2  # both planned once, under the recoil
+    assert c.exec_starts[3][2] == pytest.approx(_UP[2] - 2.0 * math.pi)
+    assert max(_turned(p, 2) for p in c.flown) < math.pi
 
 
 def test_unguarded_leg_requires_full_world(tmp_path):

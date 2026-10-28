@@ -535,6 +535,32 @@ class Runner:
                         results.append(res)
                         return results
                     lead = group[0]
+                # A group was merged on the trajectories its legs had THEN. A
+                # lazy group had none, and a replan (above, or under the
+                # recoil) plans each leg from the predicted end of the one
+                # before it, which the client hands the planner on HOME's
+                # branch: a whole turn from that end when it is written the
+                # other way round (legs.MERGE_GAP_RAD). Replayed offline
+                # 2026-10-28, a lazy retreat and home flew as one goal that
+                # turned joint_3 9.23 rad. One goal flies only legs that
+                # meet; the rest fly next, as goals of their own
+                parts = merge_groups(group)
+                if len(parts) > 1:
+                    for before, after in zip(parts, parts[1:]):
+                        a, b = before[-1], after[0]
+                        gap = (
+                            np.subtract(b.traj.points[0].positions, a.traj.points[-1].positions)
+                            if a.traj is not None and b.traj is not None
+                            else [float("nan")]
+                        )
+                        print(
+                            "[runner] %s no longer starts where %s ends (%.3f rad apart as written) — it flies "
+                            "as a goal of its own" % (b.name, a.name, float(np.max(np.abs(gap))))
+                        )
+                    groups[gi + 1 : gi + 1] = parts[1:]
+                    if host is group:
+                        host = parts[-1]
+                    group, lead = parts[0], parts[0][0]
                 # a RELEASE overlaps the replan above, never the motion:
                 # the arm must not move away from what it dropped before
                 # the fingers have settled

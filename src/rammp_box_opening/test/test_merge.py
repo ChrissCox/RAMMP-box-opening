@@ -5,6 +5,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from rammp_box_opening.constants import GAINS_MEDIUM, GAINS_STIFF, HOME
 from rammp_box_opening.geometry import ang_diff
+from rammp_box_opening.runtime.branches import planner_branch
 from rammp_box_opening.runtime.guards import GuardSpec
 from rammp_box_opening.runtime.legs import (
     MERGE_GAP_RAD,
@@ -185,8 +186,8 @@ def test_a_whole_turn_between_two_legs_is_a_gap():
     the home planned from it started at -5.833, the client having handed
     the planner planner_branch of that end."""
     rise_end = [-1.0, -0.2, 0.45, -1.1, -0.3, -1.0, 1.8]
-    home_start = list(rise_end)
-    home_start[2] -= 2.0 * math.pi
+    home_start = planner_branch(rise_end)  # the start the client hands the planner
+    assert home_start[2] == pytest.approx(rise_end[2] - 2.0 * math.pi)  # a whole turn as written
     assert ang_diff(home_start[2], rise_end[2]) == pytest.approx(0.0, abs=1e-12)  # to the arm, one angle
     rise = leg("rise", start=[-1.0, -0.2, 0.40, -1.0, -0.3, -1.1, 1.8], end=rise_end)
     rise.plan_free = True

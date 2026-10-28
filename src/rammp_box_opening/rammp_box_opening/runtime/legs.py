@@ -16,10 +16,10 @@ from enum import Enum
 # two to fly as ONE trajectory. The numbers as written, never wrapped:
 # retime_group (concat_paths) and the driver's quintic both interpolate the
 # raw positions, so a whole turn of a continuous joint between two legs is a
-# full revolution at the junction. Review 2026-10-27: a plan-free line read
-# from the arm ended at joint_3 +0.450; the home planned from it, the
-# planner handed planner_branch of that end, started at -5.833. The two
-# merged, joint_3 swept 9.03 rad, and driver.refusal passed it. The
+# full revolution at the junction. Review 2026-10-27, offline: a plan-free
+# line built from the arm's joints ended at joint_3 +0.450; the home planned
+# from it, the planner handed planner_branch of that end, started at -5.833.
+# The two merged, joint_3 swept 9.03 rad, and driver.refusal passed it. The
 # planner's float32 output starts ~1e-7 off the start it is handed, and
 # line_trajectory keeps a line's first and last points exactly, so a leg
 # built from the one before it is well inside this.
@@ -131,7 +131,9 @@ def _joined(a, b):
     """Does `b` start where `a` ends: every joint of its first waypoint
     within MERGE_GAP_RAD of `a`'s last? A lazy leg has no trajectory to
     compare yet; for it the rule that a lazy leg merges only with another
-    lazy one decides (can_merge)."""
+    lazy one decides (can_merge). The runner asks again once a group is
+    planned at flight, lazy or re-planned, and splits it where they do not
+    meet (runner.run)."""
     if a.traj is None or b.traj is None:
         return True
     end, start = a.traj.points[-1].positions, b.traj.points[0].positions
@@ -157,7 +159,8 @@ def can_merge(a, b):
         # a group profile cannot chain a trajectory that does not exist yet
         and (a.traj is None) == (b.traj is None)
         # ...and b starts where a ends: the group flies as one trajectory,
-        # so a gap between them is a jump inside one interval of it
+        # so a gap between them is flown as one interval of it that no
+        # planner checked (a whole turn: a full revolution)
         and _joined(a, b)
         # one goal flies one ImpedanceGains spec (runner._run_motion sends
         # the group's): legs under different gains fly as goals of their
