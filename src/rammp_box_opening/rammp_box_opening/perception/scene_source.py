@@ -9,11 +9,15 @@ then takes its precise fix from 12 cm, where it is good.
 
 Semantics first, geometry second. The scene is not the same every time and
 carries other containers, plates and cables, so a box-sized plateau alone
-is not enough: the OWL node's scene instance says WHICH thing is the box
-(a pixel box), and the depth points inside that box that sit at lid height
-above the table give its position. No smoothness or footprint gates — the
-scene depth at a metre is noisier than those gates were tuned for, and the
-wrist fix that follows carries the precision.
+is not enough: a detector says WHICH thing is the box (a pixel box), and
+the depth points inside that box that sit at lid height above the table
+give its position. The detector is sheppy's always-on scene segmenter
+(perception/segmenter_source: RF-DETR at 5 Hz, its holder box turned into
+the band where the lid stands) where the container config names its
+classes, with the OWL node's scene instance as the fallback; a fix
+commits when two sightings agree (commit_fix). No smoothness or footprint
+gates — the scene depth at a metre is noisier than those gates were tuned
+for, and the wrist fix that follows carries the precision.
 
 A camera level with the lid never sees a top face (flatbot's, on a table
 that high — tables change, so which view holds is not assumed): when the
@@ -23,11 +27,13 @@ camera sees (box_from_side_points). With no survey, the table the box was
 found on is measured for the planner too (table_extent).
 """
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from rammp_box_opening.perception.clear_table import MAP_R_M
+from rammp_box_opening.perception.d405 import stable_fix
 from rammp_box_opening.perception.depth_source import container_pose_from_top
 from rammp_box_opening.perception.planes import fit_plane
 
@@ -50,13 +56,16 @@ class SceneFix:
     pose: object  # ContainerPose (bottom-centre origin, yaw)
     top_xyz: tuple  # the lid top's centre in base_link
     n_points: int
-    score: float  # the OWL score behind it
+    score: float  # the detector score behind it (the newest sighting's)
     table_z_scene: float  # the table height the scene depth itself shows, or nan
     table_extent: object = None  # (x0, x1, y0, y1) where it shows that table, when no survey says
     partial: str = ""  # how the frame cut the box when it was finished from the part in view, else ""
     # the scene's points around the box (float32, base frame): what stands on
     # the table there, for where the lid may go (perception/clear_table)
     table_points: object = None
+    source: str = "owl"  # the newest sighting's detector: "segmenter" | "owl"
+    n_sightings: int = 1  # the agreeing sightings behind it (commit_fix)
+    sources: tuple = ()  # ... and each one's detector, oldest first
 
 
 def robust_yaw(xy):
@@ -195,7 +204,8 @@ def table_around(pts_base, centre_xy, below_z, ring=TABLE_RING_M):
     return float(c[2] - (n[0] * (centre_xy[0] - c[0]) + n[1] * (centre_xy[1] - c[1])) / n[2])
 
 
-def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=False):
+def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=False, anchor_rng=None, sides=(),
+                         side_is_lid=True):
     """Coarse container pose from a camera level with the lid. It sees the
     box's side, never its top face, and the wall behind a round lid falls
     inside the pixel box too (flatbot 2026-10-22: 22 of 252 points, at lid
@@ -208,7 +218,24 @@ def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=Fa
     `partial`: the frame cuts the box off at its side (a round container
     only, scene_fix_from_boxes): what is in view is not centred on it and
     is narrower than it, so the centre is the lid's circle through the arc
-    of its side in view (lid_circle) instead, and no width is asked."""
+    of its side in view (lid_circle) instead, and no width is asked;
+    `sides`, the planes of the box's sides the frame does not cut
+    (uncut_sides), which that circle must stay inside, and `side_is_lid`,
+    whether they are the lid's own (lid_circle). A cut box the lid stands
+    over (PARTIAL_OVER_M, inside the box's pixel columns) holds only the
+    holder under it, and is refused; so is a circle that something taller
+    than the lid stands inside (PARTIAL_OVER_PAD_M): its arc took in that
+    thing's side.
+
+    `anchor_rng`: `bbox` is the band above a holder box whose front stands
+    this far from the camera (holder_front_rng). A lid standing on that
+    holder is within a lid's reach of it; when the nearest thing in the band
+    stands further behind, the band looks past the holder at whatever stands
+    behind it, and is refused (detbench: the plain band lifted 320 of 624
+    phantom bowls, this 35). Only ever a refusal: an accepted lift is the
+    plain one to the millimetre — the slab cut at the holder's front instead
+    moved good fixes 29-52 mm, where something nearer than the canister
+    lies inside its holder box (flatbot 2026-10-22 14:43)."""
     x0, y0, x1, y1 = bbox
     inside = (uv[:, 0] >= x0) & (uv[:, 0] <= x1) & (uv[:, 1] >= y0) & (uv[:, 1] <= y1)
     if inside.sum() < MIN_LID_POINTS:
@@ -217,7 +244,13 @@ def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=Fa
     q = pts_base[inside]
     rng = np.linalg.norm(q - cam, axis=1)
     half = 0.5 * min(float(model.dims[0]), float(model.dims[1]))
-    near = q[rng <= np.percentile(rng, 5) + 2 * half + SIDE_DEPTH_SLACK_M]
+    p5 = np.percentile(rng, 5)
+    if anchor_rng is not None and not partial:
+        gap = float(p5) - float(anchor_rng)
+        if gap > 2 * half + SIDE_DEPTH_SLACK_M:
+            return None, ("the nearest thing above the holder stands %.0f mm behind the holder's front: the band "
+                          "looks past it, no lid stands on it" % (1000 * gap)), int(inside.sum()), float("nan")
+    near = q[rng <= p5 + 2 * half + SIDE_DEPTH_SLACK_M]
     upper = near[near[:, 2] >= np.median(near[:, 2])]
     along = upper[:, :2].mean(axis=0) - cam[:2]  # the view across the box, horizontally
     along /= np.linalg.norm(along)
@@ -246,10 +279,21 @@ def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=Fa
         seed = near[:, :2].mean(axis=0)
         reach = np.linalg.norm(pts_base - cam, axis=1) <= np.percentile(rng, 5) + 2 * half + SIDE_DEPTH_SLACK_M
         around = reach & (np.hypot(pts_base[:, 0] - seed[0], pts_base[:, 1] - seed[1]) <= d + PARTIAL_REACH_M)
+        above = (pts_base[:, 2] > top_z + PARTIAL_OVER_M[0]) & (pts_base[:, 2] <= top_z + PARTIAL_OVER_M[1])
+        cols = (uv[:, 0] >= x0) & (uv[:, 0] <= x1)  # the lid stands on its holder, inside the box's columns
+        over = int((around & cols & above).sum())
+        if over >= MIN_LID_POINTS:
+            return None, ("%d depth points stand %.0f-%.0f mm over its top around it: the box holds what is under the lid, "
+                          "not the lid" % (over, 1000 * PARTIAL_OVER_M[0], 1000 * PARTIAL_OVER_M[1])), n, table_z
         band = pts_base[around & (pts_base[:, 2] > top_z - float(model.lid_dims[2])) & (pts_base[:, 2] <= top_z + 0.005)]
-        centre, why = lid_circle(band, model, cam)
+        centre, why = lid_circle(band, model, cam, sides=sides, side_is_lid=side_is_lid)
         if centre is None:
             return None, why, n, table_z
+        under = reach & (np.hypot(pts_base[:, 0] - centre[0], pts_base[:, 1] - centre[1]) <= 0.5 * d + PARTIAL_OVER_PAD_M)
+        stand = int((under & above).sum())
+        if stand >= MIN_LID_POINTS:
+            return None, ("%d depth points stand %.0f-%.0f mm over its top where the lid's circle is: the arc took in "
+                          "something taller than the lid" % (stand, 1000 * PARTIAL_OVER_M[0], 1000 * PARTIAL_OVER_M[1])), n, table_z
         pose = container_pose_from_top((centre[0], centre[1], top_z), 0.0, model, table_z)  # round: yaw unused
         return pose, (centre[0], centre[1], top_z), n, float(table_z)
     lo, hi = np.percentile((obj[:, :2] - cam[:2]) @ across, [10, 90])
@@ -267,17 +311,31 @@ def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=Fa
     return pose, (float(cx), float(cy), top_z), n, float(table_z)
 
 
+def holder_front_rng(pts_base, uv, holder, cam_xyz):
+    """How far the front of a holder box stands from the camera: the 5th
+    percentile of the ranges of the depth points inside its pixel box, or
+    None when fewer than MIN_LID_POINTS are."""
+    x0, y0, x1, y1 = (float(v) for v in holder[:4])
+    inside = (uv[:, 0] >= x0) & (uv[:, 0] <= x1) & (uv[:, 1] >= y0) & (uv[:, 1] <= y1)
+    if inside.sum() < MIN_LID_POINTS:
+        return None
+    return float(np.percentile(np.linalg.norm(pts_base[inside] - np.asarray(cam_xyz, float), axis=1), 5))
+
+
 @dataclass(frozen=True)
 class SceneBoxFix:
     pose: object  # ContainerPose, or None when no box was this container
     top: tuple  # the lid top's centre (base) — None without a pose
     n: int  # lid points behind it
-    box: object  # the OWL candidate that won ([x0, y0, x1, y1]), or None
+    box: object  # the candidate box that won ([x0, y0, x1, y1]), or None
     tried: tuple  # why each refused candidate was refused, in order
     table_z: float = float("nan")  # the table the winner was measured against
     lift: str = ""  # "top" or "side": which view of it won
     clipped: tuple = ()  # (score, box, edges) of each candidate refused at the frame's edge
     partial: tuple = ()  # the edges the frame cut the winner at, when it was finished from part of it
+    # with rivals=True: the tops of the OTHER candidates that pass on their
+    # own more than RIVAL_M from the winner's — two places, not one box
+    rivals: tuple = ()
 
 
 # An OWL box this close to the frame's edge has its container running off
@@ -306,14 +364,153 @@ PARTIAL_REACH_M = 0.02  # beyond one lid diameter from the box's own near points
 PARTIAL_RIVAL_M = 0.035
 PARTIAL_RIVAL_FRAC = 0.85
 PARTIAL_RANSAC_ITERS = 400
+# Not every two places is a slide. Half out of the frame, a lid can show its
+# depth only as a strip along its own silhouette ray (the rest of its side is
+# past the frame's edge, or in the strip beside it where the OAK gives no
+# depth), and the circle tangent to that strip from its other side holds the
+# same points on its hidden back: the lid's mirror across its silhouette,
+# ~100 mm away. On detbench's P4 frames (flatbot 2026-10-23, the canister half
+# off the frame; found 2026-10-27) the mirror holds 62-99 % as many of the
+# band's points as the lid, and more than the lid in most calls at 17:27,
+# where only the rival rule stood between it and a fix 103 mm off. The box's
+# side the frame does not cut is the lid's silhouette, or the holder's around
+# it: the lid stands inside it, the mirror past it. So a circle that runs past
+# that side by more than this is not the box's lid. Over the 2,496 cut-box
+# calls on detbench's P2 and P4 frames (6 box sources, 4 pixel parities, 4 box
+# draws), the circles near the lid that could win (0.85 of the best's points)
+# run up to 22.7 mm past a lid-tight box (the depth smears past the lid's edge
+# and pulls them; in every call one runs 9.8 mm past or less) and stay 4.5+ mm
+# inside a holder's; the mirror runs 30.8+ mm past a holder's, 73+ mm past a
+# lid's.
+PARTIAL_BOX_SLACK_M = 0.020
+# The bound is not only a refusal: where the circle it takes out was the rival
+# of the one it keeps, a "two places" becomes a fix. That is sound only on a
+# lid's worth of arc. With the lid all but out of view, or its sliver in the
+# strip where the OAK gives no depth, the band is the holder's brim tip or the
+# smear behind it, and every circle through it is a guess: the one the box's
+# side keeps is no likelier the lid than the one it takes out. Detbench
+# 2026-10-23 13:32 (the canister ~90 % off the frame, a frame the acceptance
+# skips as difficult): the kept circle held 45 points or fewer and stood 51 mm
+# past the lid's own silhouette, and the stream committed it in 300 of 300 runs
+# where c693865 refused it as two places. So a circle the bound settles two
+# places for must hold this many points. Over detbench's P2-P4 frames (768
+# gate calls: 4 parities, 4 box draws, segmenter and OWL) the circles it
+# settled, all on P4, held 127-167 and were fixed 7-21 mm from the reference;
+# the wrong ones it settled on re-cut frames (the lid cropped 75-80 % out of
+# view with the no-depth strip, or the frame's edge moved 80 px in) held 45-84
+# (found 2026-10-28, review of b2fb875).
+PARTIAL_SETTLE_MIN_POINTS = 100
+# A cut box that holds only the holder under the lid (a "blue bowl" box as it
+# is, an OWL "a pink lid" that boxed the brim) lifts its top at the brim,
+# 13-34 mm under the lid's and inside LID_BAND_M, and the lid's circle fitted
+# to the brim put the box 43-47 mm off on detbench P4 once the mirror was no
+# second place (the rival rule had refused them by chance). The lid then
+# stands over the band: MIN_LID_POINTS this far over the lifted top, inside
+# the band's own reach and disc and the box's own pixel columns, refuse the
+# box. Over the 429 cut boxes of every detbench source on P2 and P4 that reach
+# the circle: a lid's band has at most 12 points there (the two frames whose
+# button stood up included), a brim 18+ mm under the lid 81-300 (the 2
+# shallower brims that pass fix 16 and 20 mm off). The lid stands ON the
+# holder, inside the box's columns; counted over the whole disc, a taller
+# thing beside the box refused a good cut box too (a bottle 80 mm taller 18 cm
+# beside the half-off canister at 17:27; at 14:40 a lid-wide one 27 cm off,
+# where c693865 fixed it 11.6 mm from the reference). Something taller
+# standing right behind the box, inside its columns, still refuses it.
+PARTIAL_OVER_M = (0.020, 0.050)
+# ... and nothing stands that far over the top where the fitted lid is (within
+# its radius and this): the lid is the container's top. When the band took in
+# the side of something taller beside or behind the canister, the circle slid
+# toward it, and that thing stands inside the circle. With the count above
+# kept to the box's columns, review 1's taller cylinders 1-5 cm beside or
+# behind the cut canister (detbench P2/P3/P4, ray-cast into the depth) pulled
+# 17 cut fixes 31-58 mm off that b2fb875 had refused (14 by its whole-disc
+# count); this refuses 14 of them, and 17 fixes within 30 mm. Over all 1,104
+# of those gate calls: offs 48 -> 33 (b2fb875 35, c693865 398), ok 722 -> 710
+# (b2fb875 513); over review 0's 3,782 with a second object: offs 146 -> 143
+# (b2fb875 152), ok 3017 -> 3004 (b2fb875 2431). Nothing changes on detbench's
+# own frames.
+PARTIAL_OVER_PAD_M = 0.010
+# The segmenter candidates (segmenter_source.SceneCand.kind) whose box is its
+# holder's: a cut holder grown over its lid band, and the band above an uncut
+# one. Their sides stand outside the lid's silhouette; every other box (a lid
+# RF-DETR boxed on its holder, a container boxed as it is, an OWL lid box) has
+# the lid's own (lid_circle's side_is_lid).
+HOLDER_SIDE_KINDS = ("grown", "band")
 
 
-def lid_circle(band, model, cam_xyz):
+def pixel_plane(axis, at, pts_base, uv, cam_xyz, R_base_color):
+    """The plane through the camera of the colour pixels whose coordinate
+    `axis` (0: u, 1: v) is `at`, as its base-frame normal n: n . (p - cam) > 0
+    for a point p that projects beyond it (a larger u or v). The image's scale
+    and centre along that axis are read off the cloud itself — its pixels `uv`
+    are its projection into the colour image, u = f x / z + c in the colour
+    optical frame — so no intrinsics are passed in. None when the cloud holds
+    too little."""
+    R = np.asarray(R_base_color, float)
+    step = max(1, len(pts_base) // 2000)
+    pc = (np.asarray(pts_base[::step], float) - np.asarray(cam_xyz, float)) @ R  # the colour optical frame
+    px = np.asarray(uv[::step], float)[:, axis]
+    front = pc[:, 2] > 1e-6
+    if front.sum() < MIN_LID_POINTS:
+        return None
+    f, c = np.polyfit(pc[front, axis] / pc[front, 2], px[front], 1)
+    m = np.zeros(3)
+    m[axis], m[2] = f, c - float(at)
+    return R @ m
+
+
+# the side of a pixel box across from each frame edge: (that side, its axis, its coordinate in the box, +1 when past it is +u/+v)
+_ACROSS = {"left": ("right", 0, 2, 1.0), "right": ("left", 0, 0, -1.0), "top": ("bottom", 1, 3, 1.0), "bottom": ("top", 1, 1, -1.0)}
+
+
+def uncut_sides(box, edges, pts_base, uv, cam_xyz, R_base_color):
+    """The sides of pixel box [x0, y0, x1, y1] across from the frame `edges`
+    that cut it, as planes through the camera (pixel_plane): each a base-frame
+    normal n with n . (p - cam) > 0 for a point past the box. A box the frame
+    cuts at both its sides along an axis has none on it."""
+    sides = []
+    for e in edges:
+        other, axis, k, sign = _ACROSS[e]
+        if other in edges:
+            continue
+        n = pixel_plane(axis, float(box[k]), pts_base, uv, cam_xyz, R_base_color)
+        if n is not None:
+            sides.append(sign * n)
+    return tuple(sides)
+
+
+def past_sides(centres, sides, cam_xyz, z, r):
+    """How far (m, horizontally, at height `z`) each circle of radius `r`
+    centred at `centres` (M x 2, base frame) runs past the furthest of the
+    planes `sides` (uncut_sides); negative when it stays inside them all."""
+    cam = np.asarray(cam_xyz, float)
+    c = np.atleast_2d(np.asarray(centres, float))
+    out = np.full(len(c), -np.inf)
+    for n in sides:
+        n = np.asarray(n, float)
+        h = max(float(np.hypot(n[0], n[1])), 1e-9)
+        out = np.maximum(out, ((c - cam[:2]) @ n[:2] + n[2] * (z - cam[2])) / h + r)
+    return out
+
+
+def lid_circle(band, model, cam_xyz, sides=(), side_is_lid=True):
     """The centre (x, y) of a round lid from the points of its side band a
     level camera sees (`band`, base frame): the circle of the lid's radius
     through the most of them (RANSAC over point pairs, the centre behind the
     pair as the camera sees it), refined on those. Returns ((cx, cy), None)
-    or (None, why)."""
+    or (None, why).
+
+    `sides`: the planes of its box's sides the frame does not cut
+    (uncut_sides). A circle that runs past them by more than
+    PARTIAL_BOX_SLACK_M is no candidate, before the best and its rival are
+    picked. That is not only a refusal: where the circle it takes out was
+    the rival of the best one inside (the lid's mirror, detbench P4), two
+    places become one fix, and then only on PARTIAL_SETTLE_MIN_POINTS.
+    `side_is_lid`: those sides are the lid's own silhouette (the box is the
+    lid, or the container itself), not a holder's around it. Refined past a
+    lid's side, the circle was pulled there by the smear past the silhouette,
+    and the RANSAC circle it was refined from, inside the bound, is the fix;
+    refined past a holder's side, it is refused."""
     r = 0.5 * float(model.lid_dims[0])
     if len(band) < MIN_LID_POINTS:
         return None, "only %d points on the lid's side in view (need %d)" % (len(band), MIN_LID_POINTS)
@@ -335,11 +532,25 @@ def lid_circle(band, model, cam_xyz):
                 cands.append((int(on.sum()), c))
     if not cands:
         return None, "no %.0f mm circle through the lid's side in view" % (2000 * r)
+    beyond = []  # the circles the bound took out
+    if len(sides):
+        z = float(np.median(np.asarray(band, float)[:, 2]))
+        past = past_sides([cc for _k, cc in cands], sides, cam_xyz, z, r)
+        beyond = [kc for kc, p in zip(cands, past) if p > PARTIAL_BOX_SLACK_M]
+        cands = [kc for kc, p in zip(cands, past) if p <= PARTIAL_BOX_SLACK_M]
+        if not cands:
+            return None, "every %.0f mm circle through the lid's side in view runs %.0f+ mm past its box" % (
+                2000 * r, 1000 * PARTIAL_BOX_SLACK_M)
     cands.sort(key=lambda kc: -kc[0])
     best_n, c = cands[0][0], cands[0][1].copy()
     rival = next((k for k, cc in cands if np.linalg.norm(cc - c) > PARTIAL_RIVAL_M), 0)
     if rival >= PARTIAL_RIVAL_FRAC * best_n:
         return None, "the lid's arc in view fits two places %.0f+ mm apart" % (1000 * PARTIAL_RIVAL_M)
+    if best_n < PARTIAL_SETTLE_MIN_POINTS and any(
+            k >= PARTIAL_RIVAL_FRAC * best_n and np.linalg.norm(cc - c) > PARTIAL_RIVAL_M for k, cc in beyond):
+        return None, ("the lid's arc in view fits two places %.0f+ mm apart, one past its box: the %d points of the "
+                      "other are too few to settle it (need %d)" % (1000 * PARTIAL_RIVAL_M, best_n, PARTIAL_SETTLE_MIN_POINTS))
+    picked = c.copy()
     on = np.abs(np.linalg.norm(P - c, axis=1) - r) < PARTIAL_INLIER_M
     for _it in range(30):
         dv = P[on] - c
@@ -348,6 +559,20 @@ def lid_circle(band, model, cam_xyz):
         c = c + step
         if np.linalg.norm(step) < 1e-7:
             break
+    if len(sides):
+        # where the depth runs to the frame's edge (a right-edge cut: the OAK's
+        # no-depth strip is at its left), the smear past the lid's silhouette
+        # pulls the refined circle 20-26 mm past a lid box (detbench P2 frames
+        # re-cut through the lid, as it is and mirrored: 39 of 528 calls); the
+        # circle it was refined from fixes 35 of them 20-29 mm from the
+        # reference, where c693865 put 14 further than 30 mm. A holder's side
+        # stands 18-33 mm outside the lid's circle (P4): past it, the circle is
+        # not the lid.
+        out = float(past_sides(c, sides, cam_xyz, z, r)[0])
+        if out > PARTIAL_BOX_SLACK_M:
+            if not side_is_lid:
+                return None, "the lid's circle in view, refined, runs %.1f mm past its box" % (1000 * out)
+            c = picked
     on = np.abs(np.linalg.norm(P - c, axis=1) - r) < PARTIAL_INLIER_M
     if on.sum() < MIN_LID_POINTS:
         return None, "only %d of the lid's side points lie on a %.0f mm circle" % (int(on.sum()), 2000 * r)
@@ -391,15 +616,15 @@ def off_frame_ways(edges, R_base_color):
     return ways
 
 
-def off_frame_why(score, edges, R_base_color, frame="arm_mount"):
-    """What to tell the operator about a box the OWL found running off the
-    frame at `edges`: which way that is in `frame` (off_frame_ways), and the
-    way back."""
+def off_frame_why(score, edges, R_base_color, frame="arm_mount", src="OWL"):
+    """What to tell the operator about a box the detector `src` found
+    running off the frame at `edges`: which way that is in `frame`
+    (off_frame_ways), and the way back."""
     ways = off_frame_ways(edges, R_base_color)
     back = ", ".join(("-" if w[0] == "+" else "+") + w[1] for w in ways)
-    return ("the OWL's box (%.2f) runs off the scene camera's frame toward %s %s: it sees part of the "
+    return ("the %s's box (%.2f) runs off the scene camera's frame toward %s %s: it sees part of the "
             "container, and a part is not where the box is — move the box toward %s until all of it is "
-            "in the camera's view" % (score, frame, " and ".join(ways), back))
+            "in the camera's view" % (src, score, frame, " and ".join(ways), back))
 
 
 # The top face is seen only from above it. A camera that stands less than
@@ -423,67 +648,118 @@ def sees_top_face(pts_base, uv, bbox, lid_z, cam_xyz):
     return cam[2] - float(lid_z) >= TOP_VIEW_MIN_SLOPE * d
 
 
+# Two candidates of one message that both pass this far apart (xy) are two
+# places, not one box: the message is ambiguous, and the OWL settles it
+# (SceneLocator.locate). A band above some other bowl lifts whatever stands
+# behind it; 33 of the 35 detbench phantoms the gate still passed are caught
+# this way when the canister is in view too, with no false ambiguity in 248
+# multi-candidate samples.
+RIVAL_M = 0.035
+
+
+def box_key(box):
+    """A pixel box as a tuple of floats: candidates are compared by value,
+    whichever sequence type carried them."""
+    return tuple(float(v) for v in box[:4])
+
+
 def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side_table_z=None, image_wh=None,
-                         cam_R=None):
-    """The OWL's candidates (score, [x0, y0, x1, y1]) best first: every
-    candidate lifted to the lid slab (box_from_scene_points) when a table
-    height is known (`table_z`) and the camera stands above the lid
-    (sees_top_face), then — with `cam_xyz`, the camera's position — every
-    candidate from its side (box_from_side_points), against `side_table_z`
-    when surveyed or the table around it. Which view works depends on how
-    high the table stands against the camera, so neither is assumed. Two
-    passes, not both lifts per candidate: the side lift never measures how
-    far a container runs along the view, so a tray the top-face lift just
-    refused would pass it ahead of the real box. The first that is this
-    container wins. What the live locate() does with every message, and
+                         cam_R=None, src="OWL", rivals=False):
+    """A detector's candidates (score, [x0, y0, x1, y1][, holder]) best
+    first: every candidate lifted to the lid slab (box_from_scene_points)
+    when a table height is known (`table_z`) and the camera stands above the
+    lid (sees_top_face), then — with `cam_xyz`, the camera's position —
+    every candidate from its side (box_from_side_points), against
+    `side_table_z` when surveyed or the table around it. Which view works
+    depends on how high the table stands against the camera, so neither is
+    assumed. Two passes, not both lifts per candidate: the side lift never
+    measures how far a container runs along the view, so a tray the top-face
+    lift just refused would pass it ahead of the real box. The first that is
+    this container wins. What the live locate() does with every message, and
     what an offline replay of recorded frames computes the same way. With
     `image_wh` (the colour image's w, h), a candidate reaching the frame's
     edge is refused before either lift (FRAME_EDGE_PX) — unless the model
     is round and the frame cuts it at its side (`cam_R`, the camera's axes
     in the base frame, says which image edges are), when the side lift
-    finishes it from the part in view (partial)."""
+    finishes it from the part in view (partial), inside the box's sides the
+    frame does not cut (uncut_sides).
+
+    A candidate's third field, when it has one, is the holder box under a
+    lid band (segmenter_source.SceneCand): an uncut one arms the side
+    lift's looks-past refusal (holder_front_rng). A SceneCand of a kind in
+    HOLDER_SIDE_KINDS has its holder's sides, not its lid's (lid_circle's
+    `side_is_lid`); an OWL box is the lid's. `src` names the detector
+    in every reason. With `rivals`, every OTHER candidate is gated on its
+    own too, and the tops that pass more than RIVAL_M from the winner's are
+    the fix's `rivals`."""
     tried = []
     clipped = []
-    cands = []  # (score, box, the side edges a round box is finished across, or ())
-    for score, box in boxes:
+    # (score, box, the side edges a round box is finished across or (), the holder that anchors it or None,
+    # whether the box's sides are its lid's)
+    cands = []
+    for c in boxes:
+        score, box = c[0], c[1]
+        holder = c[2] if len(c) > 2 else None
+        side_is_lid = getattr(c, "kind", None) not in HOLDER_SIDE_KINDS
         edges = frame_edges(box, image_wh) if image_wh is not None else ()
         if not edges:
-            cands.append((score, box, ()))
+            cands.append((score, box, (), holder, side_is_lid))
         elif model.round and cam_R is not None and side_cut(edges, cam_R):
-            cands.append((score, box, edges))
+            cands.append((score, box, edges, None, side_is_lid))
         else:
             clipped.append((score, box, edges))
-            tried.append("it runs off the frame at its %s edge (OWL %.2f)" % (" and ".join(edges), score))
+            tried.append("it runs off the frame at its %s edge (%s %.2f)" % (" and ".join(edges), src, score))
+    got = None
     if table_z is not None:
         lid_z = float(table_z) + float(model.dims[2])
-        for score, box, edges in cands:
+        for score, box, edges, _holder, _side_is_lid in cands:
             if edges:
                 continue  # only the side lift finishes a box from part of it
             if cam_xyz is not None and not sees_top_face(pts_base, uv, box, lid_z, cam_xyz):
                 continue
             pose, top, n = box_from_scene_points(pts_base, uv, box, table_z, model)
             if pose is not None:
-                return SceneBoxFix(pose, top, n, box, tuple(tried), float(table_z), "top", tuple(clipped))
-            tried.append("%s (OWL %.2f)" % (top, score))
-    if cam_xyz is not None:
-        for score, box, edges in cands:
-            pose, top, n, tz = box_from_side_points(pts_base, uv, box, side_table_z, model, cam_xyz, partial=bool(edges))
+                got = SceneBoxFix(pose, top, n, box, tuple(tried), float(table_z), "top", tuple(clipped))
+                break
+            tried.append("%s (%s %.2f)" % (top, src, score))
+    if got is None and cam_xyz is not None:
+        for score, box, edges, holder, side_is_lid in cands:
+            anchor = None if holder is None else holder_front_rng(pts_base, uv, holder, cam_xyz)
+            sides = uncut_sides(box, edges, pts_base, uv, cam_xyz, cam_R) if edges else ()
+            pose, top, n, tz = box_from_side_points(pts_base, uv, box, side_table_z, model, cam_xyz,
+                                                    partial=bool(edges), anchor_rng=anchor, sides=sides,
+                                                    side_is_lid=side_is_lid)
             if pose is not None:
-                return SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side", tuple(clipped), edges)
+                got = SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side", tuple(clipped), edges)
+                break
             if edges:
                 clipped.append((score, box, edges))
-                tried.append("from the side, cut off at the frame's %s edge, %s (OWL %.2f)" % (" and ".join(edges), top, score))
+                tried.append("from the side, cut off at the frame's %s edge, %s (%s %.2f)" % (" and ".join(edges), top, src, score))
             else:
-                tried.append("from the side, %s (OWL %.2f)" % (top, score))
-    return SceneBoxFix(None, None, 0, None, tuple(tried), clipped=tuple(clipped))
+                tried.append("from the side, %s (%s %.2f)" % (top, src, score))
+    if got is None:
+        return SceneBoxFix(None, None, 0, None, tuple(tried), clipped=tuple(clipped))
+    if rivals and len(boxes) > 1:
+        won = box_key(got.box)
+        others = []
+        for c in boxes:
+            if box_key(c[1]) == won:
+                continue
+            alone = scene_fix_from_boxes([c], pts_base, uv, table_z, model, cam_xyz=cam_xyz, side_table_z=side_table_z,
+                                         image_wh=image_wh, cam_R=cam_R, src=src)
+            if alone.pose is not None and float(np.hypot(alone.top[0] - got.top[0], alone.top[1] - got.top[1])) > RIVAL_M:
+                others.append(tuple(float(v) for v in alone.top))
+        if others:
+            got = replace(got, rivals=tuple(others))
+    return got
 
 
-def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6, upside_down=False):
+def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6):
     """The table height the scene depth shows, from a plane fit over the
-    lower part of the view (the image's top rows for a camera hung upside
-    down); nan when there is no clean plane. Logged beside the surveyed
-    height so a wrong survey, or a knocked camera, shows up in every run."""
-    low = uv[:, 1] < (1.0 - row_frac) * image_h if upside_down else uv[:, 1] > row_frac * image_h
+    lower part of the (upright) view; nan when there is no clean plane.
+    Logged beside the surveyed height so a wrong survey, or a knocked
+    camera, shows up in every run."""
+    low = uv[:, 1] > row_frac * image_h
     if low.sum() < 500:
         return float("nan")
     # a few thousand points are plenty for a table plane, and this number
@@ -513,14 +789,96 @@ def image_upside_down(T_base_color):
     return down_z > 0
 
 
+# --- the vote: two sightings make a fix -------------------------------------
+# One frame never moves the arm (d405.stable_fix): a scene fix commits when
+# the two newest sightings of one locate() agree within VOTE_TOL_M. With the
+# segmenter at 5 Hz that costs one frame, 0.2 s.
+VOTE_N, VOTE_TOL_M = 2, 0.020
+# The scene OWL is enabled when the segmenter has made no fix this long after
+# the streams were ready — and at once when the segmenter is down or a message
+# is ambiguous. The OWL needs ~1.3 s an inference and two boxes to commit.
+OWL_AFTER_S = 1.0
+SEG_DOWN = ("unavailable", "absent", "silent", "wrong_camera", "wrong_size", "stale")  # SegmenterRung.state
+SRC_LABEL = {"segmenter": "segmenter", "owl": "OWL"}  # how each source is named in the gate's reasons
+
+
+@dataclass(frozen=True)
+class Sighting:
+    """One message's fix, as the vote counts it."""
+
+    source: str  # "segmenter" | "owl"
+    score: float  # the detector's score of the candidate that passed
+    top: tuple  # the lid top's centre (base)
+    pose: object  # ContainerPose
+    n: int  # lid points behind it
+    partial: tuple  # the edges the frame cut it at, when it was finished from part of it
+    table_z: float  # the table it was measured against
+    lift: str  # "top" | "side"
+    box: tuple  # the box the gate lifted
+    det_box: tuple  # the detector's own box (the holder under a band)
+
+
+def commit_fix(sightings, segmenter_saw, n=VOTE_N, tol=VOTE_TOL_M, owl_settles=False):
+    """(top, None) when the newest `n` sightings agree pairwise within `tol`
+    — their median (d405.stable_fix) — else (None, why), why one of "too
+    few", "disagree", "cut OWL box unconfirmed" and "two places unsettled".
+
+    `segmenter_saw`: the segmenter is live and has seen the container in
+    this look (a sighting, or a message that passed in two places). The
+    OWL's box of a cut lid (a partial lift) then counts only with a
+    segmenter sighting beside it: the segmenter can confirm it, so it must.
+    Down, or live but blind (no food container, or every band refused), it
+    confirms nothing, and the OWL's cut boxes commit on their own. Before
+    the cut lid's arc was bounded by its box's uncut side, the OWL's circle
+    at detbench 163450 slid 46 mm in 39 % of its commits, so it waited on
+    any live segmenter; a blind one then left all 15 cut frames unfixed.
+    Bounded, those commits land 12-14 mm off and all 15 commit
+    (detbench/spec blind_stream).
+
+    `owl_settles`: a segmenter message of this look passed in two places
+    (SceneBoxFix.rivals). Two later segmenter sightings that agree on one of
+    them do not say which is the container — a frame where the canister's
+    band failed and a phantom bowl's passed, twice, would agree on the
+    phantom — so the pair must hold an OWL sighting: the OWL boxes the lid
+    itself."""
+    if len(sightings) < n:
+        return None, "too few"
+    top = stable_fix([(s.top, i) for i, s in enumerate(sightings)], tol, n)
+    if top is None:
+        return None, "disagree"
+    pair = sightings[-n:]
+    if segmenter_saw and any(s.partial and s.source == "owl" for s in pair) and not any(
+        s.source == "segmenter" for s in pair
+    ):
+        return None, "cut OWL box unconfirmed"
+    if owl_settles and not any(s.source == "owl" for s in pair):
+        return None, "two places unsettled"
+    return top, None
+
+
+def _newer(stamp, since, last):
+    """Is a segmenter frame stamped `stamp` (ns) newer than `since` and than
+    `last`, the frame gated before it (a SegFrame or None)?"""
+    if stamp is None:
+        return True  # unstamped: only "not the frame gated last" decides
+    if since is not None and stamp <= since:
+        return False
+    return last is None or last.stamp_ns is None or stamp > last.stamp_ns
+
+
+def _top_xy(top):
+    return "[%.3f, %.3f]" % (float(top[0]), float(top[1]))
+
+
 class SceneLocator:
-    """The ROS side: the scene grabber, the scene OWL rung and the
-    calibration, answering `locate()` with a SceneFix or None."""
+    """The ROS side: the scene grabber, the scene segmenter and OWL rungs
+    and the calibration, answering `locate()` with a SceneFix or None."""
 
     def __init__(self, node, cfg, model, table_z, T_base_link, spins=True, tag_px=None,
                  scene_cfg=None, base_frame=None):
         from rammp_box_opening.perception.owl_source import OwlRung
         from rammp_box_opening.perception.scene import SceneGrabber
+        from rammp_box_opening.perception.segmenter_source import SegmenterRung
 
         self.node = node
         # spins=False: the node is spun elsewhere (the mission's perception
@@ -533,15 +891,25 @@ class SceneLocator:
         # external_static_tf), read as base_frame <- the camera's link
         self.T_base_link = None if T_base_link is None else np.asarray(T_base_link, dtype=float)
         self.base_frame = base_frame
-        self.upside_down = bool((scene_cfg or {}).get("upside_down", False))
         self.grab = SceneGrabber(node, keep=3, need_depth=True, scene_cfg=scene_cfg)
         self.owl = OwlRung(node, cfg, camera="scene")
+        # sheppy's scene segmenter, for a container whose config names the
+        # classes it is boxed as (scene_detect.segmenter_classes); None: the
+        # scene OWL alone finds it, as before
+        classes = tuple(getattr(cfg, "segmenter_classes", ()) or ())
+        self.seg = SegmenterRung(node, classes) if classes else None
+        self.seg_box = getattr(cfg, "segmenter_box", "holder")
         self.last_why = None
         self.last_timing = {}
+        self.last_boxes = {}  # source -> the raw boxes of the last message locate() gated (the detection set keeps them)
+        self.last_seg_state = None  # the segmenter's state when locate() or prime() last looked
+        self._clock, self._sleep = time.monotonic, time.sleep  # tests drive them
         # where the calibration saw the cabinet's tag (scene_calib.scene_tag_px):
         # checked once per locate, before any fix is trusted
         self.tag_px = tag_px
         self.moved_note = None  # "tag not in view" and the like, for the log
+        if self.seg is not None and not self.seg.available:
+            print("[scene] the scene segmenter cannot be read (%s): the scene OWL alone finds the box" % self.seg.why)
 
     def base_to_link(self):
         """T(base <- the camera's link): the calibration's, or TF's."""
@@ -564,41 +932,101 @@ class SceneLocator:
                 self.base_frame, self.grab.link_frame)
         return "no TF from the scene camera's link to its colour frame"
 
+    def _seg_args(self, now):
+        """(now, frame_id, (w, h), stamp ns) of the grabber's own newest colour
+        frame: what a segmenter message must match (SegmenterRung.state)."""
+        from rammp_box_opening.perception.segmenter_source import stamp_ns
+
+        g = self.grab
+        color = g.color
+        wh = None if color is None else (int(color.shape[1]), int(color.shape[0]))
+        return now, getattr(g, "color_frame_id", None), wh, stamp_ns(getattr(g, "color_stamp", None))
+
+    def prime(self):
+        """Ahead of a locate() (at construction; before the look after a
+        press): the scene OWL enabled now where the segmenter cannot answer —
+        none for this container, or down — so the OWL's first box (~0.7 s,
+        inferred on the enable edge) comes while the caller does something
+        else. A live segmenter, or one still in its first second, leaves the
+        OWL off and off the GPU: locate() enables it itself when it must."""
+        if self.seg is None or not self.seg.available:
+            self.owl.enable()
+            return
+        self.last_seg_state = self.seg.state(*self._seg_args(self._clock()))
+        if self.last_seg_state in SEG_DOWN:
+            self.owl.enable()
+
     def locate(self, timeout_s):
-        """Enable the scene OWL, wait for its box, lift the depth inside it."""
-        import time
-
-        import rclpy
-
+        """The box, from the scene frames that arrive from now on. Each new
+        segmenter message's boxes (the band above the holder) go through the
+        gate (scene_fix_from_boxes) as they come; the scene OWL's boxes too
+        once the segmenter is down, a message is ambiguous, or OWL_AFTER_S
+        has passed with no fix. A fix commits when the two newest sightings
+        agree (commit_fix). Sightings belong to this call only: the looks
+        after a press never mix with those before it. None, with
+        `last_why`, when nothing commits in `timeout_s`."""
         from rammp_box_opening.perception.owl_source import bboxes_in_msg
+        from rammp_box_opening.perception.segmenter_source import segmenter_candidates, stamp_ns
 
-        t0 = time.monotonic()
-        self.owl.enable()
+        clock = self._clock
+        g = self.grab
+        seg = self.seg
+        t0 = clock()
         self.last_timing = {}  # where a locate's seconds went (the SCENE line prints it)
+        self.last_boxes = {}
+        # only frames newer than the newest one held now: those kept from
+        # before the call (before a press, say) must not vote
+        since = stamp_ns(getattr(g, "color_stamp", None))
+        t_ready = None
+        owl_on = False
+
+        def owl_now():
+            nonlocal owl_on
+            if not owl_on:
+                self.owl.enable()
+                owl_on = True
+                self.last_timing["owl_s"] = 0.0 if t_ready is None else round(clock() - t_ready, 2)
+
         try:
-            heard = False  # any message at all from the scene instance
-            t_ready = None
-            tried = []  # (why) per candidate refused, for the log
-            off_frame = None  # (score, edges, R_base_color) of the best candidate cut by the frame's edge
-            last_msg = None
+            # no segmenter for this container (or none this install can read),
+            # or prime() found it down: the OWL from the start (an enable
+            # repeated refreshes the node's window)
+            if seg is None or not seg.available or getattr(self.owl, "enabled", False):
+                owl_now()
+            heard_owl = False  # any message at all from the scene OWL
+            last_owl = last_seg = None  # the messages gated last, per source
+            n_seg = n_seg_boxes = 0  # segmenter frames gated in this call, and the boxes of its classes in them
+            tried = {"segmenter": [], "owl": []}  # why each refused candidate was refused, per source
+            ambiguous = {"segmenter": [], "owl": []}  # (top, rivals) of each message that passed in two places
+            # a segmenter message passed in two places: from then on in this
+            # look, only a pair with an OWL sighting in it commits (commit_fix)
+            owl_settles = False
+            sightings = []
+            unconfirmed = False  # an OWL pair on a cut lid was held back for want of a segmenter sighting
+            off_frame = None  # (score, edges, R_base_color, src) of the best candidate cut by the frame's edge
+            state = seg_args = m_seg = None
             found = None
-            while time.monotonic() - t0 < timeout_s:
+            if self.spins:
+                import rclpy
+            while clock() - t0 < timeout_s:
                 if self.spins:
                     rclpy.spin_once(self.node, timeout_sec=0.05)
                 else:
-                    time.sleep(0.02)
+                    self._sleep(0.02)
                 if not self.ready():
                     continue
                 if t_ready is None:
-                    t_ready = time.monotonic()
+                    t_ready = clock()
                     self.last_timing["streams_s"] = round(t_ready - t0, 2)
-                    # OWL turns the frame by the config's word; TF has the mount's
-                    hangs = image_upside_down(self.base_to_color())
-                    if hangs is not None and hangs != self.upside_down:
+                    # the detectors need upright frames (upside down, RF-DETR
+                    # found the box in 7 of 37 detbench frames, the OWL in 15),
+                    # and nothing here turns them: a camera hung upside down
+                    # rotates them on the device
+                    if image_upside_down(self.base_to_color()):
                         self.last_why = (
-                            "TF hangs the scene camera %s but its config says upside_down: %s — "
-                            "the OWL would look at its frames the wrong way up"
-                            % ("upside down" if hangs else "upright", "true" if self.upside_down else "false")
+                            "TF has the scene camera's frames upside down — its detectors need them upright: "
+                            "rotate them on the device (the OAK driver's color/depth i_rotation 180, "
+                            "rammp-deployments #133) with the upright mount in TF"
                         )
                         return None
                     # is the calibration's tag where it was? Said, never
@@ -607,24 +1035,48 @@ class SceneLocator:
                     # fixes measure instead (press_demo.scene_trust)
                     from rammp_box_opening.perception.scene_calib import scene_camera_moved
 
-                    _moved, why = scene_camera_moved(self.grab.color, self.tag_px)
+                    _moved, why = scene_camera_moved(g.color, self.tag_px)
                     self.moved_note = why
-                if self.owl.latest is None:
+                    if since is None:  # no frame at the call: the first one counts
+                        first = stamp_ns(getattr(g, "color_stamp", None))
+                        since = None if first is None else first - 1
+                now = clock()
+                if seg is not None:
+                    m_seg = seg.latest  # one read: the perception thread replaces it whole
+                    seg_args = self._seg_args(now)
+                    state = seg.state(*seg_args, frame=m_seg)
+                    self.last_seg_state = state
+                if not owl_on and (seg is None or state in SEG_DOWN or now - t_ready >= OWL_AFTER_S):
+                    owl_now()
+                msgs = []
+                if state == "live" and m_seg is not last_seg and _newer(m_seg.stamp_ns, since, last_seg):
+                    last_seg = m_seg
+                    n_seg += 1
+                    self.last_timing.setdefault("seg_s", round(now - t_ready, 2))
+                    self.last_boxes["segmenter"] = [[c, float(s)] + [float(v) for v in b] for c, s, b in m_seg.objects]
+                    n_seg_boxes += len(m_seg.objects)
+                    cands = segmenter_candidates(m_seg.objects, seg.classes, seg_args[2], box_kind=self.seg_box)
+                    if cands:
+                        msgs.append(("segmenter", cands))
+                if owl_on and self.owl.latest is not None:
+                    heard_owl = True
+                    # the newest BOX, not the newest message: a heartbeat that
+                    # lands milliseconds after it must not hide it (2026-09-23)
+                    m = self.owl.fresh_box()
+                    if m is not None and m is not last_owl:
+                        last_owl = m
+                        boxes = bboxes_in_msg(m)
+                        self.last_timing.setdefault("bbox_s", round(now - t_ready, 2))
+                        self.last_boxes["owl"] = [[float(b[4])] + [float(v) for v in b[:4]] for b in boxes]
+                        if boxes:
+                            msgs.append(("owl", [(b[4], b[:4]) for b in boxes]))
+                if not msgs:
                     continue
-                heard = True
-                # the newest BOX, not the newest message: a heartbeat that
-                # lands milliseconds after it must not hide it (2026-09-23)
-                m = self.owl.fresh_box()
-                if m is None or m is last_msg:
-                    continue
-                last_msg = m
-                # every candidate the OWL offered in this message, best
-                # first, against the container's geometry: the first one
-                # whose top is at lid height AND the container's size wins
-                if "bbox_s" not in self.last_timing:
-                    self.last_timing["bbox_s"] = round(time.monotonic() - t_ready, 2)
-                t_cloud = time.monotonic()
-                cloud = self.grab.cloud_in_color_frame(depth=self.grab.depth_median(), stride=2)
+                # every candidate of every new message, best first, against the
+                # container's geometry, on one cloud: the first whose top is at
+                # lid height AND the container's size passes
+                t_cloud = clock()
+                cloud = g.cloud_in_color_frame(depth=g.depth_median(), stride=2)
                 if cloud is None:
                     self.last_why = "no scene depth cloud"
                     return None
@@ -633,55 +1085,104 @@ class SceneLocator:
                 if T_base_color is None:
                     continue
                 pts_base = pc @ T_base_color[:3, :3].T + T_base_color[:3, 3]
-                cands = bboxes_in_msg(m)
+                h, w = g.color.shape[:2]
                 # the top-face lift needs a table height up front: surveyed,
                 # else read off the image rows (no clean plane there is no
                 # refusal: the side lift reads the table around each box)
                 top_table_z = self.table_z
                 if top_table_z is None:
-                    measured = table_from_scene_points(pts_base, uv, self.grab.color.shape[0], upside_down=self.upside_down)
+                    measured = table_from_scene_points(pts_base, uv, h)
                     top_table_z = None if np.isnan(measured) else measured
-                got = scene_fix_from_boxes(
-                    [(c[4], c[:4]) for c in cands], pts_base, uv, top_table_z, self.model,
-                    cam_xyz=T_base_color[:3, 3], side_table_z=self.table_z,
-                    image_wh=(self.grab.color.shape[1], self.grab.color.shape[0]), cam_R=T_base_color[:3, :3],
-                )
-                tried.extend(got.tried)
-                for score, _box, edges in got.clipped:
-                    if off_frame is None or score > off_frame[0]:
-                        off_frame = (score, edges, T_base_color[:3, :3])
-                if got.pose is not None:
-                    cand = next(c for c in cands if c[:4] == got.box)
-                    found = (cand, got.pose, got.top, got.n, pts_base, uv, got)
+                for source, cands in msgs:
+                    label = SRC_LABEL[source]
+                    got = scene_fix_from_boxes(
+                        cands, pts_base, uv, top_table_z, self.model, cam_xyz=T_base_color[:3, 3],
+                        side_table_z=self.table_z, image_wh=(w, h), cam_R=T_base_color[:3, :3], src=label, rivals=True,
+                    )
+                    tried[source].extend(got.tried)
+                    for score, _box, edges in got.clipped:
+                        if off_frame is None or score > off_frame[0]:
+                            off_frame = (score, edges, T_base_color[:3, :3], label)
+                    if got.pose is None:
+                        continue
+                    if got.rivals:
+                        # two places pass as this container: no sighting, and
+                        # the OWL, which boxes the lid itself, settles which
+                        ambiguous[source].append((got.top, got.rivals))
+                        owl_settles = owl_settles or source == "segmenter"
+                        owl_now()
+                        continue
+                    key = box_key(got.box)
+                    c = next(c for c in cands if box_key(c[1]) == key)
+                    det = getattr(c, "det_box", None)
+                    sightings.append(Sighting(
+                        source, float(c[0]), tuple(float(v) for v in got.top), got.pose, int(got.n), tuple(got.partial),
+                        float(got.table_z), got.lift, key, key if det is None else box_key(det),
+                    ))
+                    # a live segmenter confirms a cut OWL box only once it has seen the container in this look
+                    seg_saw = state == "live" and (
+                        bool(ambiguous["segmenter"]) or any(s.source == "segmenter" for s in sightings))
+                    top, why = commit_fix(sightings, seg_saw, owl_settles=owl_settles)
+                    unconfirmed = unconfirmed or why == "cut OWL box unconfirmed"
+                    if top is not None:
+                        found = (top, sightings[-VOTE_N:], pts_base, uv, got, T_base_color)
+                        t_fix = clock()
+                        self.last_timing["fix_s"] = round(t_fix - t_ready, 2)
+                        self.last_timing["lift_s"] = round(t_fix - t_cloud, 2)
+                        break
                 if found is not None:
-                    self.last_timing["lift_s"] = round(time.monotonic() - t_cloud, 2)
                     break
             if found is None:
-                # three different failures wear the same "no box" face: the
-                # camera is down, the OWL instance is silent (not started,
-                # still loading, or getting no frames — a launch-started
-                # instance was seen like that, 2026-09-16), or it is alive
-                # and honestly sees no box
-                self.last_why = (
-                    "scene camera streams missing: %s" % ", ".join(self.grab.missing())
-                    if self.grab.missing()
-                    else self._unplaced_why()
-                    if t_ready is None
-                    else "the scene OWL is SILENT (no heartbeat in %.1f s) — not started, still "
-                    "loading, or not receiving frames: check the launch terminal" % timeout_s
-                    if not heard
-                    else "the scene OWL saw no box in %.1f s" % timeout_s
-                    if not tried
-                    else "none of the OWL's %d candidate(s) is this container: %s" % (len(tried), "; ".join(tried[-3:]))
-                )
-                if off_frame is not None and heard and t_ready is not None and not self.grab.missing():
-                    self.last_why = "%s; %s" % (off_frame_why(*off_frame, frame=self.base_frame or "base_link"), self.last_why)
+                n_owl = sum(s.source == "owl" for s in sightings)
+                if g.missing():
+                    why = "scene camera streams missing: %s" % ", ".join(g.missing())
+                elif t_ready is None:
+                    why = self._unplaced_why()
+                else:
+                    # three different failures wear the same "no box" face: the
+                    # camera is down, a detector is silent (not started, still
+                    # loading, or getting no frames — a launch-started OWL
+                    # instance was seen like that, 2026-09-16), or it is alive
+                    # and honestly sees no box
+                    owl_part = _owl_why(timeout_s, owl_on or seg is None, heard_owl, tried["owl"], ambiguous["owl"],
+                                        n_owl, unconfirmed)
+                    if seg is None:
+                        why = owl_part
+                    else:
+                        if state in SEG_DOWN:
+                            seg_part = seg.describe(state, *seg_args[1:], frame=m_seg)
+                        elif n_seg == 0:
+                            seg_part = "no frame newer than the look in %.1f s" % timeout_s
+                        elif n_seg_boxes == 0:
+                            seg_part = "saw no %s in %d frames" % (" or ".join(seg.classes), n_seg)
+                        elif ambiguous["segmenter"]:
+                            top, riv = ambiguous["segmenter"][-1]
+                            seg_part = "two places pass as this container, %s and %s, and the OWL did not settle which" % (
+                                _top_xy(top), _top_xy(riv[0]))
+                        elif unconfirmed:
+                            seg_part = "the OWL's box of the cut lid is not confirmed by the segmenter's"
+                        elif len(sightings) == n_owl:
+                            # the same box is refused for the same reason 5 times a second: the last 3 reasons that differ
+                            last = list(dict.fromkeys(reversed(tried["segmenter"])))[:3][::-1]
+                            seg_part = "none of its %d boxes is this container: %s" % (len(tried["segmenter"]), "; ".join(last))
+                        elif len(sightings) - n_owl == 1:
+                            seg_part = "one of its boxes passed in %d frames, and a fix needs two that agree" % n_seg
+                        else:
+                            seg_part = "its fixes did not agree within %.0f mm" % (1000 * VOTE_TOL_M)
+                        why = "scene segmenter: %s; scene OWL: %s" % (seg_part, owl_part)
+                    if off_frame is not None:
+                        score, edges, R, label = off_frame
+                        why = "%s; %s" % (off_frame_why(score, edges, R, frame=self.base_frame or "base_link", src=label), why)
+                self.last_why = why
                 return None
-            bbox, pose, top, n, pts_base, uv, got = found
+            top, pair, pts_base, uv, got, T_base_color = found
+            top = tuple(float(v) for v in top)
+            newest = pair[-1]
+            pose = container_pose_from_top(top, newest.pose.yaw, self.model, newest.table_z)
             table_seen = (
                 got.table_z
                 if got.lift == "side"
-                else table_from_scene_points(pts_base, uv, self.grab.color.shape[0], upside_down=self.upside_down)
+                else table_from_scene_points(pts_base, uv, g.color.shape[0])
             )
             # no survey: the table the box was found on is the one the
             # planner must know about (WorldStore.table_extent)
@@ -696,7 +1197,29 @@ class SceneLocator:
                 partial = "cut off by the frame toward %s %s" % (
                     self.base_frame or "base_link", " and ".join(off_frame_ways(got.partial, T_base_color[:3, :3])))
             near = np.hypot(pts_base[:, 0] - top[0], pts_base[:, 1] - top[1]) < MAP_R_M
-            return SceneFix(pose=pose, top_xyz=top, n_points=n, score=float(bbox[4]), table_z_scene=table_seen,
-                            table_extent=extent, partial=partial, table_points=pts_base[near].astype(np.float32))
+            return SceneFix(pose=pose, top_xyz=top, n_points=newest.n, score=newest.score, table_z_scene=table_seen,
+                            table_extent=extent, partial=partial, table_points=pts_base[near].astype(np.float32),
+                            source=newest.source, n_sightings=len(pair), sources=tuple(s.source for s in pair))
         finally:
             self.owl.disable()
+
+
+def _owl_why(timeout_s, asked, heard, tried, ambiguous, n_sightings, unconfirmed):
+    """Why the scene OWL gave no fix: today's three texts, and the vote's."""
+    if not asked:
+        return "not asked: the segmenter was live"
+    if not heard:
+        return ("the scene OWL is SILENT (no heartbeat in %.1f s) — not started, still "
+                "loading, or not receiving frames: check the launch terminal" % timeout_s)
+    if unconfirmed and n_sightings >= VOTE_N:
+        return "its boxes of the cut lid wait on the segmenter's"
+    if n_sightings == 1:
+        return "one of its boxes passed in %.1f s, and a fix needs two that agree" % timeout_s
+    if n_sightings > 1:
+        return "its fixes did not agree within %.0f mm" % (1000 * VOTE_TOL_M)
+    if ambiguous:
+        top, riv = ambiguous[-1]
+        return "two places pass as this container, %s and %s" % (_top_xy(top), _top_xy(riv[0]))
+    if not tried:
+        return "the scene OWL saw no box in %.1f s" % timeout_s
+    return "none of the OWL's %d candidate(s) is this container: %s" % (len(tried), "; ".join(tried[-3:]))

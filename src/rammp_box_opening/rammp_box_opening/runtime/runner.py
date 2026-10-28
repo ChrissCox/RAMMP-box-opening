@@ -63,6 +63,23 @@ class LegResult:
     # arm measuring the surface it touched, independent of the camera and
     # of every model constant
     contact_xyz: list = None
+    # how the execution flew: "impedance" or "position", and the driver's
+    # ImpedanceGains profile it was sent with (None in position)
+    mode: str = None
+    gains: int = None
+    # an arrival's error: the live joints the moment the driver called it
+    # arrived against where the trajectory flown ends — the worst joint
+    # (rad, wrap-aware), and the tool frame's offset (mm) and turn (deg) by
+    # the arm's own kinematics. A goal ends when its time does, so in
+    # impedance it is what the spring has not yet caught up. Measured, never
+    # judged: 2026-10-27 16:23 flew at MEDIUM and TF put the tool 32 mm and
+    # 5.3 deg off its commanded look pose, where that day's three position
+    # runs (14:33, 15:19, 15:34) agree with one another to 0.1 mm
+    end_err_rad: float = None
+    end_err_mm: float = None
+    end_err_deg: float = None
+    # a gripper leg's knuckle when it finished (rad, 0.0 open .. 0.8 closed)
+    gripper_pos: float = None
     # what tripped the guard (guards.TorqueGuard.trip_report): the joint, its
     # deviation from the baseline in force, and the run-up — so a false trip
     # can be read off the log instead of re-flown
@@ -79,6 +96,33 @@ def _hold(seconds):
     """Hold still (the driver holds its last position). Its own function so
     a test can see the hold without waiting it out."""
     time.sleep(float(seconds))
+
+
+def _arrival_error(live, traj):
+    """(worst joint rad, tool mm, tool deg): the arm at `live` against the
+    end of `traj`, the trajectory flown (LegResult.end_err_*). Joints
+    wrap-aware — HOME's joint_3 sits 4.6 mrad from +-pi, either side of it
+    the same arm — and the tool frame by the arm's own kinematics, which a
+    chain that is not ready leaves None. A measurement only: nothing here
+    may cost the run."""
+    try:
+        end = [float(v) for v in traj.points[-1].positions]
+        live = [float(v) for v in live]
+        rad = max(abs(ang_diff(a, b)) for a, b in zip(live, end))
+    except Exception:  # noqa: BLE001 - nothing to measure against
+        return None, None, None
+    try:
+        from rammp_box_opening.runtime import approach
+        from rammp_box_opening.runtime.kinematics import rotvec
+
+        chain = approach._chain()
+        R1, t1 = chain.fk(end)
+        R2, t2 = chain.fk(live)
+        mm = 1000.0 * float(np.linalg.norm(np.asarray(t1, float) - np.asarray(t2, float)))
+        deg = math.degrees(float(np.linalg.norm(rotvec(np.asarray(R1, float) @ np.asarray(R2, float).T))))
+    except Exception:  # noqa: BLE001 - no chain (no URDF for its root, ...): no tool error
+        mm = deg = None
+    return tuple(None if v is None or not math.isfinite(v) else float(v) for v in (rad, mm, deg))
 
 
 def _path_len(traj):
@@ -493,6 +537,32 @@ class Runner:
                         results.append(res)
                         return results
                     lead = group[0]
+                # A group was merged on the trajectories its legs had THEN. A
+                # lazy group had none, and a replan (above, or under the
+                # recoil) plans each leg from the predicted end of the one
+                # before it, which the client hands the planner on HOME's
+                # branch: a whole turn from that end when it is written the
+                # other way round (legs.MERGE_GAP_RAD). Replayed offline
+                # 2026-10-28, a lazy retreat and home flew as one goal that
+                # turned joint_3 9.23 rad. One goal flies only legs that
+                # meet; the rest fly next, as goals of their own
+                parts = merge_groups(group)
+                if len(parts) > 1:
+                    for before, after in zip(parts, parts[1:]):
+                        a, b = before[-1], after[0]
+                        gap = (
+                            np.subtract(b.traj.points[0].positions, a.traj.points[-1].positions)
+                            if a.traj is not None and b.traj is not None
+                            else [float("nan")]
+                        )
+                        print(
+                            "[runner] %s no longer starts where %s ends (%.3f rad apart as written) — it flies "
+                            "as a goal of its own" % (b.name, a.name, float(np.max(np.abs(gap))))
+                        )
+                    groups[gi + 1 : gi + 1] = parts[1:]
+                    if host is group:
+                        host = parts[-1]
+                    group, lead = parts[0], parts[0][0]
                 # a RELEASE overlaps the replan above, never the motion:
                 # the arm must not move away from what it dropped before
                 # the fingers have settled
@@ -622,11 +692,19 @@ class Runner:
         self._pending = (leg, handle, time.monotonic())
         return True
 
-    def finish(self):
-        """Collect any pending gripper command (mission end / exit)."""
+    def join_pending(self):
+        """Collect a pending gripper command now, mid-run (None when nothing
+        is pending): where what comes next needs the fingers where it sent
+        them and run() would not join it first — it joins before a gripper
+        leg, a guarded motion or a join_before_motion leg's motion only, and
+        a compliant way in is none of them."""
         if self._pending is None:
             return None
         return self._join_pending()
+
+    def finish(self):
+        """Collect any pending gripper command (mission end / exit)."""
+        return self.join_pending()
 
     def _join_pending(self):
         leg, handle, t0 = self._pending
@@ -709,6 +787,7 @@ class Runner:
             info.get("message", ""),
             progress=info.get("progress"),
             t_wall=time.monotonic() - t0,
+            **self._how_it_flew(outcome, info, traj),
         )
         planned = False
         if ok and next_group is not None:
@@ -936,8 +1015,10 @@ class Runner:
             )
 
         guard = make_guard()
-        # a compliant run's impedance tuning: the group's, when a leg names one
-        gains = next((g.gains for g in group if getattr(g, "gains", None) is not None), None)
+        # a compliant run's impedance tuning: the group's one gains value
+        # (legs.can_merge merges only legs under the same one), sent when it
+        # names a profile; with None the client flies its run default
+        gains = group[0].gains
         t0 = time.monotonic()
         outcome, info = self.client.execute(
             traj,
@@ -947,6 +1028,7 @@ class Runner:
             stop_when=lead.stop_when,
             **({} if gains is None else {"gains": gains}),
         )
+        flew = self._how_it_flew(outcome, info, traj)
         if guard is not None:
             info.setdefault("torque_peak", guard.peak)
         if info.get("while_running_error"):
@@ -981,7 +1063,24 @@ class Runner:
             trip=guard.trip_report() if guard is not None else None,
             lookahead=info.get("while_running"),
             flown_traj=traj,
+            **flew,
         )
+
+    def _how_it_flew(self, outcome, info, traj):
+        """LegResult's mode, gains and end_err_* for one execution of `traj`,
+        a motion's or the recoil's. On an arrival: where the arm is the
+        moment the driver called it arrived, against the end of what flew —
+        the cached sample, no wait and no settle, since a wait would hide
+        what the spring had not caught up. Logged, never a gate (a compliant
+        run stops for nothing it reads)."""
+        rad, mm, deg = _arrival_error(self.client.joints(), traj) if outcome == "arrived" else (None, None, None)
+        return {
+            "mode": "impedance" if getattr(self.client, "compliant", False) else "position",
+            "gains": info.get("gains"),
+            "end_err_rad": rad,
+            "end_err_mm": mm,
+            "end_err_deg": deg,
+        }
 
     @staticmethod
     def _leg_ok(leg, outcome):
@@ -1008,7 +1107,7 @@ class Runner:
         )
         if ok and leg.verify is not None:
             ok, detail = leg.verify(VerifyCtx(outcome=outcome, gripper_pos=pos))
-        return LegResult(leg.name, outcome, ok, detail, t_wall=time.monotonic() - t0)
+        return LegResult(leg.name, outcome, ok, detail, t_wall=time.monotonic() - t0, gripper_pos=float(pos))
 
     def _run_gripper(self, leg):
         t0 = time.monotonic()
@@ -1017,7 +1116,7 @@ class Runner:
         detail = "gripper at %.3f%s" % (pos, " (stalled)" if stalled else "")
         if ok and leg.verify is not None:
             ok, detail = leg.verify(VerifyCtx(outcome=outcome, gripper_pos=pos))
-        return LegResult(leg.name, outcome, ok, detail, t_wall=time.monotonic() - t0)
+        return LegResult(leg.name, outcome, ok, detail, t_wall=time.monotonic() - t0, gripper_pos=float(pos))
 
     def _append(self, row):
         """One row onto this run's jsonl (created on the first row)."""

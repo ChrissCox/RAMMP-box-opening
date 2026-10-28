@@ -35,6 +35,8 @@ and the arm stop-started every 2 mm: 2.98 s for the 45 mm grip descent
 and 3 Nm of torque ripple in free air on the live run of 2026-09-17.
 """
 
+import math
+
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from rammp_box_opening.constants import JOINT_VMAX
@@ -129,6 +131,34 @@ def _point(p, t):
     q.accelerations = list(p.accelerations)
     set_stamp(q.time_from_start, t)
     return q
+
+
+def on_branch_of(traj, q_ref):
+    """A copy of planned trajectory `traj` with each continuous joint
+    (branches.CONTINUOUS_JOINTS) moved by the one whole number of turns that
+    puts its first point within half a turn of `q_ref`: every difference
+    kept, so the same motion to the arm, whose driver compares every target
+    with the measurement the short way round (runtime/branches) — written
+    to continue a path that ends at `q_ref`. The planner is handed
+    planner_branch(start), HOME's side of the wrap, which can sit a turn from
+    a plan-free line's raw end (review 2026-10-27: joint_3 +0.450 against
+    -5.833), and a junction between them is a full revolution in one goal
+    (legs.MERGE_GAP_RAD)."""
+    from rammp_box_opening.runtime.branches import CONTINUOUS_JOINTS
+
+    first = [float(v) for v in traj.points[0].positions]
+    shift = [0.0] * len(first)
+    for j in CONTINUOUS_JOINTS:
+        if j < len(first):
+            shift[j] = 2.0 * math.pi * round((float(q_ref[j]) - first[j]) / (2.0 * math.pi))
+    out = JointTrajectory()
+    out.header = traj.header
+    out.joint_names = list(traj.joint_names)
+    for p in traj.points:
+        q = _point(p, secs(p.time_from_start))
+        q.positions = [float(v) + s for v, s in zip(p.positions, shift)]
+        out.points.append(q)
+    return out
 
 
 def chain(first, second):
