@@ -421,7 +421,8 @@ def test_deferred_gripper_close_overlaps_the_next_transit(tmp_path):
     # sent, THEN the transit ran; the join is lazy — it outlives the run
     # to overlap whatever planning follows, and finish() collects it
     assert c.events == ["send", "execute"]
-    assert r.finish().ok
+    done = r.finish()
+    assert done.ok and done.gripper_pos == pytest.approx(0.8)  # the knuckle the join read
     assert c.events == ["send", "execute", "join"]
 
 

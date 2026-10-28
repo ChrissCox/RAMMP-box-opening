@@ -84,6 +84,7 @@ from rammp_box_opening.primitives.core import (
     _plan_motion,
     _push_guard_and_verify,
 )
+from rammp_box_opening.runtime import fingers
 from rammp_box_opening.runtime.guards import GuardSpec
 from rammp_box_opening.runtime.legs import Kind, Leg, can_merge, merge_groups
 
@@ -1580,6 +1581,30 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         runner.note("open_box", button_above_lid_mm=round(up_mm, 1))
         _go_home(ctx, cfg, runner, "STOP: " + open_already)
         return 1
+    # The fingers are shut before the arm moves toward the box. press_demo
+    # sent press:close before the look, and the runner joins it before a
+    # gripper leg or a guarded motion only: a compliant run has neither, so
+    # its close was collected after home and its result never read. An open
+    # aperture strikes the lid and can still read "pressed", and fingers
+    # closed on something press with it. The knuckle says which: shut is
+    # what an empty close reads. The close has had the look and the aim
+    # (about 3 s), so a normal run reads what it already did
+    closed = runner.join_pending()
+    if closed is not None and not fingers.reads_empty_close(closed.gripper_pos):
+        _go_home(ctx, cfg, runner, "STOP: %s %s (%s) — the fingers are not shut; nothing was pressed"
+                 % (closed.leg_name, closed.outcome, closed.detail))
+        return 1
+    if closed is not None and not closed.ok:
+        # "never moved": the close found the fingers already shut, at a
+        # reading press_demo did not take for shut. An empty close's reading
+        # changes (0.793 to 0.636 at a driver restart, 2026-09-25) and was
+        # learned at the straight-down touch only: learned here too, the
+        # next run finds them shut and sends no close
+        kept = fingers.learn_closed(closed.gripper_pos)
+        runner.note("closed_unmoved", knuckle=round(closed.gripper_pos, 4), learned=kept)
+        print("[press_demo] %s %s (%s), but the knuckle reads an empty close: the fingers are shut%s"
+              % (closed.leg_name, closed.outcome, closed.detail,
+                 " (kept as this gripper's empty close)" if kept else ""))
     button = tuple(float(v) for v in got[0])
     lid_before = _lid_z(button[2], up_mm)
     print(

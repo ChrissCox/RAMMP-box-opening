@@ -395,13 +395,15 @@ class _Rec:
 
 
 def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4), scene_after="same", settled=None,
-          touch=None, contact=BUTTON, home_refusals=0, run_args=None, chain=None, home_turns=0):
+          touch=None, contact=BUTTON, home_refusals=0, run_args=None, chain=None, home_turns=0, closing=None):
     """Run run_reach_press with the arm, the cameras and the planner faked
     (`run_args`: press_demo's args, a guarded TF press by default; `chain`,
     a _Chain). Every plan starts at the joints it is handed (PlanState), as
     the planner's do; each home plan's joint_3 is written `home_turns`
     whole turns off them, as a plan handed planner_branch(start) can be.
-    Returns (exit code, the record, the chain, home plan's cpose and pad —
+    `closing`: press_demo's press:close, sent before the look and pending
+    on the runner; joining it reads this (ok, knuckle, stalled), and the
+    learned empty close is kept in tmp_path. Returns (exit code, the record, the chain, home plan's cpose and pad —
     and its start, the record's length and the live joints when it was
     planned)."""
     from conftest import leg as make_leg
@@ -453,6 +455,12 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
             return out
 
     runner = R(ctx.client, log_dir=tmp_path)
+    if closing is not None:
+        from rammp_box_opening.constants import GRIPPER_CMD_CLOSED
+
+        monkeypatch.setenv("RAMMP_BOX_OPENING_STATE", str(tmp_path))  # never the robot's own gripper.json
+        ctx.client.gripper_join = lambda handle: closing
+        assert runner.start_gripper("press:close", GRIPPER_CMD_CLOSED, True)
     aims = [first, after]
 
     def aim(node, watcher, yaw, lid_z, prior_xy, runner_, tag):
@@ -1006,6 +1014,63 @@ def test_where_neither_a_line_nor_a_planned_look_brings_the_aimed_button_a_way_d
     assert "— nothing was pressed — returning home" in out
     rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
     assert not [r for r in rows if r["leg"] in ("reach_way_in", "home_refused")]
+
+
+@pytest.mark.parametrize("closing", [(True, 0.79, False), (False, 0.636, False)])
+def test_a_compliant_run_reads_the_fingers_close_before_its_way_in(ctx, monkeypatch, tmp_path, capsys, closing):
+    """press_demo sends press:close before the look, and the runner joins
+    it before a gripper leg or a guarded motion only. A compliant way in
+    has neither, so its close was collected after home, unread. Now it is
+    read once the aim has the button, before anything moves toward the
+    box: the press:close row comes before the way in's. A close that never
+    moved, its knuckle reading an empty close (0.636, after a driver
+    restart, 2026-09-25, which press_demo did not take for shut), found the
+    fingers shut: the press goes on, and 0.636 is kept as the empty close."""
+    import json
+
+    from rammp_box_opening.runtime import fingers
+    from rammp_box_opening.tasks import depth_press as dp
+
+    ok, knuckle, _stalled = closing
+    code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down([], lambda tilt, tip: True),
+                                               closing=closing)
+    assert code == 0 and got["compliant"] and ctx.client.gripper_sent == [0.8]
+    assert any("depth:press" in names and gains == [dp.COMPLIANT_GAINS] for names, gains in rec.runs)
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    legs = [r["leg"] for r in rows]
+    assert legs.count("press:close") == 1 and legs.index("press:close") < legs.index("reach_way_in")
+    close, = [r for r in rows if r["leg"] == "press:close"]
+    assert close["ok"] is ok and close["gripper_pos"] == pytest.approx(knuckle)
+    unmoved = [r for r in rows if r["leg"] == "closed_unmoved"]
+    assert fingers.learned_closed() == pytest.approx(fingers.NOMINAL_CLOSED if ok else knuckle)
+    assert (unmoved == []) if ok else (unmoved[0]["knuckle"] == knuckle and unmoved[0]["learned"] is True)
+    shut = ("press:close failed (gripper at 0.636 (overlapped)), but the knuckle reads an empty close: the fingers "
+            "are shut (kept as this gripper's empty close)")
+    assert (shut in capsys.readouterr().out) is (not ok)
+
+
+@pytest.mark.parametrize("soft", [True, False])
+@pytest.mark.parametrize("closing, read", [((False, 0.0, False), "failed (gripper at 0.000 (overlapped))"),
+                                           ((True, 0.41, True), "arrived (gripper at 0.410 (stalled) (overlapped))")])
+def test_fingers_not_shut_send_the_arm_home_from_the_look_pose_with_nothing_pressed(
+        ctx, monkeypatch, tmp_path, capsys, soft, closing, read):
+    """An open aperture strikes the lid and can still read "pressed";
+    fingers closed on something (0.41, the knob's reading) press with it.
+    Either is read after the aim, in free air at the look pose: the arm goes
+    home from there, nothing moved toward the box, nothing learned. A
+    guarded run's re-aim used to join a failed close and leave the arm
+    holding at the look, and took a stalled one for closed."""
+    from rammp_box_opening.runtime import fingers
+
+    asked = []
+    code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked, lambda tilt, tip: True),
+                                               compliant=soft, closing=closing)
+    assert code == 1 and got == {} and rec.events == ["reach:look", "aim:reach-aim", "home"]
+    if soft:
+        assert len(asked) == 1  # the scene button's proof, before the look; none for the aimed one
+    assert ("STOP: press:close %s — the fingers are not shut; nothing was pressed — returning home" % read) in (
+        capsys.readouterr().out)
+    assert fingers.learned_closed() == pytest.approx(fingers.NOMINAL_CLOSED)
 
 
 @pytest.mark.parametrize("depth", [False, True])
