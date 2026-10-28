@@ -205,7 +205,13 @@ class CustomGains(namedtuple("CustomGains", "name kq zeta torque_limit")):
 # where 16:23's stroke runs straight down at 25 mm/s and 7.2 N on its bend at
 # 41, 1.7 and 6.0 N on 15:45's at 19 and 68 (0.7: 3.0, 5.0, 1.2, 4.2). With
 # the lid rigid, that puts the force 3-4 N above the hold's for the stroke's
-# last 0.10-0.13 s (0.7: 1.5-2.3 N, which 15:45's bag does not show).
+# last 0.10-0.13 s (0.7: 1.5-2.3 N, which 15:45's bag does not show). The
+# set-down's place:touch (reach_lid_off) meets the table the same way, faster:
+# at the spots beside 15:45's and 16:23's boxes the hand reaches, its
+# reference still runs at 48-63 mm/s 6 mm before its end, the damper pushing
+# 6.5-11.9 N as the lid touches (0.7: 4.6-8.4) and the force at most 5 N above
+# its spring's for the line's last ~0.1 s (0.7: 2.7); none where the scene's
+# table stands 6 mm or more above the real one.
 # depth_press's model is Kq's alone: k, the bend and the overshoot are planned
 # on it, and press_n reads the arm at rest, where the damper pushes nothing.
 # 1.3 only if the flown look and home still overshoot (the driver takes
@@ -219,6 +225,6 @@ IMPEDANCE_NAMES[GAINS_RIGID] = GAINS_RIGID.name
 # home still merge, and the press model (depth_press.COMPLIANT_KQ) is the
 # spring that flies. Owner 2026-10-27, after 16:23 flew all six of its goals
 # at MEDIUM: "impedance mode needs to be firmer" (STIFF, first flown 13:43);
-# 2026-10-28: RIGID (above). Nothing above STIFF has flown on this arm: the
-# first attended run is its test.
+# 2026-10-28: RIGID (above), flown at zeta 0.7 from 14:21 to 16:23 (ten
+# runs); zeta 1.0 has not flown: the first attended run is its test.
 COMPLIANT_RUN_GAINS = GAINS_RIGID

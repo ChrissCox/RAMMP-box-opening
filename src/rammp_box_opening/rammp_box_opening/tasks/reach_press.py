@@ -681,11 +681,16 @@ def let_go_part_way(ctx, res):
 
 def gains_text(profile):
     """A driver gains profile, or a custom spec (constants.CustomGains), as
-    the console names it, e.g. "RIGID (Kq 400/200 N·m/rad on joints 1-4/5-7)"."""
+    the console names it, e.g. "RIGID (Kq 400/200 N·m/rad on joints 1-4/5-7,
+    zeta 1.0)": a custom spec's zeta too, its own, since one name has flown
+    more than one (RIGID at 0.7 until 2026-10-28 16:23)."""
     p = profile if isinstance(profile, CustomGains) else int(profile)
     kq = IMPEDANCE_KQ.get(p)
     name = IMPEDANCE_NAMES.get(p, "gains profile %s" % (p,))
-    return name if kq is None else "%s (Kq %g/%g N·m/rad on joints 1-4/5-7)" % (name, kq[0], kq[4])
+    if kq is None:
+        return name
+    zeta = ", zeta %s" % (p.zeta,) if isinstance(p, CustomGains) else ""
+    return "%s (Kq %g/%g N·m/rad on joints 1-4/5-7%s)" % (name, kq[0], kq[4], zeta)
 
 
 def free_guard(ctx, reference, hang_k=None):
