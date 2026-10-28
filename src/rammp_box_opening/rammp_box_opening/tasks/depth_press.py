@@ -166,23 +166,53 @@ SLIDE_OK_M = 0.015
 # A COMPLIANT press (press_down_from_here's `compliant`; owner 2026-10-27:
 # "with impedance mode, lets remove the safety check for now that stops the
 # arm when there's a bad reading or it thinks it hit or is going to hit
-# something"): one stroke straight down, in the driver's joint impedance,
-# to where its spring pushes COMPLIANT_PRESS_N through the button's bottom,
-# held push_hold_s, and straight back up. No close-up look, no stop at
-# contact, no check: the arm yields. 15:19's touch tripped at 3.4 Nm on
-# joint 4, ~13.5 N at the pads, and the button went.
+# something"): one stroke down, in the driver's joint impedance, to where
+# its springs push COMPLIANT_PRESS_N straight down through the button's
+# bottom (its end bent past the bottom: BEND_MAX_M), held push_hold_s, and
+# back up. No close-up look, no stop at contact, no check: the arm yields.
+# 15:19's touch tripped at 3.4 Nm on joint 4, ~13.5 N at the pads, and the
+# button went.
 COMPLIANT_PRESS_N = 15.0
 COMPLIANT_GAINS = GAINS_STIFF  # ~440 N/m at the pads over 15:19's box
 # The driver's joint stiffness under that profile, N·m/rad (constants
 # IMPEDANCE_KQ, kinova-gen3-driver interface/gains.cpp): the robot's, not the
 # scene's. Taken from the profile the press legs send, so the stiffness at the
-# pads, the overshoot and press_n always model the spring that flies
+# pads, the overshoot, the stroke's bend and press_n always model the spring
+# that flies: COMPLIANT_KQ must stay that profile's. The bend's direction is
+# Kq^-1 J_z^T (stroke_bend): a spring stiffer or softer by one factor on every
+# joint still pushes straight down from the same end, only harder or softer;
+# one whose ratio between joints 1-4 and 5-7 is not this one's pushes sideways
+# again.
 COMPLIANT_KQ = IMPEDANCE_KQ[COMPLIANT_GAINS]
 # how far the stroke's end lies below the button's bottom, whatever the
 # stiffness: never a graze, never a ram
 COMPLIANT_OVERSHOOT_M = (0.015, 0.06)
 # the spring held at least this much off the stroke's end: something pushed back
 COMPLIANT_FELT_N = 5.0
+# The stroke's end BENT (stroke_bend). The driver's spring is a joint spring,
+# tau = g + Kq (q_ref - q) - D (qd - qd_ref), with no Cartesian term
+# (kinova-gen3-driver joint_impedance_mode.cpp, whose header says the tip
+# stiffness "is not diagonal in the task frame"): the pads' compliance
+# J Kq^-1 J^T couples, and a reference driven straight down past the button
+# pushes sideways too. Flatbot's URDF, STIFF, the stroke as it flew before
+# the bend, the pads held where they met the button's bottom: 17.3 N down
+# and 5.3 N sideways at 15:19's box turned exactly down (2026-10-27; free
+# to slide, they slip 13 mm across its 44 mm button), 23.3 N and 12.2 N at
+# 16:23's 12 deg lean (an 18 mm slip), while k(q0) x the offset said 15 N at
+# both. So the press leg goes straight down only to the button's bottom, at
+# joints q_b, then on in joint space to q_end = q_b - F Kq^-1 J_z(q_b)^T:
+# held at the bottom the arm stands at q_b, and the springs push F straight
+# down there, nothing sideways (offline, both boxes: 15.00 N, 0.00 N). The
+# model is the URDF and the profile's Kq: no friction, no gravity-model
+# error. In free air the pads would end 11 mm (15:19) to 14 mm (16:23) aside
+# and 28-32 mm below the bottom; a bend that would move them more than
+# BEND_MAX_M sideways is near a degenerate compliance, and the stroke flies
+# straight, as before, and says why.
+BEND_MAX_M = 0.03
+BEND_STEP_RAD = 0.005  # the bend's waypoints: no joint moves more than this between two
+# a bend dropping the pads less than this has nothing to bend (a chain whose
+# pads barely move with its joints, as the test fakes' that stand still)
+BEND_MIN_DROP_M = 0.001
 # A compliant reach-out's way back up from the hold (rise_back_up): the
 # stroke's own samples reversed, joined at the first one whose pads stand
 # this far above where the spring held them, the held arm's step to it no
@@ -196,7 +226,10 @@ COMPLIANT_FELT_N = 5.0
 # nearest the held arm in joint space lies near its END: a way up joined
 # there (the recoil's reverse_tail) drives the pads 23-30 mm lower first, a
 # second press. Joined 16-17 mm up instead, the step runs 0.14-0.18 rad and
-# the pads only rise.
+# the pads only rise. Bent (stroke_bend), the arm held at the button's bottom
+# is the stroke's own sample there, 0.035-0.046 rad off the commanded end,
+# and joined 16 mm up its step runs 0.05-0.06 rad; flown straight, or held
+# anywhere but at the bottom, it is as above.
 RISE_JOIN_ABOVE_M = 0.015
 RISE_FIRST_STEP_MAX_RAD = 0.25
 RISE_CHECK_POINTS = 10
@@ -535,9 +568,13 @@ class StrokePlan:
     """The compliant press's stroke from the hand turned down at `q0`
     (compliant_stroke): `legs` [(name, joint points, speed)], 'depth:approach'
     at press_speed to TOUCH_SLOW_M above the button's top — none when the
-    hand already stands that low — then 'depth:press' at TOUCH_SPEED to
-    `end_z`, `over` below the button's bottom, where the spring at the pads
-    (`k`, N/m) pushes COMPLIANT_PRESS_N."""
+    hand already stands that low — then 'depth:press' at TOUCH_SPEED,
+    straight down to the button's bottom and, `bent`, on in joint space to
+    `q_end` (stroke_bend), where the springs push COMPLIANT_PRESS_N straight
+    down at the pads held at the bottom; not bent, straight on down
+    (`bend_why` says why). Either way the pads' reference ends at `end_z`,
+    `over` below the button's bottom, and `k` (N/m) is the spring at the
+    pads at the bottom."""
 
     legs: list
     k: float
@@ -547,6 +584,10 @@ class StrokePlan:
     pad0: object  # ... and the pads (DOWN_CONTACT_TOOL)
     q0: list
     quat: list
+    q_end: list = None  # the stroke's last joints: the springs' reference at the hold
+    bent: bool = False
+    bend_m: float = 0.0  # how far the bend moves the pads' reference sideways from the bottom (m)
+    bend_why: str = None  # why the stroke is not bent
 
 
 def joint_arc(pts):
@@ -835,54 +876,136 @@ def _feel_the_lid(ctx, cfg, runner, quat, top_z, over, depth, lens, seen, up_mm)
     return DepthPress(free=True, contact=True, popped=True, knob_mm=float(up_mm))
 
 
-def fingertip_stiffness_z(chain, q, kq=COMPLIANT_KQ):
-    """How stiff the pads are straight down (N/m) under joint stiffness `kq`
-    with the arm at `q`: 1 / (J K^-1 J^T)_zz, J the pads' translation
-    Jacobian (central differences of the arm's own kinematics)."""
+def _pads(chain, q):
+    """The pads (DOWN_CONTACT_TOOL) in the world with the arm at joints `q`."""
+    R, t = chain.fk(list(q))
+    return np.asarray(t, float) + np.asarray(R, float) @ np.asarray(DOWN_CONTACT_TOOL, float)
+
+
+def fingertip_jacobian(chain, q):
+    """The pads' translation Jacobian at joints `q`, 3 x len(q) (m/rad):
+    central differences of the arm's own kinematics at DOWN_CONTACT_TOOL."""
     q = np.asarray(q, float)
     J = np.zeros((3, len(q)))
     for i in range(len(q)):
         dq = np.zeros(len(q))
         dq[i] = 1e-5
-        pads = []
-        for sgn in (1.0, -1.0):
-            R, t = chain.fk(list(q + sgn * dq))
-            pads.append(np.asarray(t, float) + np.asarray(R, float) @ np.asarray(DOWN_CONTACT_TOOL, float))
-        J[:, i] = (pads[0] - pads[1]) / 2e-5
-    c = float((J @ np.diag(1.0 / np.asarray(kq, float)[: len(q)]) @ J.T)[2, 2])
+        J[:, i] = (_pads(chain, q + dq) - _pads(chain, q - dq)) / 2e-5
+    return J
+
+
+def fingertip_compliance(chain, q, kq=COMPLIANT_KQ):
+    """The pads' compliance (m/N, 3 x 3, world axes) under joint stiffness
+    `kq` with the arm at `q`: C = J Kq^-1 J^T, J fingertip_jacobian's. Not
+    diagonal: a push straight down moves the pads sideways too."""
+    J = fingertip_jacobian(chain, q)
+    return J @ np.diag(1.0 / np.asarray(kq, float)[: J.shape[1]]) @ J.T
+
+
+def fingertip_stiffness_z(chain, q, kq=COMPLIANT_KQ):
+    """How stiff the pads are straight down (N/m) under joint stiffness `kq`
+    with the arm at `q`: 1 / C_zz (fingertip_compliance)."""
+    c = float(fingertip_compliance(chain, q, kq)[2, 2])
     return float("inf") if c <= 0.0 else 1.0 / c
+
+
+def stroke_bend(chain, q_b, kq=COMPLIANT_KQ):
+    """The compliant stroke's bend from joints `q_b`, the pads at the
+    button's bottom: its end q_end = q_b - F Kq^-1 J_z(q_b)^T, J_z the
+    vertical row of fingertip_jacobian at q_b and F COMPLIANT_PRESS_N —
+    scaled, where the pads' reference would then drop less or more below
+    the bottom than COMPLIANT_OVERSHOOT_M allows, to drop that bound. Under
+    the driver's joint spring, linear in joint space, that end is the
+    static balance itself: the pads held at the bottom, the arm stands at
+    q_b and the springs push F straight down there, whatever the arm's
+    compliance couples. Returns (q_end, how far it moves the pads'
+    reference sideways (m), None), or (None, that, why) where the stroke
+    flies straight instead: pads that do not move with the joints, or less
+    than BEND_MIN_DROP_M, a bend past BEND_MAX_M, or an end outside a
+    joint's limits."""
+    q_b = np.asarray(q_b, float)
+    J = fingertip_jacobian(chain, q_b)
+    inv = 1.0 / np.asarray(kq, float)[: len(q_b)]
+    if float(J[2] @ (inv * J[2])) <= 0.0:
+        return None, 0.0, "the pads do not move with the joints here"
+    pad_b = _pads(chain, q_b)
+
+    def end(force):
+        q = q_b - force * inv * J[2]
+        return q, float(pad_b[2] - _pads(chain, q)[2])
+
+    force = COMPLIANT_PRESS_N
+    q_end, drop = end(force)
+    if drop < BEND_MIN_DROP_M:
+        return None, 0.0, "a bend would drop the pads only %.1f mm" % (1000 * drop)
+    bound = min(max(drop, COMPLIANT_OVERSHOOT_M[0]), COMPLIANT_OVERSHOOT_M[1])
+    if bound != drop:
+        force *= bound / drop
+        q_end, drop = end(force)
+    aside = float(np.hypot(*(_pads(chain, q_end) - pad_b)[:2]))
+    if aside > BEND_MAX_M:
+        return None, aside, "a bend would move the pads' reference %.0f mm sideways, past BEND_MAX_M's %.0f" % (
+            1000 * aside, 1000 * BEND_MAX_M)
+    within = getattr(chain, "within_limits", None)  # the arm's own chain has limits; the test fakes have none
+    if within is not None and not within(list(q_end)):
+        return None, aside, "the bend's end is outside a joint's limits"
+    return q_end, aside, None
 
 
 def compliant_stroke(chain, cfg, q0, quat, top_z, kq=COMPLIANT_KQ):
     """press_compliant's stroke from the hand turned down at joints `q0`,
     holding `quat`, onto the button whose top is at `top_z`, as the arm's
     own kinematics solves it: straight down to TOUCH_SLOW_M above the top,
-    then to the stroke's end below the button's bottom — as far as the
-    spring there (fingertip_stiffness_z under `kq`) needs to push
-    COMPLIANT_PRESS_N, within COMPLIANT_OVERSHOOT_M. Returns (StrokePlan,
-    None) or (None, why)."""
+    then to the button's bottom (its last joints q_b), then the bend
+    (stroke_bend) on to where the springs under `kq` push COMPLIANT_PRESS_N
+    straight down at the pads held at the bottom, as joint waypoints no
+    joint moving more than BEND_STEP_RAD between two, in the same leg. No
+    bend: straight on down to as far below the bottom as the spring there
+    (fingertip_stiffness_z at q_b) needs to push COMPLIANT_PRESS_N, within
+    COMPLIANT_OVERSHOOT_M. Returns (StrokePlan, None) or (None, why)."""
     q0 = [float(v) for v in q0]
     R0, t0 = chain.fk(q0)
     R0, t0 = np.asarray(R0, float), np.asarray(t0, float)
     pad0 = t0 + R0 @ np.asarray(DOWN_CONTACT_TOOL, float)
-    k = fingertip_stiffness_z(chain, q0, kq)
-    over = min(max(COMPLIANT_PRESS_N / k, COMPLIANT_OVERSHOOT_M[0]), COMPLIANT_OVERSHOOT_M[1])
-    end_z = float(top_z) - float(cfg.button_travel_m) - over
-    slow_from = float(top_z) + TOUCH_SLOW_M
-    if pad0[2] <= end_z:
-        return None, "the pads already stand %.0f mm below where the press would end" % (1000 * (end_z - pad0[2]))
-    legs, q = [], q0
-    for name, z, speed in (("depth:approach", slow_from, cfg.press_speed), ("depth:press", end_z, TOUCH_SPEED)):
+    bottom = float(top_z) - float(cfg.button_travel_m)
+
+    def down_to(q, z):
+        # the straight line from q until the pads stand at z, the attitude held: [] when already this low
         _R, t = chain.fk(q)
         tool_z = float(t0[2]) + (z - float(pad0[2]))  # the attitude held: the tool drops as the pads do
         if float(t[2]) - tool_z < 0.005:
-            continue  # already this low
+            return [], None  # already this low
         pts, why = chain.straight_line(q, [float(t0[0]), float(t0[1]), tool_z], quat)
-        if pts is None:
-            return None, "the press stroke is not a straight line the arm can fly (%s)" % why
-        legs.append((name, pts, speed))
-        q = pts[-1]
-    return StrokePlan(legs, k, over, end_z, t0, pad0, q0, list(quat)), None
+        return pts, (None if pts is not None else "the press stroke is not a straight line the arm can fly (%s)" % why)
+
+    approach, why = down_to(q0, float(top_z) + TOUCH_SLOW_M)
+    if approach is None:
+        return None, why
+    q_a = approach[-1] if approach else q0
+    press, why = down_to(q_a, bottom)
+    if press is None:
+        return None, why
+    q_b = np.asarray(press[-1] if press else q_a, float)
+    k = fingertip_stiffness_z(chain, q_b, kq)
+    q_end, bend_m, bend_why = stroke_bend(chain, q_b, kq)
+    if q_end is not None:
+        n = max(2, int(math.ceil(float(np.abs(q_end - q_b).max()) / BEND_STEP_RAD)))
+        press = list(press or [list(q_b)]) + [list(q_b + (q_end - q_b) * (i / n)) for i in range(1, n + 1)]
+        end_z = float(_pads(chain, q_end)[2])
+        over = bottom - end_z
+    else:
+        over = min(max(COMPLIANT_PRESS_N / k, COMPLIANT_OVERSHOOT_M[0]), COMPLIANT_OVERSHOOT_M[1])
+        end_z = bottom - over
+        if pad0[2] <= end_z:
+            return None, "the pads already stand %.0f mm below where the press would end" % (1000 * (end_z - pad0[2]))
+        press, why = down_to(q_a, end_z)  # straight from where the approach ends, as before the bend
+        if press is None:
+            return None, why
+        q_end, bend_m = np.asarray(press[-1] if press else q_a, float), 0.0
+    legs = [(name, pts, speed) for name, pts, speed in (("depth:approach", approach, cfg.press_speed),
+                                                         ("depth:press", press, TOUCH_SPEED)) if pts]
+    return StrokePlan(legs, k, over, end_z, t0, pad0, q0, list(quat), [float(v) for v in q_end], bend_why is None,
+                      bend_m, bend_why), None
 
 
 def compliant_line(ctx, name, pts, quat, speed, world):
@@ -902,48 +1025,74 @@ def _lean_deg(quat):
 
 def press_text(stroke, cfg):
     """What the console says of a compliant stroke (compliant_stroke's)
-    before it flies: how far down, past the button's bottom, with what
-    spring, held how long — and the lean, from LEAN_SAID_DEG on."""
+    before it flies: how far down, past the button's bottom, bent how far
+    aside (or why not), with what spring, held how long — and the lean,
+    from LEAN_SAID_DEG on."""
     lean = _lean_deg(stroke.quat)
-    return ("PRESS (compliant)%s: straight down %.0f mm to %.0f mm below the button's bottom — the spring "
-            "pushes ~%.0f N there (%.0f N/m at the pads); held %.1f s, then back up. Nothing stops it but the e-stop"
-            % (", the hand leaning %.0f deg back toward the arm" % lean if lean >= LEAN_SAID_DEG else "",
-               1000 * (stroke.pad0[2] - stroke.end_z), 1000 * stroke.over, stroke.k * stroke.over, stroke.k,
+    if stroke.bent:
+        how = ("straight down %.0f mm to the button's bottom, its reference on %.0f mm below it and %.0f mm aside, "
+               "where the springs push ~%.0f N straight down on the pads held there (%.0f N/m at the pads)"
+               % (1000 * (stroke.pad0[2] - stroke.end_z - stroke.over), 1000 * stroke.over, 1000 * stroke.bend_m,
+                  stroke.k * stroke.over, stroke.k))
+    else:
+        how = ("straight down %.0f mm to %.0f mm below the button's bottom — the spring pushes ~%.0f N there "
+               "(%.0f N/m at the pads)%s" % (1000 * (stroke.pad0[2] - stroke.end_z), 1000 * stroke.over,
+                                             stroke.k * stroke.over, stroke.k,
+                                             "; not bent: %s" % stroke.bend_why if stroke.bend_why else ""))
+    return ("PRESS (compliant)%s: %s; held %.1f s, then back up. Nothing stops it but the e-stop"
+            % (", the hand leaning %.0f deg back toward the arm" % lean if lean >= LEAN_SAID_DEG else "", how,
                cfg.push_hold_s))
 
 
 def compliant_hold(ctx, cfg, runner, stroke, top_z, seen):
     """The compliant press's hold at the end of its stroke (`stroke`,
     compliant_stroke's) on the button whose top is at `top_z`: held
-    push_hold_s where the spring left the pads, pressing — the hold IS the
-    reading. What it pressed with is the pads' height off the stroke's end
-    times the stiffness there; COMPLIANT_FELT_N or more is a press, and
-    seen["touch_xyz"] is where the pads were held. seen["held_joints"] is
-    the arm held there, the way back up's start (rise_back_up). The run
-    record (depth_compliant_press) and the console say it. Returns the
-    verdict: a DepthPress, free, judged False (a compliant press does not
-    look)."""
+    push_hold_s where the springs left the pads, pressing — the hold IS the
+    reading. What the pads pushed with is the joint springs' pull from the
+    held arm toward the stroke's end (stroke.q_end, under COMPLIANT_KQ) as
+    the pads feel it: the force f, world axes, with J^T f = Kq (q_end -
+    q_held), least squares, J fingertip_jacobian's at the held arm. Its
+    downward part is the press, COMPLIANT_FELT_N or more a press, and the
+    rest the sideways shove. seen["touch_xyz"] is where the pads were held,
+    pressing, and seen["held_joints"] the arm held there, the way back up's
+    start (rise_back_up). The run record (depth_compliant_press) and the
+    console say it, the bend, and how far from the aim (the pads at q0)
+    the pads were held. Returns the verdict: a DepthPress, free, judged
+    False (a compliant press does not look)."""
     from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.branches import on_branch
 
+    chain = approach._chain()
     k, end_z = stroke.k, stroke.end_z
+    q_end = stroke.q_end if stroke.q_end is not None else (stroke.legs[-1][1][-1] if stroke.legs else stroke.q0)
+    q_end = np.asarray(q_end, float)
     held = ctx.client.settled_efforts(duration_s=0.15, settle_s=max(0.0, float(cfg.push_hold_s) - 0.15))
     qh = held[1] if held is not None else ctx.client.joints()
     seen["held_joints"] = [float(v) for v in qh]
-    Rh, th = approach._chain().fk(qh)
-    pad = np.asarray(th, float) + np.asarray(Rh, float) @ np.asarray(DOWN_CONTACT_TOOL, float)
-    force = k * max(0.0, float(pad[2]) - end_z)
+    qh = np.asarray(on_branch(qh, q_end), float)  # the reading is wrapped into (-pi, pi], the stroke's joints are not
+    pad = _pads(chain, qh)
+    pull = np.asarray(COMPLIANT_KQ, float)[: len(qh)] * (q_end - qh)
+    f = np.linalg.lstsq(fingertip_jacobian(chain, qh).T, pull, rcond=None)[0]
+    force, aside = float(-f[2]) + 0.0, float(np.hypot(f[0], f[1]))  # + 0.0: a spring at rest says 0 N, not -0
     felt = force >= COMPLIANT_FELT_N
     if felt:
         seen["touch_xyz"] = tuple(round(float(v), 5) for v in pad)  # where the pads were held, pressing
+    off = pad[:2] - np.asarray(stroke.pad0, float)[:2]  # the held pads from the aim
     facts = dict(top_z=round(float(top_z), 4), end_z=round(end_z, 4), held_pad_xyz=[round(float(v), 4) for v in pad],
-                 stiffness_n_per_m=round(k, 1), press_n=round(force, 1), felt=felt)
+                 stiffness_n_per_m=round(k, 1), press_n=round(force, 1), sideways_n=round(aside, 1), felt=felt,
+                 bent=bool(stroke.bent), bend_mm=round(1000 * float(stroke.bend_m), 1),
+                 held_off_aim_mm=[round(1000 * float(v), 1) for v in off])
+    if stroke.bend_why:
+        facts["bend_why"] = stroke.bend_why
     lean = _lean_deg(stroke.quat)
     if lean >= LEAN_SAID_DEG:
         facts["lean_deg"] = lean
     runner.note("depth_compliant_press", **facts)
-    print("[press_demo] %s: the pads held %.0f mm above the stroke's end, %.0f mm %s the button's top" % (
-        "PRESSED with ~%.0f N" % force if felt else "NOTHING PRESSED (%.0f N)" % force, 1000 * (pad[2] - end_z),
-        1000 * abs(float(top_z) - pad[2]), "below" if pad[2] < float(top_z) else "above"))
+    print("[press_demo] %s, %.0f N sideways: the pads held %.0f mm above the stroke's end, %.0f mm %s the button's "
+          "top, %.0f mm from the aim" % (
+              "PRESSED with ~%.0f N" % force if felt else "NOTHING PRESSED (%.0f N)" % force, aside,
+              1000 * (pad[2] - end_z), 1000 * abs(float(top_z) - pad[2]), "below" if pad[2] < float(top_z) else "above",
+              1000 * float(np.hypot(*off))))
     return DepthPress(free=True, contact=felt, felt=felt, judged=False, press_n=force)
 
 
@@ -967,8 +1116,7 @@ def compliant_rise(ctx, runner, stroke, held):
 
 
 def _pads_z(chain, q):
-    R, t = chain.fk(q)
-    return float((np.asarray(t, float) + np.asarray(R, float) @ np.asarray(DOWN_CONTACT_TOOL, float))[2])
+    return float(_pads(chain, q)[2])
 
 
 def rise_back_up(chain, stroke, q_held, join_above_m=RISE_JOIN_ABOVE_M):
@@ -1013,16 +1161,18 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     """The COMPLIANT press (COMPLIANT_PRESS_N): from where the hand stands
     over the button, turned down (`turned`, else TURN here), straight down
     at press_speed to TOUCH_SLOW_M above the button's top `top_z`, then at
-    TOUCH_SPEED to the stroke's end below its bottom — one execution — held
-    push_hold_s, and back up to where it began. What it pressed with is
-    where the spring held the pads: the pads' height off the stroke's end,
-    times the stiffness there. Its TURN may stop up to 15 deg short of
-    straight down (COMPLIANT_TURN_SHORT_DEG): the pads' centre still over
-    the button, the stroke still vertical. Nothing it reads stops it. The
-    stroke, the hold and the rise are compliant_stroke, compliant_hold and
-    compliant_rise: a compliant reach-out flies the same stroke as the end
-    of its one-execution way in (reach_press.way_in_legs) and calls this
-    only where that does not fly."""
+    TOUCH_SPEED to its bottom and on to the stroke's end below it, bent so
+    the springs push straight down there (stroke_bend) — one execution —
+    held push_hold_s, and back up to where it began. What it pressed with
+    is the joint springs' pull from where they held the arm toward the
+    stroke's end, seen at the pads (compliant_hold). Its TURN may stop up
+    to 15 deg short of straight down (COMPLIANT_TURN_SHORT_DEG): the pads'
+    centre still over the button, the stroke still vertical to the bottom.
+    Nothing it reads stops it. The stroke, the hold and the rise are
+    compliant_stroke, compliant_hold and compliant_rise: a compliant
+    reach-out flies the same stroke as the end of its one-execution way in
+    (reach_press.way_in_legs) and calls this only where that does not
+    fly."""
     from rammp_box_opening.runtime import approach
 
     if top_z is None:
