@@ -1582,16 +1582,15 @@ def _way_home(ctx, cfg, runner, stroke, held, q_held, ahead, scene_fix, locator)
 def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     """The whole reach-out press from the scene camera's fix. Returns the
     process exit code: 0 pressed and the knob popped (--press-only: pressed),
-    1 a failure, the box moved or the knob not up, 2 no button, 4 nowhere to
-    set the lid down.
+    1 a failure, the box moved or the knob not up, 2 no button.
 
     THE FULL RUN (a compliant run without --press-only, the default since
-    2026-10-28): the lid's spot resolved before anything moves
-    (reach_lid_off.resolve_lid_drop), then from the one-execution way in
-    and the hold on, tasks/reach_lid_off.run_full — back to the look pose,
-    the knob judged there, the press once more where it is not up, the lid
-    off and set down, home: 0 only with the lid set down and the arm home. A
-    box the aim sees already open has its lid taken off unpressed.
+    2026-10-28): from the one-execution way in and the hold
+    on, tasks/reach_lid_off.run_full — back to the look pose, the knob
+    judged there, the press once more where it is not up, the lid off, its
+    spot chosen with the lid lifted (the owner: never at the start, never a
+    failure), set down, home: 0 only with the lid set down and the arm home.
+    A box the aim sees already open has its lid taken off unpressed.
 
     COMPLIANT (args.compliant with args.depth_press, press_demo's default
     since 2026-10-27; press_demo sets depth_press on every run since
@@ -1663,15 +1662,10 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     proof = soft and depth
     # The full run (owner 2026-10-28): a compliant depth press goes on to
     # take the lid off (tasks/reach_lid_off); --press-only stops at the
-    # press. Where the lid goes is resolved before anything moves, by the
-    # staging run's rules, refused (exit 4) where the cameras see no room or
-    # the hand reaches none of it.
+    # press. Where the lid goes is chosen only once it is lifted, from what
+    # the wrist camera sees then — never here, never a refusal (owner
+    # 2026-10-28: "it should go no matter what").
     lid_off = proof and not bool(getattr(args, "press_only", False))
-    if lid_off:
-        from rammp_box_opening.tasks import reach_lid_off
-
-        if not reach_lid_off.resolve_lid_drop(ctx, cfg, runner, watcher, scene_fix):
-            return 4
     looks = [] if proof else None
     # One read: the hold that primes the joint impedance and the look's plan
     # start from the same joints. The first compliant goal after a POSITION
@@ -1681,6 +1675,9 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     # ran more than 3 ms over its own. The hold (client.prime_compliant) pays
     # both while the reach is planned. A preview and a guarded run send none.
     q0 = ctx.client.joints()
+    # where the arm stood when the scene camera found the box: its points
+    # there are the arm, not the table (reach_lid_off.spot_map)
+    eyes = (node, watcher, scene_fix, list(q0))
     if args.execute and soft:
         prime = getattr(ctx.client, "prime_compliant", None)
         if prime is not None and prime(q0):
@@ -1802,7 +1799,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         # less its height: an estimate the grip errs low from (grip_lid_z)
         lid_z = max(float(prior_button[2]), float(got[0][2]) - float(up_mm) / 1000.0)
         try:
-            return reach_lid_off.take_lid_off(ctx, cfg, runner, button, plan.tilt_deg, lid_z,
+            return reach_lid_off.take_lid_off(ctx, cfg, runner, eyes, button, plan.tilt_deg, lid_z,
                                               "the open box's lid at %.3f" % lid_z)
         except BaseException:
             let_go(ctx)
@@ -1877,7 +1874,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             if lid_off:
                 from rammp_box_opening.tasks import reach_lid_off
 
-                return reach_lid_off.run_full(node, ctx, cfg, runner, watcher, way, legs, button, yaw, lid_before)
+                return reach_lid_off.run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before)
             return _fly_way_in(ctx, cfg, runner, way, legs, button[2], scene_fix, locator)
         print("[press_demo] the way in does not fly as one execution (%s) — leg by leg, each solved again from where "
               "the arm stands" % why_not)
