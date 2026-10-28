@@ -1220,12 +1220,14 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     print("[press_demo] %s" % press_text(stroke, cfg))
     try:
         res = runner.run(legs, execute=True)
-        first = res[0]
-        if len(res) == 1 and not first.ok and (first.outcome == "refused" or not first.progress):
+        if len(res) == 1 and not res[0].ok and (res[0].outcome == "refused" or not res[0].progress):
             # nothing moved: the runner's gates refused the stroke, or the
-            # driver or the client's own gates its goal before it flew
+            # driver or the client's own gates its goal before it flew. A
+            # stroke with no legs (the pads already within 5 mm of its end,
+            # compliant_stroke) flies nothing and has no result: it goes on
+            # to the hold and the rise
             return DepthPress(free=True, why="the press stroke did not start (%s) — nothing was pressed"
-                              % (first.detail or first.outcome))
+                              % (res[0].detail or res[0].outcome))
         # the stroke meets the box by design: from here every world (home's
         # too) pads it for a shove, as _touch_lid's contact does
         ctx.contact_pad = CONTACT_SHIFT_PAD_M

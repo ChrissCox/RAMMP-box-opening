@@ -268,7 +268,7 @@ def _press(ctx, monkeypatch, tmp_path, looks, tilt=30, touch_at=TOUCH_AT, push="
                 events.append(lg.name)
                 arm.trace.append(lg.name)
                 legs[lg.name] = lg
-            name = legs_[-1].name
+            name = legs_[-1].name if legs_ else None
             top = list(ctx.client.live)
             # the stroke flies fast, then slowly (depth:approach, depth:touch):
             # `touch_at` is down from where the stroke began, and a lid higher
@@ -3180,6 +3180,30 @@ def test_a_compliant_stroke_that_did_not_start_lets_nothing_go_and_the_arm_may_g
     assert asked == [] and arm.reads == [] and ctx.contact_pad == 0.0
     assert events == ["depth:turn", "depth:approach", "depth:press"]  # handed over, nothing after
     assert dp.exit_code(result) == 1
+
+
+def test_a_compliant_stroke_with_no_legs_goes_on_to_the_hold_and_the_rise(ctx, monkeypatch, tmp_path):
+    """compliant_stroke has no legs to give where the pads already stand
+    within 5 mm of the stroke's end (a top_z far above the real button):
+    the runner flies nothing and has no result. That is no refused stroke,
+    and no crash on an empty result: the hold reads (nothing pressed), the
+    arm already stands at the stroke's start so no way up flies, it is
+    free, and nothing is let go."""
+    import dataclasses
+
+    asked = _releases(ctx)
+    real = dp.compliant_stroke
+
+    def at_its_end(chain, cfg, q0, quat, top_z, kq=dp.COMPLIANT_KQ):
+        stroke, why = real(chain, cfg, q0, quat, top_z, kq)
+        return dataclasses.replace(stroke, legs=[], q_end=list(q0)), why
+
+    monkeypatch.setattr(dp, "compliant_stroke", at_its_end)
+    ctx.client.compliant = True
+    result, events, arm, _legs, _start = _press(ctx, monkeypatch, tmp_path, [], touch_at=None, compliant=True,
+                                                top_z=COMPLIANT_TOP)
+    assert result.free and result.why is None and not result.felt and dp.exit_code(result) == 1
+    assert asked == [] and len(arm.reads) == 1 and events == ["depth:turn"]
 
 
 def test_a_compliant_stroke_that_stopped_part_way_lets_go_once_and_holds(ctx, monkeypatch, tmp_path):
