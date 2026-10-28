@@ -191,10 +191,12 @@ state):
    guard, no at-rest check; the e-stop and Ctrl+C do.
 4. **LID** — back up the stroke and out to the look pose, where the wrist
    judges the knob; one more press where it is not up (still not up:
-   STOP, home). The fingers open as the hand comes down onto the knob and
-   close on it (on air: they open, the hand backs out, home); the lift off
-   the canister, the carry and the set-down on the spot are ONE execution;
-   the fingers open, and home.
+   STOP, home). A lid that rose (released) with its knob flush is neither
+   gripped nor pressed again: STOP, home, the box left open. The fingers
+   open as the hand comes down onto the knob and close on it (on air: they
+   open, the hand backs out, home); the lift off the canister, the carry
+   and the set-down on the spot are ONE execution; the fingers open, and
+   home.
 
 `--press-only` stops after the press (rise, home; the lid stays on).
 `--guarded` flies the same reach-out position-controlled, with its torque
