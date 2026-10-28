@@ -223,9 +223,10 @@ class _NeverStops:
 
 
 # How long the scene camera gets to find the box before the arm has moved
-# at all: the scene OWL answers at ~2 Hz once enabled, and the depth lift is
-# instant, so this is two or three inference ticks.
-SCENE_LOCATE_S = 5.0  # was 3.0: the first box has come at 2.2-2.7 s — too tight
+# at all: sheppy's scene segmenter fixes it in about 0.35 s (two agreeing
+# frames at 5 Hz; scene_source.commit_fix), and the scene OWL fallback needs
+# about 2.6 s for two boxes (~1.3 s an inference once enabled).
+SCENE_LOCATE_S = 5.0  # was 3.0: the OWL's first box came at 2.2-2.7 s — too tight
 # ... and the run's FIRST look, before anything moves, keeps at it longer:
 # flatbot 2026-10-27 15:34:01 refused all three candidates the OWL offered
 # in 5 s (0.12, 26-28 depth points in each) and the run went home; 25 s
@@ -284,9 +285,21 @@ def record_residual(scene_fix, wrist_top, wrist_yaw, path=RESIDUALS_FILE):
             "wrist_top": [round(float(v), 4) for v in wrist_top],
             "scene_yaw": round(float(scene_fix.pose.yaw), 4),
             "wrist_yaw": round(float(wrist_yaw), 4),
-            "owl_score": round(float(scene_fix.score), 3),
+            "owl_score": round(float(scene_fix.score), 3),  # the detector's score, whichever detector
+            "source": getattr(scene_fix, "source", "owl"),
             "n_points": int(scene_fix.n_points),
         }) + "\n")
+
+
+def scene_source_label(fix):
+    """'SEG 0.88, 2 sightings (segmenter+segmenter)': the detector behind a
+    scene fix (the newest sighting's), its score, and the sightings that
+    agreed on it (scene_source.commit_fix)."""
+    source = getattr(fix, "source", "owl")
+    n = int(getattr(fix, "n_sightings", 1))
+    sources = tuple(getattr(fix, "sources", ()) or (source,))
+    return "%s %.2f, %d sighting%s (%s)" % (
+        "SEG" if source == "segmenter" else "OWL", float(fix.score), n, "" if n == 1 else "s", "+".join(sources))
 
 
 # The scene camera's box this far (xy) from the button the wrist found, on
@@ -436,39 +449,62 @@ class SceneApproach:
         self.status = status  # what the aim saw, for the log when got is None
 
 
+def _table_offset_words(off, off_raw):
+    """The AIM line's word on the wrist's table against the scene camera's
+    (button_aim.ButtonAimer.table_offset_m; nan: none)."""
+    if math.isfinite(off):
+        return ", the wrist reads its table %+.0f mm from the scene's%s" % (
+            1000 * off, ", the button's top raised %.0f mm" % (-1000 * off) if off < 0.0 else "")
+    if math.isfinite(off_raw):
+        return ", the wrist reads its table %+.0f mm from the scene's (not taken out)" % (1000 * off_raw)
+    return ""
+
+
 def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=None, tag="aim", out=None,
-                          lid_z=None, prior_xy=None):
+                          lid_z=None, prior_xy=None, min_hits=None):
     """The press aim from staging: the button's circle alone (owner's
     design 2026-09-17 — no OWL and no box-footprint gate here; the scene
     camera already said which thing is the box), the press point its
     centre. Returns (got, status) where got is
-    ((x, y, z), yaw) like the watcher's fix, or None. The aimed frame is
-    saved and the aim logged (`runner`) every time.
+    ((x, y, z), yaw) like the watcher's fix, or None — z raised by the
+    wrist's table offset where its hits agree on one (ButtonAimer.fix). The
+    aimed frame is saved and the aim logged (`runner`) every time.
 
     lid_z / prior_xy: the lid height to expect and where the button should
-    be — what the reach-out press's oblique look aims with (button_aim)."""
+    be — what the reach-out press's oblique look aims with (button_aim);
+    min_hits: the agreeing hits a tilted view's fix takes (unset, MIN_HITS).
+    `out` gets button_up_mm and measured_xyz, the press point as the wrist
+    measured it: what the wrist's own later readings are judged against."""
     from rammp_box_opening.perception.button_aim import ButtonAimer
 
     # only what is set: unset, the call is the straight-down aim's own
-    kw = {k: v for k, v in (("lid_z", lid_z), ("prior_xy", prior_xy)) if v is not None}
+    kw = {k: v for k, v in (("lid_z", lid_z), ("prior_xy", prior_xy), ("min_hits", min_hits)) if v is not None}
     aimer = ButtonAimer(watcher.grab, watcher.model, watcher.table_z, **kw)
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout_s:
         _spin_detect(node)
+        n0 = getattr(aimer, "frames", None)
         if aimer.tick():
-            xyz = aimer.fix()
+            xyz = aimer.fix()  # its z raised by the wrist's table offset, where that is agreed
+            measured = aimer.fix(measured=True)
+            agreeing = aimer.fix_hits()  # which hits the fix was made from
             s = aimer.last_sighting
             up_m = aimer.button_above_lid_m()
             up_mm = None if up_m is None else 1000.0 * up_m
+            off, off_raw = aimer.table_offset_m(), aimer.table_offset_m(raw=True)
             if out is not None:
                 out["button_up_mm"] = up_mm  # the caller decides (refuse_open_box)
+                out["measured_xyz"] = tuple(float(v) for v in measured)
+            # the agreeing hits apart from all of them: 15:19 2026-10-27 printed
+            # "4/19 frames agree" where 3 of its 4 hits did
             print(
                 "[press_demo] AIM: button circle at pixel (%.0f, %.0f) r %.0f px, %.0f mm across, %s above its own "
-                "lid%s; pressing its centre; %d/%d frames agree (%.1f s)" % (
+                "lid%s%s; pressing its centre; %d of %d hits agree (%d frames, %.1f s)" % (
                     s.uv[0], s.uv[1], s.r_px, 1000 * s.diameter_m,
                     "height unknown" if up_mm is None else "%+.1f mm" % up_mm,
                     "" if not s.oblique else ", depth on %.0f%% of it" % (100 * s.disc_fill),
-                    aimer.hits, aimer.frames, time.monotonic() - t0)
+                    _table_offset_words(off, off_raw),
+                    len(agreeing), aimer.hits, aimer.frames, time.monotonic() - t0)
             )
             folder = save_aim_frame(watcher.grab, s, tag)
             # the press point, when the press goes on it (aim_source), and its frame
@@ -478,15 +514,32 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
                     tag,
                     seam_uv=[round(v, 1) for v in s.uv], r_px=round(s.r_px, 1),
                     diameter_mm=round(1000 * s.diameter_m, 1), press_xyz=[round(v, 4) for v in xyz],
+                    measured_z=round(measured[2], 4),
                     button_above_lid_mm=None if up_mm is None else round(up_mm, 1),
                     disc_fill=round(s.disc_fill, 2) if s.oblique else None,
+                    # the wrist's table against the scene camera's: taken out (press_xyz's
+                    # z raised by it, never lowered), and as read, taken out or not —
+                    # drift shows here before it fails a run
+                    table_offset_mm=round(1000 * off, 1) if math.isfinite(off) else None,
+                    table_offset_raw_mm=round(1000 * off_raw, 1) if math.isfinite(off_raw) else None,
                     hits=aimer.hits, frames=aimer.frames, aim_s=round(time.monotonic() - t0, 2),
+                    # the hits the fix was made from (indices), and each hit's time since
+                    # the aimer was built and its knob reading: when the fix could have
+                    # come, and whether the knob was read alike
+                    agreeing=list(agreeing), hit_s=[round(float(v), 2) for v in aimer.hit_s],
+                    above_lid_mm=[round(1000 * float(v), 1) if math.isfinite(v) else None for v in aimer.above_lid],
                     # the wrist's depth-vs-colour stamp offsets: what PAIR_TOL_S rests on
                     pair_dt_ms=[round(v, 1) for v in aimer.pair_dt_ms] or None,
                     capture=None if folder is None else str(folder),
                 )
             return (xyz, yaw), aimer.status()
-        time.sleep(0.02)
+        # A tick that took a frame goes straight on to the next: judging a
+        # tilted one costs 45-75 ms (StillDepth and the oblique find), and
+        # with a sleep after every tick the reach-out aims of 2026-10-27 took
+        # 10.1-14.0 of the wrist OAK's 15 frames a second. Only a tick that
+        # took no new frame (none landed, or its depth not yet) waits a beat.
+        if getattr(aimer, "frames", None) == n0:
+            time.sleep(0.02)
     watcher.last_reject = aimer.last_why  # for the frame dump's caption
     return None, aimer.status()
 
@@ -2459,9 +2512,9 @@ def scene_detect_report(locator, duration_s=DETECT_REPORT_S):
             continue
         tops.append(fix.top_xyz)
         print(
-            "[press_demo]   SCENE: box at [%.3f, %.3f] yaw %.1f deg, lid top z %.3f, table %.3f%s, OWL %.2f, %d lid points%s"
+            "[press_demo]   SCENE: box at [%.3f, %.3f] yaw %.1f deg, lid top z %.3f, table %.3f%s, %s, %d lid points%s"
             % (fix.pose.xyz[0], fix.pose.xyz[1], math.degrees(fix.pose.yaw), fix.top_xyz[2],
-               fix.table_z_scene, table_seen_over(fix.table_extent), fix.score, fix.n_points,
+               fix.table_z_scene, table_seen_over(fix.table_extent), scene_source_label(fix), fix.n_points,
                "; %s, finished from its lid's arc in view" % fix.partial if getattr(fix, "partial", "") else "")
         )
     if not tops:
@@ -2766,11 +2819,13 @@ def main():
                     tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
                     scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
                 )
-                # enable its OWL NOW: the first bbox takes ~0.7 s (the node
-                # infers on the enable edge: one inference, no tick wait) and
-                # the readiness checks below are about that long — by the time
-                # locate() asks, the box is already on the topic
-                locator.owl.enable()
+                # the scene OWL NOW, where sheppy's scene segmenter cannot
+                # answer (no classes for this container, or down): its first
+                # bbox takes ~0.7 s (the node infers on the enable edge) and the
+                # readiness checks below are about that long — by the time
+                # locate() asks, the box is already on the topic. A live
+                # segmenter keeps the OWL off, and off the GPU (prime)
+                locator.prime()
         # camera on from here to exit
         ctx = Ctx(
             model=model,
@@ -2869,6 +2924,8 @@ def main():
                     fix_xyz=None if scene_fix is None else scene_fix.top_xyz,
                     score=None if scene_fix is None else scene_fix.score,
                     why=locator.last_why if scene_fix is None else None,
+                    source=None if scene_fix is None else getattr(scene_fix, "source", "owl"),
+                    boxes=getattr(locator, "last_boxes", None),
                 )
             if locator.moved_note and scene_fix is not None:
                 print("[press_demo] scene camera: %s" % locator.moved_note)  # e.g. the tag was not in view
@@ -2894,12 +2951,12 @@ def main():
             surveyed = watcher.table_z
             print(
                 "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points%s "
-                "(OWL %.2f; the scene reads the table at %.3f%s, surveyed %s; %.1f s to locate "
+                "(%s; the scene reads the table at %.3f%s, surveyed %s; %.1f s to locate "
                 "[%s], %.1f s since start) — flying to staging"
                 % (sp.xyz[0], sp.xyz[1], math.degrees(sp.yaw), scene_fix.n_points,
                    " (%s, finished from its lid's arc in view)" % scene_fix.partial
                    if getattr(scene_fix, "partial", "") else "",
-                   scene_fix.score, scene_fix.table_z_scene, table_seen_over(scene_fix.table_extent),
+                   scene_source_label(scene_fix), scene_fix.table_z_scene, table_seen_over(scene_fix.table_extent),
                    ("%.3f" % surveyed) if surveyed is not None else "n/a",
                    time.monotonic() - t_scene,
                    " ".join("%s %.2f" % (k[:-2], v) for k, v in locator.last_timing.items()),
@@ -2911,7 +2968,9 @@ def main():
                 yaw_deg=round(math.degrees(sp.yaw), 2),
                 top_xyz=[round(float(v), 4) for v in scene_fix.top_xyz],
                 n_points=scene_fix.n_points,
-                owl_score=round(scene_fix.score, 3),
+                owl_score=round(scene_fix.score, 3),  # the detector's score, whichever detector
+                source=getattr(scene_fix, "source", "owl"),
+                n_sightings=int(getattr(scene_fix, "n_sightings", 1)),
                 table_z_scene=None if scene_fix.table_z_scene != scene_fix.table_z_scene
                 else round(scene_fix.table_z_scene, 4),
             )

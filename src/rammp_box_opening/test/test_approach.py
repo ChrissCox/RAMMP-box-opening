@@ -256,3 +256,47 @@ def test_every_vertical_approach_says_where_its_descent_begins():
     )
     assert fallback.success and "PLANNER descent" in fallback.message
     assert fallback.waypoint == (2, [0.2] * 7)
+
+
+def test_a_plan_is_written_on_the_branch_of_the_line_it_continues():
+    """The planner is handed planner_branch(start), HOME's side of the wrap:
+    a plan-free line ending at joint_3 +0.450 gets a home plan starting at
+    -5.833 (review 2026-10-27), and one goal through both turns joint_3 a
+    full revolution at the junction. on_branch_of moves each continuous
+    joint (1, 3, 5, 7) by the one whole number of turns that puts the
+    plan's first point within half a turn of the line's end: every
+    difference kept — the same motion to the arm, whose driver flies the
+    differences — the other joints untouched, the plan itself as it was."""
+    import copy
+
+    from rammp_box_opening.runtime.approach import on_branch_of
+    from rammp_box_opening.runtime.branches import CONTINUOUS_JOINTS
+
+    turn = 2.0 * math.pi
+    end = [0.2, -0.3, 0.450, 1.0, -0.4, 0.8, 1.7]  # the line's end, as the arm's joints were read
+    start = [0.2 - turn, -0.3 + 1e-7, 0.450 - turn, 1.0, -0.4 + turn, 0.8, 1.7 - 2.0 * turn]
+    rows = [start]
+    for d in ((0.1, -0.2, 0.3, 0.05, -0.1, 0.2, -0.3), (0.3, -0.5, -2.0, 0.1, 0.4, -0.2, 0.6)):
+        rows.append([v + dv for v, dv in zip(start, d)])
+    plan = _traj(rows, [0.0, 0.5, 1.2])
+    for p, v in zip(plan.points, (0.0, 0.7, 0.0)):
+        p.velocities = [v] * 7
+    before = copy.deepcopy(plan)
+    out = on_branch_of(plan, end)
+    got, was = np.array([p.positions for p in out.points]), np.array(rows)
+    turns = (got - was) / turn
+    assert turns == pytest.approx(np.round(turns), abs=1e-9)  # whole turns ...
+    assert [int(round(v)) for v in turns[0]] == [1, 0, 1, 0, -1, 0, 2]
+    assert (np.round(turns) == np.round(turns[0])).all()  # ... the same for every point
+    others = [j for j in range(7) if j not in CONTINUOUS_JOINTS]
+    assert (got[:, others] == was[:, others]).all()
+    assert np.diff(got, axis=0) == pytest.approx(np.diff(was, axis=0), abs=1e-12)  # every difference kept
+    assert all(abs(got[0][j] - end[j]) <= math.pi for j in CONTINUOUS_JOINTS)
+    assert got[0] == pytest.approx(end, abs=1e-6)
+    assert [_secs(p) for p in out.points] == [_secs(p) for p in plan.points]
+    assert [list(p.velocities) for p in out.points] == [list(p.velocities) for p in plan.points]
+    assert [list(p.positions) for p in plan.points] == [list(p.positions) for p in before.points]  # a copy
+    # a plan already on the line's side of the wrap is left as it is, and so is one half a turn less off
+    assert [list(p.positions) for p in on_branch_of(out, end).points] == [list(p.positions) for p in out.points]
+    near = _traj([[v + 3.0 for v in end], [v + 3.1 for v in end]], [0.0, 1.0])
+    assert [list(p.positions) for p in on_branch_of(near, end).points] == [list(p.positions) for p in near.points]

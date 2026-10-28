@@ -41,11 +41,17 @@ def learned_closed():
     return v if CLOSED_RANGE[0] <= v <= CLOSED_RANGE[1] else NOMINAL_CLOSED
 
 
+def reads_empty_close(pos):
+    """Whether a knuckle reading `pos` is one an empty close can give
+    (CLOSED_RANGE), whichever of them this gripper gives today: the fingers
+    on the knob read ~0.4, on the box ~0.1, and neither may ever pass for shut."""
+    return pos is not None and CLOSED_RANGE[0] <= float(pos) <= CLOSED_RANGE[1]
+
+
 def learn_closed(pos):
     """Keep `pos` as the empty-close reading — only a reading an empty close
-    can give (CLOSED_RANGE): the fingers on the knob read ~0.4, on the box
-    ~0.1, and neither may ever pass for shut. Returns whether it was kept."""
-    if pos is None or not CLOSED_RANGE[0] <= float(pos) <= CLOSED_RANGE[1]:
+    can give (reads_empty_close). Returns whether it was kept."""
+    if not reads_empty_close(pos):
         return False
     try:
         f = _file()

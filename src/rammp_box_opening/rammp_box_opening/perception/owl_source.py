@@ -54,20 +54,16 @@ def owl_floor(cfg, camera):
     return float(cfg.owl_min_score_scene if camera == "scene" else cfg.owl_min_score)
 
 
-def owl_detect(proc, model, rgb, queries, floor, device="cuda", k=None, upside_down=False):
+def owl_detect(proc, model, rgb, queries, floor, device="cuda", k=None):
     """OWLv2 on one RGB frame: the top boxes above `floor`, best first —
     [(score, [x0, y0, x1, y1])]. What the owl_detector node publishes, and
-    what an offline replay of recorded frames computes the same way.
-
-    upside_down: the camera hangs upside down, so OWLv2 is shown the frame
-    turned upright and the boxes come back in the frame's own pixels
-    (flatbot's scene OAK: the pink lid 0.04 as published, 0.44 upright,
-    2026-10-22)."""
+    what an offline replay of recorded frames computes the same way. The
+    frame must be upright: OWLv2 scored flatbot's pink lid 0.04 upside down,
+    0.44 upright (2026-10-22), and the cameras now rotate on the device
+    (rammp-deployments #133)."""
     import torch
 
     h, w = rgb.shape[:2]
-    if upside_down:
-        rgb = rgb[::-1, ::-1].copy()
     inputs = proc(text=[list(queries)], images=[rgb], return_tensors="pt").to(device)
     with torch.no_grad():
         out = model(**inputs)
@@ -78,8 +74,6 @@ def owl_detect(proc, model, rgb, queries, floor, device="cuda", k=None, upside_d
         res["scores"].tolist(), res["labels"].tolist(), [b.tolist() for b in res["boxes"]], floor,
         **({} if k is None else {"k": k}),
     )
-    if upside_down:
-        top = [(s, [w - x1, h - y1, w - x0, h - y0]) for s, (x0, y0, x1, y1) in top]
     return top
 
 
