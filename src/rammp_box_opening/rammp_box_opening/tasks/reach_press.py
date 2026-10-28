@@ -117,6 +117,21 @@ def reach_push_m(cfg, tilt_deg):
 # the stroke starts this far above the button (a straight-down press's final
 # approach) — and the unload ends there: above a popped knob's 10-25 mm
 REACH_START_M = 0.06
+# Where a compliant depth press's turn down at the slide's end does not fly,
+# the slide carries on straight down at its attitude and the hand turns
+# there, the fingertip this far above the button's top, highest first; the
+# lowest is depth_press.TOUCH_SLOW_M, where its stroke slows anyway. Out at
+# the edge of reach it is the turn's END that fails, not its path: with the
+# pads 60 mm above the button the elbow runs out of bend (flatbot 2026-10-28
+# 14:28:35, the aimed button r 0.791 az -39: the 15 deg turn reaches
+# joint_4 -0.30 at 88% and its last step does not converge; the arm went
+# home from the look). 15 mm lower the same turn ends at joint_4 -0.30 and
+# the stroke bottoms at -0.68: the stroke goes DOWN, toward the shoulder
+# (0.25 above arm_mount), so only the turn's height bounds the reach. The
+# turn pivots on the fingertip, the lowest point of the hand at these
+# tilts, so nothing comes lower than it (32.7 mm over the lid at 35 mm,
+# flatbot's URDF); the box is shut (refuse_open_box), its lid flush.
+TURN_LOW_ABOVE_M = (0.045, 0.035)
 # Before planning home from over the box, the tool this far above the box's
 # padded cuboid (worlds.planned_top_z). The planner's lowest collision
 # spheres belong to the gripper's base link, not the fingers (rammp_curobo
@@ -266,14 +281,18 @@ def reach_geometry(model, button, tilt, travel_m):
     return quat, start, bottom, look
 
 
-def walk_or_turn(ctx, q_look, slide_pts, start_xyz, quat):
+def walk_or_turn(ctx, q_look, slide_pts, start_xyz, quat, top_z=None):
     """way_down's way to the hand turned down over the slide's end
     `start_xyz`, no stroke: one walk in from the look pose's joints
     `q_look` (depth_press.walk_down_path), else the turn about the
     fingertip where the slide `slide_pts` ends (depth_press.turn_down_path,
-    up to 15 deg short: COMPLIANT_TURN_SHORT_DEG). The reach-out's lid off
-    comes down to the knob the same way (reach_lid_off.solve_grip_way).
-    Returns (depth_press.WayDown, None) or (None, why)."""
+    up to 15 deg short: COMPLIANT_TURN_SHORT_DEG) — where that turn does not
+    fly and `top_z` (the button's top, or the lid's) is given, the slide
+    carried on straight down to TURN_LOW_ABOVE_M above it and the turn
+    there (WayDown slide, start_xyz and above_m: the callers fly that
+    slide). The reach-out's lid off comes down to the knob the same way
+    (reach_lid_off.solve_grip_way). Returns (depth_press.WayDown, None) or
+    (None, why)."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.tasks import depth_press as dp  # imports this module: not at the top
 
@@ -283,9 +302,27 @@ def walk_or_turn(ctx, q_look, slide_pts, start_xyz, quat):
         return dp.WayDown(pts, down, short, True), None
     pts, down, short, why_turn = dp.turn_down_path(chain, ctx.model, slide_pts[-1], CONTACT_TOOL,
                                                    dp.COMPLIANT_TURN_SHORT_DEG)
-    if pts is None:
-        return None, "walk in: %s; turn after the slide: %s" % (why_walk, why_turn)
-    return dp.WayDown(pts, down, short, False), None
+    if pts is not None:
+        return dp.WayDown(pts, down, short, False), None
+    whys = ["turn after the slide: %s" % why_turn]
+    if top_z is not None:
+        tip = np.asarray(start_xyz, float) + _rot(quat) @ np.asarray(CONTACT_TOOL)
+        for above in TURN_LOW_ABOVE_M:
+            if float(tip[2]) <= float(top_z) + above + LINE_MIN_M:
+                continue  # the slide already ends this low
+            low = tool_for_contact((float(tip[0]), float(tip[1]), float(top_z) + above), quat)
+            drop, why = chain.straight_line(slide_pts[-1], low, quat)
+            if drop is None:
+                whys.append("slid on down to %.0f mm above the button: %s" % (1000 * above, why))
+                continue
+            pts, down, short, why_turn = dp.turn_down_path(chain, ctx.model, drop[-1], CONTACT_TOOL,
+                                                           dp.COMPLIANT_TURN_SHORT_DEG)
+            if pts is None:
+                whys.append("turned %.0f mm above the button: %s" % (1000 * above, why_turn))
+                continue
+            slide = [list(q) for q in slide_pts] + [list(q) for q in drop[1:]]
+            return dp.WayDown(pts, down, short, False, slide, low, above), None
+    return None, "walk in: %s; %s" % (why_walk, "; ".join(whys))
 
 
 def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
@@ -298,7 +335,10 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     fingertip (CONTACT_TOOL) where it ends (depth_press.turn_down), up to
     15 deg short of straight down as the compliant press turns
     (depth_press.COMPLIANT_TURN_SHORT_DEG: way_down serves only that
-    press); then the press stroke from the hand turned down
+    press) — where that turn does not fly, the slide carried on straight
+    down to TURN_LOW_ABOVE_M above the button and the turn there (WayDown
+    slide and start_xyz: the callers fly that slide); then the press stroke
+    from the hand turned down
     (depth_press.compliant_stroke). Each of those lines is one the runner
     flies (depth_press.line_refusal): a walk it refuses is no walk, and the
     slide and the turn are tried. The aimed button's walk or turn and
@@ -311,15 +351,16 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     from rammp_box_opening.tasks import depth_press as dp  # imports this module: not at the top
 
     chain = approach._chain()
-    way, why = walk_or_turn(ctx, q_look, slide_pts, start_xyz, quat)
+    way, why = walk_or_turn(ctx, q_look, slide_pts, start_xyz, quat, top_z)
     if way is None:
         return None, None, why
-    stroke, why = dp.compliant_stroke(chain, cfg, way.pts[-1] if way.pts else slide_pts[-1], way.quat, top_z)
+    slide = slide_pts if way.slide is None else way.slide  # it turned lower down: the slide carries on to there
+    stroke, why = dp.compliant_stroke(chain, cfg, way.pts[-1] if way.pts else slide[-1], way.quat, top_z)
     if stroke is None:
         return None, None, why
     # the walk or the turn passed the runner's gate in turn_walk; the slide
     # before a turn and the stroke fly as legs of their own too
-    lines = ([] if way.walked else [("the slide in", slide_pts)]) + [(name, p) for name, p, _speed in stroke.legs]
+    lines = ([] if way.walked else [("the slide in", slide)]) + [(name, p) for name, p, _speed in stroke.legs]
     for name, line in lines:
         why = dp.line_refusal(chain, line)
         if why is not None:
@@ -361,6 +402,8 @@ def plan_reach(ctx, cfg, button, q_from, tilts=REACH_TILTS_DEG, depth=False, loo
                 if looks is not None:
                     looks.append(ReachPlan(tilt, quat, (bx, by, bz), look, start, bottom, leg, slide, None))
                 continue
+            if down.slide is not None:  # it turns lower down: the slide carries on to there
+                slide, start = down.slide, down.start_xyz
             return ReachPlan(tilt, quat, (bx, by, bz), look, start, bottom, leg, slide, None, down, stroke), None
         stroke, why = chain.straight_line(slide[-1], bottom, quat)
         if stroke is None:
@@ -455,6 +498,8 @@ def solve_way_in(ctx, cfg, button, tilt, q_from):
     if down is None:
         return None, "the way down (%s)" % why, "down"
     plan.down, plan.stroke = down, stroke
+    if down.slide is not None:  # it turns lower down: the slide carries on to there
+        plan.slide_pts, plan.start_xyz = down.slide, down.start_xyz
     return WayIn(move, plan, down, None if down.walked else plan.slide_pts, stroke), None, None
 
 
@@ -1655,7 +1700,9 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         return 1
     runner.note("reach_plan", tilt_deg=plan.tilt_deg, look_xyz=[round(v, 4) for v in plan.look_xyz],
                 button=list(prior_button), proof=proven,
-                down=None if plan.down is None else {"walked": plan.down.walked, "short_deg": plan.down.short_deg})
+                down=None if plan.down is None else dict(
+                    {"walked": plan.down.walked, "short_deg": plan.down.short_deg},
+                    **({} if plan.down.above_m is None else {"turn_above_mm": round(1000 * plan.down.above_m)})))
     try:
         slide_nm, stroke_nm = _predicted_drift(plan)
         drift = "; gravity alone moves joint_4 %.2f Nm along the slide and %.2f down the stroke (taken out)" % (slide_nm, stroke_nm)
@@ -1804,7 +1851,8 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             return 1
         move, plan2 = way.move, way.plan
         runner.note("reach_way_in", tilt_deg=plan2.tilt_deg, walked=way.down.walked, short_deg=way.down.short_deg,
-                    k=round(way.stroke.k, 1), end_z=round(way.stroke.end_z, 4))
+                    k=round(way.stroke.k, 1), end_z=round(way.stroke.end_z, 4),
+                    **({} if way.down.above_m is None else {"turn_above_mm": round(1000 * way.down.above_m)}))
         # Nothing is read between the re-aim, the slide in, the turn and the
         # stroke here, yet each flew as a goal of its own, ending at rest
         # (16:23 2026-10-27: 0.18 s between its re-aim and its slide in), and

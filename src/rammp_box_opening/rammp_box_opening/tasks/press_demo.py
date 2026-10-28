@@ -2692,9 +2692,8 @@ def main():
     ap.add_argument(
         "--depth-press",
         action="store_true",
-        help="once the hand is over the box (the scene camera and the wrist's aim, as ever), the hand turns "
-        "straight down, the wrist camera's own depth says how far down the lid is, and the joint torques find "
-        "it and judge the press (tasks/depth_press)",
+        help="always on since 2026-10-28 (the reach-out's depth press is press_demo's run); accepted so older "
+        "command lines still parse",
     )
     ap.add_argument(
         "--guarded",
@@ -2724,6 +2723,7 @@ def main():
         "config/camera_scene.yaml; the stub harness passes its own)",
     )
     args = ap.parse_args()
+    args.depth_press = True  # the depth press is the run (owner 2026-10-28)
     args.compliant = COMPLIANT_DEFAULT and not args.guarded
     cfg_path = args.container or cli_common.default_container_yaml()
     bench = args.bench_world or cli_common.default_bench_yaml()
@@ -2974,16 +2974,21 @@ def main():
                 table_z_scene=None if scene_fix.table_z_scene != scene_fix.table_z_scene
                 else round(scene_fix.table_z_scene, 4),
             )
+            # EVERY box the scene camera fixes is pressed by the reach-out: the
+            # tilted look, the wrist's aim, the hand turned down onto the
+            # button (owner 2026-10-28: "make the arm always go to that 45
+            # degree looking pose even if it's close enough to go straight up
+            # and down. completely scrap the home -> straight vertical if
+            # close enough mode"). The straight-down staging approach no
+            # longer flies.
+            from rammp_box_opening.tasks.reach_press import run_reach_press
+
+            ctx.cpose = scene_fix.pose  # the box every world and plan from here is built around
+            watcher.roi = None  # the scene bbox never applied to the wrist frame
+            sys.exit(run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator))
             reach = approach_from_scene(
                 node, ctx, cfg, runner, watcher, args.execute, scene_fix, lookahead=not args.depth_press
             )
-            if reach.reach_out:
-                # no straight-down staging reaches this box: and ONLY then,
-                # the reach-out press (hand tilted back, fingertip straight down)
-                from rammp_box_opening.tasks.reach_press import run_reach_press
-
-                print("[press_demo] straight down is out of reach: %s" % reach.status)
-                sys.exit(run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator))
             # the staging the approach flew (lowered when staging_m was out
             # of reach): the stroke, the recentre, the retreat and recovery's
             # rise over the button all go by it from here

@@ -91,6 +91,7 @@ class _Watcher:
 
 LOCATES = []  # every timeout the scene locator was asked for, in order
 HOME_FIRSTS = []  # the keywords of every home_first call, in order
+REACH_OUTS = []  # the scene fixes handed to the reach-out
 
 
 def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
@@ -174,6 +175,17 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
         return approach(ctx)
 
     monkeypatch.setattr(press_demo, "approach_from_scene", fake_approach)
+    from rammp_box_opening.tasks import reach_press
+
+    def fake_reach_out(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
+        # every scene-camera box goes to the reach-out (2026-10-28); what it
+        # flies is test_reach_press's: here it ends as the scripted approach says
+        ctx.cpose = scene_fix.pose
+        REACH_OUTS.append(scene_fix)
+        got = approach(ctx)
+        return 1 if getattr(got, "failed", False) else 0
+
+    monkeypatch.setattr(reach_press, "run_reach_press", fake_reach_out)
     if centre is not None:
         monkeypatch.setattr(press_demo, "centre_over_button", centre)
     real_init = worlds_mod.WorldStore.__init__
@@ -221,25 +233,6 @@ def _off_by(monkeypatch, *offs):
     monkeypatch.setattr(press_demo, "_off_button", lambda ctx, cfg: offs.pop(0) if len(offs) > 1 else offs[0])
 
 
-def test_a_refused_recentre_plan_presses_from_the_last_aim(monkeypatch, tmp_path, capsys):
-    """The tool stands 40 mm off the aimed button and the planner refuses
-    the move over it (IK_FAIL near the reach edge): nothing was sent, so the
-    arm still stands at staging and the press goes from the last aim — not
-    a RuntimeError traceback with the arm hanging over the lid."""
-    from rammp_box_opening.tasks import press_demo
-
-    _off_by(monkeypatch, 0.04)
-    monkeypatch.setattr(press_demo, "knob_height_mm", lambda *a, **k: 11.0)
-    client = FakeClient()
-    client.plans = [IkFail()]  # approach:recentre
-    client.exec_script = [TOUCH]
-    code, _c, rows = run_main(monkeypatch, tmp_path, ["--execute", "--press-only"], _at_staging(), client=client)
-    out = capsys.readouterr().out
-    assert "CENTRE: the move over the button was refused" in out and "pressing from the last aim" in out
-    assert "approach:recentre" not in _legs(rows)  # nothing was sent
-    assert "press:down" in _legs(rows)
-
-
 def test_the_first_look_for_the_box_keeps_at_it_longer_than_a_re_check(monkeypatch, tmp_path):
     """Flatbot 2026-10-27 15:34:01: the scene camera refused the OWL's three
     candidates in 5 s and the run went home; the next run had the box at
@@ -249,8 +242,10 @@ def test_the_first_look_for_the_box_keeps_at_it_longer_than_a_re_check(monkeypat
     LOCATES.clear()
     client = FakeClient()
     client.exec_script = [TOUCH]
+    REACH_OUTS.clear()
     run_main(monkeypatch, tmp_path, ["--execute", "--press-only"], _at_staging(), client=client)
     assert LOCATES[0] == press_demo.SCENE_FIRST_LOCATE_S > press_demo.SCENE_LOCATE_S
+    assert len(REACH_OUTS) == 1  # a box within the straight-down staging reach goes to the reach-out too
 
 
 def _refused(ctx):
@@ -276,71 +271,23 @@ def test_a_compliant_depth_press_run_starts_from_the_spring_hold_it_finds(monkey
 
 def test_every_other_run_still_starts_at_its_exact_rest_pose(monkeypatch, tmp_path):
     """--guarded reads its at-rest reference at the rest pose and checks
-    gravity against it; without --depth-press, or with --no-scene, there is
-    no compliant reach-out. All of them keep AT_REST_RAD."""
+    gravity against it; with --no-scene there is no compliant reach-out.
+    Both keep AT_REST_RAD. A bare --execute is the compliant depth press
+    since 2026-10-28, as --depth-press was: it takes REST_TOL_RAD."""
+    from rammp_box_opening.constants import REST_TOL_RAD
     from rammp_box_opening.tasks import press_demo
 
     # --no-scene's run stops where the others do: its search's first step fails (exit 1)
     monkeypatch.setattr(press_demo, "search_for_box", lambda *a, **k: (None, "look"))
-    for i, argv in enumerate((["--execute", "--depth-press", "--guarded"], ["--execute"],
+    HOME_FIRSTS.clear()
+    code, _c, _rows = run_main(monkeypatch, tmp_path / "bare", ["--execute"], _refused)
+    assert code == 1 and [k.get("tol") for k in HOME_FIRSTS] == [REST_TOL_RAD]
+    for i, argv in enumerate((["--execute", "--depth-press", "--guarded"],
                               ["--execute", "--depth-press", "--no-scene"])):
         HOME_FIRSTS.clear()
         code, _c, _rows = run_main(monkeypatch, tmp_path / str(i), argv, _refused)
         assert code == 1, argv
         assert [k.get("tol") for k in HOME_FIRSTS] == [press_demo.AT_REST_RAD], argv
-
-
-def test_an_open_box_seen_by_the_re_aim_over_the_button_is_not_pressed(monkeypatch, tmp_path, capsys):
-    """The first aim could not read the button's height (its lid ring off
-    the frame's edge); the tool stood 40 mm off, moved over the button and
-    aimed again — and that aim, from straight above, reads the knob 10 mm
-    UP. The run stops and goes home before any press. A re-aim that reads
-    the knob flush (2 mm) goes on to press."""
-    from rammp_box_opening.tasks import press_demo
-
-    for up_mm, pressed in ((10.0, False), (2.0, True)):
-        _off_by(monkeypatch, 0.04, 0.0)
-        first, asked = [], []
-
-        def approach(ctx, first=first):
-            a = _at_staging(button_up_mm=None)(ctx)
-            first.append(a.got)
-            return a
-
-        def aim(node, watcher, yaw, runner=None, out=None, up_mm=up_mm, first=first, asked=asked, **kw):
-            asked.append(out is not None)
-            if out is not None:
-                out["button_up_mm"] = up_mm
-            return first[0], "3/3"
-
-        monkeypatch.setattr(press_demo, "aim_button_at_staging", aim)
-        monkeypatch.setattr(press_demo, "knob_height_mm", lambda *a, **k: 11.0)
-        client = FakeClient()
-        client.exec_script = [("arrived", {"message": "ok", "progress": 1.0}), TOUCH]
-        code, _c, rows = run_main(
-            monkeypatch, tmp_path / ("%g" % up_mm), ["--execute", "--press-only"], approach, client=client
-        )
-        out = capsys.readouterr().out
-        assert asked == [True], up_mm  # the re-aim hands back the height it measured
-        assert ("press:down" in _legs(rows)) is pressed, up_mm
-        assert ("already OPEN" in out) is not pressed, up_mm
-        if not pressed:
-            assert code == 1 and "returning home" in out
-            assert [r["button_above_lid_mm"] for r in rows if r["leg"] == "open_box"] == [10.0]
-
-
-def test_a_refused_press_plan_at_staging_goes_home_with_a_stop_line(monkeypatch, tmp_path, capsys):
-    """No pre-planned descent and the fresh press plan is refused: a STOP
-    line and the recovery home, never a traceback with the arm over the box."""
-    client = FakeClient()
-    client.plans = [IkFail()]  # press:down
-    code, _c, rows = run_main(
-        monkeypatch, tmp_path, ["--execute", "--press-only"], _at_staging(), client=client, centre=_no_centre
-    )
-    out = capsys.readouterr().out
-    assert code == 1
-    assert "STOP before the press" in out and "IK_FAIL" in out and "returning home" in out
-    assert "press:down" not in _legs(rows) and "home" in _legs(rows)
 
 
 def test_a_refused_chained_press_plan_stops_with_a_stop_line(monkeypatch, tmp_path, capsys):

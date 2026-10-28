@@ -416,9 +416,12 @@ def solve_grip_way(ctx, cfg, button, tilt, q_from, lid_z):
     why = dp.line_refusal(chain, move)
     if why is not None:
         return None, "the move to its look pose (%s)" % why
-    down, why = rp.walk_or_turn(ctx, move[-1] if move else q_from, plan.slide_pts, plan.start_xyz, plan.quat)
+    down, why = rp.walk_or_turn(ctx, move[-1] if move else q_from, plan.slide_pts, plan.start_xyz, plan.quat,
+                                lid_z)
     if down is None:
         return None, "the way down (%s)" % why
+    if down.slide is not None:  # it turns lower down, as the press did: the slide carries on to there
+        plan.slide_pts, plan.start_xyz = down.slide, down.start_xyz
     grip, why = grip_descent(chain, cfg, down.pts[-1] if down.pts else plan.slide_pts[-1], down.quat, lid_z)
     if grip is None:
         return None, why

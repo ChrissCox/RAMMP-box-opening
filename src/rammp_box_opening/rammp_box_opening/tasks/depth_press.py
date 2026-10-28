@@ -180,6 +180,11 @@ SLIDE_OK_M = 0.015
 # 15:19's touch tripped at 3.4 Nm on joint 4, ~13.5 N at the pads, and the
 # button went.
 COMPLIANT_PRESS_N = 15.0
+# The compliant stroke's approach and press fly at this fraction of
+# cfg.press_speed and TOUCH_SPEED: 0.175 and 0.075 for the pink box (owner
+# 2026-10-28: "make the arm press down half as slow as it is now", half the
+# speed)
+COMPLIANT_STROKE_SLOWDOWN = 0.5
 # the compliant run's gains (constants.GAINS_RIGID): ~1130 N/m straight down at
 # the pads on 15:19's button's bottom (STIFF's was ~450)
 COMPLIANT_GAINS = COMPLIANT_RUN_GAINS
@@ -577,6 +582,13 @@ class WayDown:
     quat: list  # its attitude at their end
     short_deg: float  # how far short of straight down (walked: TURN_SHORT_DEG; turned: COMPLIANT_TURN_SHORT_DEG)
     walked: bool  # True: one walk from the look pose (walk_in_down), else the turn after the slide
+    # a turn lower than the slide's end (reach_press.TURN_LOW_ABOVE_M): the
+    # slide carried on straight down to there, and the tool where it ends;
+    # None where the hand turns at the slide's own end; `above_m` how far
+    # above the button's top the fingertip stands there
+    slide: list = None
+    start_xyz: list = None
+    above_m: float = None
 
 
 @dataclass
@@ -1059,8 +1071,9 @@ def compliant_stroke(chain, cfg, q0, quat, top_z, kq=COMPLIANT_KQ):
         if press is None:
             return None, why
         q_end, bend_m = np.asarray(press[-1] if press else q_a, float), 0.0
-    legs = [(name, pts, speed) for name, pts, speed in (("depth:approach", approach, cfg.press_speed),
-                                                         ("depth:press", press, TOUCH_SPEED)) if pts]
+    legs = [(name, pts, speed) for name, pts, speed in (
+        ("depth:approach", approach, COMPLIANT_STROKE_SLOWDOWN * cfg.press_speed),
+        ("depth:press", press, COMPLIANT_STROKE_SLOWDOWN * TOUCH_SPEED)) if pts]
     return StrokePlan(legs, k, over, end_z, t0, pad0, q0, list(quat), [float(v) for v in q_end], bend_why is None,
                       bend_m, bend_why), None
 

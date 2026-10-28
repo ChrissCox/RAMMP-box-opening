@@ -1394,7 +1394,9 @@ def test_a_compliant_press_is_one_stroke_held_and_back_up_with_no_look_and_no_gu
     assert len(ctx.client.executed) == 3  # the turn, the stroke (approach and press merged), the rise
     assert all(g is None for g in ctx.client.guards)
     assert ctx.client.gains_sent == [None, dp.COMPLIANT_GAINS, dp.COMPLIANT_GAINS]
-    assert legs["depth:press"].speed == dp.TOUCH_SPEED and legs["depth:approach"].speed == cfg.press_speed
+    # half their speed (owner 2026-10-28): 0.075 and 0.175 for the pink box
+    assert legs["depth:press"].speed == dp.COMPLIANT_STROKE_SLOWDOWN * dp.TOUCH_SPEED == pytest.approx(0.075)
+    assert legs["depth:approach"].speed == dp.COMPLIANT_STROKE_SLOWDOWN * cfg.press_speed == pytest.approx(0.175)
     k = note["stiffness_n_per_m"]
     over = min(max(dp.COMPLIANT_PRESS_N / k, dp.COMPLIANT_OVERSHOOT_M[0]), dp.COMPLIANT_OVERSHOOT_M[1])
     assert note["end_z"] == pytest.approx(COMPLIANT_TOP - cfg.button_travel_m - over, abs=1e-4)
@@ -1872,11 +1874,13 @@ def test_a_compliant_run_whose_aimed_button_no_way_down_reaches_goes_home_from_t
 
     code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, turn=scene_only)
     assert code == 1 and rec.events == ["reach:look", "aim:reach-aim", "home"] and got == {}
-    assert len(turns) == 2
+    assert len(turns) == 1 + 1 + len(rp.TURN_LOW_ABOVE_M)  # the scene's; the aimed one's at the slide's end, then lower
     out = capsys.readouterr().out
     assert ("STOP: no press reaches the aimed button (the way down (walk in: 0 deg short: no turning walk modelled; "
             "2 deg short: no turning walk modelled; 5 deg short: no turning walk modelled; turn after the slide: 0 deg "
-            "short: IK did not converge 73% of the way)) — nothing was pressed — returning home") in out
+            "short: IK did not converge 73% of the way; turned 45 mm above the button: 0 deg short: IK did not converge "
+            "73% of the way; turned 35 mm above the button: 0 deg short: IK did not converge 73% of the way)) — nothing "
+            "was pressed — returning home") in out
     rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
     assert not [r for r in rows if r["leg"] in ("reach_way_in", "home_refused")]
 
@@ -1957,7 +1961,8 @@ def test_a_compliant_reach_out_flies_its_way_in_as_one_execution(ctx, monkeypatc
         assert lg.guard is None and lg.gains == dp.COMPLIANT_GAINS and lg.plan_free and lg.world.startswith("full"), (
             lg.name, lg.guard, lg.gains, lg.world)
     speeds = {n: FREE_LINE_SPEED for n in way_in[:-2]}
-    speeds.update({"depth:approach": cfg.press_speed, "depth:press": dp.TOUCH_SPEED})
+    speeds.update({"depth:approach": dp.COMPLIANT_STROKE_SLOWDOWN * cfg.press_speed,
+                   "depth:press": dp.COMPLIANT_STROKE_SLOWDOWN * dp.TOUCH_SPEED})
     assert {lg.name: lg.speed for lg in legs} == speeds
     # then the rise back up to where the stroke began, the clear and home: one run, one execution
     assert rec.runs[-1] == (["depth:rise", "depth:clear", "home"], [dp.COMPLIANT_GAINS])

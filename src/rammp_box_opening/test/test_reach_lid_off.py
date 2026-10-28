@@ -55,7 +55,7 @@ class _Rec(trp._Rec):
         self.plans = []  # (leg name, how many events came before it was planned)
 
 
-def _walk_or_turn(ctx_, q_look, slide, start, quat):
+def _walk_or_turn(ctx_, q_look, slide, start, quat, top_z=None):
     """reach_press.walk_or_turn for the fake chain: the turn in place where
     the slide ends, as test_reach_press._way_down's."""
     turn = [[float(v) for v in slide[-1]], [float(v) + 0.01 for v in slide[-1]]]
