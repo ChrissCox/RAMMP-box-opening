@@ -91,11 +91,6 @@ def measured_config(tmp, edit=None, name="oxo_measured.yaml"):
     (--execute refuses an unmeasured config), `edit`ed further if asked.
     `name` lets one harness keep several variants side by side."""
     text = CONTAINER_YAML.read_text().replace("measure_me: true", "measure_me: false")
-    # no re-centring over the button: the stub planner has no real IK (the
-    # arm's forward kinematics say nothing about where it "stands") and the
-    # stub camera does not ride the arm, so the loop could never converge.
-    # Unit-tested instead (test_tasks: recentre*).
-    text = text.replace("recentre_max_moves: 2", "recentre_max_moves: 0", 1)
     if edit is not None:
         text = edit(text)
     cfg = tmp / name

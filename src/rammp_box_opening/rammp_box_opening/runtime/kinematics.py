@@ -260,8 +260,9 @@ class ArmChain:
         rad; the walk from HOME 2.4-2.5 s; the folded wrist 1.6 s.
 
         The last answer is kept for the exact same inputs: the staging's
-        reach proof (press_demo.staging_out_of_reach) and the planner client
-        ask the same question back to back, ~0.29 s of IK each (2026-10-22)."""
+        reach proof (removed with the staging press, 2026-10-28) and the
+        planner client asked the same question back to back, ~0.29 s of IK
+        each (2026-10-22)."""
         from rammp_box_opening.runtime.branches import joint_time
 
         key = (

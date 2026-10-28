@@ -12,8 +12,9 @@ button is, and a circle of the button's diameter, at lid height, sitting
 on a flat lid, answers it without knowing the box's footprint at all.
 
 Owner's design (2026-09-17): scene OWL finds the box, the arm flies over
-it, then OpenCV's circle alone aims the press; the OWL-gated wrist scan is
-the fallback when the scene camera finds nothing.
+it, then OpenCV's circle alone aims the press. The OWL-gated wrist scan
+that was the fallback when the scene camera found nothing is gone: no
+scene fix stops the run (owner, 2026-10-22).
 
 The reach-out press (flatbot: the box 0.80-0.89 m out, where the hand
 cannot point straight down) sees the button from a tilted pose, 29-39 deg

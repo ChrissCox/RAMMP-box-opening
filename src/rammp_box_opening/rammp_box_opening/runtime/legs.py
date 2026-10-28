@@ -75,9 +75,6 @@ class Leg:
     world_path: str = None  # generated world YAML to push (SetWorld wants a path)
     # MOTION legs planned with a vertical approach: (index into traj.points,
     # joints) of the waypoint the final straight line starts from, at rest.
-    # A leg that has one can be re-fitted to a corrected target without a
-    # planner round trip (runtime/approach.refit_descent), which moves it
-    # to above the new target.
     waypoint: tuple = None
     # MOTION legs with a guard: index into traj.points where the final
     # straight DESCENT begins (the waypoint's). Flown on its own, the leg's
@@ -113,7 +110,8 @@ class Leg:
     # A touch stroke expects contact at this fraction of its own PATH, and
     # judges the trip against the matching TIME fraction of whatever
     # trajectory actually flies: `retime(traj)` recomputes that, and is
-    # called on every replan, warp and merge (primitives.core.press_stroke)
+    # called on every replan, warp and merge (the staging press's touch
+    # stroke set them; it was removed 2026-10-28)
     contact_path_frac: float = field(default=None, compare=False)
     retime: object = field(default=None, compare=False)
     # MOTION legs: the arm's own straight line (runtime/kinematics

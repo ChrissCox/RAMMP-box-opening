@@ -134,7 +134,7 @@ TIP_TO_TOOL_M = 0.008
 # from an already-planned trajectory without FK.
 JOINT_ARC_PER_M = 4.05
 
-# A --depth-press reach-out runs COMPLIANT by default (owner 2026-10-27:
+# The reach-out (press_demo's run) runs COMPLIANT by default (owner 2026-10-27:
 # "with impedance mode, lets remove the safety check for now that stops the
 # arm when there's a bad reading or it thinks it hit or is going to hit
 # something"): every leg in the driver's joint impedance, nothing the run

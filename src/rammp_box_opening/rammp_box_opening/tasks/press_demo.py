@@ -1,68 +1,49 @@
-"""press_demo — the camera-driven autonomous press-and-open (owner design
-2026-08-24).
+"""press_demo — the camera-driven autonomous box opening (owner design
+2026-08-24; one run, the reach-out, since 2026-10-28).
 
     sheppy: the `arm` and `planner` nodes (rammp-deployments, december_2026)
-    ros2 launch rammp_box_opening press_demo.launch.py   # TF, D405, OWL node
+    ros2 launch rammp_box_opening press_demo.launch.py   # TF, OWL nodes
     export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     ros2 run rammp_box_opening press_demo --execute
 
-Flow, states logged one line each:
+Every box is pressed by the reach-out, however near it stands (owner
+2026-10-28: "make the arm always go to that 45 degree looking pose even if
+it's close enough to go straight up and down"; the straight-down staging
+mode is gone). States logged one line each:
 
-  SCENE   before any motion, the fixed scene camera finds the box: its
-          OWL instance boxes it, the depth inside the box at lid height
-          gives its position through config/camera_scene.yaml (a few cm),
-          or through TF where the robot's TF carries the camera's mount
-          (world external_static_tf: flatbot).
-          The arm flies straight to staging above it, the wrist confirms
-          from 12 cm, and the descent pre-planned during the approach
-          flies when the wrist agrees within 2 mm (else it is re-fitted to
-          the aim: the press goes to the circle's centre). detect.confirm_in_flight
-          makes approach and descent ONE goal with the wrist confirming on
-          the way (needs the wrist camera's timestamp lag measured). The
-          scene camera alone finds the box; the wrist only aims (owner,
-          2026-10-22): no scene fix, or no button at staging -> home, exit 2.
-  LOOK    --no-scene only (the stub harness, A/B runs): the wrist searches
-          instead. The arm's own rest pose with the hand lifted and the wrist
-          turned down — a joint-space move of two joints, 3.42 s,
-          against 3.89 s to fly to the old fixed scan pose. Nothing in it
-          is expressed in the bench frame, so it holds wherever the chair
-          is standing. Seeing nothing, the base SWEEPS a bounded arc each
-          way at search speed, stopping the instant the camera sees a
-          box. Planned in the bench world (the unseen-container keep-out
-          band); a step the arm already stands at is skipped.
-  DETECT  two paths over the same frames (depth_source). COARSE runs
-          during the motion — no stillness gate, no button circle — and
-          only ever stops a search. PRECISE is taken at rest, needs still
-          frames with a segmented button circle, and is what the press is
-          aimed with. Both look for the lid at the SURVEYED table plus
-          dims.z (a camera-fitted table read the blank bench ~35 mm high
-          and moved the band off the lid, field 2026-09-16).
-          detect.source: vlm walks the ladder in vlm.backends only when
-          the whole search could not answer. No fix -> home, exit 2.
-          press:close is dispatched before the look and rides it.
-  PRESS   two stages. The TOUCH: the approach chained into ONE guarded
-          stroke toward travel_m below the lid plane, re-timed into a
-          single execution — no stop between reaching and touching. A trip
-          near the expected contact = the surface, measured by the arm's
-          own fingertip TF; an early trip = honest strike failure; no trip
-          = no surface, also a failure. The PUSH: button_travel_m past that
-          contact, until the button's stop is felt. Then a reflex recoil,
-          a LAZY retreat to the hop (planned from live) with grip:open
-          riding it, and a look at the knob: not popped = one more press.
-  GRIP    guarded descent to grip_clear_m above the lid around the
-          popped knob (a trip = struck it), band-verified close.
-  PLACE   the lift, the carry and the set-down as ONE execution — nothing
-          happens between them the arm must be still for. The drop spot is
-          where the cameras see room for the lid and the hand, every run
-          (perception/clear_table); no place is configured. The set-down is guarded at
-          setdown_touch_nm (the trip IS the success) and re-checks the grip
-          band before releasing, then lazy retreat to the carry hover,
-          home — or the look pose when park_tool_down.
+  SCENE   before the arm moves toward the box, the fixed scene camera finds
+          it — sheppy's scene segmenter, or the scene OWL where that cannot
+          answer, boxes it; the depth inside the box at lid height places it
+          through config/camera_scene.yaml, or through TF where the robot's
+          TF carries the camera's mount (world external_static_tf:
+          flatbot). What it sees standing on the table goes into the
+          planner's worlds. The wrist never searches (owner, 2026-10-22):
+          no scene fix -> home, exit 2. The fingers close as the run starts.
+  SPOT    where the lid will go, among what the scene camera sees standing
+          on the table, the first spot the hand reaches: resolved before
+          anything moves toward the box; none -> exit 4
+          (tasks/reach_lid_off.resolve_lid_drop).
+  LOOK    the hand tilted 30-45 deg back toward the arm, above the box: the
+          wrist camera aims at the button from there (the oblique aim).
+          No button -> home, exit 2. A box already open is not pressed.
+  PRESS   the way in as ONE execution — the re-aim, the slide in turning
+          the hand down, the stroke — in the driver's joint impedance, the
+          spring pushing through the button's bottom and holding there
+          (tasks/reach_press, tasks/depth_press). Nothing the run reads
+          stops the arm; the e-stop and Ctrl+C do.
+  LID     back to the look pose, the knob judged there, the press once more
+          where it is not up; the fingers open on the way down, close on the
+          knob, and the lift, the carry and the set-down where the cameras
+          saw room; home (tasks/reach_lid_off). An open box goes straight to
+          this.
 
-Each next phase is planned as a Runner lookahead while the previous
-phase's last unguarded motion flies. --press-only stops after the press
-(retreat to staging, home). --detect-only reports the scene camera's
-fixes for 15 s with nothing moving.
+--press-only stops after the press: rise, home, the lid on. --guarded flies
+the reach-out's depth press position-controlled, with its torque guards and
+at-rest checks, as before 2026-10-27, and ends at the press. --detect-only
+reports the scene camera's fixes for 15 s with nothing moving;
+--wrist-detect is the wrist-mount calibration observation (the look pose,
+15 s of the wrist camera's fixes, home). Without --execute the run is
+previewed up to the look pose.
 
 --execute alone arms it: NO typed confirmation (owner decision
 2026-08-24 — autonomous once started, Ctrl+C stops everything via the
@@ -71,6 +52,7 @@ measure_me worksheet gate still applies. Without --execute nothing is ever
 sent to the driver: the client is not armed.
 """
 
+import argparse
 import math
 import sys
 import threading
@@ -83,12 +65,8 @@ import rclpy
 
 from rammp_box_opening.constants import (
     COMPLIANT_DEFAULT,
-    FINGERTIP_FRAMES,
-    TCP_OFFSET_M,
-    TIP_TO_TOOL_M,
     REST_TOL_RAD,
     GRIPPER_CMD_CLOSED,
-    GRIPPER_CMD_OPEN,
     HOME,
     SEARCH_SPEED,
     TRANSIT_SPEED,
@@ -103,32 +81,18 @@ from rammp_box_opening.models.container import (
 from rammp_box_opening.detection_set import MISSIONS_SET, MissionFrames, scene_frame, wrist_frame, write_frame
 from rammp_box_opening.perception.depth_source import BoxTopWatcher
 from rammp_box_opening.primitives.look import look_joints, sweep_targets
-from rammp_box_opening.perception.vlm_source import resolve_roi
 from rammp_box_opening.perception import clear_table
 from rammp_box_opening.primitives.core import (
     CARRY_CLEAR_M,
     CLEAR_MARGIN_MAX_STEP_RAD,
-    SETDOWN_OVERDRIVE_M,
     ClearMarginFree,
     Ctx,
-    Home,
-    Lift,
-    Place,
     PlanState,
-    Retreat,
     _full_world,
-    _gripper_leg,
     _interaction_world,
     _plan_motion,
-    band_verify,
-    press_push,
-    press_push_from_touch,
-    press_stroke,
-    tcp_z,
 )
-from rammp_box_opening.runtime.guards import ARM_AFTER_CAP, GuardSpec, WARP_SETTLE_FRAC
 from rammp_box_opening.runtime import fingers
-from rammp_box_opening.runtime.warp import warp_trajectory
 from rammp_box_opening.models.container import from_container
 from rammp_box_opening.runtime.runner import Runner
 from rammp_box_opening.tasks import cli_common
@@ -200,22 +164,10 @@ def build_search_leg(ctx, step, start_joints, watcher):
     return leg
 
 
-# How long the arm stands still after a search step that saw nothing before
-# moving on to the next direction. The precise path needs still frames
-# (depth_source), and min_hits * detect_period_s is the floor under any
-# commit — this is that floor with a frame of slack, not a guess.
-SETTLE_S = 0.5
-# ... and how long it waits after a step that DID glimpse something. Longer,
-# because a coarse sighting is good evidence a box is there — but bounded,
-# because a glimpse that never confirms (the arm stopped at an angle the
-# button circle cannot be read from) must not strand the search staring at
-# it while the directions it has not looked in go unlooked.
-CONFIRM_S = 2.0
-
-
 class _NeverStops:
     """A watcher stand-in for a search leg that must fly to the end: the
-    detect-only observation parks at the look pose and reports from there."""
+    wrist-mount observation (--wrist-detect) parks at the look pose and
+    reports from there, and record_detection_set stands at each pose."""
 
     @staticmethod
     def coarse_fix(now=None):
@@ -232,63 +184,23 @@ SCENE_LOCATE_S = 5.0  # was 3.0: the OWL's first box came at 2.2-2.7 s — too t
 # in 5 s (0.12, 26-28 depth points in each) and the run went home; 25 s
 # later the next run had the box 0.83 s in. Looking longer costs only time.
 SCENE_FIRST_LOCATE_S = 15.0
-# How long the wrist camera gets at staging to confirm the box precisely.
-# From 12 cm the lid fills a third of the frame and the hit rate is high;
-# this is generous.
+# How long the straight-down aim gets (aim_button_at_staging's default:
+# record_detection_set's, from its staging over a placed box; the reach-out
+# gives its oblique aim its own). From 12 cm the lid fills a third of the
+# frame and the hit rate is high; this is generous.
 STAGING_FIX_S = 2.5
-# A precise fix this close to the coarse one flies the descent that was
-# pre-planned during the approach as it is; further, and the descent is
-# re-fitted to the aim (runtime/approach.refit_descent: 0.1 s, no plan) or,
-# failing that, re-planned. It was 5 mm while the alternative was a 0.45 s
-# re-plan — and a press could land that far from the circle's centre on the
-# SCENE camera's say-so. The aim repeats to about 2 mm; the press goes to
-# the centre (owner, 2026-09-21).
-PREPLAN_TOL_M = 0.002
-# detect.confirm_in_flight is a different decision: whether the reach may
-# fly THROUGH staging into the descent without stopping, on the wrist's
-# passing glance. There the descent cannot be re-fitted (it is already
-# flying), so this is how far from the circle's centre that mode may press:
-# its documented trade (off in the shipped configs).
-IN_FLIGHT_TOL_M = 0.005
 RESIDUALS_FILE = state_dir() / "scene_calib" / "residuals.jsonl"
 
 
-def scene_residual(scene_top, wrist_top, yaw_scene, yaw_wrist):
-    """(dx_mm, dy_mm, dz_mm, dyaw_deg) between the scene camera's box and the
-    wrist camera's — the scene calibration's error at this spot, and the raw
-    material for refining it (one pair per run, in RESIDUALS_FILE)."""
-    d = [1000.0 * (float(w) - float(s)) for s, w in zip(scene_top, wrist_top)]
-    dyaw = (float(yaw_wrist) - float(yaw_scene) + math.pi / 4) % (math.pi / 2) - math.pi / 4
-    return d[0], d[1], d[2], math.degrees(dyaw)
-
-
 def residuals_path_for(scene_calib_arg):
-    """Where this run's scene-vs-wrist pairs go: the real file, unless the
-    run uses its own calibration file (--scene-calib: the e2e harness's
-    synthetic one), whose pairs then sit next to that file. The harness
-    wrote ~90 synthetic pairs into the real file before this (2026-09-17)."""
+    """Where the scene-vs-wrist pairs for this run's calibration are kept:
+    the real file, unless the run uses its own calibration file
+    (--scene-calib), whose pairs sit next to that file. The old stub
+    harness wrote ~90 synthetic pairs into the real file before this
+    (2026-09-17)."""
     if scene_calib_arg:
         return Path(scene_calib_arg).resolve().with_name("residuals.jsonl")
     return RESIDUALS_FILE
-
-
-def record_residual(scene_fix, wrist_top, wrist_yaw, path=RESIDUALS_FILE):
-    """Append this run's scene-vs-wrist pair for the calibration refinement."""
-    import json
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as f:
-        f.write(json.dumps({
-            "t": time.time(),
-            "scene_top": [round(float(v), 4) for v in scene_fix.top_xyz],
-            "wrist_top": [round(float(v), 4) for v in wrist_top],
-            "scene_yaw": round(float(scene_fix.pose.yaw), 4),
-            "wrist_yaw": round(float(wrist_yaw), 4),
-            "owl_score": round(float(scene_fix.score), 3),  # the detector's score, whichever detector
-            "source": getattr(scene_fix, "source", "owl"),
-            "n_points": int(scene_fix.n_points),
-        }) + "\n")
 
 
 def scene_source_label(fix):
@@ -305,21 +217,10 @@ def scene_source_label(fix):
 # The scene camera's box this far (xy) from the button the wrist found, on
 # the last run under the calibration in force: scene_trust distrusts it.
 # Since the wrist stopped searching (2026-10-22) a distrusted fix is still
-# flown and the distrust only printed: the aim at staging decides, so the
-# pairs correct only an offset the wrist can still see from staging. Its fixes were 9-11 cm off after a re-aim (2026-09-23) and
-# 12 cm off under a bad calibration (2026-09-24); the close-up aim corrects
-# a few centimetres by itself (RECENTRE_TOL_M, a move over the button).
+# flown and the distrust only printed: the wrist's aim decides. Its fixes
+# were 9-11 cm off after a re-aim (2026-09-23) and 12 cm off under a bad
+# calibration (2026-09-24).
 SCENE_TRUST_M = 0.05
-# The pairs recorded under the calibration in force correct it by
-# themselves (auto_refine) when the LAST this-many say it is this far off
-# (rms, xy) and a horizontal fit leaves them this close. Only the last
-# ones: a camera knocked since the calibration leaves its older pairs
-# describing where it was (2026-09-25: -2/-6 mm at 11:50, -39/-53 and
-# -53/-59 at the same spot after 14:04), and fitted together they never
-# agree.
-AUTO_REFINE_MIN_PAIRS = 3
-AUTO_REFINE_BEFORE_MM = 15.0
-AUTO_REFINE_AFTER_MM = 8.0
 
 
 def scene_trust(path, calib):
@@ -328,9 +229,10 @@ def scene_trust(path, calib):
     SCENE_TRUST_M from the button the wrist then found — what a re-aimed
     camera looks like. The cabinet-door tag used to decide this, and
     misfired (scene_calib.TAG_MOVED_PX). main flies a distrusted fix anyway
-    and prints why: with no wrist search, the aim at staging is the check,
-    and its pair against the scene's is recorded so the next run judges the
-    camera afresh (auto_refine)."""
+    and prints why: with no wrist search, the wrist's aim is the check. The
+    pairs were recorded by the straight-down staging aim, one a run, until
+    that mode was scrapped (2026-10-28): the reach-out records none, so
+    this judges by the last pair recorded under the calibration in force."""
     from rammp_box_opening.perception.scene_refine import calibrated_at, load_pairs
 
     try:
@@ -343,110 +245,6 @@ def scene_trust(path, calib):
     if off > SCENE_TRUST_M:
         return False, "on the last run its box was %.0f mm from the button the wrist found" % (1000 * off)
     return True, None
-
-
-def auto_refine(path, calib):
-    """Correct the scene calibration from the pairs recorded under it, when
-    at least AUTO_REFINE_MIN_PAIRS say it is AUTO_REFINE_BEFORE_MM off (rms,
-    xy) and a horizontal fit (scene_refine.fit) leaves them within
-    AUTO_REFINE_AFTER_MM: written with a backup beside the pairs, which then
-    retire (refined_at). Nobody has to run the refinement script for a
-    camera that drifted. Returns the line to print, or None; never ends a
-    run."""
-    try:
-        from rammp_box_opening.perception.scene_refine import calibrated_at, fit, load_pairs, write_refinement
-
-        scene, wrist = load_pairs(path, since=calibrated_at(calib))
-        if len(scene) < AUTO_REFINE_MIN_PAIRS:
-            return None
-        r = fit(scene[-AUTO_REFINE_MIN_PAIRS:], wrist[-AUTO_REFINE_MIN_PAIRS:])
-        if r.rms_before_mm < AUTO_REFINE_BEFORE_MM or r.rms_after_mm > AUTO_REFINE_AFTER_MM:
-            return None
-        backup = write_refinement(calib, r, Path(path).parent, "automatic, by the mission")
-        return (
-            "[press_demo] scene calibration REFINED by itself from %d pairs (%s fit): %.0f mm -> %.1f mm rms "
-            "(was %s)" % (r.n, r.mode, r.rms_before_mm, r.rms_after_mm, backup)
-        )
-    except Exception as e:  # a refinement must never end a run
-        return "[press_demo] (automatic calibration refinement not made: %s)" % e
-
-
-def residual_hint(path, calib=None):
-    """After a pair is recorded: how the calibration is doing, and when to
-    refine it (scripts/refine_scene_calibration.py). Only the pairs made
-    under the calibration in `calib` (the file this run used) count."""
-    try:
-        from rammp_box_opening.perception.scene_refine import (
-            MIN_PAIRS_ROTATION, MIN_SPREAD_M, calibrated_at, fit, load_pairs, spread_m,
-        )
-
-        since = None if calib is None else calibrated_at(calib)
-        scene, wrist = load_pairs(path, since=since)
-        retired = len(load_pairs(path)[0]) - len(scene)
-        if len(scene) == 0:
-            return
-        mean = (wrist - scene)[:, :2].mean(0) * 1000  # horizontal: heights are not compared (scene_refine)
-        sp = spread_m(scene)
-        msg = "[press_demo] scene calibration: %d pair(s) on file, mean offset [%+.0f, %+.0f] mm, spread %.2f m" % (
-            len(scene), mean[0], mean[1], sp)
-        if retired:
-            msg += " (%d older pair(s) were made under an earlier calibration and do not count)" % retired
-        if len(scene) >= MIN_PAIRS_ROTATION and sp >= MIN_SPREAD_M:
-            r = fit(scene, wrist)
-            msg += " — a refinement would leave %.1f mm rms (applied by itself past %.0f mm: auto_refine)" % (
-                r.rms_after_mm, AUTO_REFINE_BEFORE_MM)
-        elif abs(mean).max() > 8:
-            msg += " — boxes at other spots (>= %d pairs over %.2f m) allow a rotation fit" % (MIN_PAIRS_ROTATION, MIN_SPREAD_M)
-        print(msg)
-    except Exception as e:  # a hint must never end a run
-        print("[press_demo] (residual hint unavailable: %s)" % e)
-
-
-def use_preplanned_descent(coarse_pose, precise_pose, preplanned, tol_m=PREPLAN_TOL_M):
-    """The descent planned from the coarse pose while the approach flew may
-    be flown as it is when the precise fix landed within `tol_m` of it."""
-    if preplanned is None:
-        return False
-    d = math.hypot(
-        float(precise_pose.xyz[0]) - float(coarse_pose.xyz[0]),
-        float(precise_pose.xyz[1]) - float(coarse_pose.xyz[1]),
-    )
-    return d <= tol_m
-
-
-# How far before the junction into the descent an unconfirmed reach is cut,
-# as a fraction of the goal's time: the cancel takes a few feedback ticks to
-# land, and the arm must be stopped ABOVE the box, never into it.
-JUNCTION_MARGIN = 0.05
-
-
-def in_flight_stop(progress, junction, confirmed, disagrees, margin=JUNCTION_MARGIN):
-    """Cut the reach-and-descend goal now? Yes the moment the wrist has
-    DISAGREED with the scene (the descent must be re-planned), and yes when
-    the descent is about to begin with nothing confirmed yet — the arm then
-    stops at staging and looks, exactly as the two-goal path does."""
-    if disagrees:
-        return True
-    if confirmed:
-        return False
-    return progress is not None and float(progress) >= float(junction) - margin
-
-
-class SceneApproach:
-    """What the reach from the scene fix came back with."""
-
-    def __init__(self, got=None, preplanned=None, pressed=None, press_leg=None, in_flight=False, status="", button_up_mm=None,
-                 failed=False, reach_out=False, cfg=None):
-        self.cfg = cfg  # the press config the approach flew (its staging may be lowered), or None
-        self.failed = failed  # the approach's own motion failed (the runner said why)
-        self.reach_out = reach_out  # no straight-down staging reaches the box: the reach-out press's case
-        self.button_up_mm = button_up_mm  # the aim's button-above-its-lid reading (refuse_open_box)
-        self.got = got  # the wrist's precise fix, or None
-        self.preplanned = preplanned  # the descent planned during the approach
-        self.pressed = pressed  # results, when the descent already flew and touched
-        self.press_leg = press_leg
-        self.in_flight = in_flight
-        self.status = status  # what the aim saw, for the log when got is None
 
 
 def _table_offset_words(off, off_raw):
@@ -462,10 +260,11 @@ def _table_offset_words(off, off_raw):
 
 def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=None, tag="aim", out=None,
                           lid_z=None, prior_xy=None, min_hits=None):
-    """The press aim from staging: the button's circle alone (owner's
-    design 2026-09-17 — no OWL and no box-footprint gate here; the scene
-    camera already said which thing is the box), the press point its
-    centre. Returns (got, status) where got is
+    """The wrist's press aim: the button's circle alone (owner's design
+    2026-09-17 — no OWL and no box-footprint gate here; the scene camera
+    already said which thing is the box), the press point its centre.
+    Straight down from a staging over the box by default (record_detection_set);
+    the reach-out's oblique look passes lid_z / prior_xy / min_hits. Returns (got, status) where got is
     ((x, y, z), yaw) like the watcher's fix, or None — z raised by the
     wrist's table offset where its hits agree on one (ButtonAimer.fix). The
     aimed frame is saved and the aim logged (`runner`) every time.
@@ -633,30 +432,6 @@ def dump_wrist_frame(watcher, tag):
     return out
 
 
-def keep_wrist_frame(ctx, watcher, pose):
-    """The wrist's newest frame into this run's detection record
-    (ctx.mission_frames) as search step `pose`. Held, not written: see
-    detection_set.MissionFrames."""
-    from rammp_box_opening.perception.depth_source import camera_pose_at
-
-    g = getattr(watcher, "grab", None)
-    if ctx.mission_frames is None or g is None or g.color is None or g.depth is None or g.k is None or g.color_stamp is None:
-        return
-    cam = camera_pose_at(g)
-    if cam is not None:
-        ctx.mission_frames.wrist(pose, wrist_frame(g, cam))
-
-
-def aim_source(watcher, pos):
-    """Where the press point `pos` came from: "aim" when it is the last
-    close-up aim at the button (aim_button_at_staging), else "fix" — a
-    search's or an in-flight fix, from further up."""
-    aim = getattr(watcher, "last_aim", None)
-    if aim is not None and all(abs(float(a) - float(p)) < 1e-9 for a, p in zip(aim, pos)):
-        return "aim"
-    return "fix"
-
-
 def save_aim_frame(grab, sighting, tag="aim"):
     """The frame the press was aimed on, with the seam circle (green) and
     the PRESS POINT — its centre (red +) — drawn, every run, so a miss is a
@@ -692,275 +467,6 @@ def _prune_captures(tag):
         pass
 
 
-# RE-STAGE: at staging with no button in view, the lid the wrist DOES see
-# (lid_in_view) brings the CAMERA over it. Staging stands the tool over the
-# button and the wrist camera ~10 cm to its side, so the lid sits near the
-# frame's edge by construction, and a few centimetres off push the button
-# past the depth image (flatbot 2026-10-23). The move is the lid's place
-# less where the camera's axis meets it, both read through the one camera
-# pose, so the wrist mount's error in TF cancels out of it: moving the tool
-# over the lid instead (the first version) went 6 cm the wrong way. The aim
-# from there centres the tool as ever (centre_over_button).
-RESTAGE_MAX_M = 0.10  # the lid farther than this from where the camera looks is not a re-staging
-RESTAGE_MIN_M = 0.01  # nearer than this, where the camera looks is not what hides the button
-RESTAGE_TRIES = 2
-
-
-def wrist_lid(watcher):
-    """lid_in_view on the wrist camera's newest frame, at that frame's own
-    pose: ((x, y, z), info) or (None, why). info["view_xy"]: where the
-    camera's axis meets the lid's height, through the same pose."""
-    from rammp_box_opening.perception.button_aim import lid_in_view
-    from rammp_box_opening.perception.d405 import frame_snapshot
-    from rammp_box_opening.perception.depth_source import camera_pose_at
-
-    g = getattr(watcher, "grab", None)
-    if g is None:
-        return None, "no wrist camera"
-    f = frame_snapshot(g)
-    if f.depth is None or f.k is None or f.color_stamp is None:
-        return None, "no wrist frame"
-    cam = camera_pose_at(g, stamp=f.color_stamp)
-    if cam is None:
-        return None, "no camera pose for the wrist frame"
-    lid, info = lid_in_view(f.depth, f.k, cam[0], cam[1], watcher.model)
-    if lid is None:
-        return lid, info
-    rot, trans = cam
-    axis = [float(rot[i][2]) for i in range(3)]
-    if axis[2] > -0.5:
-        return None, "the wrist camera does not look down at the lid"
-    reach = (lid[2] - float(trans[2])) / axis[2]
-    info["view_xy"] = (float(trans[0]) + reach * axis[0], float(trans[1]) + reach * axis[1])
-    return lid, info
-
-
-def restage_on_lid(node, ctx, cfg, runner, watcher, execute, yaw, why):
-    """From staging with no button in view (`why`): move the wrist camera
-    over the lid it sees (wrist_lid: the lid less where the camera looks),
-    at the staging's height and attitude, planned and collision-checked in
-    the world the scene camera's box is in, and aim again, the button
-    expected on that lid — at most RESTAGE_TRIES moves of at most
-    RESTAGE_MAX_M each. Returns (got, status, moves, seen) as
-    aim_button_at_staging, plus how many moves flew and the aim's `out`.
-    ctx.cpose is left the scene camera's."""
-    from rammp_box_opening.runtime.approach import _chain
-
-    m = ctx.model
-    quat = m.press_quat(from_container(ctx.cpose, m.button_offset))  # the staging's own attitude
-    for moves in range(RESTAGE_TRIES):
-        lid, info = wrist_lid(watcher)
-        if lid is None:
-            return None, "%s; no lid in the wrist frame to stage over (%s)" % (why, info), moves, {}
-        dx, dy = lid[0] - info["view_xy"][0], lid[1] - info["view_xy"][1]
-        off = math.hypot(dx, dy)
-        runner.note("restage_lid", lid_xy=[round(v, 4) for v in lid[:2]], off_mm=round(1000 * off, 1),
-                    lid_frac=round(info["frac"], 2), cut=info["cut"], move=moves + 1)
-        if off > RESTAGE_MAX_M:
-            return None, "%s; the lid in view is %.0f mm from where the camera looks — more than a re-staging (%.0f mm)" % (
-                why, 1000 * off, 1000 * RESTAGE_MAX_M), moves, {}
-        if off < RESTAGE_MIN_M:
-            return None, "%s; the lid is where the camera looks (%.0f mm off) — moving would not show the button" % (
-                why, 1000 * off), moves, {}
-        print("[press_demo] RE-STAGE: no button in view, but the wrist sees the lid%s %.0f mm from where it looks "
-              "— moving the camera over it" % (" (cut by the frame)" if info["cut"] else "", 1000 * off))
-        live = list(ctx.client.joints())
-        _R, t = _chain().fk(live)
-        target = [float(t[0]) + dx, float(t[1]) + dy, float(t[2])]
-        try:
-            leg, _ = _plan_motion(ctx, _state(live), "approach:restage", ("pose", target, quat), _full_world(ctx),
-                                  TRANSIT_SPEED)
-        except RuntimeError as e:
-            return None, "%s; the move over the lid was refused (%s)" % (why, e), moves, {}
-        res = runner.run([leg], execute=execute)
-        bad = [r for r in res if not r.ok]
-        if bad and all(r.outcome == "refused" for r in bad):
-            return None, "%s; the move over the lid was refused" % why, moves, {}
-        if bad:
-            # out and failed in flight: no press, and no automatic motion after a fault
-            print("[press_demo] STOP: the move over the lid failed (%s) — not pressing; arm holds" % bad[-1].detail)
-            sys.exit(1)
-        seen = {}
-        got, status = aim_button_at_staging(node, watcher, yaw, runner=runner, out=seen, prior_xy=(lid[0], lid[1]))
-        if got is not None:
-            return got, status, moves + 1, seen
-        why = status
-    return None, "%s (after %d moves over the lid)" % (why, RESTAGE_TRIES), RESTAGE_TRIES, {}
-
-
-def approach_from_scene(node, ctx, cfg, runner, watcher, execute, scene_fix, lookahead=True):
-    """The arm straight to staging above the scene camera's box, the descent
-    pre-planned on the way, then the wrist's precise fix.
-
-    Two ways. With detect.confirm_in_flight the approach and the guarded
-    descent fly as ONE goal and the wrist confirms the box while the arm is
-    still reaching: the goal is cut at the junction only if nothing has
-    confirmed by then, or the wrist disagrees with the scene by more than
-    IN_FLIGHT_TOL_M. Otherwise the approach stops at staging and the wrist
-    confirms from 12 cm at rest.
-
-    When cfg.staging_m is above the arm's straight-down reach, a lower
-    staging is tried, down to the clearance floor load_press_demo allows
-    (staging_for_reach); when none reaches the box, nothing moves here and
-    `reach_out` hands the press to tasks/reach_press.
-
-    `lookahead` False: no descent is planned on the way (--depth-press flies
-    its own).
-
-    Returns a SceneApproach; `got` is None when the approach failed or the
-    wrist saw nothing, `status` says which — the caller then stops. Its
-    `cfg` is the one flown: main presses with it."""
-    ctx.cpose = scene_fix.pose
-    watcher.roi = None  # the scene bbox never applied to the wrist frame
-    live = ctx.client.joints()  # one read: the reach proof and the plan start from the same joints
-    asked = cfg
-    cfg = staging_for_reach(ctx, cfg, runner, live)
-    if cfg is None:
-        floor = staging_floor(ctx.model)
-        return SceneApproach(
-            failed=True, reach_out=True, cfg=asked,
-            status="no straight-down staging reaches the box (the arm's kinematics: none %.3f-%.3f m above "
-            "the button)" % (asked.staging_m, min(floor, asked.staging_m)),
-        )
-    try:
-        approach = [build_approach_leg(ctx, cfg, start_joints=live)]
-    except RuntimeError as e:
-        # the kinematics found this staging, so a refusal is a late
-        # set_world, a start in collision or an unlucky plan: a STOP — but a
-        # lowered staging the planner refuses (IK_FAIL) is where the asked
-        # staging_m already proved out of reach: the reach-out press's case
-        if "IK_FAIL" in str(e) and cfg is not asked:
-            return SceneApproach(failed=True, reach_out=True, cfg=asked,
-                                 status="no straight-down staging reaches the box: the lowered %.3f m was refused (%s)"
-                                 % (cfg.staging_m, e))
-        return SceneApproach(failed=True, cfg=cfg, status="the approach to staging was refused (%s)" % e)
-    if not cfg.confirm_in_flight:
-        # No OWL and no plateau detector on this path: the scene camera
-        # said which thing is the box; at staging the button's circle
-        # alone aims the press (aim_button_at_staging).
-        res = runner.run(
-            approach,
-            execute=execute,
-            lookahead=(lambda q: build_press_legs(ctx, cfg, start_joints=q)) if lookahead else None,
-        )
-        if any(not r.ok for r in res):
-            return SceneApproach(failed=True, cfg=cfg, status="the approach to staging failed")
-        preplanned = runner.lookahead_result
-        seen = {}
-        got, status = aim_button_at_staging(node, watcher, scene_fix.pose.yaw, runner=runner, out=seen,
-                                            prior_xy=button_xy(ctx))
-        if got is None and execute:
-            # the scene camera brings the arm near the box; the wrist may
-            # still see only part of the lid: move over what it sees
-            got, status, moves, seen_again = restage_on_lid(
-                node, ctx, cfg, runner, watcher, execute, scene_fix.pose.yaw, status)
-            if moves:
-                preplanned = None  # planned for the staging the arm has left
-                seen = seen_again or seen
-        return SceneApproach(got=got, preplanned=preplanned, status=status, button_up_mm=seen.get("button_up_mm"),
-                             cfg=cfg)
-
-    # ONE goal: approach chained into the descent, the wrist watching on the way
-    press = build_press_legs(ctx, cfg, start_joints=approach[-1].goal_joints)
-    state = {"got": None, "precise": None, "disagrees": False}
-
-    def stop_when(progress=None):
-        if state["got"] is None:
-            watcher.tick_now()  # every poll sees the newest frame
-            got = watcher.fix()
-            if got is not None:
-                precise = watcher.to_container_pose(got)
-                state["got"], state["precise"] = got, precise
-                state["disagrees"] = not use_preplanned_descent(scene_fix.pose, precise, press, tol_m=IN_FLIGHT_TOL_M)
-                if not state["disagrees"]:
-                    print("[press_demo] the wrist confirmed the box in flight — descending without a stop")
-        fracs = (runner.last_retime or {}).get("seg_start_fracs") or [0.0, 1.0]
-        return in_flight_stop(progress, fracs[-1], state["got"] is not None, state["disagrees"])
-
-    press[0].stop_when = stop_when
-    watcher.active = True
-    try:
-        res = runner.run([*approach, *press], execute=execute)
-    finally:
-        watcher.active = False
-    if any(not r.ok for r in res):
-        return SceneApproach(in_flight=True, failed=True, cfg=cfg, status="the approach to staging failed")
-    outcome = res[-1].outcome
-    if outcome == "touch":
-        # the descent flew and found the surface: pressed, no stop anywhere
-        got = state["got"] if state["got"] is not None else watcher.fix()
-        if got is None:
-            # main stops: the wrist aims every press, and none confirmed this one
-            return SceneApproach(failed=True, pressed=res, press_leg=press[0], in_flight=True, cfg=cfg,
-                                 status="the arm touched on the scene camera's pose alone — the wrist never confirmed it")
-        return SceneApproach(got=got, pressed=res, press_leg=press[0], in_flight=True, cfg=cfg)
-    # stopped at the junction: confirm at rest, as the two-goal path does
-    print(
-        "[press_demo] stopped above the box: %s"
-        % ("the wrist disagreed with the scene — re-planning the descent" if state["disagrees"]
-           else "the wrist had not confirmed the box by the junction — looking from here")
-    )
-    got = state["got"] if state["got"] is not None else wait_for_fix(node, watcher, cfg, timeout_s=STAGING_FIX_S)
-    return SceneApproach(got=got, preplanned=None, in_flight=True, cfg=cfg)
-
-
-def search_for_box(node, ctx, cfg, runner, watcher, execute, accept_coarse=False):
-    """Look, then sweep each way, until the camera has found the box.
-
-    Returns (fix, failed_step): a precise fix and None when a box is found;
-    (None, None) when the whole search came up empty; (None, name) when that
-    step's motion failed — the runner has already said why.
-
-    Each step flies with the coarse detector live (build_search_leg), so a
-    sighting cancels the motion where it was seen instead of finishing a pan
-    that is no longer needed. The fix the press is AIMED with is always the
-    precise one, taken at rest afterwards: a step that saw something coarse
-    earns the whole detect budget standing there, an empty one gets a settle
-    beat before the search moves on.
-
-    A step the arm already stands at is skipped outright — parked at the
-    look pose between runs, the mission starts by looking, not by flying.
-
-    The whole search shares ONE budget (detect.timeout_s): each step gets a
-    bounded beat, and whatever is left is spent standing where the search
-    ended, still watching."""
-    deadline = time.monotonic() + cfg.timeout_s
-    for name, target, speed in search_targets(cfg):
-        live = ctx.client.joints()
-        if rest_distance(live, target) > REST_TOL_RAD:
-            watcher.active = True  # the coarse path runs during the motion
-            try:
-                leg = build_search_leg(ctx, (name, target, speed), live, watcher)
-                res = runner.run([leg], execute=execute)
-            finally:
-                watcher.active = False
-            if any(not r.ok for r in res):
-                return None, name
-        else:
-            print("[press_demo] already at the %s pose — no flight" % name)
-        beat = CONFIRM_S if watcher.coarse_fix() is not None else SETTLE_S
-        budget = min(beat, deadline - time.monotonic())
-        got = wait_for_fix(node, watcher, cfg, timeout_s=budget) if budget > 0 else None
-        keep_wrist_frame(ctx, watcher, name)  # after the beat: a frame shot at rest
-        if got is not None:
-            return got, None
-        if accept_coarse and watcher.last_coarse() is not None:
-            # seen but not precisely — from half a metre up the button may
-            # not resolve, or the fingers hide part of the lid. With a
-            # close-up aim to follow, that is enough: stop here instead of
-            # sweeping on past the box (2026-09-23, run 2: 59 of 94 frames
-            # saw it, then NO BOX). The caller stages over watcher.last_coarse().
-            return None, None
-    # every direction looked in and nothing has committed: spend what is
-    # left of the budget standing where the search ended, still watching
-    left = deadline - time.monotonic()
-    if left > 0:
-        got = wait_for_fix(node, watcher, cfg, timeout_s=left)
-        if got is not None:
-            return got, None
-    return None, None
-
-
 def build_home_leg(ctx, start_joints, joints=None, chain=0):
     """The no-box / recovery exit: back to the rest pose in the bench world,
     above the band where an unlocated container may be standing."""
@@ -976,97 +482,11 @@ def build_home_leg(ctx, start_joints, joints=None, chain=0):
     return leg
 
 
-# joint_1 swings and elbow flips of HOME: IK seeds spread over the arm's
-# branches, for the out-of-reach proof (a continuation walk from one seed
-# misses solutions near the workspace edge — review 2026-10-22)
-REACH_SEED_J1_RAD = (-2.4, -1.2, 0.0, 1.2, 2.4)
-
-
-def staging_out_of_reach(ctx, cfg, live=None):
-    """True only when the arm's own kinematics finds NO pose inside every
-    limit for the straight-down staging build_approach_leg asks for (the
-    same button, attitude and height) — walked from the live joints (`live`,
-    read here when not given) and look_joints(HOME), and solved from seeds
-    spread over the arm's branches: the planner's IK_FAIL also covers a goal
-    in collision on a box well inside reach. Flatbot 2026-10-22, its table
-    at 0.293 in arm_mount: 0.12 above the button solves nowhere, 0.10 (the
-    clearance floor) out to about 0.52 m and no further (the boxes that
-    night stood 0.59-0.60 m out). A kinematics problem proves nothing."""
-    from rammp_box_opening.perception.d405 import quat_to_mat
-    from rammp_box_opening.primitives.look import look_joints
-    from rammp_box_opening.runtime.approach import _chain
-    from rammp_box_opening.runtime.branches import planner_branch
-
-    m = ctx.model
-    button = from_container(ctx.cpose, m.button_offset)
-    staging = [button[0], button[1], button[2] + cfg.staging_m]
-    quat = m.press_quat(button)
-    try:
-        chain = _chain()
-        live = planner_branch(ctx.client.joints() if live is None else live)
-        if chain.nearest_solution(live, staging, quat, seeds=(look_joints(HOME),)) is not None:
-            return False
-        R = quat_to_mat(*quat)
-        for j1 in REACH_SEED_J1_RAD:
-            for elbow in (1.0, -1.0):
-                seed = list(HOME)
-                seed[0] += j1
-                seed[3] *= elbow
-                q = chain.solve_pose(seed, staging, R)
-                if q is not None and chain.equivalents(live, q):
-                    return False
-        return True
-    except Exception as e:  # noqa: BLE001 - e.g. the bench URDF under arm_mount
-        print("[press_demo] could not check staging's reach with the arm's kinematics (%s)" % e)
-        return False
-
-
-STAGING_STEP_M = 0.005  # the lower stagings tried when cfg.staging_m is out of reach
-
-
-def staging_floor(model):
-    """The lowest staging the full world still plans: the clearance floor
-    load_press_demo enforces (dims.z - button_offset.z + 0.10)."""
-    return round(float(model.dims[2]) - float(model.button_offset[2]) + 0.10, 4)
-
-
-def staging_for_reach(ctx, cfg, runner=None, live=None):
-    """`cfg` when its staging is in straight-down reach (staging_out_of_reach);
-    else `cfg` with the highest STAGING_STEP_M-lower staging that is, one
-    step lower still for margin off the reach ceiling (the recentre moves
-    at staging height), never below staging_floor; None when even the floor
-    is out of reach — the reach-out press's case. Tables vary: flatbot's at
-    0.293 put the pink canister's 0.12 staging above the ceiling everywhere,
-    the 0.10 floor solving out to about 0.52 m. The floor is proved before
-    the steps between, so a box out of reach costs two proofs, not a proof
-    per step (~0.6 s each when nothing solves, flatbot 2026-10-22)."""
-    if not staging_out_of_reach(ctx, cfg, live=live):
-        return cfg
-    floor = staging_floor(ctx.model)
-    if cfg.staging_m <= floor or staging_out_of_reach(ctx, replace(cfg, staging_m=floor), live=live):
-        return None
-    h = floor
-    for k in range(1, int(round((cfg.staging_m - floor) / STAGING_STEP_M)) + 1):
-        step = round(cfg.staging_m - k * STAGING_STEP_M, 4)
-        if step <= floor:
-            break
-        if not staging_out_of_reach(ctx, replace(cfg, staging_m=step), live=live):
-            h = round(max(floor, step - STAGING_STEP_M), 4)
-            break
-    print(
-        "[press_demo] staging %.3f m above the button is out of straight-down reach: staging at %.3f m"
-        % (cfg.staging_m, h)
-    )
-    if runner is not None:
-        runner.note("staging_lowered", staging_m=h, asked_m=round(cfg.staging_m, 4), floor_m=floor)
-    return replace(cfg, staging_m=h)
-
-
 def build_approach_leg(ctx, cfg, start_joints=None):
-    """Staging directly above the detected button, in the full world, from
-    `start_joints` (the live joints when not given). The fingers are already
-    closing: main() dispatched press:close before the look, and the Runner
-    joins it before the guarded stroke."""
+    """Staging directly above the button of ctx.cpose, cfg.staging_m up, in
+    the full world, from `start_joints` (the live joints when not given):
+    record_detection_set's close-up look over a placed box. press_demo no
+    longer flies it (the reach-out presses every box, 2026-10-28)."""
     m = ctx.model
     button = from_container(ctx.cpose, m.button_offset)
     quat = m.press_quat(button)  # the same attitude the press holds
@@ -1080,310 +500,6 @@ def build_approach_leg(ctx, cfg, start_joints=None):
         TRANSIT_SPEED,
     )
     return leg
-
-
-# The press is aimed from OVER the button. Bench 2026-09-23: the arm stood
-# 11 cm from the box at staging (a scene camera moved since its
-# calibration), the wrist aimed with the button 194 px from the image
-# centre, and the press — landing within 0.5 mm of that aim — hit the side
-# of the button and did not open the box. Every press that landed dead
-# centre had been aimed with the button under the tool. So the aim is
-# closed-loop: aim, move over the button at staging height, aim again.
-# the tool this close over the button: press from here. The aim's own error
-# grew to 10-15 mm with the button ~110 mm off the tool. Nearer, it is
-# small: aimed 12 mm and 48 mm off, the aim taken again from over the
-# button moved 0.8 mm both times (runs 2026-09-23 12:03, 2026-09-24 15:22)
-# — so the 5 mm bar this was spent 1.4 s (a move and a second aim) to gain
-# under a millimetre, most runs. 25 mm keeps the move for a staging that
-# stood well off the box.
-RECENTRE_TOL_M = 0.025
-RECENTRE_MAX = 2  # moves over the button before pressing from the last aim (detect.recentre_max_moves)
-# A re-centre is the wrist camera's offset from the tool (~10 cm in TF) plus
-# the aim's own error: an aim farther than this from under the tool is not a
-# button to centre on, and nothing moves to it (flatbot 2026-10-23 15:09: an
-# aim 313 mm off — a circle on a cabinet — and the arm flew there)
-RECENTRE_MAX_MOVE_M = 0.15
-
-
-def button_xy(ctx):
-    """Where the button is expected (base xy): ctx.cpose's. Every staging
-    aim is judged against it (button_aim.DOWN_PRIOR_MAX_M)."""
-    b = from_container(ctx.cpose, ctx.model.button_offset)
-    return float(b[0]), float(b[1])
-
-
-def tool_xy(ctx):
-    """Where the tool stands (base xy), from the arm's own kinematics."""
-    from rammp_box_opening.runtime.approach import _chain
-
-    _R, t = _chain().fk(ctx.client.joints())
-    return float(t[0]), float(t[1])
-
-
-def _off_button(ctx, cfg):
-    """How far (m) the tool stands from over the press point of ctx.cpose."""
-    button = from_container(ctx.cpose, ctx.model.button_offset)
-    tx, ty = tool_xy(ctx)
-    return math.hypot(button[0] + cfg.press_offset_xy[0] - tx, button[1] + cfg.press_offset_xy[1] - ty)
-
-
-def centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=None, open_ok=False):
-    """From staging, with a first aim `got` ((xyz, yaw)): until the tool
-    stands within RECENTRE_TOL_M over the button, fly to staging over the
-    aimed button (planned, collision-checked) and aim again from there — at
-    most RECENTRE_MAX times. Returns (got, moves, off_m): the aim to press
-    from (the last good one), how many moves it took, and how far the tool
-    then stood from over the button. Sets ctx.cpose from that aim. A dry run
-    says what it would do and moves nothing. `max_moves` overrides
-    detect.recentre_max_moves. `open_ok`: an open box the re-aim sees is
-    the caller's to open (the depth press feels its lid, never presses the
-    knob) — not a stop here."""
-    moves = 0
-    ctx.cpose = watcher.to_container_pose(got)
-    off = _off_button(ctx, cfg)
-    if max_moves is None:
-        max_moves = int(getattr(cfg, "recentre_max_moves", RECENTRE_MAX))
-    while off > RECENTRE_TOL_M and moves < max_moves:
-        if off > RECENTRE_MAX_MOVE_M:
-            runner.note("centre_refused", off_mm=round(1000 * off, 1), max_mm=round(1000 * RECENTRE_MAX_MOVE_M))
-            try_home(ctx, runner, execute,
-                     "STOP: the aim is %.0f mm from under the tool — more than a re-centre (%.0f mm); not moving "
-                     "to it, not pressing" % (1000 * off, 1000 * RECENTRE_MAX_MOVE_M))
-            sys.exit(1)
-        if not execute:
-            print("[press_demo] (dry run) would move %.0f mm over the button and aim again" % (1000 * off))
-            break
-        print("[press_demo] CENTRE: the button is %.0f mm from under the tool — moving over it" % (1000 * off))
-        try:
-            leg = build_approach_leg(ctx, cfg)
-        except RuntimeError as e:
-            # a refused plan sends nothing: the arm still stands at staging
-            print("[press_demo] CENTRE: the move over the button was refused (%s) — pressing from the last aim" % e)
-            break
-        leg.name = "approach:recentre"
-        res = runner.run([leg], execute=execute)
-        bad = [r for r in res if not r.ok]
-        if bad and all(r.outcome == "refused" for r in bad):
-            break  # nothing was sent: the arm is still at staging; the last aim stands
-        if bad:
-            # the move went out and failed in flight (an aborted goal, a
-            # following error): the arm holds where it stopped — no press
-            # after a motion fault, and no automatic motion either
-            print("[press_demo] STOP: the move over the button failed (%s) — not pressing; arm holds" % bad[-1].detail)
-            sys.exit(1)
-        moves += 1
-        seen = {}
-        again, status = aim_button_at_staging(node, watcher, got[1], runner=runner, out=seen, prior_xy=button_xy(ctx))
-        if again is None:
-            print("[press_demo] CENTRE: lost the button after the move (%s) — pressing from the last aim" % status)
-            break
-        # the aim from straight over the button is the best look at the knob
-        # the run gets: an open box it shows stops the run like the first aim's
-        open_already = refuse_open_box(seen.get("button_up_mm"))
-        if open_already is not None and not open_ok:
-            runner.note("open_box", button_above_lid_mm=round(seen["button_up_mm"], 1))
-            try_home(ctx, runner, execute, "STOP: " + open_already)
-            sys.exit(1)
-        got = again
-        ctx.cpose = watcher.to_container_pose(got)
-        off = _off_button(ctx, cfg)
-    if moves and off > RECENTRE_TOL_M:
-        print(
-            "[press_demo] CENTRE: still %.1f mm off after %d moves — pressing from the last aim, taken nearest the button"
-            % (1000 * off, moves)
-        )
-    elif moves:
-        print("[press_demo] CENTRE: over the button (%.1f mm) after %d move(s)" % (1000 * off, moves))
-    runner.note("centre", moves=moves, off_mm=round(1000 * off, 1))
-    return got, moves, off
-
-
-def centre_for_press(node, ctx, cfg, runner, watcher, execute, got, depth_press=False):
-    """centre_over_button at staging — but not before the depth press, which
-    centres the fingers itself from straight down by the wrist camera's own
-    frame (tasks/depth_press CENTRE), not by the wrist mount's TF this one
-    aims through (wrong on flatbot, rammp-deployments#128): there an aim
-    farther off than that may move (CENTRE_MAX_M) gets one planned move over
-    the button, and nothing else moves. Sets ctx.cpose from the aim either
-    way. Returns (got, moves, off_m) as centre_over_button."""
-    if not depth_press:
-        return centre_over_button(node, ctx, cfg, runner, watcher, execute, got)
-    from rammp_box_opening.tasks.depth_press import CENTRE_MAX_M
-
-    ctx.cpose = watcher.to_container_pose(got)
-    off = _off_button(ctx, cfg)
-    if off > CENTRE_MAX_M:
-        return centre_over_button(node, ctx, cfg, runner, watcher, execute, got, max_moves=1, open_ok=True)
-    runner.note("centre", moves=0, off_mm=round(1000 * off, 1), depth_press=True)
-    return got, 0, off
-
-
-def stage_over_search_fix(node, ctx, cfg, runner, watcher, execute, got, coarse=False, depth_press=False):
-    """The wrist search's fix was taken from the look pose, half a metre
-    up: fly to staging over it, aim at the button close up, and centre over
-    it (centre_over_button) — the same aim every press gets, wherever the
-    box stands. Returns (got, at_staging, preplanned, planned_for): the
-    aim, and the descent planned during the flight for the pose it flew to
-    (descent_from_staging). An aim that sees nothing at
-    staging leaves the search's fix standing; the press then goes from
-    staging all the same. Stops the run on an already-open box.
-
-    `coarse`: the fix is a sighting only (a top cut by the fingers or the
-    image edge, or no button circle from high up) — biased by up to half
-    the lid. It may bring the arm here; it may not aim a press, so an aim
-    that sees nothing stops the run.
-
-    `depth_press`: no descent planned on the way, and centred as
-    centre_for_press says."""
-    ctx.cpose = planned_for = watcher.to_container_pose(got)
-    try:
-        approach = build_approach_leg(ctx, cfg)
-    except RuntimeError as e:
-        try_home(ctx, runner, execute, "STOP: the move to staging over the search's fix was refused — %s" % e)
-        sys.exit(1)
-    res = runner.run(
-        [approach],
-        execute=execute,
-        # the descent, planned while the arm flies there (as from the scene
-        # camera's fix): at staging it is re-fitted to the aim, no plan
-        lookahead=None if depth_press else (lambda q: build_press_legs(ctx, cfg, start_joints=q)),
-    )
-    if any(not r.ok for r in res):
-        sys.exit(1)
-    preplanned = runner.lookahead_result
-    seen = {}
-    aim, status = aim_button_at_staging(node, watcher, got[1], runner=runner, out=seen, prior_xy=button_xy(ctx))
-    if aim is None:
-        if coarse:
-            dump_wrist_frame(watcher, "staging")
-            try_home(
-                ctx, runner, execute,
-                "STOP: the search saw a box here but the button is not in view close up (%s) — "
-                "not pressing on a sighting" % status,
-            )
-            sys.exit(1)
-        print("[press_demo] no button close up at staging (%s) — pressing from the search's fix" % status)
-        return got, True, preplanned, planned_for
-    open_already = refuse_open_box(seen.get("button_up_mm"))
-    if open_already is not None:
-        runner.note("open_box", button_above_lid_mm=round(seen["button_up_mm"], 1))
-        try_home(ctx, runner, execute, "STOP: " + open_already)
-        sys.exit(1)
-    aim, _moves, _off = centre_for_press(node, ctx, cfg, runner, watcher, execute, aim, depth_press=depth_press)
-    return aim, True, preplanned, planned_for
-
-
-AT_START_RAD = 0.002  # the arm this close (every joint) to where a pre-planned descent starts stands there
-
-
-def descent_from_staging(ctx, cfg, planned_for, preplanned):
-    """The press legs to fly from staging, and how they came about (for the
-    log). `preplanned` is the descent planned while the arm flew to staging
-    (the approach's lookahead — from the scene camera's fix or the
-    search's), for the container pose `planned_for`: flown as it is when
-    the arm stands where it starts and the wrist's aim landed within
-    PREPLAN_TOL_M of it; otherwise its straight line is re-FITTED to the
-    aim from where the arm stands, with no planner call (runtime/approach.
-    refit_descent — after a move over the button too); and only when that
-    is refused (no waypoint, too far, the line refused) is the descent
-    planned afresh. Whichever it is flies its free air fast
-    (fly_free_air_fast).
-
-    A move over the button used to discard the pre-planned descent, and the
-    search never had one: 0.4 s of planning with the arm standing over the
-    box (bench 2026-09-24)."""
-    from rammp_box_opening.runtime.approach import refit_descent
-
-    legs, how = None, None
-    if not preplanned or planned_for is None:
-        legs, how = build_press_legs(ctx, cfg), "descent planned from over the button"
-    else:
-        from rammp_box_opening.runtime.branches import on_branch
-
-        leg = preplanned[0]
-        # the live reading on the pre-planned leg's side of the wrap: the
-        # re-fitted lines are solved from it (runtime/branches)
-        live = on_branch(ctx.client.joints(), leg.traj.points[0].positions)
-        at_start = rest_distance(live, leg.traj.points[0].positions) <= AT_START_RAD
-        button = from_container(ctx.cpose, ctx.model.button_offset)
-        moved = math.hypot(button[0] - planned_for.xyz[0], button[1] - planned_for.xyz[1])
-        aim = [
-            button[0] + cfg.press_offset_xy[0],
-            button[1] + cfg.press_offset_xy[1],
-            tcp_z(button[2] - cfg.travel_m),
-        ]
-        if at_start and use_preplanned_descent(planned_for, ctx.cpose, preplanned):
-            legs, how = preplanned, "the descent planned during the approach"
-        elif refit_descent(leg, aim, ctx.model.press_quat(button), start_joints=live):
-            if leg.retime is not None:
-                leg.retime(leg.traj)
-            legs, how = preplanned, "the pre-planned descent re-fitted %.1f mm to the aim (no plan)" % (1000 * moved)
-        else:
-            legs, how = build_press_legs(ctx, cfg), (
-                "descent re-planned from the precise fix (%.0f mm from the pre-planned one)" % (1000 * moved)
-            )
-    if fly_free_air_fast(legs[0], cfg):
-        how += "; free air at %.2f" % cfg.warp_fast_speed
-    return legs, how
-
-
-def fly_free_air_fast(leg, cfg):
-    """The press descent from staging, fast where nothing can be touched:
-    above its straight line — the last PRESS_APPROACH_M, which starts
-    4.5 cm above the button — at warp_fast_speed, the line itself at the
-    contact speed it always had. Returns True when warped.
-
-    The guard covers what it covered before and no more: flown on its own,
-    this leg's guard took its baseline and armed where the line begins,
-    plus a settle (runner._run_motion: guard_from — braking into the
-    waypoint read as a touch three inches up, 2026-09-21), so the free air
-    above it could never trip. Warped, the guard does the same on the new
-    timeline: baseline and arming GROUP_SETTLE_S into the line, at the
-    line's unchanged contact speed (the warp's own rule would baseline at
-    the waypoint, where the arm stands still, and arm while it accelerates
-    away). The whole stroke used to fly at contact speed — 2.6 s from
-    staging to the touch, the slowest stretch of the mission (bench
-    2026-09-24). It is the trade grip:down already makes
-    (warp_fast_speed in the container config), and 0 there turns both off."""
-    from rammp_box_opening.runtime.guards import GROUP_SETTLE_S
-    from rammp_box_opening.runtime.warp import path_fraction_after
-
-    from rammp_box_opening.runtime.approach import human_timed_above_waypoint
-
-    fast = float(cfg.warp_fast_speed or 0.0)
-    if leg.waypoint is None or leg.traj is None or leg.guard is None or leg.warp is not None or fast <= leg.speed:
-        return False
-    human_timed_above_waypoint(leg)  # the planner's own timing of the free air was slow
-    slow_frac = path_fraction_after(leg.traj, int(leg.waypoint[0]))
-    warped, arm_frac = warp_trajectory(leg.traj, slow_frac, fast, leg.speed)
-    if arm_frac is None:
-        return False
-    from rammp_box_opening.runtime.stamps import secs
-
-    total = secs(warped.points[-1].time_from_start)
-    settle = max(WARP_SETTLE_FRAC, GROUP_SETTLE_S / max(total, 1e-6))
-    armed_at = min(max(leg.guard.arm_after or 0.0, arm_frac + settle), ARM_AFTER_CAP)
-    leg.traj = warped
-    leg.warp = (fast, leg.speed, slow_frac, GROUP_SETTLE_S)  # a replan re-warps the same way (runner)
-    leg.speed = 1.0  # the profile is baked in; do not dilate it again
-    leg.guard = replace(leg.guard, rebaseline_after=armed_at, arm_after=armed_at)
-    if leg.retime is not None:
-        leg.retime(leg.traj)
-    return True
-
-
-def build_press_legs(ctx, cfg, start_joints=None):
-    """The guarded TOUCH stroke, planned from where the approach ENDS.
-
-    `start_joints` is the approach's predicted end: chained that way, the
-    approach and the descent merge into ONE re-timed execution and the arm
-    does not stop between reaching and touching (runtime/legs.can_merge).
-    Falls back to live joints when nothing is chained in front of it.
-    The push, the retreat and what follows are built from the contact this
-    stroke measures (build_push_legs)."""
-    st = _state(ctx.client.joints() if start_joints is None else start_joints)
-    press, _st = press_stroke(ctx, st, cfg)
-    return [press]
 
 
 # Is the knob UP? Two instruments, and everything the bench has produced:
@@ -1414,25 +530,20 @@ def refuse_open_box(up_mm):
     """Why this box must not be pressed, or None: the aim found its button
     already standing `up_mm` above its own lid. Pressing an open OXO shuts
     it — three runs did exactly that on 2026-09-21 (13:35, 14:14, 14:14).
-    The depth press at staging opens it instead (depth_press._feel_the_lid)."""
+    The full run takes such a box's lid off unpressed (reach_press); this
+    is what --press-only and --guarded stop on."""
     if not knob_is_up(up_mm):
         return None
     return (
         "the button already stands %.0f mm above its lid — this box is already OPEN (left up by the "
-        "run before?). Pressing it would shut it. Push the button down flush and run again, or run with "
-        "--depth-press, which takes an open box's lid off" % up_mm
+        "run before?). Pressing it would shut it. Push the button down flush and run again, or run without "
+        "--press-only and --guarded: the full run takes an open box's lid off" % up_mm
     )
 
 
 def knob_is_up(up_mm):
     """The pop check's verdict on a camera reading (mm above the lid; None: no reading)."""
     return up_mm is not None and up_mm >= KNOB_UP_MIN_MM
-
-
-def popped_offset_m(contact_xyz, ctx):
-    """How far above the predicted button top the pads stopped (m)."""
-    surface = float(contact_xyz[2]) - TIP_TO_TOOL_M - TCP_OFFSET_M
-    return surface - from_container(ctx.cpose, ctx.model.button_offset)[2]
 
 
 def touch_verdict(off_m):
@@ -1443,182 +554,6 @@ def touch_verdict(off_m):
     if off_m >= POPPED_MIN_M:
         return "popped"
     return "press"
-
-
-def build_push_legs(ctx, cfg, contact_xyz, touch_leg=None, push=True):
-    """After the touch: the bounded push from the measured contact (held on
-    the button cfg.push_hold_s before the recoil), then the retreat to the
-    hop with grip:open riding it. push=False (the knob was already up): no
-    push, the retreat starts from the touch itself.
-
-    Press-only stops at the hop too (it used to go straight home): the
-    wrist reads the knob from there, so a press that did not open the box
-    is pressed again instead of reported PRESSED (2026-09-23), and home is
-    flown afterwards from the hop (build_home_from_hop).
-
-    Retreat at TRANSIT speed (owner: everything fast EXCEPT the press
-    stroke). The retreat is LAZY: the push may stop on a trip, so its start
-    is unknown until then — the Runner plans it from live, once."""
-    live = list(ctx.client.joints())
-    st = _state(live)
-    world = ctx.last_world or _full_world(ctx)
-    # the arm's own straight line down from the stop (no planner call while
-    # the fingers press the button); planned when that line is refused
-    legs = []
-    if push:
-        made = (
-            press_push_from_touch(ctx, st, cfg, touch_leg, live, contact_xyz, world)
-            if touch_leg is not None
-            else None
-        )
-        push_leg, st = made if made is not None else press_push(ctx, st, cfg, contact_xyz, world)
-        push_leg.hold_s = float(cfg.push_hold_s)
-        # the recoil reverses the push, then carries on back up the touch
-        push_leg.recoil_via = touch_leg.traj if touch_leg is not None else None
-        legs.append(push_leg)
-    retreat_legs, st = Retreat(
-        cfg.grip_hop_m + cfg.button_travel_m, speed=TRANSIT_SPEED, lazy=True
-    ).plan(ctx, st)
-    legs += retreat_legs
-    legs.append(_grip_open_after_retreat(ctx, st))
-    return legs
-
-
-def build_home_from_hop(ctx, cfg, start_joints=None):
-    """Home from the hop, where press-only ends up: the fingers stand 5 cm
-    over the lid, inside the band the blind home world blocks, so rise out
-    of the corridor first (in the button's own world), then home in the
-    full world — one execution. start_joints: the post-press retreat's
-    end, when built as a lookahead while that retreat flies (run_push) —
-    both plans were made with the arm standing at the hop."""
-    q = ctx.client.joints() if start_joints is None else list(start_joints)
-    _world, rise, st = _rise_over_button(ctx, cfg, _state(q), "retreat:rise")
-    home, _ = _plan_motion(ctx, st, "home", ("joints", list(rest_joints(cfg))), _full_world(ctx), TRANSIT_SPEED)
-    return [rise, home]
-
-
-def _grip_open_after_retreat(ctx, st):
-    """grip:open dispatched on arrival at the hop, overlapping the grip
-    phase's planning; the Runner joins it before the guarded grip:down.
-    Never at the press bottom: the pads sit in the button recess there and
-    the knob pops 15 mm — at the hop they are 35 mm above it."""
-    world = ctx.last_world or _full_world(ctx)
-    # rides the retreat: sent the moment the retreat starts flying, which
-    # is after the recoil has already lifted the pads ~22 mm (RECOIL_ARC_RAD:
-    # back out of the push and on up the touch stroke) — the fingers open
-    # while the arm rises (2026-09-04)
-    return _gripper_leg(
-        ctx,
-        st,
-        "grip:open",
-        GRIPPER_CMD_OPEN,
-        world,
-        defer_join=True,
-        send_with_previous_motion=True,
-    )
-
-
-
-
-def _apply_warp(leg, cfg, slow_speed):
-    """Run a guarded descent fast through free air and slow into contact.
-
-    Positions are untouched; only the timing changes, and every scale is
-    <= 1.0 so no executed velocity exceeds the plan's. The guard stays
-    armed the whole way and re-baselines at the speed change, so contact
-    is judged against a same-regime reference (spec §6 intent preserved).
-    Returns the leg, warped in place, or unchanged when warping is off.
-    """
-    if not cfg.warp_fast_speed or cfg.warp_fast_speed <= slow_speed:
-        return leg
-    warped, arm_frac = warp_trajectory(
-        leg.traj, cfg.warp_slow_frac, cfg.warp_fast_speed, slow_speed
-    )
-    if arm_frac is None:
-        return leg
-    leg.traj = warped
-    leg.speed = 1.0  # the profile is baked in; do not dilate it again
-    leg.warp = (cfg.warp_fast_speed, slow_speed, cfg.warp_slow_frac)
-    # A warped guard OBSERVES the whole stroke but may only TRIP once the
-    # slow-zone rebaseline has settled: in the fast segment the arm's own
-    # dynamics swing the wrist torques by several Nm, and the 3 Nm touch
-    # threshold tripped there at 42 % of the stroke — "struck something
-    # above the button" with nothing struck (bench 2026-09-03). The
-    # runner keeps this rule on every replan (_restore_execution_profile).
-    # capped: a degenerate warp (no real slow zone) must still leave the
-    # guard able to trip at the very end, never disable it outright
-    leg.guard = replace(
-        leg.guard,
-        rebaseline_after=arm_frac,
-        arm_after=min(
-            max(leg.guard.arm_after or 0.0, arm_frac + WARP_SETTLE_FRAC), ARM_AFTER_CAP
-        ),
-    )
-    return leg
-
-
-def build_grip_legs(ctx, cfg, start_joints=None):
-    """Descend around the now-popped knob to grip_clear_m ABOVE the lid
-    plane, grabbing it at its BASE — close on it (band-verified: 0.8 means
-    closed on air), and pull the lid.
-
-    The press goes below the lid plane because it compresses a sprung
-    button; open fingertips sent there hit solid lid and trip the guard
-    (field 2026-08-26) — grip_clear_m keeps them above it."""
-    m = ctx.model
-    button = from_container(ctx.cpose, m.button_offset)
-    quat = m.press_quat(button)
-    world = _interaction_world(ctx, button[2], cfg.travel_m, "button")
-    ctx.last_world = world
-    # start_joints: the post-press retreat's end, when built as a lookahead
-    # while that retreat flies (audit 2026-09-02)
-    st = _state(ctx.client.joints() if start_joints is None else start_joints)
-    # the fingers were opened on arrival at the hop (press phase); the
-    # Runner joins that before the guarded descent below
-    target = [
-        button[0] + cfg.grip_offset_xy[0],
-        button[1] + cfg.grip_offset_xy[1],
-        tcp_z(button[2] + cfg.grip_clear_m),
-    ]
-    # obstruction semantics: a trip on the way down = the open fingers
-    # STRUCK the knob/rim instead of straddling it — honest failure
-    guard = GuardSpec(touch_nm=m.touch_nm, trip="obstruction")
-    down, st = _plan_motion(
-        ctx,
-        st,
-        "grip:down",
-        # vertical final 40 mm: the fingers must straddle the knob from
-        # straight above, not arrive on an arc (field 2026-09-01)
-        ("pose", target, quat, 0.04),
-        world,
-        cfg.grip_speed,
-        guard=guard,
-        invalidates=True,
-    )
-    if cfg.warp_fast_speed and cfg.warp_fast_speed > cfg.grip_speed:
-        from rammp_box_opening.runtime.approach import human_timed_above_waypoint
-
-        # the planner's own timing of the free air above the straight line
-        # was slow (1.66 s for 45 mm, 2026-09-24); the warp then slows the
-        # last warp_slow_frac of the path into contact as before
-        human_timed_above_waypoint(down)
-    _apply_warp(down, cfg, cfg.grip_speed)
-    close = _gripper_leg(
-        ctx,
-        st,
-        "grip:close",
-        GRIPPER_CMD_CLOSED,
-        world,
-        verify=band_verify(cfg.grip_band),
-    )
-    # No band check on the lift: it would close the lift's merge group and
-    # cost a dead stop between the lift and the carry, every run. The check
-    # moved to the set-down (primitives/core.Place), which is the last
-    # moment before the fingers open and the moment it actually matters.
-    lift_legs, st = Lift(cfg.lift_m, speed=cfg.lift_speed).plan(
-        ctx, st
-    )
-    return [down, close, *lift_legs]
 
 
 DROP_X_M = (0.28, 0.65)  # set-down zone: inside the tool-down reach band
@@ -1669,8 +604,9 @@ def lid_drop_candidates(m, cpose, table_z, prefer_xy=None, zone=None):
     that corner): a box at the edge of the table the scene camera saw has
     no axis spot inside it (flatbot 2026-10-23: the box at [0.39, -0.20],
     the zone x 0.43-0.63, y -0.63 to -0.23 — every axis spot out, a
-    diagonal in). One that does not plan falls through to the next
-    (build_place_legs), and the place is planned before the grip."""
+    diagonal in). Without the scene camera's points these are the lid's
+    spots (reach_lid_off.resolve_lid_drop), the first the hand reaches
+    taken."""
     need = lid_place_min_clear(m)
     bx, by = float(cpose.xyz[0]), float(cpose.xyz[1])
     dirs = []
@@ -1695,20 +631,6 @@ def lid_drop_candidates(m, cpose, table_z, prefer_xy=None, zone=None):
     return out
 
 
-def box_relative_lid_drop(m, cpose, table_z, prefer_xy=None, zone=None):
-    """Where the lid goes: beside the DETECTED box, on the table the camera
-    measured. Returns (xyz, direction) or (None, None).
-
-    This used to be a surveyed base-frame point that only moved when the box
-    happened to crowd it. A fixed point assumes a fixed table, which is the
-    assumption a wheelchair takes away — so the spot is derived from the box
-    every run: the first of lid_drop_candidates (`prefer_xy`, when given,
-    chooses only which side is tried first). build_place_legs falls through
-    the rest when the planner refuses one."""
-    spots = lid_drop_candidates(m, cpose, table_z, prefer_xy, zone=zone)
-    return spots[0] if spots else (None, None)
-
-
 CLEAR_SPOTS_Y_M = 0.45  # the map is searched for a drop spot this far either side of the box
 
 
@@ -1723,8 +645,8 @@ def clear_lid_drops(m, cpose, tmap, table_z, judged_out=None):
     flatbot 2026-10-23 17:57 put it on the front edge of the microwave
     standing 14 cm in front of the box, and the wrist camera came down on
     it. The search spans the reach band in x and CLEAR_SPOTS_Y_M either side
-    of the box; the planner then says what the arm reaches
-    (build_place_legs falls through the rest)."""
+    of the box; the first the hand reaches is taken
+    (reach_lid_off.resolve_lid_drop)."""
     lid_h = float(m.lid_dims[2])
     bx, by = float(cpose.xyz[0]), float(cpose.xyz[1])
     spots, why = clear_table.clear_spots(
@@ -1756,9 +678,10 @@ def wrist_points(watcher):
 def room_map(watcher, scene_fix, cpose, at_staging):
     """The table map the lid's spot is chosen on (clear_lid_drops): the
     scene camera's points around the box, moved by its error at the box
-    (the wrist measured where the box is), and, at staging, the wrist's own
-    frame looking straight down at the table around it. None without the
-    scene's points."""
+    (the wrist measured where the box is), and, `at_staging`, the wrist's
+    own frame looking straight down at the table around it — the scrapped
+    staging run's look (until 2026-10-28; every caller now passes False,
+    test_tasks replays 17:57's with it). None without the scene's points."""
     import numpy as np
 
     pts = getattr(scene_fix, "table_points", None)
@@ -1816,362 +739,6 @@ def place_quat(m, lid):
     return yaw_about_world_z(m.press_quat(lid.xyz), float(lid.yaw))
 
 
-def build_place_legs(ctx, cfg, start_joints=None, chain=0):
-    """Carry the lid to the drop spot, guarded set-down, release, retreat,
-    home — the placed lid joins the collision world.
-
-    start_joints: where this phase begins, which is the lift's predicted
-    end when it is chained behind the grip (build_grip_and_place_legs).
-    `chain` continues that chain, so the carry can merge with the lift
-    ahead of it instead of starting a new execution.
-
-    The spot is the one resolved at fix time (ctx.lid_drop). When the
-    planner refuses the carry or the set-down there, the other spots beside
-    the box (lid_drop_candidates) are tried in order and the first that
-    plans is used — an unplannable spot used to end the mission in a
-    traceback with the arm above the box (field 2026-09-17)."""
-    m = ctx.model
-    # this builder OWNS lid_at: a discarded earlier build (a lookahead
-    # thrown away by a no-motion retry) must not leave the transit and
-    # set-down planning around a lid that is still in the gripper
-    ctx.lid_at = None
-    # no spot resolved is no spot found: nowhere is configured to fall back
-    # to (owner 2026-10-27: nothing in the environment is hard coded; the
-    # yaml's lid_place was a bench point 21 cm under flatbot's table)
-    if ctx.lid_drop is None:
-        raise RuntimeError("planning failed for place:lid: no spot to set the lid down was found this run")
-    first = ctx.lid_drop
-    st0 = _state(
-        ctx.client.joints() if start_joints is None else start_joints, chain
-    )
-    refused = []
-    spots = [first]
-    k = 0
-    while k < len(spots):
-        lid = spots[k]
-        k += 1
-        try:
-            legs, st, target, hover = _place_lid_at(ctx, cfg, lid, st0)
-            break
-        except RuntimeError as e:
-            if "planning failed for place:lid:" not in str(e) or ctx.cpose is None:
-                raise
-            refused.append("[%.2f, %.2f] (%s)" % (lid.xyz[0], lid.xyz[1], str(e).split(": ", 1)[-1][:60]))
-            if k == 1 and ctx.lid_drops is not None:
-                # the other spots the cameras saw room at, on this table
-                for d in ctx.lid_drops:
-                    if math.hypot(d.xyz[0] - first.xyz[0], d.xyz[1] - first.xyz[1]) > 1e-3:
-                        spots.append(ContainerPose(xyz=(d.xyz[0], d.xyz[1], first.xyz[2]), yaw=d.yaw))
-            elif k == 1:
-                # only now pay for the alternatives: the first spot
-                # plans on almost every run
-                for xyz, _d in lid_drop_candidates(m, ctx.cpose, first.xyz[2], zone=drop_zone(m, ctx.worlds)):
-                    if math.hypot(xyz[0] - first.xyz[0], xyz[1] - first.xyz[1]) > 1e-3:
-                        spots.append(ContainerPose(xyz=tuple(xyz), yaw=first.yaw))
-    else:
-        raise RuntimeError(
-            "planning failed for place:lid: no drop spot beside the box plans — "
-            + "; ".join(refused)
-        )
-    if refused:
-        print(
-            "[press_demo] lid spot %s refused by the planner — setting the lid "
-            "down at [%.2f, %.2f] instead" % (", ".join(refused), lid.xyz[0], lid.xyz[1])
-        )
-        ctx.lid_drop = lid
-    # The set-down is NOT warped: it flies as the tail of the carry's merge
-    # group, and the group profile gives it the same fast-then-slow the warp
-    # used to bake in — cruising the carry at transit speed and the descent
-    # at setdown_speed, flowing through the junction instead of stopping at
-    # it. The Runner arms the guard at that junction (runner._run_motion).
-    # Warping it here would take it back out of the group (legs.can_merge:
-    # a baked-in profile cannot join one).
-    ctx.lid_at = lid  # worlds carry the placed lid from here on
-    # Retreat to the CARRY height, not 0.11 m: the transit hover sits
-    # 37 mm higher (carry floor), and from the lower retreat end the arm's
-    # spheres sit 18-21 mm from the padded container — inside its 20 mm
-    # padding — so home was refused 12/12 draws at two of three bench
-    # geometries (2026-09-02); from the hover it is valid 18/18. Lazy:
-    # the set-down stops on a touch, so both legs plan from live, once,
-    # as one group.
-    down_z = target[2] - SETDOWN_OVERDRIVE_M
-    retreat_legs, st = Retreat(hover[2] - down_z, speed=TRANSIT_SPEED, lazy=True).plan(
-        ctx, st
-    )
-    home_legs, st = Home(rest_joints(cfg)).plan(ctx, st)
-    return [*legs, *retreat_legs, *home_legs]
-
-
-def _place_lid_at(ctx, cfg, lid, st):
-    """The carry and set-down onto one drop spot: (legs, state, target,
-    hover). Raises the planner's RuntimeError when it refuses either."""
-    m = ctx.model
-    quat = place_quat(m, lid)
-    # the fingers grip the knob grip_clear_m ABOVE the lid plane, so the
-    # lid touches down when the TOOL is that much above lid-top height —
-    # without this the stroke over-travels by grip_clear_m past contact
-    # and crunches the lid into the table (field 2026-09-02, felt as
-    # "pushes too hard" the moment grip_clear_m grew to 5 mm)
-    target = [
-        lid.xyz[0],
-        lid.xyz[1],
-        # the same fingertip correction as the grip: the lid hangs from
-        # where the fingers took it, so both ends must shift together
-        tcp_z(lid.xyz[2] + m.lid_dims[2] + cfg.grip_clear_m),
-    ]
-    hover = Place.hover_for(ctx, target)
-    legs, st = Place(
-        target,
-        quat,
-        name="place:lid",
-        speed=cfg.setdown_speed,
-        touch_nm=cfg.setdown_touch_nm,
-        band=cfg.grip_band,
-    ).plan(ctx, st)
-    return legs, st, target, hover
-
-
-def build_grip_and_place_legs(ctx, cfg, start_joints=None):
-    """The whole tail after the press, as ONE chain: descend on the knob,
-    close, lift, carry, set down, release, retreat, home.
-
-    Built together so the unguarded stretch in the middle — the lift, the
-    carry and the descent onto the drop spot — merges into a single
-    execution. Those were three goals with two full stops between them, and
-    nothing happens at either stop that the arm has to be still for. The
-    contacts keep their own executions: grip:close and the set-down are
-    physical events, and nothing merges across one."""
-    grip = build_grip_legs(ctx, cfg, start_joints=start_joints)
-    place = build_place_legs(
-        ctx, cfg, start_joints=grip[-1].goal_joints, chain=grip[-1].chain
-    )
-    return [*grip, *place]
-
-
-# After a depth press the lid's height is the touch's own: where the pads met
-# the button, flush with the lid, to about a millimetre. The camera's was good
-# to 2-3 mm, and 2 mm then grazed the lid (bench 2026-09-01: grip_clear_m 5
-# mm). The Ankou's popped knob stood only 4.5-8 mm (2026-10-23): 5 mm left the
-# pads ~3 mm of it. The grip:down is guarded either way.
-DEPTH_GRIP_CLEAR_M = 0.003
-
-
-def lid_off_after_depth_press(ctx, cfg, runner, execute, result):
-    """After a depth press that popped the knob (depth_press.lid_ready): the
-    fingers shut for the press open above it, then the tail every press
-    ends with — down around the knob, close, lift, carry to ctx.lid_drop,
-    set down, release, retreat, home (build_grip_and_place_legs), from
-    where the depth press's rise left the arm, the box where the pads met
-    its button (and where the wrist camera saw it slide to, when it slid).
-    Returns the process exit code: 0 only with the lid placed."""
-    from rammp_box_opening.tasks.depth_press import finish
-
-    if result.moved:
-        print("[press_demo] the press slid the box %.0f mm, still standing — gripping it where the wrist camera sees "
-              "it now" % (1000 * result.shift_m))
-    if result.touch_xyz is not None:
-        # the box stands where the pads measured it: grip its knob low, and set
-        # the lid down on the table it stands on when that is lower than the
-        # scene camera's (its table swung 0.180-0.200 m over 2026-10-23, and a
-        # set-down that arrives above the table stops, holding the lid)
-        cfg = replace(cfg, grip_clear_m=min(float(cfg.grip_clear_m), DEPTH_GRIP_CLEAR_M))
-        base_z = float(ctx.cpose.xyz[2])
-        d = ctx.lid_drop
-        if d is not None and base_z < float(d.xyz[2]):
-            print("[press_demo] the lid goes down on the table the touch measured: %.3f, not the scene's %.3f" % (
-                base_z, float(d.xyz[2])))
-            ctx.lid_drop = ContainerPose(xyz=(float(d.xyz[0]), float(d.xyz[1]), base_z), yaw=d.yaw)
-    print("[press_demo] GRIP AND PLACE: the fingers open above the knob, then onto it, close, lift, carry and set "
-          "down as one motion")
-    live = list(ctx.client.joints())
-    try:
-        legs = build_grip_and_place_legs(ctx, cfg, start_joints=live)
-    except RuntimeError as e:
-        homed = try_home(ctx, runner, execute, "STOP before the grip — %s" % e)
-        return max(1, finish(ctx, result, homed))
-    opened = _gripper_leg(ctx, _state(live), "grip:open", GRIPPER_CMD_OPEN, _full_world(ctx))
-    res = runner.run([opened, *legs], execute=execute)
-    grip = [r for r in res if r.leg_name == "grip:close"]
-    if grip and grip[-1].ok:
-        print("[press_demo] LID PULLED — %s" % grip[-1].detail)
-    elif grip:
-        print("[press_demo] GRIP FAILED — %s: the fingers closed on air, so the knob did not pop or the grip missed "
-              "it" % grip[-1].detail)
-    if any(not r.ok for r in res):
-        return 1  # grip or set-down failed — arm holds
-    runner.finish()
-    frames = getattr(ctx, "mission_frames", None)
-    if frames is not None:
-        frames.note(stage="done", popped=True, touch_xyz=None if result.touch_xyz is None else list(result.touch_xyz))
-    print("[press_demo] DONE — box open, lid placed, arm home")
-    return 0
-
-
-def run_push(ctx, cfg, runner, args, touch, touch_leg=None, node=None, watcher=None, retries=1):
-    """The push stage from the touch's measured contact, then the retreat
-    and what follows; the grip phase is planned while the retreat flies.
-    Returns (results, touch).
-
-    The touch's height decides (touch_verdict): on the button → push until
-    the button's stop is felt; on a popped knob → no push, grip; on
-    something else → stop and go home. After the push the wrist looks at
-    the knob from the hop (knob_height_mm): not up → one more press from
-    staging height, then an honest stop. Exits honestly when the arm could
-    not measure its contact."""
-    if not args.execute:
-        # dry-run: the touch never ran, so there is no contact to push from
-        return [], touch
-    contact = touch[-1].contact_xyz if touch else None
-    if contact is None:
-        try_home(
-            ctx,
-            runner,
-            args.execute,
-            "the touch tripped but no fingertip TF was readable — cannot "
-            "bound the push (are %s in the tree?)" % (FINGERTIP_FRAMES[0],),
-        )
-        sys.exit(1)
-    off = popped_offset_m(contact, ctx)
-    verdict = touch_verdict(off)
-    runner.note("touch", offset_mm=round(1000 * off, 1), verdict=verdict)
-    if verdict == "foreign":
-        try_home(
-            ctx, runner, args.execute,
-            "STOP: the pads met a surface %.0f mm above the button top — not this box's "
-            "button (something on the lid, or not the box)" % (1000 * off),
-        )
-        sys.exit(1)
-    push = verdict != "popped"
-    if not push:
-        print(
-            "[press_demo] the button is ALREADY popped — the pads met the knob %.1f mm above "
-            "the lid; not pressing it back down, lifting off to grip it" % (1000 * off)
-        )
-    legs = build_push_legs(ctx, cfg, contact, touch_leg=touch_leg, push=push)
-    res = runner.run(
-        legs,
-        execute=args.execute,
-        # the WHOLE tail is planned here, under the retreat: grip, carry
-        # and place as one chain, so the lift flows into the carry and the
-        # set-down without a stop (build_grip_and_place_legs); press-only's
-        # tail is the rise and home from the hop (fly_home_from_hop)
-        lookahead=(lambda q: build_home_from_hop(ctx, cfg, start_joints=q))
-        if args.press_only
-        else (lambda q: build_grip_and_place_legs(ctx, cfg, start_joints=q)),
-    )
-    if any(not r.ok for r in res):
-        sys.exit(1)
-    if push and node is not None and watcher is not None:
-        seen = {}
-        up_mm = knob_height_mm(node, watcher, ctx, evidence=seen)
-        popped = knob_is_up(up_mm)
-        runner.note(
-            "pop_check", knob_up_mm=None if up_mm is None else round(up_mm, 1), popped=popped, retries_left=retries, **seen
-        )
-        if ctx.mission_frames is not None:
-            ctx.mission_frames.note(popped=None if up_mm is None else bool(popped))
-        if up_mm is None:
-            print("[press_demo] POP CHECK: no wrist frame to judge the knob by — carrying on")
-        elif popped:
-            print("[press_demo] POP CONFIRMED — the knob stands %.1f mm above the lid" % up_mm)
-        elif retries > 0:
-            print(
-                "[press_demo] NOT POPPED — the knob reads %.1f mm above the lid after the push; "
-                "pressing once more" % up_mm
-            )
-            try:
-                return _press_again(ctx, cfg, runner, args, node, watcher, retries - 1)
-            except RuntimeError as e:
-                # its re-plan refused: the arm stands at the hop over the box
-                try_home(ctx, runner, args.execute, "STOP before pressing again — %s" % e)
-                sys.exit(1)
-        else:
-            try_home(
-                ctx, runner, args.execute,
-                "STOP: pressed to the stop twice and the knob still reads %.1f mm above the lid — "
-                "the button did not pop (jammed, or not this mechanism)" % up_mm,
-            )
-            sys.exit(1)
-    return res, touch
-
-
-KNOB_WINDOW_PX = 20  # half-size of the depth window read at the button's pixel
-KNOB_FRAMES = 3
-
-
-def knob_height_mm(node, watcher, ctx, timeout_s=1.5, evidence=None):
-    """From the hop: how far the button's top stands above the lid plane,
-    by the wrist camera (median depth in a window around the button's
-    pixel, over up to KNOB_FRAMES still frames), in mm — or None.
-
-    The frame it judged is kept every run (captures/wrist-pop-*), with the
-    window drawn on it; `evidence` (a dict) receives what each frame read,
-    the window's pixel and the folder. The first reading this check made
-    on the real box — 9.2 mm after a centred push that met the button's
-    stop, 2026-09-21 — left nothing to say whether the knob was down or
-    the reading was low."""
-    import numpy as np
-
-    from rammp_box_opening.perception.depth_source import DEPTH_MAX_M, DEPTH_MIN_M, camera_pose_at
-
-    g = watcher.grab
-    button = from_container(ctx.cpose, ctx.model.button_offset)
-    lid_z = float(button[2])
-    heights, last_stamp, uv = [], None, None
-    # Only frames SHOT after the arm came to rest here are judged: one still
-    # in the pipe from before the push shows the button as it was. The
-    # harness read [-0.0, -0.0, 16.0] mm and called a popped knob "not
-    # popped" (2026-09-21).
-    at_rest_s = node.get_clock().now().nanoseconds * 1e-9
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout_s and len(heights) < KNOB_FRAMES:
-        _spin_detect(node)
-        if g.color_stamp is None or g.depth is None or g.k is None:
-            time.sleep(0.02)
-            continue
-        stamp = (g.color_stamp.sec, g.color_stamp.nanosec)
-        if stamp == last_stamp or stamp[0] + 1e-9 * stamp[1] < at_rest_s:
-            time.sleep(0.01)
-            continue
-        last_stamp = stamp
-        cam = camera_pose_at(g)
-        if cam is None:
-            continue
-        rot, trans = cam
-        k = np.asarray(g.k, float)
-        pc = rot.T @ (np.asarray(button, float) - np.asarray(trans, float))
-        if pc[2] <= 0.05:
-            continue
-        u, v = int(round(k[0, 0] * pc[0] / pc[2] + k[0, 2])), int(round(k[1, 1] * pc[1] / pc[2] + k[1, 2]))
-        h, w = g.depth.shape
-        if not (KNOB_WINDOW_PX <= u < w - KNOB_WINDOW_PX and KNOB_WINDOW_PX <= v < h - KNOB_WINDOW_PX):
-            continue
-        win = g.depth[v - KNOB_WINDOW_PX : v + KNOB_WINDOW_PX + 1, u - KNOB_WINDOW_PX : u + KNOB_WINDOW_PX + 1]
-        valid = win[(win > DEPTH_MIN_M) & (win < DEPTH_MAX_M) & np.isfinite(win)]
-        if valid.size < 40:
-            continue
-        zc = float(np.median(valid))
-        p = rot @ np.array([(u - k[0, 2]) / k[0, 0] * zc, (v - k[1, 2]) / k[1, 1] * zc, zc]) + np.asarray(trans, float)
-        heights.append(1000 * (float(p[2]) - lid_z))
-        uv = (u, v)
-    up_mm = None if not heights else float(np.median(heights))
-    if uv is not None:
-
-        def draw(img):
-            import cv2
-
-            a, b = (uv[0] - KNOB_WINDOW_PX, uv[1] - KNOB_WINDOW_PX), (uv[0] + KNOB_WINDOW_PX, uv[1] + KNOB_WINDOW_PX)
-            cv2.rectangle(img, a, b, (0, 255, 0), 2)
-
-        folder = CAPTURES_DIR / ("wrist-pop-%s" % time.strftime("%Y%m%d-%H%M%S"))
-        out = _save_wrist_frame(g, folder, "knob %.1f mm above the lid (up from %.0f)" % (up_mm, KNOB_UP_MIN_MM), draw)
-        if out is not None:
-            _prune_captures("pop")
-        if evidence is not None:
-            evidence.update(frames_mm=[round(h, 1) for h in heights], uv=uv, capture=None if out is None else str(out))
-    return up_mm
-
-
 def _rise_over_button(ctx, cfg, st, name):
     """A rise back to staging height above the BUTTON, from wherever the arm
     stands in the corridor it came down. Built from the button and nothing
@@ -2191,99 +758,6 @@ def _rise_over_button(ctx, cfg, st, name):
     return world, rise, st
 
 
-def build_restage_legs(ctx, cfg):
-    """From the hop, fingers open over a knob that did not pop: rise back
-    to staging height above the button (_rise_over_button) and close them
-    on the way up — the close rides the rise (it used to stand still at the
-    hop for the whole close first). Up and away from a flush button, the
-    closing fingers touch nothing; the Runner joins the close before the
-    guarded press descends."""
-    st = _state(ctx.client.joints())
-    world, rise, st = _rise_over_button(ctx, cfg, st, "retreat:restage")
-    close = _gripper_leg(
-        ctx, st, "press:close", GRIPPER_CMD_CLOSED, world, defer_join=True, send_with_previous_motion=True
-    )
-    return [rise, close]
-
-
-def _press_again(ctx, cfg, runner, args, node, watcher, retries):
-    """One more press, from staging height, and the same judgement after it."""
-    try:
-        legs = build_restage_legs(ctx, cfg)
-    except RuntimeError as e:
-        try_home(ctx, runner, args.execute, "STOP before pressing again — %s" % e)
-        sys.exit(1)
-    # the descent is planned while the rise flies, from its end
-    res = runner.run(legs, execute=args.execute, lookahead=lambda q: build_press_legs(ctx, cfg, start_joints=q))
-    if any(not r.ok for r in res):
-        sys.exit(1)
-    try:
-        legs = runner.lookahead_result or build_press_legs(ctx, cfg)
-    except RuntimeError as e:
-        try_home(ctx, runner, args.execute, "STOP before pressing again — %s" % e)
-        sys.exit(1)
-    fly_free_air_fast(legs[0], cfg)  # as the first press: free air fast, the line at contact speed
-    ctx.last_pose = (list(legs[-1].target[1]), list(legs[-1].target[2]))
-    res = runner.run(legs, execute=args.execute)
-    if any(not r.ok for r in res):
-        sys.exit(1)
-    touch = [r for r in res if r.leg_name.startswith("press")]
-    return run_push(ctx, cfg, runner, args, touch, touch_leg=legs[-1], node=node, watcher=watcher, retries=retries)
-
-
-def report_press_depth(runner, touch, press, ctx, model):
-    """How deep the press actually went, measured by the arm.
-
-    The touch's fingertip TF is the button's true top height in the frame
-    the arm is commanded in — no camera, no dims.z, no TCP constant. It is
-    printed against what the camera predicted, with the push's depth, and
-    logged, so 'it pressed too low' is a number."""
-    if not touch or touch[-1].contact_xyz is None:
-        return
-    tip = [float(v) for v in touch[-1].contact_xyz]
-    tip_z = tip[2]
-    surface = tip_z - TIP_TO_TOOL_M - TCP_OFFSET_M  # the pad face, base z
-    button = from_container(ctx.cpose, model.button_offset)
-    predicted = button[2]
-    # where the pads LANDED against the aimed centre, in the arm's own
-    # radial/tangential directions: the 2026-09-14..16 miss was +6 mm
-    # radial from a bowing descent and only this number showed it
-    bearing = math.atan2(button[1], button[0])
-    dx, dy = tip[0] - button[0], tip[1] - button[1]
-    radial = dx * math.cos(bearing) + dy * math.sin(bearing)
-    tangential = -dx * math.sin(bearing) + dy * math.cos(bearing)
-    pushed = None
-    if press:
-        end = press[-1].contact_xyz
-        pushed = (tip_z - float(end[2])) * 1000 if end is not None else None
-    runner.note(
-        "press_depth",
-        surface_z=round(surface, 4),
-        predicted_button_z=round(predicted, 4),
-        surface_vs_predicted_mm=round((surface - predicted) * 1000, 1),
-        landed_radial_mm=round(radial * 1000, 1),
-        landed_tangential_mm=round(tangential * 1000, 1),
-        pushed_mm=None if pushed is None else round(pushed, 1),
-        push_outcome=press[-1].outcome if press else None,
-    )
-    print(
-        "[press_demo] pads landed %+.1f mm radial / %+.1f mm tangential of the aimed centre"
-        % (radial * 1000, tangential * 1000)
-    )
-    print(
-        "[press_demo] button surface at z %.4f by touch — the camera predicted "
-        "%.4f (%+.1f mm); push %s"
-        % (
-            surface,
-            predicted,
-            (surface - predicted) * 1000,
-            "met a stop after %.1f mm" % pushed
-            if pushed is not None
-            else ("ran its full bound" if press else "did not run"),
-        )
-    )
-
-
 def _spin_detect(node):
     try:
         rclpy.spin_once(node, timeout_sec=0.1)
@@ -2291,31 +765,6 @@ def _spin_detect(node):
         # rclpy teardown artifact: our SIGINT handler raising inside a
         # subscription take surfaces as RuntimeError, not KeyboardInterrupt
         raise KeyboardInterrupt from e
-
-
-def wait_for_fix(node, watcher, cfg, timeout_s=None):
-    """Spin (the watcher ticks on its timer) until a fresh stable fix.
-
-    The window is never purged here: the watcher keeps its in-flight
-    samples — geometry is lifted with frame-stamp TF, the still-camera
-    filter drops moving frames, the freshness window (1 s) means only
-    the scan's parked tail can support a commit anyway, and the
-    3-agreeing gate still stands — so a fix is often ready the moment
-    the arm parks instead of half a second later (owner: detect during
-    the flip, 2026-09-01)."""
-    limit = cfg.timeout_s if timeout_s is None else timeout_s
-    t0 = time.monotonic()
-    watcher.active = True  # the detector only works inside a detect window
-    try:
-        while time.monotonic() - t0 < limit:
-            _spin_detect(node)
-            watcher.tick_now()  # not at the timer's mercy
-            got = watcher.fix()
-            if got is not None:
-                return got
-        return None
-    finally:
-        watcher.active = False
 
 
 # cuRobo takes 17-21 s to load after sheppy starts the planner (measured
@@ -2371,37 +820,6 @@ def readiness_refusal(client, execute, planner_wait_s=PLANNER_WAIT_S, camera_cfg
                 "no TF from %s to %s — sheppy's `box_opening` node (the arm's TF, the scene camera's and "
                 "the OWL detectors) is not running: `sheppy up box-opening`. Nothing moved." % (client._base_frame, parent)
             )
-    return None
-
-
-def fly_home_from_hop(ctx, cfg, runner, execute):
-    """Press-only's last motion: home from the hop (build_home_from_hop),
-    planned under the retreat (run_push's lookahead) or, when that failed,
-    from here. A refused plan goes through try_home — never a traceback with
-    the arm left 5 cm over the open box. Returns True when home flew."""
-    try:
-        legs = runner.lookahead_result or build_home_from_hop(ctx, cfg)
-    except RuntimeError as e:
-        try_home(ctx, runner, execute, "STOP after the press — home from the hop refused (%s)" % e)
-        return False
-    res = runner.run(legs, execute=execute)
-    return all(r.ok for r in res)
-
-
-def depth_press_refusal(depth_press, cfg, scene, cfg_path=None):
-    """Why --depth-press must not start with this container, or None. Checked
-    before the runtime comes up, so before anything is actuated.
-
-    With detect.confirm_in_flight the scene approach carries the TF-height
-    guarded descent in its own goal (approach_from_scene); once that touches,
-    reach.pressed is set, the depth press is skipped and the press that runs
-    is TF's — the very stroke --depth-press exists to replace."""
-    if depth_press and scene and getattr(cfg, "confirm_in_flight", False):
-        return (
-            "--depth-press with detect.confirm_in_flight: the approach would carry the TF-height descent and "
-            "press before the depth press could run. Set detect.confirm_in_flight: false in %s, or drop "
-            "--depth-press. Nothing moved." % (cfg_path or "the container yaml")
-        )
     return None
 
 
@@ -2526,9 +944,9 @@ def scene_detect_report(locator, duration_s=DETECT_REPORT_S):
 
 
 def detect_only_report(node, watcher, ctx, cfg, runner, execute):
-    """--detect-only --no-scene, the wrist-mount calibration observation:
-    hold at the look pose reporting every fresh fix (top-face centre, yaw,
-    footprint), then park home.
+    """--wrist-detect, the wrist-mount calibration observation: hold at the
+    look pose reporting every fresh fix (top-face centre, yaw, footprint),
+    then park home.
 
     Place the container at a TAPE-MEASURED spot first; the printed base
     pose vs truth solves the wrist-mount error."""
@@ -2570,8 +988,8 @@ def detect_only_report(node, watcher, ctx, cfg, runner, execute):
 
 
 # This close (every joint, wrap-aware) to the rest pose is AT it; anywhere
-# else, the run's first motion goes there (home_first). A compliant
-# depth-press run starts from anywhere within REST_TOL_RAD instead: after a
+# else, the run's first motion goes there (home_first). A compliant run
+# starts from anywhere within REST_TOL_RAD instead: after a
 # compliant run's impedance home the joint spring holds the arm off HOME
 # (flatbot 2026-10-27 16:24: 0.03 rad, and the run flew a POSITION home to
 # take it out).
@@ -2588,9 +1006,9 @@ def home_first(ctx, runner, execute, rest, tol=AT_REST_RAD):
     abort) is home_arm's case, whose bare-world and lift-first fallbacks
     want the operator's eye on the bench, not an automatic start.
 
-    main passes tol=REST_TOL_RAD for a compliant depth-press run, which
-    relaxes "the same place" from 0.01 to 0.05 rad for that run alone. An
-    impedance hold cannot stand at exact HOME: the joint spring holds the
+    main passes tol=REST_TOL_RAD for a compliant run, which relaxes "the
+    same place" from 0.01 to 0.05 rad for that run alone. An impedance hold
+    cannot stand at exact HOME: the joint spring holds the
     arm where its pull meets gravity, 0.03 rad off after the 16:23 run's
     impedance home (flatbot 2026-10-27), and the run's first compliant leg
     sags by as much anyway. Flying HOME from there cost the 16:24 run a
@@ -2599,7 +1017,7 @@ def home_first(ctx, runner, execute, rest, tol=AT_REST_RAD):
     have paid the switch back (16:23's paid 0.26 s). Such a start is one
     line and a start_offset note, each joint's offset in it (the sag the
     impedance gains are judged by), and nothing after it plans from HOME:
-    the approach and the reach-out plan from the live joints. A start
+    the reach-out plans from the live joints. A start
     beyond `tol` homes as before.
 
     It used to REFUSE any start more than 1.2 rad from a rest pose and fly
@@ -2687,43 +1105,40 @@ def main():
     ap.add_argument(
         "--press-only",
         action="store_true",
-        help="stop after the press (the step-1 demo): press, retreat, home",
+        help="stop after the press: the reach-out presses, rises and goes home; the lid stays on",
     )
-    ap.add_argument(
-        "--depth-press",
-        action="store_true",
-        help="always on since 2026-10-28 (the reach-out's depth press is press_demo's run); accepted so older "
-        "command lines still parse",
-    )
+    # always on since 2026-10-28 (the reach-out's depth press IS the run):
+    # accepted, and without effect, so older command lines and sheppy's
+    # local tasks still parse
+    ap.add_argument("--depth-press", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument(
         "--guarded",
         action="store_true",
-        help="a --depth-press reach-out with its torque guards and checks, position-controlled, as before "
-        "2026-10-27; without it that press runs COMPLIANT (constants.COMPLIANT_DEFAULT): joint impedance, "
-        "nothing it reads stops the arm",
+        help="the reach-out's depth press with its torque guards and checks, position-controlled, as before "
+        "2026-10-27; it ends at the press (no lid off). Without it the run is COMPLIANT "
+        "(constants.COMPLIANT_DEFAULT): joint impedance, nothing it reads stops the arm",
     )
-    ap.add_argument(
+    detect = ap.add_mutually_exclusive_group()
+    detect.add_argument(
         "--detect-only",
         action="store_true",
-        help="report the scene camera's fixes for 15 s and exit; nothing moves. "
-        "With --no-scene: the wrist-mount calibration observation (look pose, "
-        "15 s of wrist fixes, home)",
+        help="report the scene camera's fixes for 15 s and exit; nothing moves",
     )
-    ap.add_argument(
-        "--no-scene",
+    detect.add_argument(
+        "--wrist-detect",
         action="store_true",
-        help="find the box with the wrist camera's search instead of the scene "
-        "camera (the stub harness, and A/B runs); without it the scene camera "
-        "alone finds the box",
+        help="the wrist-mount calibration observation (was --detect-only --no-scene): the arm to the look pose, "
+        "15 s of the wrist camera's fixes printed, home; the scene camera is not used",
     )
     ap.add_argument(
         "--scene-calib",
         default=None,
-        help="scene camera calibration yaml (default: the installed "
-        "config/camera_scene.yaml; the stub harness passes its own)",
+        help="scene camera calibration yaml (default: the installed config/camera_scene.yaml)",
     )
     args = ap.parse_args()
-    args.depth_press = True  # the depth press is the run (owner 2026-10-28)
+    # the reach-out reads it (reach_press.run_reach_press): its depth press
+    # is the run (owner 2026-10-28), whatever the command line said
+    args.depth_press = True
     args.compliant = COMPLIANT_DEFAULT and not args.guarded
     cfg_path = args.container or cli_common.default_container_yaml()
     bench = args.bench_world or cli_common.default_bench_yaml()
@@ -2732,10 +1147,7 @@ def main():
     # the grip band in this gripper's current readings (runtime/fingers: an
     # empty close read 0.793 when it was measured, 0.636 since 2026-09-25)
     cfg = replace(cfg, grip_band=tuple(round(v, 3) for v in fingers.scaled_band(cfg.grip_band)))
-    cli_common.refuse_unmeasured(model, args.execute, measuring=args.detect_only)
-    why = depth_press_refusal(args.depth_press, cfg, scene=not args.no_scene, cfg_path=cfg_path)
-    if why:
-        sys.exit("[press_demo] not starting: %s" % why)
+    cli_common.refuse_unmeasured(model, args.execute, measuring=args.detect_only or args.wrist_detect)
     node, client = cli_common.init_runtime(args.execute)
     worlds = WorldStore(bench)
     client._base_frame = worlds.base_frame
@@ -2751,17 +1163,14 @@ def main():
         )
     runner = Runner(client)
     cli_common.apply_speed_scale(runner, args)
-    # The persistent owl_detector node owns the OWL model; there is no
-    # in-process copy (a second OWLv2 beside cuRobo on one GPU, field
-    # 2026-09-01). The rung also owns the node's ENABLE gate: inference
-    # runs only inside the mission's detect windows, because at 100 % GPU
-    # duty it doubled every cuRobo solve (measured 2026-09-02).
-    # PERCEPTION ON ITS OWN THREAD. The cameras, the detector's tick and the
-    # OWL rungs live on a second node spun by a background executor, so the
-    # control loop's spin cadence (a 1 kHz joint-state stream, action
+    # PERCEPTION ON ITS OWN THREAD. The cameras and the scene camera's
+    # detector rungs live on a second node spun by a background executor, so
+    # the control loop's spin cadence (a 1 kHz joint-state stream, action
     # feedback, planning calls) never starves them: on the stub bench the
-    # single executor gave the detector 1.6 frames a second, and the wrist
-    # could not confirm a box in a one-second reach (2026-09-16).
+    # single executor gave the wrist's detector 1.6 frames a second
+    # (2026-09-16). The persistent owl_detector nodes own the OWL models;
+    # there is no in-process copy (a second OWLv2 beside cuRobo on one GPU,
+    # field 2026-09-01).
     pnode = rclpy.create_node("rammp_box_opening_perception")
     from rclpy.executors import SingleThreadedExecutor
 
@@ -2780,27 +1189,12 @@ def main():
 
         announce_container(pnode, cfg_path)
 
-        impls = {}
-        owl = None
-        watcher_holder = {}
-        if cfg.detect_source == "vlm":
-            from rammp_box_opening.perception.vlm_source import fetch_box_roi
-
-            impls["claude"] = fetch_box_roi  # bounded at call time, below
-            if "owl" in cfg.vlm_backends:
-                from rammp_box_opening.perception.owl_source import OwlRung
-
-                # listener starts NOW, not at detect time: the node sees the
-                # box as the arm settles and its bbox gates the depth watcher,
-                # so the fix is usually ready within a few still frames
-                owl = OwlRung(pnode, cfg, watcher_holder)
-                impls["owl"] = owl
-        # the box found by geometry: the lid plateau above the surveyed table
+        # the wrist camera's frames: the aim from the look pose
+        # (aim_button_at_staging) and the wrist-mount observation
         watcher = BoxTopWatcher(pnode, cfg, model, worlds.table_top_z, base_frame=worlds.base_frame,
                                 camera_cfg_name=worlds.wrist_camera_config)
-        watcher_holder["watcher"] = watcher
         # The scene camera finds the box before the arm moves — the only thing
-        # that does, unless --no-scene. It is placed by its calibration
+        # that does. It is placed by its calibration
         # (scripts/calibrate_scene_camera.py), or by TF where the robot's TF
         # carries its mount: flatbot's static_tf, whose camera is not the one
         # the installed camera_scene.yaml calibrates.
@@ -2808,7 +1202,7 @@ def main():
 
         scene_by_tf = worlds.external_static_tf
         locator = None
-        if not args.no_scene:
+        if not args.wrist_detect:
             T_base_scene_link = None if scene_by_tf else load_scene_calibration(args.scene_calib)
             if scene_by_tf or T_base_scene_link is not None:
                 from rammp_box_opening.perception.scene_source import SceneLocator
@@ -2836,7 +1230,7 @@ def main():
         )
 
         ctx.press_cfg = cfg  # recovery homes go to the mission's rest pose
-        if args.execute and not args.detect_only:
+        if args.execute and not (args.detect_only or args.wrist_detect):
             # every run keeps what its cameras saw and, when the press lands,
             # where the button really was: a detection set that grows with the
             # bench's own runs (detection_set.MissionFrames; written at the end)
@@ -2844,56 +1238,28 @@ def main():
         why = readiness_refusal(client, args.execute, camera_cfg_name=worlds.wrist_camera_config)
         if why:
             sys.exit("[press_demo] not starting: %s" % why)
-        if locator is None and not args.no_scene:
+        if locator is None and not args.wrist_detect:
             sys.exit(
                 "[press_demo] not starting: the scene camera finds the box, and it is not calibrated (no %s: "
-                "scripts/calibrate_scene_camera.py). `--no-scene` searches with the wrist instead. Nothing moved."
-                % (args.scene_calib or scene_calib_path())
+                "scripts/calibrate_scene_camera.py). Nothing moved." % (args.scene_calib or scene_calib_path())
             )
-        if args.detect_only and locator is not None:
+        if args.detect_only:
             sys.exit(0 if scene_detect_report(locator) else 2)
         # THE FIRST MOTION: the arm to its exact rest pose, when it is not
         # already there (home_first) — every run starts from the same place.
-        # A compliant depth-press run starts from the spring's hold it finds
-        # within REST_TOL_RAD. client.compliant is still False here (only
-        # run_reach_press sets it), so this is its condition read from args,
-        # and the reach-out exists only on the scene path; a box within
-        # straight-down reach after all is approached from the live joints
-        # too. --guarded keeps AT_REST_RAD: its reach-out reads an at-rest
-        # reference at the rest pose and checks gravity against it.
-        start_tol = REST_TOL_RAD if (args.compliant and args.depth_press and not args.no_scene) else AT_REST_RAD
+        # A compliant run starts from the spring's hold it finds within
+        # REST_TOL_RAD. client.compliant is still False here (only
+        # run_reach_press sets it), so this is its condition read from args.
+        # --guarded and the wrist-mount observation keep AT_REST_RAD: the
+        # guarded reach-out reads an at-rest reference at the rest pose and
+        # checks gravity against it.
+        start_tol = REST_TOL_RAD if (args.compliant and not args.wrist_detect) else AT_REST_RAD
         if not home_first(ctx, runner, args.execute, rest_joints(cfg), tol=start_tol):
             sys.exit(3)
-        live = client.joints()
-        # The wrist's OWL is enabled where the wrist starts looking (the
-        # reach, or the search), NOT here: the scene camera's instance runs
-        # first, and two instances inferring at once on this GPU is the
-        # contention that left the scene one silent (field 2026-09-16).
-        # The fingers shut NOW and ride the look (they sit in the
-        # bottom rows of the wrist camera's frame, the box in its middle —
-        # no occlusion, capture 20260901-130610). The join lands before the
-        # guarded touch, which needs them closed. No closed fingers = no
-        # press: an open aperture strikes the lid and can still read
-        # "pressed", so a refused close ends the run here.
-        _ok, finger_pos, _s = client.gripper_cmd(None)  # a query: nothing moves
-        if not args.detect_only and fingers.already_closed(finger_pos):
-            # already shut (the last run left them so): a close would not
-            # move them, and "never moved" is a failed close (runtime/fingers)
-            print("[press_demo] the fingers are already closed (%.3f)" % finger_pos)
-        elif not args.detect_only and not runner.start_gripper(
-            "press:close", GRIPPER_CMD_CLOSED, args.execute
-        ):
-            try_home(
-                ctx,
-                runner,
-                args.execute,
-                "press:close refused or failed — the fingers are not closed",
-            )
-            sys.exit(1)
-        t_detect = time.monotonic()
-        if args.detect_only:
+        if args.wrist_detect:
             # the calibration observation parks at the look pose and stays
             # there: a sighting must not cut its motion short
+            live = client.joints()
             name, target, speed = search_targets(cfg)[0]
             if rest_distance(live, target) > REST_TOL_RAD:
                 res = runner.run(
@@ -2904,446 +1270,99 @@ def main():
                     sys.exit(1)
             detect_only_report(node, watcher, ctx, cfg, runner, args.execute)
             sys.exit(0)
+        # The fingers shut NOW and ride the look (they sit in the bottom rows
+        # of the wrist camera's frame, the box in its middle — no occlusion,
+        # capture 20260901-130610); the reach-out joins the close before the
+        # arm moves toward the box (reach_press._reach_press). No closed
+        # fingers = no press: an open aperture strikes the lid and can still
+        # read "pressed", so a refused close ends the run here.
+        _ok, finger_pos, _s = client.gripper_cmd(None)  # a query: nothing moves
+        if fingers.already_closed(finger_pos):
+            # already shut (the last run left them so): a close would not
+            # move them, and "never moved" is a failed close (runtime/fingers)
+            print("[press_demo] the fingers are already closed (%.3f)" % finger_pos)
+        elif not runner.start_gripper("press:close", GRIPPER_CMD_CLOSED, args.execute):
+            try_home(
+                ctx,
+                runner,
+                args.execute,
+                "press:close refused or failed — the fingers are not closed",
+            )
+            sys.exit(1)
 
         # THE SCENE CAMERA ALONE FINDS THE BOX. It sees the whole workspace
         # from where it stands, so the box is found before the arm has moved
-        # at all, and the arm flies straight to staging above it. The wrist
-        # camera then aims from 12 cm, where it is good, and the descent that
-        # was pre-planned during the approach flies at once when it agrees.
-        # The wrist never searches for it (owner, 2026-10-22): no scene fix,
-        # or no button at staging, and the run stops.
-        got, preplanned, scene_fix, at_staging, reach = None, None, None, False, SceneApproach()
-        scene_seen = None  # the scene camera's box, for its residual against the wrist's button
-        planned_for = None  # the pose `preplanned` was planned for
-        if locator is not None:
-            t_scene = time.monotonic()
-            scene_fix = locator.locate(SCENE_FIRST_LOCATE_S)
-            if ctx.mission_frames is not None:
-                ctx.mission_frames.scene(
-                    scene_frame(locator.grab, locator.base_to_link()),
-                    fix_xyz=None if scene_fix is None else scene_fix.top_xyz,
-                    score=None if scene_fix is None else scene_fix.score,
-                    why=locator.last_why if scene_fix is None else None,
-                    source=None if scene_fix is None else getattr(scene_fix, "source", "owl"),
-                    boxes=getattr(locator, "last_boxes", None),
-                )
-            if locator.moved_note and scene_fix is not None:
-                print("[press_demo] scene camera: %s" % locator.moved_note)  # e.g. the tag was not in view
-            if scene_fix is None:
-                try_home(ctx, runner, args.execute, "NO BOX — scene camera: %s" % locator.last_why)
-                sys.exit(2)
-            scene_seen = scene_fix
-            if not scene_by_tf:
-                trusted, distrust = scene_trust(
-                    residuals_path_for(args.scene_calib), args.scene_calib or scene_calib_path()
-                )
-                if not trusted:
-                    print(
-                        "[press_demo] scene camera: %s — flying to its box anyway; the aim at staging "
-                        "decides, and this run's pair judges the camera again" % distrust
-                    )
-            sp = scene_fix.pose
-            adopt_scene_table(ctx, worlds, watcher, scene_fix)
-            # ... and what stands on it, before the first motion toward the box
-            adopt_seen(ctx, runner, room_map(watcher, scene_fix, sp, at_staging=False), sp.xyz[:2],
-                       worlds.table_top_z if worlds.table_top_z is not None else scene_fix.table_z_scene,
-                       when="scene camera")
-            surveyed = watcher.table_z
-            print(
-                "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points%s "
-                "(%s; the scene reads the table at %.3f%s, surveyed %s; %.1f s to locate "
-                "[%s], %.1f s since start) — flying to staging"
-                % (sp.xyz[0], sp.xyz[1], math.degrees(sp.yaw), scene_fix.n_points,
-                   " (%s, finished from its lid's arc in view)" % scene_fix.partial
-                   if getattr(scene_fix, "partial", "") else "",
-                   scene_source_label(scene_fix), scene_fix.table_z_scene, table_seen_over(scene_fix.table_extent),
-                   ("%.3f" % surveyed) if surveyed is not None else "n/a",
-                   time.monotonic() - t_scene,
-                   " ".join("%s %.2f" % (k[:-2], v) for k, v in locator.last_timing.items()),
-                   time.monotonic() - t_main)
+        # toward it. The wrist never searches for it (owner, 2026-10-22): no
+        # scene fix, and the run stops.
+        t_scene = time.monotonic()
+        scene_fix = locator.locate(SCENE_FIRST_LOCATE_S)
+        if ctx.mission_frames is not None:
+            ctx.mission_frames.scene(
+                scene_frame(locator.grab, locator.base_to_link()),
+                fix_xyz=None if scene_fix is None else scene_fix.top_xyz,
+                score=None if scene_fix is None else scene_fix.score,
+                why=locator.last_why if scene_fix is None else None,
+                source=None if scene_fix is None else getattr(scene_fix, "source", "owl"),
+                boxes=getattr(locator, "last_boxes", None),
             )
-            runner.note(
-                "scene_fix",
-                origin_xyz=[round(float(v), 4) for v in sp.xyz],
-                yaw_deg=round(math.degrees(sp.yaw), 2),
-                top_xyz=[round(float(v), 4) for v in scene_fix.top_xyz],
-                n_points=scene_fix.n_points,
-                owl_score=round(scene_fix.score, 3),  # the detector's score, whichever detector
-                source=getattr(scene_fix, "source", "owl"),
-                n_sightings=int(getattr(scene_fix, "n_sightings", 1)),
-                table_z_scene=None if scene_fix.table_z_scene != scene_fix.table_z_scene
-                else round(scene_fix.table_z_scene, 4),
-            )
-            # EVERY box the scene camera fixes is pressed by the reach-out: the
-            # tilted look, the wrist's aim, the hand turned down onto the
-            # button (owner 2026-10-28: "make the arm always go to that 45
-            # degree looking pose even if it's close enough to go straight up
-            # and down. completely scrap the home -> straight vertical if
-            # close enough mode"). The straight-down staging approach no
-            # longer flies.
-            from rammp_box_opening.tasks.reach_press import run_reach_press
-
-            ctx.cpose = scene_fix.pose  # the box every world and plan from here is built around
-            watcher.roi = None  # the scene bbox never applied to the wrist frame
-            sys.exit(run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator))
-            reach = approach_from_scene(
-                node, ctx, cfg, runner, watcher, args.execute, scene_fix, lookahead=not args.depth_press
-            )
-            # the staging the approach flew (lowered when staging_m was out
-            # of reach): the stroke, the recentre, the retreat and recovery's
-            # rise over the button all go by it from here
-            cfg = reach.cfg or cfg
-            ctx.press_cfg = cfg
-            got, preplanned, planned_for = reach.got, reach.preplanned, scene_fix.pose
-            at_staging = got is not None
-            open_already = refuse_open_box(reach.button_up_mm)
-            # the depth press opens an open box (it feels the lid beside the
-            # knob, depth_press._feel_the_lid); no other press may touch it
-            opens_it = args.depth_press and at_staging and reach.pressed is None
-            if open_already is not None:
-                runner.note("open_box", button_above_lid_mm=round(reach.button_up_mm, 1), opened=opens_it)
-                if not opens_it:
-                    try_home(ctx, runner, args.execute, "STOP: " + open_already)
-                    sys.exit(1)
-                print("[press_demo] the button stands %.0f mm above its lid: this box is already OPEN — not pressing "
-                      "it; the depth press takes the lid off" % reach.button_up_mm)
-            if at_staging and not reach.in_flight:
-                # a move over the button leaves the pre-planned descent
-                # behind the arm: it is re-fitted from where it stands
-                got, _moves, _off = centre_for_press(node, ctx, cfg, runner, watcher, args.execute, got,
-                                                     depth_press=args.depth_press)
-            if reach.failed:
-                try_home(
-                    ctx, runner, args.execute,
-                    "STOP: %s — the scene camera's box is %.2f m out from %s"
-                    % (reach.status, math.hypot(sp.xyz[0], sp.xyz[1]), worlds.base_frame),
-                )
-                sys.exit(1)
-            if got is None and not args.execute:
-                print("[press_demo] preview ends at staging: the aim, the press and what follows need --execute")
-                sys.exit(0)
-            if got is None:
-                dump_wrist_frame(watcher, "staging")
-                try_home(
-                    ctx, runner, args.execute,
-                    "STOP: no button at staging (%s) — the wrist aims, it does not search; is the scene "
-                    "camera's box off?" % (reach.status or watcher.status()),
-                )
-                sys.exit(2)
-        if got is None:
-            print("[press_demo] LOOK: wrist down over the table, sweeping if empty")
-            if owl is not None:
-                owl.enable()  # a fresh window: the first one may have expired
-            # DEPTH FIRST, INSTANTLY, AND WHILE MOVING. One box-sized plateau
-            # on the bench is unambiguous geometry: the coarse path reads it
-            # during the look and the sweeps and stops the arm where it saw
-            # it, and the precise fix the press is aimed with is taken
-            # standing there. Blocking on a semantic model first cost 13 s in
-            # the field (2026-09-01), so the ladder runs ONLY when the whole
-            # search could not answer — semantics on demand.
-            # a sighting is enough to go and look close up (every search fix
-            # is aimed at staging): only with --execute, since a dry run
-            # has no close-up aim to follow
-            got, failed = search_for_box(
-                node, ctx, cfg, runner, watcher, args.execute,
-                accept_coarse=args.execute and not args.detect_only,
-            )
-            if failed is not None:
-                sys.exit(1)
-        seen = watcher.last_coarse() if (got is None and args.execute and not args.detect_only) else None
-        if got is None and seen is None and cfg.detect_source == "vlm" and watcher.grab.color is not None:
-            # (no colour frame at all = the wrist camera is down: there is
-            # nothing to show a model, and status() below says which streams
-            # are missing. This used to WAIT for a frame, forever, on a node
-            # the camera is not even subscribed on — a D405 that dropped off
-            # USB hung the mission here instead of ending it.)
-            # The ladder gets its OWN budget, not what the search left: the
-            # search spends the detect window MOVING, and measuring the
-            # cloud rung against that clock left it with nothing to call
-            # with every time (live dry run 2026-09-15). Still bounded —
-            # on the no-internet target an unbounded call stalled far past
-            # any budget (review 2026-09-02).
-            t_ladder = time.monotonic()
-            bound = dict(impls)
-            if "claude" in bound:
-                # budget read when the rung is CALLED (the owl rung may have
-                # waited 2 s first), never frozen early
-                bound["claude"] = lambda img, c: fetch_box_roi(
-                    img,
-                    c,
-                    budget_s=cfg.timeout_s - (time.monotonic() - t_ladder),
-                )
-            roi, lines = resolve_roi(watcher.grab.color, cfg, impls=bound)
-            for ln in lines:
-                print("[press_demo] VLM %s" % ln)
-            watcher.roi = roi  # None = ungated, honest refusals stand
-            # a bbox only helps a plateau the geometry found ambiguous, and
-            # a commit needs min_hits agreeing frames — a beat, not another
-            # full detect window
-            got = wait_for_fix(node, watcher, cfg, timeout_s=CONFIRM_S)
-        if owl is not None:
-            owl.disable()  # detect window closed: give the GPU back
-        coarse_search = False
-        if got is None and args.execute and not args.detect_only:
-            seen = watcher.last_coarse()
-            if seen is not None:
-                print(
-                    "[press_demo] the search saw the box but not well enough to aim from there (%s) — "
-                    "going over it to look close up" % watcher.status()
-                )
-                got, coarse_search = seen, True
-        if got is None:
-            # benign detect timeout: park home, exit 2
-            dump_wrist_frame(watcher, "nobox")
-            try_home(ctx, runner, args.execute, "NO BOX — %s" % watcher.status())
+        if locator.moved_note and scene_fix is not None:
+            print("[press_demo] scene camera: %s" % locator.moved_note)  # e.g. the tag was not in view
+        if scene_fix is None:
+            try_home(ctx, runner, args.execute, "NO BOX — scene camera: %s" % locator.last_why)
             sys.exit(2)
-
-        if not at_staging and args.execute and not args.detect_only:
-            got, at_staging, preplanned, planned_for = stage_over_search_fix(
-                node, ctx, cfg, runner, watcher, args.execute, got, coarse=coarse_search, depth_press=args.depth_press
+        if not scene_by_tf:
+            trusted, distrust = scene_trust(
+                residuals_path_for(args.scene_calib), args.scene_calib or scene_calib_path()
             )
-        pos, _yaw = got
-        ctx.cpose = watcher.to_container_pose(got)
-        if ctx.mission_frames is not None:
-            source = aim_source(watcher, pos)
-            ctx.mission_frames.located(pos, source, getattr(watcher, "last_aim_capture", None) if source == "aim" else None)
-        print(
-            "[press_demo] BOX at [%.3f, %.3f, %.3f] (%s) -> container origin "
-            "[%.3f, %.3f, %.3f] yaw %.1f deg"
-            % (
-                pos[0],
-                pos[1],
-                pos[2],
-                watcher.status(),
-                ctx.cpose.xyz[0],
-                ctx.cpose.xyz[1],
-                ctx.cpose.xyz[2],
-                math.degrees(ctx.cpose.yaw),
-            )
-        )
-        if scene_seen is not None and at_staging and aim_source(watcher, pos) == "aim":
-            # the pair: where the scene camera put the box, against the
-            # button the close-up aim found; under a calibration file it
-            # corrects that file by itself when enough agree (auto_refine)
-            dx, dy, dz, dyaw = scene_residual(scene_seen.top_xyz, pos, scene_seen.pose.yaw, ctx.cpose.yaw)
-            print(
-                "[press_demo] scene camera was off by [%+.0f, %+.0f] mm, %+.1f deg here %s" % (
-                    dx, dy, dyaw,
-                    "(its mount is TF's: re-measure it, or scripts/calibrate_scene_camera.py --transforms-out)"
-                    if scene_by_tf else "(recorded for the calibration refinement)")
-            )
-            runner.note("scene_residual", dx_mm=round(dx, 1), dy_mm=round(dy, 1), dz_mm=round(dz, 1), dyaw_deg=round(dyaw, 2))
-            if not scene_by_tf:
-                residuals = residuals_path_for(args.scene_calib)
-                record_residual(scene_seen, pos, ctx.cpose.yaw, path=residuals)
-                refined = auto_refine(residuals, args.scene_calib or scene_calib_path())
-                if refined:
-                    print(refined)
-                else:
-                    residual_hint(residuals, args.scene_calib or scene_calib_path())
-        runner.note(
-            "fix",
-            top_xyz=[round(float(v), 4) for v in pos],
-            origin_xyz=[round(float(v), 4) for v in ctx.cpose.xyz],
-            yaw_deg=round(math.degrees(ctx.cpose.yaw), 2),
-            top_residual_mm=round((pos[2] - (watcher.table_z + model.dims[2])) * 1000, 1),
-            roi=list(watcher.roi) if watcher.roi is not None else None,
-            status=reach.status if at_staging else watcher.status(),
-            detect_s=round(time.monotonic() - t_detect, 2),
-        )
-
-        # the depth press (tasks/depth_press) presses from here; with
-        # --press-only the run ends at the press, without it the lid comes
-        # off after it as after any press (lid_off_after_depth_press)
-        depth_here = args.depth_press and at_staging and reach.pressed is None
-        if not args.press_only:
-            # the box lands wherever it lands: resolve the drop spot NOW,
-            # before any container-directed motion — where the cameras see
-            # room for the lid and the hand (clear_lid_drops), refusing
-            # before the press when they see none; without the scene's
-            # points, beside the box (nothing in the environment is
-            # configured: no place, no preferred side)
-            zone = drop_zone(model, worlds)
-            tmap = room_map(watcher, scene_seen, ctx.cpose, at_staging) if scene_seen is not None else None
-            if tmap is not None:
-                drops, spots, why = clear_lid_drops(model, ctx.cpose, tmap, watcher.table_z)
-                # the planner's worlds from the same map (the wrist's look
-                # outvotes the scene camera's speckle), the lid's spots clear
-                adopt_seen(ctx, runner, tmap, ctx.cpose.xyz[:2], watcher.table_z, keep_clear=[d.xyz for d in drops],
-                           when="scene camera and wrist" if at_staging else "scene camera")
-                if not drops:
-                    try_home(ctx, runner, args.execute, "nowhere to set the lid down: %s — move the box, or clear "
-                             "the table around it" % why)
-                    sys.exit(4)
-                best = spots[0]
-                runner.note("lid_spot", xyz=[round(v, 4) for v in drops[0].xyz], turn_deg=round(math.degrees(best.turn)),
-                            room_mm=round(1000 * best.room_m, 1), nearest=best.what, spots=len(spots),
-                            wrist=at_staging)
-                print("[press_demo] lid goes to [%.2f, %.2f, %.3f] — %.0f mm from the box, where the cameras see room "
-                      "for it and the hand (%.0f mm to spare%s)%s" % (
-                          *drops[0].xyz, 1000 * math.hypot(best.xy[0] - ctx.cpose.xyz[0], best.xy[1] - ctx.cpose.xyz[1]),
-                          1000 * best.room_m, "" if best.what == "nothing" else ", %s nearest anything" % best.what,
-                          "; the hand turns %+.0f deg to set it down" % math.degrees(best.turn) if best.turn else ""))
-                ctx.lid_drops, ctx.lid_drop = drops, drops[0]
-            else:
-                drop, _side = box_relative_lid_drop(model, ctx.cpose, watcher.table_z, zone=zone)
-                if drop is None:
-                    try_home(
-                        ctx,
-                        runner,
-                        args.execute,
-                        "no lid drop spot beside the box at [%.2f, %.2f] falls "
-                        "inside the set-down zone (need %.0f mm clear, x %s y %s%s) "
-                        "— move the box"
-                        % (
-                            ctx.cpose.xyz[0],
-                            ctx.cpose.xyz[1],
-                            lid_place_min_clear(model) * 1000,
-                            [round(v, 2) for v in zone[:2]],
-                            [round(v, 2) for v in zone[2:]],
-                            ": the table the scene camera saw" if worlds.table_extent is not None else "",
-                        ),
-                    )
-                    sys.exit(4)
+            if not trusted:
                 print(
-                    "[press_demo] lid goes to [%.2f, %.2f, %.3f] — %.0f mm from "
-                    "the box, beside it (no room map: nothing checked what stands there)"
-                    % (
-                        drop[0],
-                        drop[1],
-                        drop[2],
-                        math.hypot(
-                            drop[0] - ctx.cpose.xyz[0], drop[1] - ctx.cpose.xyz[1]
-                        )
-                        * 1000,
-                    )
+                    "[press_demo] scene camera: %s — reaching out to its box anyway; the wrist's aim from the "
+                    "look pose decides" % distrust
                 )
-                ctx.lid_drop = ContainerPose(xyz=tuple(drop), yaw=0.0)  # the hand unturned
-
+        sp = scene_fix.pose
+        adopt_scene_table(ctx, worlds, watcher, scene_fix)
+        # ... and what stands on it, before the first motion toward the box
+        adopt_seen(ctx, runner, room_map(watcher, scene_fix, sp, at_staging=False), sp.xyz[:2],
+                   worlds.table_top_z if worlds.table_top_z is not None else scene_fix.table_z_scene,
+                   when="scene camera")
+        surveyed = watcher.table_z
         print(
-            "[press_demo] PRESS target origin [%.3f, %.3f, %.3f] yaw %.1f deg"
-            % (ctx.cpose.xyz[0], ctx.cpose.xyz[1], ctx.cpose.xyz[2], math.degrees(ctx.cpose.yaw))
+            "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points%s "
+            "(%s; the scene reads the table at %.3f%s, surveyed %s; %.1f s to locate "
+            "[%s], %.1f s since start) — reaching out"
+            % (sp.xyz[0], sp.xyz[1], math.degrees(sp.yaw), scene_fix.n_points,
+               " (%s, finished from its lid's arc in view)" % scene_fix.partial
+               if getattr(scene_fix, "partial", "") else "",
+               scene_source_label(scene_fix), scene_fix.table_z_scene, table_seen_over(scene_fix.table_extent),
+               ("%.3f" % surveyed) if surveyed is not None else "n/a",
+               time.monotonic() - t_scene,
+               " ".join("%s %.2f" % (k[:-2], v) for k, v in locator.last_timing.items()),
+               time.monotonic() - t_main)
         )
-        if depth_here:
-            # over the button at staging, the hand already straight down: how
-            # far down from the wrist camera's depth, the press by the
-            # torques (tasks/depth_press)
-            from rammp_box_opening.tasks import depth_press
+        runner.note(
+            "scene_fix",
+            origin_xyz=[round(float(v), 4) for v in sp.xyz],
+            yaw_deg=round(math.degrees(sp.yaw), 2),
+            top_xyz=[round(float(v), 4) for v in scene_fix.top_xyz],
+            n_points=scene_fix.n_points,
+            owl_score=round(scene_fix.score, 3),  # the detector's score, whichever detector
+            source=getattr(scene_fix, "source", "owl"),
+            n_sightings=int(getattr(scene_fix, "n_sightings", 1)),
+            table_z_scene=None if scene_fix.table_z_scene != scene_fix.table_z_scene
+            else round(scene_fix.table_z_scene, 4),
+        )
+        # EVERY box the scene camera fixes is pressed by the reach-out: the
+        # tilted look, the wrist's aim, the hand turned down onto the button,
+        # and — the full run — the lid off and set down (tasks/reach_press,
+        # tasks/reach_lid_off). Owner 2026-10-28: "make the arm always go to
+        # that 45 degree looking pose even if it's close enough to go
+        # straight up and down. completely scrap the home -> straight
+        # vertical if close enough mode".
+        from rammp_box_opening.tasks.reach_press import run_reach_press
 
-            result = depth_press.press_down_from_here(node, ctx, cfg, runner, watcher, depth_press.DOWN_CONTACT_TOOL,
-                                                      knob_up_mm=reach.button_up_mm)
-            result = depth_press.after_scene_check(ctx, runner, result, scene_fix, locator)
-            if not args.press_only:
-                result = depth_press.knob_up_after(node, ctx, watcher, runner, result)
-                if depth_press.lid_ready(result):
-                    sys.exit(lid_off_after_depth_press(ctx, cfg, runner, args.execute, result))
-            homed = result.free and try_home(ctx, runner, args.execute, depth_press.home_why(result) or "DEPTH PRESS done")
-            sys.exit(depth_press.finish(ctx, result, homed))
-        if at_staging and reach.pressed is not None:
-            # the reach carried its descent and touched: nothing to fly here
-            runner.note("press_plan", in_flight=True)
-            print("[press_demo] reached and touched in one motion")
-            touched, touch_leg = reach.pressed, reach.press_leg
-        else:
-            if at_staging:
-                # the arm already stands at staging above the box: the descent
-                # alone — the one pre-planned during the approach when the aim
-                # agrees with the scene's fix, re-FITTED to the aim when it
-                # moved the target a little, re-planned only otherwise
-                try:
-                    press_legs, how = descent_from_staging(ctx, cfg, planned_for, preplanned)
-                except RuntimeError as e:
-                    # a refused press plan: nothing has touched the box —
-                    # rise over it and go home, never a traceback over the lid
-                    try_home(ctx, runner, args.execute, "STOP before the press — %s" % e)
-                    sys.exit(1)
-                runner.note("press_plan", from_staging=True, preplanned=press_legs is preplanned, how=how)
-                print("[press_demo] PRESS from staging — %s" % how)
-            else:
-                # The approach and the descent are built as ONE chain and run
-                # as ONE execution: the descent is planned from where the
-                # approach ends, so the Runner re-times them into a single
-                # profile that flows through the junction (legs.can_merge).
-                # What this gives up is a close-range re-fix at a staging
-                # stop (owner: no recalibrating mid flight). Each half is
-                # planned in its OWN world, so the lateral run happens where
-                # the container is visible.
-                runner.note("press_plan", chained=True)
-                try:
-                    approach = build_approach_leg(ctx, cfg)
-                    press_legs = [
-                        approach,
-                        *build_press_legs(ctx, cfg, start_joints=approach.goal_joints),
-                    ]
-                except RuntimeError as e:
-                    try_home(ctx, runner, args.execute, "STOP before the press — %s" % e)
-                    sys.exit(1)
-            touch_leg = press_legs[-1]
-            # what follows the touch (the push's xy, the retreat) is relative
-            # to the pose this stroke is ACTUALLY aimed at — a re-fitted or
-            # pre-planned one was aimed before the last pose was commanded
-            ctx.last_pose = (list(touch_leg.target[1]), list(touch_leg.target[2]))
-            touched = runner.run(press_legs, execute=args.execute)
-            if any(not r.ok for r in touched):
-                sys.exit(1)
-        touch = [r for r in touched if r.leg_name.startswith("press")]
-        if args.execute:
-            # the fingers are shut on nothing in the air above the button up
-            # to the touch: what their knuckle reads now is this gripper's
-            # empty close (runtime/fingers)
-            fingers.learn_closed(client.gripper_cmd(None)[1])
-        res, touch = run_push(
-            ctx, cfg, runner, args, touch, touch_leg=touch_leg, node=node, watcher=watcher
-        )
-        press = [r for r in res if r.leg_name.startswith("press:push")]
-        if ctx.mission_frames is not None:
-            ctx.mission_frames.note(stage="pressed")
-        print(
-            "[press_demo] PRESSED — %s"
-            % (press[-1].detail if press else "no push ran (dry-run)")
-        )
-        report_press_depth(runner, touch, press, ctx, model)
-        if args.press_only:
-            if args.execute:
-                # the pop is confirmed (or pressed again) at the hop; home from there
-                if not fly_home_from_hop(ctx, cfg, runner, args.execute):
-                    sys.exit(1)
-            runner.finish()
-            sys.exit(0)
-
-        # No pre-grip re-look: at the hop the lid does not fit in the depth
-        # frame (its far edge projects past the last row), so the border
-        # gate refused every attempt — 1.2 s per run for nothing (audit
-        # 2026-09-02). A press that scoots the box is caught by the guarded
-        # grip:down (an obstruction trip) and the band verify (closed on
-        # air), both honest failures.
-        print(
-            "[press_demo] GRIP AND PLACE: onto the knob, close, then lift, "
-            "carry and set down as one motion"
-        )
-        try:
-            legs = runner.lookahead_result or build_grip_and_place_legs(ctx, cfg)
-        except RuntimeError as e:
-            # nothing of the tail has moved yet: the button is popped and
-            # the fingers are open above the box — go home, never a
-            # traceback with the arm left hanging (field 2026-09-17)
-            try_home(ctx, runner, args.execute, "STOP before the grip — %s" % e)
-            sys.exit(1)
-        res = runner.run(legs, execute=args.execute)
-        grip = [r for r in res if r.leg_name == "grip:close"]
-        if grip and grip[-1].ok:
-            print("[press_demo] LID PULLED — %s" % grip[-1].detail)
-        elif grip:
-            print(
-                "[press_demo] GRIP FAILED — %s: the fingers closed on air, so the "
-                "button did not pop or the grip missed the knob" % grip[-1].detail
-            )
-        if any(not r.ok for r in res):
-            sys.exit(1)  # grip or set-down failed — arm holds
-        runner.finish()
-        if ctx.mission_frames is not None:
-            ctx.mission_frames.note(stage="done")
-        print("[press_demo] DONE — box open, lid placed, arm home")
+        ctx.cpose = scene_fix.pose  # the box every world and plan from here is built around
+        watcher.roi = None  # the scene bbox never applied to the wrist frame
+        sys.exit(run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator))
     except KeyboardInterrupt:
         sys.exit(130)  # the abort path already reported what was confirmed
     finally:

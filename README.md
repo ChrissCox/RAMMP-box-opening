@@ -1,9 +1,9 @@
 # RAMMP-box-opening
 
-Open an OXO POP container with the Kinova Gen3 7-DoF + Robotiq 2F-85:
-find the box with the wrist camera, press its lid button, pull the lid
-and set it aside — one autonomous mission (`press_demo`) composed of
-guarded legs. This repo is a **client** of sheppy's two arm containers
+Open a push-button container with the Kinova Gen3 7-DoF + Robotiq 2F-85:
+find the box with the scene camera, press its lid button with the hand
+tilted toward it, pull the lid and set it aside — one autonomous mission
+(`press_demo`). This repo is a **client** of sheppy's two arm containers
 (rammp-deployments, `december_2026` manifest): the kinova-gen3-ros2 driver
 executes and grips, the RAMMP-CuRobo v1.0.0 planner plans. Interfaces and
 the robot description come from the `~/rammp_deps_ws` overlay — no copied
@@ -112,18 +112,16 @@ the wrist-flat lore: the wrist-flat TRANSIT family fails inside ~0.5 m
 radius, while TOOL-DOWN work covers the whole band — which is why every
 mission pose uses the tool-down family.
 
-For the mission, the practical zone is tighter than the reach band: the
-box must be in VIEW before it can be reached, and what has to be in view is
-the whole box TOP: it sits `dims.z` nearer the camera than the table, so it
-is seen through a smaller window, and a top touching the image border is
-refused. From the LOOK (HOME's hand lifted and wrist turned down) the camera
-stands at (0.49, 0, 0.48) looking straight down, and at lid height the frame
-covers **x 0.28–0.71, y ±0.38** — the narrow axis is x. The base then sweeps
-`scan.search_arc_rad` (0.6 rad) each way, carrying that view centre to
-(0.41, ∓0.28) and swinging the narrow axis somewhere new. A
-container outside what the search covers exits honestly via the no-box
-path. (`open_box.park_tool_down: true` makes the look pose the resting
-pose too — off by default; the run ends at HOME.)
+This band is straight-down reach, and the mission no longer presses
+straight down (2026-10-28): every box is pressed by the reach-out, the
+hand tilted back toward the arm (`tasks/reach_press.py`), which reaches
+farther (flatbot: boxes 0.50-0.82 m out). For the mission the box must
+stand where the scene camera sees it — it alone finds the box — and where
+the reach-out's look and press plan: both are proven by the arm's own
+kinematics before the arm moves toward the box, and a box they do not
+reach is refused with nothing moved. (`open_box.park_tool_down: true`
+makes HOME's wrist turned down the resting pose — off by default; the run
+ends at HOME.)
 
 Caveats (also in the JSON meta): bare-bench world — the container's own
 collision model shrinks this only locally; every PROBE plan starts at
@@ -135,13 +133,13 @@ absorbs tool-down yaw). Re-run whenever bench geometry changes:
 python3 scripts/reach_probe.py            # ~2 min on the Orin; --quick to smoke
 ```
 
-## The mission (owner design 2026-08-24; press proven live 2026-08-25)
+## The mission (owner design 2026-08-24; one run, the reach-out, since 2026-10-28)
 
 One launch, one command, autonomous once started:
 
 ```zsh
 # rammp-deployments/december_2026: arm, planner, both cameras AND this
-# package's launch (robot TF, scene TF, two OWL nodes — the `box_opening` node)
+# package's launch (robot TF, scene TF, the OWL nodes — the `box_opening` node)
 sheppy up box-opening
 ros2 run rammp_box_opening press_demo --execute      # in its own shell
 ```
@@ -150,104 +148,66 @@ Without sheppy, the launch runs by hand instead:
 `ros2 launch rammp_box_opening press_demo.launch.py` (`camera:=true` adds
 a host D405 driver). Its output under sheppy is `sheppy logs box_opening`.
 
-Flow (`tasks/press_demo.py`, one log line per state):
+Every box is pressed by the REACH-OUT, however near it stands (owner,
+2026-10-28: "make the arm always go to that 45 degree looking pose even if
+it's close enough to go straight up and down. completely scrap the home ->
+straight vertical if close enough mode"). Flow (`tasks/press_demo.py`, then
+`tasks/reach_press.py` and `tasks/reach_lid_off.py`; one log line per
+state):
 
-0. **SCENE** — before the arm moves at all, the fixed scene camera finds
-   the box (`perception/scene_source.py`): its own OWL instance says which
-   thing in the frame is the box, and the depth points inside that box
-   at lid height, lifted through the calibration in
-   `config/camera_scene.yaml` (`scripts/calibrate_scene_camera.py`, no
-   motion, no marker to attach), give the box's position to a few
-   centimetres. The arm flies straight to staging above it in one goal
-   from HOME; from there the press is aimed by the button's CIRCLE alone
-   (`perception/button_aim.py`: OpenCV's largest circle of the button's
-   diameter, at lid height, on a flat lid — no OWL, no box-footprint gate
-   on this path; owner's design 2026-09-17). The press point is the
-   circle's CENTRE, nothing else. The descent pre-planned during the
-   approach flies as it is when the aim agrees within 2 mm, and is
-   re-fitted to the aim otherwise (a level move at staging height, then
-   straight down; no planner call). When the aim finds the button more
-   than 5 mm from under the tool, the arm first moves over it and aims
-   again (up to twice): every press is aimed from directly above the
-   button, wherever the box stands. A
-   box that is ALREADY OPEN is not pressed (an open OXO pressed is an OXO
-   shut): the aim measures the button against its own lid ring in the same
-   frame, and at 6 mm or more the run stops and says so — this knob stands
-   about 10 mm proud when up. After the push the wrist confirms the pop the
-   same way (>= 6 mm) before the grip; only a knob that is really down is
-   pressed once more. A touch 8-35 mm above the button top also means the
-   knob is up (no push), but the raised knob is soft and a stroke can ride
-   it down unnoticed, so the camera is the judge. Every run records
-   the scene-versus-wrist residual
-   (`~/.ros/rammp_box_opening/scene_calib/residuals.jsonl`), which is the
-   data that refines the calibration. With `detect.confirm_in_flight`
-   (only once the wrist camera's timestamp lag has been measured, see
-   `config/camera_d405_wrist.yaml`) the approach and the guarded descent
-   are ONE goal and the wrist confirms on the way: the arm never stops
-   above the box. The scene camera alone finds the box (owner,
-   2026-10-22): no scene fix, or no button found at staging, and the run
-   stops and homes. `--no-scene` runs the OWL-gated wrist search below
-   instead (the stub harness, A/B runs). On a robot whose TF carries the
-   scene camera's mount (world `external_static_tf`: flatbot) it is placed
-   by TF, not by `camera_scene.yaml`. `config/containers/ankou_pink.yaml` is the pink canister
-   (the default); `oxo_pop.yaml` the 4.1-inch OXO, `oxo_pop_small.yaml` the
-   2.9-inch one (`--container`).
-1. **LOOK** (`--no-scene` only) — the arm's own rest pose with the hand lifted and the wrist
-   pitched down (`primitives/look.py`): 3.42 s, where flying to a fixed
-   bench pose measured 3.89 s. Seeing nothing, the
-   base SWEEPS `scan.search_arc_rad` each way at `SEARCH_SPEED`, and the
-   motion is cancelled the instant the camera sees a box. Planned in the
-   bench world, whose unseen-container band blocks the whole placement
-   zone to container height. A step the arm already stands at is skipped.
-   Nothing in any of this is expressed in the bench frame, so it holds
-   wherever the chair is standing.
-2. **DETECT** — the lid-top plateau above the table
-   (`perception/depth_source.py`: band, smoothness, footprint and border
-   gates, button-circle refine), on TWO paths over the same frames.
-   COARSE runs while the arm moves — no stillness gate, no button circle,
-   looser agreement — and only ever stops a search. PRECISE is taken at
-   rest and is what the press is aimed with. Both look for the lid at the
-   SURVEYED table height plus `dims.z`. The table is not fitted from the
-   camera: passive stereo reads a blank bench as a smear whose mode sits
-   ~35 mm above the real surface, and a fit taken from it moved the lid
-   band off the lid (field 2026-09-16). Gated by the persistent OWL
-   node's bbox (`owl_detector`, `perception/owl_source.py`) — depth
-   answers first, and the semantic ladder (`vlm.backends`: local OWL,
-   then the cloud) is walked only when the whole search could not answer.
-   No stable fix → home, exit 2. The fingers close (`press:close`) before
-   the look and ride it.
-3. **PRESS** — two stages. The TOUCH: the approach CHAINED into ONE
-   guarded stroke toward `press_demo.travel_m` below the lid plane,
-   re-timed into a single execution — the approach cruises at transit
-   speed, the descent at `press_demo.speed`, and the guard
-   (`press.contact_nm`) arms at the junction between them. A trip near the
-   expected contact is the surface, measured by the arm's own fingertip
-   TF; an EARLY trip reports as a strike, and full travel with no trip as
-   "no surface" — both failures. The PUSH: `press.button_travel_m` past
-   that contact, until the button's stop is felt (`press.touch_nm` is its
-   backstop). Then a reflex recoil, a LAZY retreat to the hop with
-   `grip:open` riding it, and a look at the knob from the hop: not popped
-   → one more press.
-4. **GRIP** — guarded descent to `grip_clear_m` above the lid around the
-   popped knob (a trip = struck it), band-verified close
-   (`open_box.grip_band`; 0.8 = closed on air).
-5. **PLACE** — the lift, the carry and the set-down as ONE execution, since
-   nothing happens between them the arm has to be still for. The drop spot
-   is where the cameras see room for the lid and the hand, every run
-   (`perception/clear_table`; no lid pose is configured), at the measured
-   table height. The
-   set-down is guarded at `setdown_touch_nm` (4.0 Nm — the trip IS the
-   success) and re-checks the grip band before releasing, so a lid that
-   slipped on the way is caught before the fingers open. Then lazy retreat
-   to the carry height, home (or the look pose).
+0. **SCENE** — before the arm moves toward it, the fixed scene camera finds
+   the box (`perception/scene_source.py`): sheppy's scene segmenter, or the
+   scene OWL instance where the segmenter cannot answer, says which thing
+   in the frame is the box, and the depth points inside it at lid height,
+   lifted through the calibration in `config/camera_scene.yaml`
+   (`scripts/calibrate_scene_camera.py`, no motion, no marker to attach) —
+   or through TF on a robot whose TF carries the scene camera's mount
+   (world `external_static_tf`: flatbot) — give the box's position to a
+   few centimetres. What the scene camera sees standing on the table goes
+   into every world the planner plans in. The scene camera alone finds the
+   box (owner, 2026-10-22): no scene fix, and the run homes and exits 2.
+   The fingers close as the run starts. `config/containers/ankou_pink.yaml`
+   is the pink canister (the default); `oxo_pop.yaml` the 4.1-inch OXO,
+   `oxo_pop_small.yaml` the 2.9-inch one (`--container`).
+1. **SPOT** — where the lid will go: among what the scene camera sees
+   standing on the table (`perception/clear_table`; no lid pose is
+   configured), the first spot the hand reaches. Resolved before the arm
+   moves toward the box; nowhere → exit 4, nothing moved.
+2. **LOOK** — the hand tilted 30-45 deg back toward the arm (the smallest
+   tilt that plans), pulled back and raised clear of the box, the press
+   proven by the arm's own kinematics before it flies there. From the look
+   pose the wrist aims at the button's CIRCLE (`perception/button_aim.py`,
+   the oblique aim: OpenCV's circle of the button's diameter at lid height
+   — no OWL, no box-footprint gate; owner's design 2026-09-17); the press
+   point is its centre. No button → home, exit 2. A box ALREADY OPEN — its
+   button 6 mm or more above its own lid ring in the same frame; this knob
+   stands about 10 mm proud when up — is not pressed (an open box pressed
+   is a box shut): its lid comes straight off.
+3. **PRESS** — the way in as ONE execution from the aimed look pose: the
+   re-aim, the slide in turning the hand straight down over the button, and
+   the stroke (`tasks/depth_press.py`), all in the driver's joint
+   impedance: its springs push the button through and hold it there
+   `press.push_hold_s`. Nothing the run reads stops the arm — no torque
+   guard, no at-rest check; the e-stop and Ctrl+C do.
+4. **LID** — back up the stroke and out to the look pose, where the wrist
+   judges the knob; one more press where it is not up (still not up:
+   STOP, home). The fingers open as the hand comes down onto the knob and
+   close on it (on air: they open, the hand backs out, home); the lift off
+   the canister, the carry and the set-down on the spot are ONE execution;
+   the fingers open, and home.
 
-Each next phase is planned as a Runner lookahead while the previous
-phase's last unguarded motion flies. `--press-only` stops after the
-press (retreat to staging, home); `--detect-only` reports the scene
-camera's fixes for 15 s with nothing moving, and `--detect-only
---no-scene` is the wrist-mount calibration observation (15 s of wrist
-fixes at the look pose, then home). All knobs live
-in the container's YAML (`config/containers/ankou_pink.yaml` by default).
+`--press-only` stops after the press (rise, home; the lid stays on).
+`--guarded` flies the same reach-out position-controlled, with its torque
+guards and at-rest checks (as before 2026-10-27), and ends at the press.
+`--detect-only` reports the scene camera's fixes for 15 s with nothing
+moving; `--wrist-detect` is the wrist-mount calibration observation (HOME's
+wrist turned down, 15 s of wrist fixes, then home). Without `--execute`
+the run is previewed up to the look pose. `--depth-press` is still
+accepted from older command lines and changes nothing. Exit codes: 0 done
+(the lid set down and the arm home; `--press-only`, `--guarded`: pressed),
+1 a stop, 2 no box or no button, 3 the move home first refused, 4 nowhere
+for the lid, 130 Ctrl+C. All knobs live in the container's YAML
+(`config/containers/ankou_pink.yaml` by default).
 
 Containers are YAML models in `config/containers/`, chosen with `--container`:
 the round clear canister with the pink push-button lid (`ankou_pink.yaml`, THE
@@ -257,21 +217,19 @@ geometry estimated from photos and flagged `measure_me` until taped), the
 CLI and both OWL detector nodes fall back to the default; the detectors take
 their prompts from whichever container the mission is run with.
 
-Every contact descent (press, grip, set-down) arrives from a waypoint
-straight above its target: the v1.0.0 planner has no approach constraint,
-so the waypoint is a planner result and the stretch below it is the arm's
-own straight line (`runtime/kinematics.py`: FK/IK from the driver's URDF;
-`runtime/approach.py`), flown as one trajectory with a brief rest at the
-waypoint. A planner plan for that stretch bowed 5-7 mm sideways — the
-constant off-centre press of 2026-09-14..16.
+Every contact line of the run — the slide in, the stroke, the grip's
+descent, the set-down — is the arm's own straight line
+(`runtime/kinematics.py`: FK/IK from the driver's URDF), never a planner
+path: a planner plan for such a stretch bowed 5-7 mm sideways (the
+constant off-centre press of 2026-09-14..16).
 
-Proven off-bench by `scripts/press_demo_e2e.py` (stub driver + stub planner +
-synthetic D405/OWL on an isolated domain, shipped config minus the cloud
-rung): the actual depth pipeline recovers the box origin to ~1 mm and
-its yaw to a fraction of a degree, the full leg chain runs with the
-guard-trip/cancel/replan path exercised, a button that does not pop the
-first time is pressed again (`repress`), and an empty table homes and
-exits 2. Rebuild, then run it and `scripts/abort_e2e.py` after any change
-(`press_demo_e2e.py repress` runs one scenario). The harnesses keep their
-run logs and captures in their own work folder (`RAMMP_BOX_OPENING_STATE`),
-never beside the bench's in `~/.ros/rammp_box_opening`.
+The stub harness that flew the old straight-down mission end to end
+(`scripts/press_demo_e2e.py`, with synthetic D405 and scene cameras) went
+with that mission on 2026-10-28: the reach-out's compliant legs, its tilted
+look and a wrist camera that rides the arm are beyond its stubs. The
+reach-out and its lid off are tested offline (`test/test_reach_press.py`,
+`test_reach_lid_off.py`, `test_depth_press.py`, `test_press_demo_main.py`);
+`scripts/abort_e2e.py` still proves the Ctrl+C path against a stub driver
+and planner — rebuild and run it after any client, runner or CLI change. It
+keeps its run logs in its own work folder (`RAMMP_BOX_OPENING_STATE`), never
+beside the bench's in `~/.ros/rammp_box_opening`.

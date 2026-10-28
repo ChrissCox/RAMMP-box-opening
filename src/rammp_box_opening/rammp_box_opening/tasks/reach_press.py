@@ -1,11 +1,13 @@
-"""The reach-out press: for a box the hand cannot stand straight down over.
+"""The reach-out press: how every box is pressed.
 
 Flatbot, 2026-10-22: a table 0.30 m above the arm's mount and the box
 0.80-0.89 m out — no straight-down pose reaches the button there at any
 wrist yaw (planner probe, 12 yaws x 3 heights). It is pressed with the hand
 tilted back toward the arm, ONE FINGERTIP coming STRAIGHT DOWN onto the
-button, and only when the arm's own kinematics proves straight down out of
-reach (press_demo.staging_out_of_reach):
+button. It was the press for a box out of straight-down reach; since
+2026-10-28 it presses every box, however near (owner: "make the arm always
+go to that 45 degree looking pose even if it's close enough to go straight
+up and down"; press_demo's straight-down staging press is gone):
 
   LOOK    the hand pulled back toward the arm (REACH_PULLBACK_M) and up
           (REACH_LOOK_RISE_M) clear of the box's padded cuboid, already at
@@ -1582,16 +1584,17 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     process exit code: 0 pressed and the knob popped (--press-only: pressed),
     1 a failure, the box moved or the knob not up, 2 no button.
 
-    THE FULL RUN (a compliant --depth-press run without --press-only, the
-    default since 2026-10-28): from the one-execution way in and the hold
+    THE FULL RUN (a compliant run without --press-only, the default since
+    2026-10-28): from the one-execution way in and the hold
     on, tasks/reach_lid_off.run_full — back to the look pose, the knob
     judged there, the press once more where it is not up, the lid off, its
     spot chosen with the lid lifted (the owner: never at the start, never a
     failure), set down, home: 0 only with the lid set down and the arm home.
     A box the aim sees already open has its lid taken off unpressed.
 
-    COMPLIANT (args.compliant with --depth-press, press_demo's default
-    since 2026-10-27): every leg in the driver's joint impedance, under the
+    COMPLIANT (args.compliant with args.depth_press, press_demo's default
+    since 2026-10-27; press_demo sets depth_press on every run since
+    2026-10-28): every leg in the driver's joint impedance, under the
     client's compliant_gains (RIGID) where a leg names none, and
     nothing the run reads stops the arm — no torque guard, no at-rest read
     or check, no look after the press (depth_press.press_compliant). Its
@@ -1645,8 +1648,8 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     # table against the model's 121 (2026-10-22), so the aim measures it
     prior_button = (float(prior[0]), float(prior[1]), float(scene_fix.top_xyz[2]))
     print(
-        "[press_demo] REACH-OUT: the hand cannot stand straight down over this box — pressing it with the hand tilted "
-        "back toward the arm, one fingertip straight down onto the button"
+        "[press_demo] REACH-OUT: pressing with the hand tilted back toward the arm, one fingertip straight down onto "
+        "the button"
     )
     soft = compliant(ctx)  # no guard references to read, no checks to make
     depth = bool(getattr(args, "depth_press", False))

@@ -70,13 +70,16 @@ With the container at its bench spot, lid on:
    button top IS the container top on this box).
 4. `button_diameter_m`: caliper the round button — it sizes the circle
    the detector aims the press at.
-5. `press.touch_nm`: the press guard's trip threshold. Bracketed at the
-   bench (6.1 stopped short of the seal, 8.1 scooted the box); tune only
-   with `torque_peak` from the run log in front of you.
+5. `press.touch_nm`: a `--guarded` press's trip threshold (the compliant
+   run has no guard: its joint springs push 15 N,
+   `depth_press.COMPLIANT_PRESS_N`, through `press.button_travel_m` and hold
+   `press.push_hold_s`). Bracketed at the bench (6.1 stopped short of the
+   seal, 8.1 scooted the box); tune only with `torque_peak` from the run log
+   in front of you.
 6. `press_demo.travel_m`: press the button by hand with a caliper — the
-   travel at which the lid releases, plus ~2 mm margin. The stroke is
-   position-controlled with the torque guard as a stop; too-large travel
-   means the guard is your only brake.
+   travel at which the lid releases, plus ~2 mm margin. A `--guarded`
+   touch is position-controlled with the torque guard as a stop; too-large
+   travel means the guard is your only brake.
 7. Where the lid goes: nothing to set. It goes where the cameras see room
    for it and the hand, every run (`perception/clear_table`), at the
    measured table height; `open_container.lid_place` is gone (2026-10-27:
@@ -84,23 +87,20 @@ With the container at its bench spot, lid on:
    when nowhere has room.
 8. `open_box.grip_band`: close the fingers on the POPPED knob by hand and
    record the position feedback the runner prints (0.387 at the bench);
-   the band must hold it and exclude 0.8 (closed on air). Also
-   `grip_clear_m` (fingertip stop above the lid plane) and
-   `grip_offset_xy` (a mm-scale trim) — read their comments.
+   the band must hold it and exclude 0.8 (closed on air).
 9. Flip `measure_me: false` — the CLIs refuse `--execute` until then;
    that refusal is the worksheet's completion gate.
 10. Wrist-mount check (needs the camera AT the look pose, so this comes
     after the flip): run §4 steps 2–3, then `press_demo --execute
-    --detect-only --no-scene` with the container placed at a tape-measured spot. The
+    --wrist-detect` with the container placed at a tape-measured spot. The
     arm turns its wrist down — a joint move into free air, no flight —
     reports every fix for 15 s and homes; the printed top-face centre vs
     the tape solves the wrist-mount error. If it reports no fix, check
     `ros2 topic hz /wrist_camera/aligned_depth_to_color/image_raw`
     (sheppy's wrist_camera node up, aligned depth on?), then the status
     line's last reject reason, then where the box is standing — from the
-    look the camera sees 0.58 × 0.33 m of table around (0.36, 0). The
-    `--no-scene` mission sweeps the base to cover more; the observation
-    does not. A failed detect always returns the arm home.
+    look the camera sees 0.58 × 0.33 m of table around (0.36, 0). A failed
+    detect always returns the arm home.
 11. Scene camera calibration (once, and again whenever the camera or the
     cabinet tag is moved). With the launch up and the arm at HOME:
     `python3 scripts/calibrate_scene_camera.py`. It moves nothing: the wrist
@@ -115,14 +115,13 @@ With the container at its bench spot, lid on:
     against the saved file. The table's tilt in base_link that the solve
     uses is `table_normal_base` in world_bench.yaml, measured from the wrist
     camera's own view of the table.
-12. Wrist timestamp lag (once, before `detect.confirm_in_flight` may be
-    turned on): run `python3 scripts/record_scan_frames.py --lag-sweep`
+12. Wrist timestamp lag (optional: the run aims only with the arm at
+    rest): run `python3 scripts/record_scan_frames.py --lag-sweep`
     during any ordinary `--execute` run, then
     `python3 scripts/record_scan_frames.py --analyze-lag <capture dir>` and
     put the offset it reports in `camera_d405_wrist.yaml` `stamp_offset_s`.
     Until then frames shot while the arm moves are placed where the arm
-    was, not where the shutter fired, and the wrist may only confirm the
-    box at rest.
+    was, not where the shutter fired.
 
 ## 3. Every-session preflight
 
@@ -135,10 +134,11 @@ With the container at its bench spot, lid on:
    running); `/gripper_state` reports a gripper present; the wrist
    camera's colour, camera_info and ALIGNED depth all streaming (fails =
    the D405 is off USB, or the camera was launched without
-   `align_depth.enable:=true`). WARN lines do not fail it — the mission has
-   a fallback — but say what is degraded: a silent scene camera (the
-   mission searches with the wrist instead), an owl_detector not running,
-   or up but deaf (`sheppy restart box_opening`).
+   `align_depth.enable:=true`). WARN lines do not fail it but say what is
+   degraded: a silent scene camera (the mission then finds no box and
+   stops before the arm moves toward one: the wrist no longer searches),
+   an owl_detector not running, or up but deaf (`sheppy restart
+   box_opening`).
 2. **Abort drill** (every session, no exceptions): start
    `ros2 run rammp_box_opening home_arm --execute` (it flies as soon as you
    run it — `--execute` alone arms it), then
@@ -150,63 +150,70 @@ With the container at its bench spot, lid on:
    after any client/runner/CLI change, BEFORE burning bench time on the
    live drill.
 
-## 4. The mission (owner design 2026-08-24; press proven live 2026-08-25)
+## 4. The mission (owner design 2026-08-24; one run, the reach-out, since 2026-10-28)
 
 Attended, e-stop in hand. `--execute` alone arms it — NO typed
 confirmation (owner decision: autonomous once started, Ctrl+C stops
-everything; the abort drill above is the proof it does).
+everything; the abort drill above is the proof it does). There is one
+run, the full box opening: every box is pressed by the REACH-OUT — the
+hand tilted back toward the arm, one fingertip straight down onto the
+button — however near it stands (owner, 2026-10-28: "make the arm always
+go to that 45 degree looking pose even if it's close enough to go straight
+up and down. completely scrap the home -> straight vertical if close
+enough mode"), and then the lid comes off and is set down.
 
 1. Off-bench, after any code change: rebuild, then
-   `python3 scripts/abort_e2e.py && python3 scripts/press_demo_e2e.py`
-   — both must PASS before bench time.
+   `python3 scripts/abort_e2e.py` — it must PASS before bench time. (The
+   stub harness that flew the old straight-down mission end to end,
+   `scripts/press_demo_e2e.py`, went with that mission; the reach-out and
+   its lid off are covered offline by `test/test_reach_press.py`,
+   `test_reach_lid_off.py` and `test_depth_press.py`.)
 2. Bringup (§1): `sheppy up bench` — arm, planner, both cameras and the
    `box_opening` node, which runs this package's launch (robot TF, the
    scene camera's TF from `config/camera_scene.yaml` when it exists, and
-   two OWL instances, wrist and scene; stops host strays). The mission
-   shell needs `~/rammp_deps_ws` and this repo's install sourced on top of
+   the OWL instances; stops host strays). The mission shell needs
+   `~/rammp_deps_ws` and this repo's install sourced on top of
    `~/ros2_ws`. The OWL models load once there — `sheppy restart
    box_opening` (or restart a hand-run launch) at the start of
    each session: an OWL instance left running for an hour or two stopped
    receiving camera frames and answered nothing (2026-09-16; the cameras
    themselves were still at 30 Hz).
-3. Preflight + abort drill (§3). Container in the reach band AND the
-   camera's view zone (README), lid on, button flush, nothing else
-   box-sized on the bench (two container-sized tops in view is refused
-   as ambiguous unless the OWL bbox picks one).
-4. Dry-run: `ros2 run rammp_box_opening press_demo` — read the leg
-   preview and the BOX line (container origin must match reality to
-   ~1 cm; if not, stop and check the mount / `table_z`).
+3. Preflight + abort drill (§3). The container where the scene camera
+   sees it and the reach-out reaches it (README, "Where the container may
+   sit"), lid on, button flush.
+4. Dry-run: `ros2 run rammp_box_opening press_demo` — read the SCENE line
+   (the box where it really stands, to a few cm; if not, stop and check
+   the scene camera's calibration or mount) and the lid's spot; the
+   preview ends at the look pose.
 5. First run on this stack: `ros2 run rammp_box_opening press_demo
-   --execute --press-only --speed-scale 0.3` — the driver, the gripper
-   setpoint path and the two-plan approach are new, so watch one slow
-   press before the full mission. (`--speed-scale` is the SAME run watched
-   slowly: every guard takes its baseline and arms at the same point along
-   the path as at full speed — its settle time dilates with the motion. It
-   did not before 2026-09-21, and slow mode false-tripped a press that full
-   speed flew.) Then
+   --execute --press-only --speed-scale 0.3` — watch one slow press before
+   the full run (`--speed-scale` is the SAME run watched slowly). Then
    `ros2 run rammp_box_opening press_demo --execute`. Expected, one log
-   line per state: SCENE (or LOOK) → BOX at … (fix committed;
-   `press:close` went out before the look) → PRESS: the touch ("surface
-   found"), then the push → PRESSED — "met a stop" or "full … push" (the
-   lid should visibly release) → recoil, retreat to the hop with
-   `grip:open` riding it, POP CONFIRMED → GRIP: guarded descent,
-   band-verified close, LID PULLED → PLACE: carry, guarded set-down
-   ("surface felt … set down" at 4.0 Nm), release, retreat to the carry
-   height, home → DONE, exit 0. No box → the arm parks home and it exits 2.
-   Pre-detection legs (scan, no-box home) plan above an unseen-container
-   keep-out band covering the whole placement zone to container height —
-   a failed detection never sweeps low through the container it could
-   not see. Keep OTHER tall objects out of the band.
-   `--press-only` stops after the press (retreat to staging, home).
-6. Repeat from different container positions in the band. Exit
-   criterion: repeatable pressed-and-opened runs, verified in
+   line per state: SCENE: box at … — reaching out → lid goes to … (where
+   the cameras see room for it and the hand) → COMPLIANT … → REACH-OUT:
+   hand tilted N deg … → AIM: button circle … and AIMED from the look pose
+   … → ONE MOTION from the look pose to below the button (the re-aim, the
+   slide in turning the hand down, the stroke) and the hold → back to the
+   look pose → AFTER PRESS 1: knob UP … — the box is open (not up:
+   "pressing once more" and AFTER PRESS 2; still not up: STOP, home) →
+   GRIP: the fingers open on the way down … → CLOSE, then ONE MOTION … →
+   LID GRIPPED → RELEASE, then ONE MOTION … → DONE — box open, lid set
+   down at …, arm home, exit 0. No box → the arm goes home, exit 2; no
+   button from the look pose → home, exit 2; nowhere for the lid → exit 4
+   with nothing moved. Every move flies in the driver's joint impedance
+   and nothing the run reads stops it: the e-stop and Ctrl+C do.
+   `--press-only` stops after the press (rise, home; the lid stays on).
+   `--guarded` flies the same reach-out position-controlled, with its
+   torque guards and at-rest checks (as before 2026-10-27), and ends at
+   the press. `--depth-press` is still accepted and changes nothing: the
+   depth press is the run.
+6. Repeat from different container positions. Exit criterion: repeatable
+   opened-and-lid-off runs, verified in
    `~/.ros/rammp_box_opening/runs/run-*.jsonl`.
-7. Optional: `open_box.park_tool_down: true` rests the arm at the LOOK
-   pose between runs instead of the factory HOME (saves the 2.4-2.9 rad
-   wrist flip twice per run; a run that starts there skips the look
-   itself, since the search skips any step the arm already stands at). It
-   then holds the tool out over where the box goes. Off by default — the
-   run ends at HOME (owner, 2026-09-04).
+7. Optional: `open_box.park_tool_down: true` rests the arm at HOME's wrist
+   turned down between runs instead of the factory HOME (saves the 2.4-2.9
+   rad wrist flip twice per run). It then holds the tool out over the
+   table. Off by default — the run ends at HOME (owner, 2026-09-04).
 
 ## 5. Retired: the Phase-1 primitive ladder
 
@@ -215,8 +222,8 @@ retreat / open_container / pickup_container) and the hand-measured
 `bench_pose` they planned from were retired with the Phase-0/1 tier once
 the camera-driven mission ran live. `home_arm` is the only isolated
 mover left (§3). Exercise the phases through `press_demo` itself:
-`--detect-only` for perception, `--press-only` for the press, the full
-run for grip and place.
+`--detect-only` for the scene camera, `--wrist-detect` for the wrist's
+mount, `--press-only` for the press, the full run for the lid.
 
 ## 6. When something trips
 
@@ -224,19 +231,10 @@ run for grip and place.
   and prints leg name, outcome, torque peak, progress. The same row is
   appended to `~/.ros/rammp_box_opening/runs/run-*.jsonl` (the metrics
   source — do not delete).
-- `press:down` "guard tripped EARLY at N% of the stroke" → the stroke
-  struck something above the button: the box is not where the fix said
-  (scooted by a previous press, or a wrong mount), or something
-  is in the corridor. Stop, look, re-place; re-check the BOX line.
-- `grip:down` trips (obstruction) → the open fingers struck the knob or
-  rim instead of straddling it — the press scooted the box, or
-  `grip_offset_xy` is off. `grip:close` "grip X vs band" fails → closed on
-  air (0.8: the knob was not popped, or the fix was off) or on something
-  too wide.
-- `place:lid:down` "full stroke with no trip — never felt the surface" →
-  the drop spot is higher than modelled or `setdown_touch_nm` is too
-  high; "tripped at N% … set-down NOT confirmed" → struck something on
-  the way down. The lid is still held; clear the area, `home_arm`.
+- "GRIP FAILED — …: the fingers closed on air or on something else" →
+  the knob was not up where the look put it, or the box moved: the fingers
+  open, the hand backs out the way it came down, home. "the fingers read N
+  at the table, outside the grip band" → the lid slipped on the way.
 - "refused before sending: trajectory starts N rad from the live arm" →
   the plan went stale (the arm moved after planning); the runner replans
   from live on drift, so repeated refusals mean something else is moving
@@ -253,16 +251,6 @@ run for grip and place.
   against the knob after changing them.
 - Guard refuses to run: `/joint_states` has no effort fields — the arm
   bringup is wrong, not the guard.
-- press_demo NO BOX with the container plainly in view: read the status
-  line — "camera streams missing" means the driver (aligned depth
-  included) isn't up; "0/N frames … (last reject: …)" names the gate that
-  refused: "no points at container height" → `dims.z`, or a table the fit
-  could not find (a view with no flat dominant surface: clutter, a slope,
-  or the arm looking off the edge);
-  "footprint" → `dims` xy; "touches the image border" → move the box
-  toward the scan axis; "ambiguous" → a second box-sized top is in view
-  and the OWL node did not pick one; "camera moving" only → the arm never
-  parked still.
 - A failed post-touch replan (retreat or home refused from the contact
   pose) stops the mission with the arm holding. Clear the area and run
   `home_arm --execute`; when that is refused as an INVALID START in both
@@ -280,12 +268,12 @@ run for grip and place.
   else; never plan a mission from wreckage.
 - "SCENE: none of the OWL's N candidate(s) is this container: ..." → the
   scene's boxes were all the wrong size or height for `dims` (another
-  container, a lid off, the wrong `--container`); the run falls back to
-  the wrist search. With two containers on the table the right one is
-  chosen by its footprint — the OWL offers its top three.
+  container, a lid off, the wrong `--container`); the run goes home and
+  exits 2 (the wrist does not search). With two containers on the table
+  the right one is chosen by its footprint — the OWL offers its top three.
 - "SCENE: the scene OWL is SILENT" / "saw no box in 3.0 s" with the box
-  plainly in the scene image → the run falls back to the wrist search
-  (slower, still fine). `ros2 topic hz /rammp_box_opening/owl_bbox_scene`
+  plainly in the scene image → no box: the run goes home and exits 2.
+  `ros2 topic hz /rammp_box_opening/owl_bbox_scene`
   should show ~2 Hz heartbeats even disabled. Silent with "re-subscribed"
   lines in `sheppy logs box_opening` → the node stopped receiving frames
   (2026-09-16/17: two executors spinning one node, fixed in the grabbers;
@@ -326,31 +314,27 @@ run for grip and place.
   taller stands right beside or behind the cut box, so that box is refused
   and the frame's other boxes are tried. With no fix at all the run goes
   home and exits 2, as for any scene refusal.
-- "lid spot [x, y] refused by the planner — setting the lid down at [x, y]
-  instead" → normal: the first drop spot beside the box could not be
-  planned and the next side was used. "STOP before the grip — ... no drop
-  spot beside the box plans" → every side of the box is refused (a box
-  near the edge of the set-down zone or the reach): the arm goes home;
-  move the box toward the middle of the table.
+- "lid spot(s) refused by the planner (…) — setting the lid down at [x, y]
+  instead" → normal: the first spot could not be planned and the next was
+  used. "STOP: nowhere to set the lid down: …" or "STOP: the hand reaches
+  none of the N spot(s) the lid could go to (…) — move the box nearer the
+  arm; nothing moved" → resolved before anything moves (exit 4): clear
+  the table around the box, or move the box.
 - "SCENE: scene camera streams missing: colour, ..." → the Gemini driver
   has no device: `docker logs sheppy-scene_camera` stops at "Loaded node"
   with no device lines. Check it is on USB (`lsusb | grep -i orbbec`;
   2026-09-17 it had vanished and the D405 sat on its old port), re-plug
-  it, `sheppy restart scene_camera`. The mission meanwhile falls back to
-  the wrist search.
-- "the wrist did not find the button at staging (0 of N hits agree in M
-  frames (last reject: ...))" → the saved frame
-  (`captures/wrist-staging-<stamp>/frame_000.jpg`) shows what it saw.
-  "no circle of A-B px radius" → the button's `button_diameter_m` is
-  wrong for this box, or the lid is not at `dims.z`; "ring around it is
-  not lid" on every circle → the box is smaller than the model (the
-  annulus around its button reaches the table). `oxo_pop.yaml` is the
-  4.1-inch OXO, `oxo_pop_small.yaml` the 2.9-inch, `ankou_pink.yaml` the
-  round clear canister with the pink push-button lid (THE DEFAULT since
-  2026-09-22: same press-and-pop mechanism as the OXO) — run another with
-  `--container <yaml>`. The search that follows still uses the
-  plateau detector, whose footprint gate wants the model's `dims`.
-  The two OWL detector nodes follow the mission's `--container`
+  it, `sheppy restart scene_camera`. Until then the run finds no box
+  (exit 2).
+- "STOP: no button from the look pose (…) — nothing was pressed" → the
+  saved frame (`captures/wrist-reach-look-<stamp>/frame_000.jpg`) shows
+  what the wrist saw; the status names the last reject. The button's
+  `button_diameter_m` wrong for this box, or the lid not where the scene
+  camera put it, are the usual causes. `oxo_pop.yaml` is the 4.1-inch OXO,
+  `oxo_pop_small.yaml` the 2.9-inch, `ankou_pink.yaml` the round clear
+  canister with the pink push-button lid (THE DEFAULT since 2026-09-22:
+  same press-and-pop mechanism as the OXO) — run another with
+  `--container <yaml>`. The two OWL detector nodes follow the mission's `--container`
   automatically (their prompts and score floor live in it; the mission
   announces its file on a latched topic and the nodes reload) — the log
   line "container -> ... queries [...]" in `sheppy logs box_opening`
@@ -365,92 +349,46 @@ run for grip and place.
   sweep found "clear", "jar", "canister" and "container" alone at 0.00 and
   every "... pink lid" phrase at 0.36-0.67 — the lid is the anchor; the
   OXO's own prompts score the OXO 0.08-0.13 on real wrist frames).
-  `press_demo --detect-only --no-scene --execute --container <yaml>` measures the
+  `press_demo --wrist-detect --execute --container <yaml>` measures the
   top's footprint and height from the wrist as a cross-check — the one
   `--execute` an unmeasured container allows (it flies the look pose and
   home only, never near the box).
-- "STOP: the button already stands N mm above its lid — this box is
-  already OPEN" (N >= 6, read by the aim against the button's own lid
-  ring) → the box was left open by the run before. Nothing is pressed (a
-  press would shut it — three runs did, 2026-09-21); the arm goes home.
-  Push the button down flush and run again. This knob stands ~10 mm proud
-  when up.
-- "the button is ALREADY popped — the pads met the knob N mm above the
-  lid" (N >= 8) → the same thing found by touch, on a path that has no aim
-  (the wrist search); the mission skips the push and grips. The raised
-  knob is soft: a stroke can also ride it down without noticing, which is
-  why the aim's camera check above comes first.
-- "STOP: the pads met a surface N mm above the button top — not this
-  box's button" (N > 35) → something is on the lid, or this is not the
-  box the model describes.
-- "POP CONFIRMED — the knob stands N mm above the lid" (N >= 6; this
-  knob reads 9-11 up and within a millimetre of 0 down) → normal. "NOT
-  POPPED — the knob reads N mm ... pressing once more" → the push did not
-  pop it; the arm closes, rises to staging and presses again. "STOP:
-  pressed to the stop twice and the knob still reads N mm" → the button
-  did not pop under the configured force (`touch_nm`): check the box,
-  then the force. A stop over the box still gets home: when the blind
-  recovery home is refused from there ("home refused from here ... rising
-  over the box first"), the arm rises back to staging height above the
-  button and homes from it.
-- "scene calibration: N pair(s) on file, mean offset [...] mm, spread S m"
-  printed after every staging run → the calibration's own residuals.
-  When it says a rigid refinement is available (>= 4 pairs over 0.15 m —
-  put the box at different spots), run
-  `python3 scripts/refine_scene_calibration.py --apply` (backup kept);
-  with pairs at one spot it applies a shift only. Run it without
-  `--apply` first: it prints the fit and what each pair would be left
-  with. Only pairs recorded AFTER the calibration file was last corrected
-  count (the file's `refined_at`, else its modification time) — older ones
-  measured a calibration that no longer exists, and both the mission and
-  the script say how many they left out.
-- "CENTRE: the button is N mm from under the tool — moving over it" →
-  normal whenever the scene camera's fix is more than 5 mm off: the arm
-  moves over the button at staging height and aims again, so every press
-  is aimed from directly above the button (the only place presses have
-  landed dead centre; aimed 11 cm off, one hit the button's edge and did
-  not open the box, 2026-09-23). "still N mm off after 2 moves" → the
-  wrist camera's mount calibration, not the scene. The wrist search's fix
-  gets the same treatment: staging, a close-up aim, centring, then the
-  press. `detect.recentre_max_moves` (default 2; 0 = aim once).
-- "the search saw the box but not well enough to aim from there — going
-  over it to look close up" → normal when the box stands near the robot
-  (the bottom of the search's view, behind the gripper's fingers) or the
-  button does not resolve from half a metre up: the search stops at the
-  first sighting — a whole top, or a PARTIAL one (cut by the image edge or
-  the fingers, at least 45 % of the lid) — and the arm goes over it; the
-  close-up aim decides the press. "STOP: the search saw a box here but the
-  button is not in view close up" → a sighting is never pressed on; look
-  at the saved captures/wrist-staging-* frame.
+- "ALREADY OPEN: the knob stands N mm above its lid — not pressing it,
+  which would shut the box; taking the lid off" (N >= 6, read by the aim
+  against the button's own lid ring) → the box was left open by the run
+  before; the full run takes its lid off unpressed (a press would shut it
+  — three runs did, 2026-09-21). With `--press-only` or `--guarded` it is
+  "STOP: the button already stands N mm above its lid — this box is
+  already OPEN" and the arm goes home. This knob stands ~10 mm proud when
+  up.
+- "AFTER PRESS 1: knob UP N mm — the box is open" (N >= 6; this knob
+  reads 9-11 up and within a millimetre of 0 down) → normal. "the knob is
+  not up (…): pressing once more — the same press, from the look pose" →
+  the first press did not pop it; "STOP: pressed 2 times and the knob is
+  not up" → the button did not pop under the spring's push: check the box.
+- "scene camera: … — reaching out to its box anyway" → on the last run
+  that recorded a scene-versus-wrist pair the scene camera's box stood
+  more than 5 cm from the button the wrist found. Those pairs were
+  recorded by the straight-down staging aim, one a run; the reach-out
+  records none, so `scripts/refine_scene_calibration.py` refines only from
+  the pairs already on file
+  (`~/.ros/rammp_box_opening/scene_calib/residuals.jsonl`).
 - After `sheppy restart box_opening` the detectors take ~9 s to load; a run
   started sooner reports "the scene OWL is SILENT". Wait for preflight's
   "owl_detector (scene camera) up and receiving frames".
 - "the SCENE CAMERA HAS MOVED since its calibration: the tag is at ..." →
-  the scene camera was re-aimed or knocked; its fixes are refused and the
-  wrist searches instead. Recalibrate with the arm at HOME:
+  the scene camera was re-aimed or knocked. Recalibrate with the arm at HOME:
   `python3 scripts/calibrate_scene_camera.py` (it only listens), then
   `sheppy restart box_opening`. The calibration records where it saw the
   cabinet's tag (`tag_px` in camera_scene.yaml) and every run compares.
-- `--press-only` ends at the hop, reads the knob, presses once more when it
-  did not pop, then rises out of the corridor and goes home — "PRESSED"
-  alone no longer means the box opened; "POP CONFIRMED" does.
-- "PRESS from staging — the pre-planned descent re-fitted N mm to the aim
-  (no plan)" → normal: the aim moved the target a few mm and the descent
-  was rebuilt without the planner. You will see the arm shift sideways by
-  that N mm AT STAGING HEIGHT, then come straight down. A large N every
-  run (10 mm and more) is the scene camera's calibration, not the press:
-  see the "scene calibration" line above.
-- The press lands off the button centre by the SAME amount every run
-  (compare `press:down`'s `contact_xyz` against the BOX line across
-  run-*.jsonl, in the arm's radial/tangential directions) → first check
-  the run output for "NOTE press:down: PLANNER descent": the straight
-  final stretch was refused and the planner's own plan flew, which bows
-  5-7 mm radially (2026-09-16). Only a miss on a straight descent is a
-  pad-vs-tool offset for `press_offset_xy`. Random misses are the fix.
-- PRESSED "met a stop" at a rise below `touch_nm` with the button not
-  popped → the backstop caught it: the stroke was off-centre (above) or
-  the button needs more than `touch_nm` — raise it in 0.5 Nm steps,
-  never past the runner's obstruction ceiling.
+- `--press-only` ends after the press: the rise and home, the lid on. A
+  compliant press is judged by its spring's hold ("PRESSED: ~N N held on
+  the button (a compliant run does not look at the knob)"), not by a look
+  at the knob.
+- A `--guarded` press "met a stop" at a rise below `touch_nm` with the
+  button not popped → the backstop caught it: the stroke was off-centre
+  (above) or the button needs more than `touch_nm` — raise it in 0.5 Nm
+  steps, never past the runner's obstruction ceiling.
 - "camera streams missing" for the WRIST camera with its container up →
   `docker logs sheppy-wrist_camera`: `xioctl ... No such device` means
   the D405 dropped off USB (seen 2026-09-16 13:56). Re-seat the cable

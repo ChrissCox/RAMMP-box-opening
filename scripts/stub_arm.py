@@ -1,5 +1,5 @@
 """Stand-in for the kinova-gen3-ros2 driver container, for the stub-isolated
-e2e harnesses.
+e2e harness (scripts/abort_e2e.py).
 
 Serves what box-opening uses of the driver, minus the physics:
 
@@ -24,9 +24,6 @@ real arm on a button keeps its load through the cancel) and releases when a
 later goal runs to completion, i.e. the arm moved away: the two-stage press
 baselines the push on the in-contact load.
 STUB_GRIP_POS: the knuckle a CLOSE stalls at (the knob between the fingers).
-STUB_POP_ON_TRIP=<k>: the stub button pops on the k-th spike (default 1, the
-first press). 2 makes the first press fail to pop it — the mission's pop
-check must notice and press again (the re-press scenario).
 """
 
 import os
@@ -39,14 +36,13 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool
 
 from rammp_arm_interfaces.action import ExecuteJointTrajectory
 from rammp_arm_interfaces.msg import GripperSetpoint, GripperState
 
-# HOME: every mission run now starts there, flying there first when it is not
+# HOME: every mission run starts there, flying there first when it is not
 # (press_demo.home_first). STUB_START_OFF_HOME=1 starts the stub 0.4 rad off
-# it (joint_1) — the scenario that proves that first move.
+# it (joint_1): abort_e2e interrupts home_arm's move back.
 START = (
     [0.4, 0.262, 3.142, -2.269, 0.0, 0.960, 1.571]
     if os.environ.get("STUB_START_OFF_HOME") == "1"
@@ -56,15 +52,11 @@ NAMES = ["joint_%d" % i for i in range(1, 8)]
 KNUCKLE = "robotiq_85_left_knuckle_joint"
 KNUCKLE_CLOSED = 0.8
 GRIP_TRAVEL_S = 0.3  # a full open-to-closed stroke
-from rclpy.qos import DurabilityPolicy
-
-KNOB_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
 TRIP_EXEC_NS = {
     int(v) for v in os.environ.get("STUB_TRIP_EXEC_N", "").split(",") if v.strip()
 }
 GRIP_POS = os.environ.get("STUB_GRIP_POS")
-POP_ON_TRIP = int(os.environ.get("STUB_POP_ON_TRIP", "1"))
 
 
 class StubArm(Node):
@@ -81,11 +73,6 @@ class StubArm(Node):
         self.grip = (0.0, 0.0, 0.0, 0.0)  # (from, to, t0, duration)
         self.grip_command = None
         self.pub = self.create_publisher(JointState, "/joint_states", qos_profile_sensor_data)
-        # the stub bench's own contract with stub_d405: latched, so a
-        # camera stub that starts later still learns the knob is up
-        self.knob_up = False
-        self.spikes = 0
-        self.knob_pub = self.create_publisher(Bool, "/stub_bench/knob_up", KNOB_QOS)
         self.state_pub = self.create_publisher(
             GripperState, "/gripper_state", qos_profile_sensor_data
         )
@@ -182,15 +169,6 @@ class StubArm(Node):
                 print("EFFORT SPIKE injected (goal #%d)" % goal_n, flush=True)
                 self.level += 9.0
                 self.injected = True
-                self.spikes += 1
-                if not self.knob_up and self.spikes >= POP_ON_TRIP:
-                    # the first trip is the press (POP_ON_TRIP: a later
-                    # one): the stub button pops, and the stub camera
-                    # (stub_d405) renders the knob standing up from here
-                    # on — the mission's pop check reads it
-                    self.knob_up = True
-                    self.knob_pub.publish(Bool(data=True))
-                    print("KNOB UP (stub button popped)", flush=True)
             fb = ExecuteJointTrajectory.Feedback()
             fb.fraction_complete = float(min(1.0, el / dur))
             gh.publish_feedback(fb)

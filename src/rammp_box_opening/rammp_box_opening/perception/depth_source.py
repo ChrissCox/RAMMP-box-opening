@@ -491,7 +491,7 @@ class BoxTopWatcher:
     """Continuous detection on a node timer, FixWindow commit rules, and
     the fix()/status()/reset() surface the mission's detect flow uses.
 
-    In-flight samples are KEPT across a detect wait (wait_for_fix never
+    In-flight samples are KEPT across a detect wait (it never
     purges): geometry is lifted with frame-stamp TF, the still-camera
     filter drops moving frames, the 1 s freshness window means only the
     scan's parked tail can support a commit, and the 3-agreeing gate
@@ -549,8 +549,8 @@ class BoxTopWatcher:
         self._last_stamp = None
         self._last_depth_stamp = None  # the depth that last voted (depth_paired)
         self._last_cam = None  # previous frame's camera pose (still filter)
-        # detection runs only inside a detect window (wait_for_fix and the
-        # detect-only report set it); the idle 20 Hz tick otherwise costs a
+        # detection runs only inside a detect window (the wrist-mount
+        # observation's report sets it); the idle 20 Hz tick otherwise costs a
         # TF lookup per frame for nothing
         self.active = False
         # an offered roi is applied only once the camera has been still

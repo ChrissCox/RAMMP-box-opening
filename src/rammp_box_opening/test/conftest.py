@@ -191,7 +191,7 @@ def runner(client, tmp_path):
 
 
 # where the lid goes in the `ctx` fixture: a run resolves its own before the
-# press (press_demo main); nowhere is configured to fall back to
+# press (reach_lid_off.resolve_lid_drop); nowhere is configured to fall back to
 LID_SPOT = ContainerPose(xyz=(0.45, -0.25, -0.027), yaw=0.0)
 
 
@@ -207,31 +207,3 @@ def ctx():
         config_path=CFG,
         lid_drop=LID_SPOT,
     )
-
-
-def predicted_contact(ctx):
-    """Where the fingertip TF WOULD read if the touch met the button exactly
-    at the camera's estimate — the offline stand-in for a measured contact
-    (the tip-link origin sits TIP_TO_TOOL_M + TCP_OFFSET_M above the pad
-    face)."""
-    from rammp_box_opening.constants import TCP_OFFSET_M, TIP_TO_TOOL_M
-    from rammp_box_opening.models.container import from_container
-
-    button = from_container(ctx.cpose, ctx.model.button_offset)
-    return [button[0], button[1], button[2] + TCP_OFFSET_M + TIP_TO_TOOL_M]
-
-
-def build_demo_legs(ctx, cfg):
-    """The whole mission as one leg list, the way main() composes it in
-    phases — with the push starting from the predicted contact, since no
-    touch has measured one offline."""
-    from rammp_box_opening.tasks import press_demo
-
-    approach = press_demo.build_approach_leg(ctx, cfg)
-    return [
-        approach,
-        *press_demo.build_press_legs(ctx, cfg, start_joints=approach.goal_joints),
-        *press_demo.build_push_legs(ctx, cfg, predicted_contact(ctx)),
-        *press_demo.build_grip_legs(ctx, cfg),
-        *press_demo.build_place_legs(ctx, cfg),
-    ]
