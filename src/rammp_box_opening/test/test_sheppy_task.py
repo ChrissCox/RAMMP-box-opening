@@ -171,7 +171,7 @@ def _new_subpackage(t):  # one "Only in" line to diff
     return ["differs: lift/__init__.py", "differs: lift/lid.py"]
 
 
-def _edited_container(t):
+def _edited_container(t):  # in a subdirectory: a config diff without -r exits 0 over it
     _write(t.src / "config" / "containers" / "ankou_pink.yaml", "name: ankou_pink\npush_mm: 12\n")
     return ["differs: config/containers/ankou_pink.yaml"]
 

@@ -6,10 +6,11 @@
 set -eo pipefail
 
 # install/setup.bash chains humble's local_setup.bash itself, then ros2_ws,
-# then this ws. humble's own setup.bash ahead of it cost 0.21-0.23 s and
-# changed nothing (2026-10-27, sheppyd's env: the same 30 variables). It is
-# decided before the install source, so a rebuild that drops the chain
-# still gets humble first.
+# then this ws. humble's own setup.bash sources only that same
+# local_setup.bash: ahead of the chain it cost 0.21-0.23 s and changed
+# nothing (2026-10-27, sheppyd's env: the same 30 variables). It is decided
+# before the install source, so a rebuild that drops the chain still gets
+# humble first.
 grep -q '^COLCON_CURRENT_PREFIX="/opt/ros/humble"$' "$HOME/RAMMP-box-opening/install/setup.bash" 2>/dev/null \
   || source /opt/ros/humble/setup.bash
 source "$HOME/RAMMP-box-opening/install/setup.bash"
@@ -53,11 +54,13 @@ for a in "$@"; do
 done
 if [ -d "$inst_py" ] && [ ! -L "$inst_py" ]; then
   # drift()'s 57 cmp were 81-97 ms of every launch; two diffs find agreeing
-  # trees in 7 ms (2026-10-27). Agreeing trees are exactly when drift()
-  # prints nothing, so it runs only when they differ, and reports as before.
-  # diff's exit status is the verdict, unfiltered: an unbuilt subpackage is
-  # one "Only in" line with no .py in it, and a stray file (a README) only
-  # costs the full loop.
+  # trees in 5-7 ms (2026-10-27). Trees that agree leave drift() nothing to
+  # print, so it runs only when they differ, and reports as before. diff's
+  # exit status is the verdict, unfiltered: an unbuilt subpackage is one
+  # "Only in" line with no .py in it, and a stray file (a README) only costs
+  # the full loop. config takes -r too: without it containers/ is one
+  # "Common subdirectories" line, and diff exits 0 over an edited
+  # containers/*.yaml.
   if diff -rq --exclude=__pycache__ "$src/rammp_box_opening" "$inst_py" >/dev/null 2>&1 \
     && diff -rq "$src/config" "$inst/share/rammp_box_opening/config" >/dev/null 2>&1; then
     stale=""
