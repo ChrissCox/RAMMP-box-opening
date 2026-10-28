@@ -304,7 +304,7 @@ run for grip and place.
   2026-09-17 it had vanished and the D405 sat on its old port), re-plug
   it, `sheppy restart scene_camera`. The mission meanwhile falls back to
   the wrist search.
-- "the wrist did not find the button at staging (K of N hits agree in M
+- "the wrist did not find the button at staging (0 of N hits agree in M
   frames (last reject: ...))" → the saved frame
   (`captures/wrist-staging-<stamp>/frame_000.jpg`) shows what it saw.
   "no circle of A-B px radius" → the button's `button_diameter_m` is

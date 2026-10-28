@@ -980,8 +980,9 @@ class ButtonAimer:
 
     def fix(self, measured=False):
         """The press point when enough hits agree (agreeing_fix: the median
-        of the last MIN_HITS, or the mean of a tilted view's agreeing pair),
-        else None. Its xy is as measured; its z is RAISED by the wrist's
+        of the last MIN_HITS; a tilted view's, the mean of its newest
+        agreeing pair or the median of three of its last `window`), else
+        None. Its xy is as measured; its z is RAISED by the wrist's
         table offset where that is known and below the given table
         (table_offset_m, over the same hits): the wrist that reads its table
         20 mm low reads the lid 20 mm low too. It is never lowered: the

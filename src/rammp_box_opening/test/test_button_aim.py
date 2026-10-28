@@ -91,6 +91,39 @@ def test_a_fix_is_three_in_a_row_or_a_tilted_views_newest_agreeing_pair():
     assert agreeing_fix([a, b, (0.6, 0.0, 0.29), (0.7, 0.0, 0.29), a], [0.0] * 5, 2) is None
 
 
+def test_two_of_four_fixes_wherever_three_in_a_row_would_and_never_later():
+    """The tilted aim's rule (agreeing_fix, n=2) on random streams of hits,
+    three in ten up to 2 cm off, half the knob readings a shut box's and
+    half anywhere from -2 to +12 mm: wherever the last three agree it has
+    fixed, at that hit or sooner — two hits can only shorten an aim — its
+    first fix holds the newest hit (the aim returns on it), and a pair it
+    fixes on reads the knob alike."""
+    import random
+
+    from rammp_box_opening.perception.button_aim import KNOB_NOISE_M, agreeing_fix
+
+    rng = random.Random(7)
+    sooner = 0
+    for _ in range(1000):
+        pts, up, first = [], [], None
+        for k in range(8):
+            if rng.random() < 0.3:
+                pts.append((0.5 + rng.uniform(-0.02, 0.02), -0.16 + rng.uniform(-0.02, 0.02), 0.29))
+            else:
+                pts.append((0.5 + rng.gauss(0.0, 0.0015), -0.16 + rng.gauss(0.0, 0.0015), 0.29))
+            up.append(rng.gauss(0.002, 0.0015) if rng.random() < 0.5 else rng.uniform(-0.002, 0.012))
+            got = agreeing_fix(pts, up, 2)
+            if first is None and got is not None:
+                first, idx = k, got[1]
+                assert k in idx
+                assert len(idx) == 3 or abs(up[idx[0]] - up[idx[1]]) <= KNOB_NOISE_M
+            if agreeing_median(pts) is not None:
+                assert first is not None and first <= k
+                sooner += first < k
+                break
+    assert sooner > 100
+
+
 MISSED = Path(__file__).parent / "data" / "wrist_aim_pressed_right_20260921.npz"
 
 
