@@ -3272,6 +3272,59 @@ def test_a_compliant_reach_out_lets_go_where_it_stopped_loaded_or_part_way_and_n
     assert got == code and asked == asked_after
 
 
+STOPPED = ("failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.4})
+REJECTED = ("failed", {"message": "goal rejected by the driver", "progress": 0.0})
+
+
+@pytest.mark.parametrize("fallback, ends, code, asked_after", [
+    ("none planned", {}, 0, []),  # the look, the way in, the rise alone, the clear, home: nothing let go
+    ("none planned", {4: STOPPED}, 1, [4]),  # ... the clear from over the box stopped 40% of the way
+    ("none planned", {5: STOPPED}, 1, [5]),  # ... home from the clear's end stopped
+    ("home off the clear", {4: REJECTED}, 0, []),  # [rise, clear], its home turned down, home from there
+    ("home off the clear", {4: REJECTED, 5: STOPPED}, 1, [5]),  # ... and that home stopped
+], ids=["none planned, home", "none planned, clear stopped", "none planned, home stopped", "later goal, home",
+        "later goal, home stopped"])
+def test_a_compliant_reach_outs_fallback_home_from_over_the_box_lets_go_where_it_stopped(
+        ctx, monkeypatch, tmp_path, fallback, ends, code, asked_after):
+    """Where no way home was planned ahead (home refused from both clears'
+    ends: the rise alone, _rise_then_home), or a later goal of it did not
+    start, the way home is home from over the box (_home_from_over_box):
+    the clear up and back, then home, goals of their own. Either stopped
+    part-way leaves the springs pulling toward its next point, its
+    feed-forward on, as the one execution's stop does: free, but not home.
+    It lets go once, after that goal, and the arm holds there. A fallback
+    that gets home lets nothing go."""
+    kw = {}
+    if fallback == "none planned":
+        kw["home_refusals"] = 2
+    else:
+        real = rp._home_legs
+
+        def off_the_clear(ctx_, cfg_, start=None):
+            legs = real(ctx_, cfg_, start=start)
+            if start is not None:  # planned ahead, from the clear's end: 10 mrad off it, a goal of its own
+                p = legs[0].traj.points[0]
+                p.positions = [float(v) + (0.01 if j == 1 else 0.0) for j, v in enumerate(p.positions)]
+            return legs
+
+        monkeypatch.setattr(rp, "_home_legs", off_the_clear)
+    asked = _releases(ctx)
+    real_execute = ctx.client.execute
+
+    def execute(traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        n = len(ctx.client.executed) + 1  # every goal sent, the look's the first
+        if n in ends:
+            ctx.client.exec_script.insert(0, (ends[n][0], dict(ends[n][1])))
+        return real_execute(traj, speed, guard=guard, while_running=while_running, stop_when=stop_when, gains=gains)
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+    got, rec, _chain, _home, _got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True,
+                                                chain=_sinking_chain(), **kw)
+    assert got == code and asked == asked_after
+    after = [names for names, _g in _after_the_hold(rec)]
+    assert after[0] == (["depth:rise"] if fallback == "none planned" else WAY_OUT)  # the fallback, not home in one
+
+
 def test_a_ctrl_c_in_a_compliant_reach_outs_hold_lets_go_once_and_still_stops_the_run(ctx, monkeypatch, tmp_path):
     """The one-execution reach-out's hold, between its way in and its way
     home: a Ctrl+C there lets go once, after the way in, and still ends the

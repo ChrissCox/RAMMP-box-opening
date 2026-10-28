@@ -1042,6 +1042,42 @@ def test_a_planned_look_the_arm_stands_off_flies_its_way_in_leg_by_leg(ctx, monk
     assert (["reach:slide-in"], [None]) in rec.runs and slide.gains is None  # a goal of its own, as before
 
 
+@pytest.mark.parametrize("soft, stops, code, asked_after", [
+    (True, None, 0, []),  # home: nothing let go after it, nor between its goals
+    (True, "depth:clear", 1, [4]),  # the look, the planned look, the slide in, then the clear: stopped 40% of the way
+    (True, "home", 1, [5]),  # ... home from the clear's end stopped
+    (False, "depth:clear", 1, []),  # --guarded: its clear stopped as before, nothing to let go of
+], ids=["home", "clear stopped", "home stopped", "guarded"])
+def test_a_reach_out_flown_leg_by_leg_lets_go_where_its_home_from_over_the_box_stopped(
+        ctx, monkeypatch, tmp_path, soft, stops, code, asked_after):
+    """A compliant way in flown leg by leg (the planned look the arm stands
+    off) presses and rises in press_compliant, then goes home from over the
+    box (_home_from_over_box): the clear up and back, then home, goals of
+    their own. Either stopped part-way leaves the springs pulling toward its
+    next point, its feed-forward on: the run lets go once, after that goal,
+    and the arm holds there. Home, nothing is let go. A guarded run's
+    POSITION goals hold where they stopped: it lets nothing go."""
+    chain = _Chain(refuse=[lambda xyz, quat: xyz[2] > 0.52]) if soft else None  # the planned look, as above
+    asked = []
+    ctx.client.release = lambda: asked.append(len(ctx.client.executed)) or True
+    nth = {"depth:clear": 4, "home": 5}.get(stops)
+    real = ctx.client.execute
+
+    def execute(traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        if len(ctx.client.executed) + 1 == nth:
+            ctx.client.exec_script.insert(0, ("failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.4}))
+        out = real(traj, speed, guard=guard, while_running=while_running, stop_when=stop_when, gains=gains)
+        if soft and len(ctx.client.executed) == 2:  # the planned look for the aimed button: 5 mrad short on joint_2
+            ctx.client.live[1] -= 0.005
+        return out
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+    got, rec, _c, _h, pressed = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down([], lambda tilt, tip: True),
+                                                  compliant=soft, chain=chain)
+    assert got == code and asked == asked_after and pressed["compliant"] == soft
+    assert rec.events[3:] == ["reach:slide-in", "depth:clear", "home"][:2 if stops == "depth:clear" else 3]
+
+
 def test_where_neither_a_line_nor_a_planned_look_brings_the_aimed_button_a_way_down_the_arm_goes_home_from_the_look(
         ctx, monkeypatch, tmp_path, capsys):
     """No straight line reaches the aimed button's look pose, and at no

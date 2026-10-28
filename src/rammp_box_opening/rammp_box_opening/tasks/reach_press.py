@@ -574,8 +574,10 @@ def let_go(ctx):
     reference it was stopped at — below the button, or the next point of a
     path cut short. Only where the arm is loaded or was stopped part-way:
     between legs in free air the reference is a leg's end, the arm at rest
-    there, and a release would only add its own sag. A client with no
-    release lets nothing go."""
+    there, and a release would only add its own sag. A way home from the
+    box that did not get home lets go: a leg of it stopped part-way, or,
+    where a plan was refused instead, that sag is all it costs. A client
+    with no release lets nothing go."""
     getattr(ctx.client, "release", lambda: None)()
 
 
@@ -1009,7 +1011,8 @@ def _clear_over_box(ctx, runner, ref):
 def _home_from_over_box(ctx, cfg, runner, result):
     """Home after a free depth press (DepthPress.free): clear of the box's
     padded volume first, then planned once, the back-off left as the
-    fallback. False — the arm holds — when it did not get there."""
+    fallback. False — the arm holds, and a compliant run's caller lets go
+    (let_go) — when it did not get there."""
     ref = result.ref or (None if compliant(ctx) else _settled(ctx, "over the box"))
     if ref is not None or compliant(ctx):
         clear = _clear_over_box(ctx, runner, ref)
@@ -1256,8 +1259,9 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
     goes home from the look pose; one that stopped part-way holds the arm
     there, its STOP naming the leg in flight. From the way in's start to
     where the way home ends, a stop lets go (let_go): the way in stopped
-    part-way, the way home stopped, anything raised. Returns the process
-    exit code."""
+    part-way, the way home stopped or did not get home (its fallback's
+    clear or home, _home_from_over_box), anything raised. Returns the
+    process exit code."""
     from rammp_box_opening.tasks import depth_press as dp
 
     names = [lg.name for lg in legs]
@@ -1316,9 +1320,12 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
               % (_phase_at(names, retimed.get("seg_start_fracs") or [0.0], last.progress), last.detail or last.outcome))
         let_go(ctx)
         return 1
-    if not result.free:
+    if not result.free or not homed:
         # the way home stopped (_way_home): the arm holds on the button — no
-        # way up flies — or where the rise or the one execution stopped
+        # way up flies — or where the rise or the one execution stopped. Free
+        # but not home, its fallback home from over the box did not get there
+        # (_home_from_over_box): its clear or home stopped part-way, as the one
+        # execution can, or a plan was refused, the arm at rest at a leg's end
         let_go(ctx)
     runner.finish()
     return dp.finish(ctx, dataclasses.replace(result, touch_xyz=seen.get("touch_xyz")), homed)
@@ -1781,6 +1788,10 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
                                                   top_z=button[2])
         result = depth_press.after_scene_check(ctx, runner, result, scene_fix, locator)
         homed = result.free and _home_from_over_box(ctx, cfg, runner, result)
+        if soft and result.free and not homed:
+            # free but not home: its clear or home stopped part-way, as
+            # _fly_way_in's fallback can (press_compliant lets go of its own)
+            let_go(ctx)
         runner.finish()
         return depth_press.finish(ctx, result, homed)
 
