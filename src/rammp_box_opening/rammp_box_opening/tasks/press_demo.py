@@ -223,9 +223,10 @@ class _NeverStops:
 
 
 # How long the scene camera gets to find the box before the arm has moved
-# at all: the scene OWL answers at ~2 Hz once enabled, and the depth lift is
-# instant, so this is two or three inference ticks.
-SCENE_LOCATE_S = 5.0  # was 3.0: the first box has come at 2.2-2.7 s — too tight
+# at all: sheppy's scene segmenter fixes it in about 0.35 s (two agreeing
+# frames at 5 Hz; scene_source.commit_fix), and the scene OWL fallback needs
+# about 2.6 s for two boxes (~1.3 s an inference once enabled).
+SCENE_LOCATE_S = 5.0  # was 3.0: the OWL's first box came at 2.2-2.7 s — too tight
 # ... and the run's FIRST look, before anything moves, keeps at it longer:
 # flatbot 2026-10-27 15:34:01 refused all three candidates the OWL offered
 # in 5 s (0.12, 26-28 depth points in each) and the run went home; 25 s
@@ -284,9 +285,21 @@ def record_residual(scene_fix, wrist_top, wrist_yaw, path=RESIDUALS_FILE):
             "wrist_top": [round(float(v), 4) for v in wrist_top],
             "scene_yaw": round(float(scene_fix.pose.yaw), 4),
             "wrist_yaw": round(float(wrist_yaw), 4),
-            "owl_score": round(float(scene_fix.score), 3),
+            "owl_score": round(float(scene_fix.score), 3),  # the detector's score, whichever detector
+            "source": getattr(scene_fix, "source", "owl"),
             "n_points": int(scene_fix.n_points),
         }) + "\n")
+
+
+def scene_source_label(fix):
+    """'SEG 0.88, 2 sightings (segmenter+segmenter)': the detector behind a
+    scene fix (the newest sighting's), its score, and the sightings that
+    agreed on it (scene_source.commit_fix)."""
+    source = getattr(fix, "source", "owl")
+    n = int(getattr(fix, "n_sightings", 1))
+    sources = tuple(getattr(fix, "sources", ()) or (source,))
+    return "%s %.2f, %d sighting%s (%s)" % (
+        "SEG" if source == "segmenter" else "OWL", float(fix.score), n, "" if n == 1 else "s", "+".join(sources))
 
 
 # The scene camera's box this far (xy) from the button the wrist found, on
@@ -2459,9 +2472,9 @@ def scene_detect_report(locator, duration_s=DETECT_REPORT_S):
             continue
         tops.append(fix.top_xyz)
         print(
-            "[press_demo]   SCENE: box at [%.3f, %.3f] yaw %.1f deg, lid top z %.3f, table %.3f%s, OWL %.2f, %d lid points%s"
+            "[press_demo]   SCENE: box at [%.3f, %.3f] yaw %.1f deg, lid top z %.3f, table %.3f%s, %s, %d lid points%s"
             % (fix.pose.xyz[0], fix.pose.xyz[1], math.degrees(fix.pose.yaw), fix.top_xyz[2],
-               fix.table_z_scene, table_seen_over(fix.table_extent), fix.score, fix.n_points,
+               fix.table_z_scene, table_seen_over(fix.table_extent), scene_source_label(fix), fix.n_points,
                "; %s, finished from its lid's arc in view" % fix.partial if getattr(fix, "partial", "") else "")
         )
     if not tops:
@@ -2738,11 +2751,13 @@ def main():
                     tag_px=None if scene_by_tf else scene_tag_px(args.scene_calib or scene_calib_path()),
                     scene_cfg=worlds.scene_camera_cfg, base_frame=worlds.base_frame,
                 )
-                # enable its OWL NOW: the first bbox takes ~0.7 s (the node
-                # infers on the enable edge: one inference, no tick wait) and
-                # the readiness checks below are about that long — by the time
-                # locate() asks, the box is already on the topic
-                locator.owl.enable()
+                # the scene OWL NOW, where sheppy's scene segmenter cannot
+                # answer (no classes for this container, or down): its first
+                # bbox takes ~0.7 s (the node infers on the enable edge) and the
+                # readiness checks below are about that long — by the time
+                # locate() asks, the box is already on the topic. A live
+                # segmenter keeps the OWL off, and off the GPU (prime)
+                locator.prime()
         # camera on from here to exit
         ctx = Ctx(
             model=model,
@@ -2833,6 +2848,8 @@ def main():
                     fix_xyz=None if scene_fix is None else scene_fix.top_xyz,
                     score=None if scene_fix is None else scene_fix.score,
                     why=locator.last_why if scene_fix is None else None,
+                    source=None if scene_fix is None else getattr(scene_fix, "source", "owl"),
+                    boxes=getattr(locator, "last_boxes", None),
                 )
             if locator.moved_note and scene_fix is not None:
                 print("[press_demo] scene camera: %s" % locator.moved_note)  # e.g. the tag was not in view
@@ -2858,12 +2875,12 @@ def main():
             surveyed = watcher.table_z
             print(
                 "[press_demo] SCENE: box at [%.3f, %.3f] yaw %.1f deg from %d lid points%s "
-                "(OWL %.2f; the scene reads the table at %.3f%s, surveyed %s; %.1f s to locate "
+                "(%s; the scene reads the table at %.3f%s, surveyed %s; %.1f s to locate "
                 "[%s], %.1f s since start) — flying to staging"
                 % (sp.xyz[0], sp.xyz[1], math.degrees(sp.yaw), scene_fix.n_points,
                    " (%s, finished from its lid's arc in view)" % scene_fix.partial
                    if getattr(scene_fix, "partial", "") else "",
-                   scene_fix.score, scene_fix.table_z_scene, table_seen_over(scene_fix.table_extent),
+                   scene_source_label(scene_fix), scene_fix.table_z_scene, table_seen_over(scene_fix.table_extent),
                    ("%.3f" % surveyed) if surveyed is not None else "n/a",
                    time.monotonic() - t_scene,
                    " ".join("%s %.2f" % (k[:-2], v) for k, v in locator.last_timing.items()),
@@ -2875,7 +2892,9 @@ def main():
                 yaw_deg=round(math.degrees(sp.yaw), 2),
                 top_xyz=[round(float(v), 4) for v in scene_fix.top_xyz],
                 n_points=scene_fix.n_points,
-                owl_score=round(scene_fix.score, 3),
+                owl_score=round(scene_fix.score, 3),  # the detector's score, whichever detector
+                source=getattr(scene_fix, "source", "owl"),
+                n_sightings=int(getattr(scene_fix, "n_sightings", 1)),
                 table_z_scene=None if scene_fix.table_z_scene != scene_fix.table_z_scene
                 else round(scene_fix.table_z_scene, 4),
             )
