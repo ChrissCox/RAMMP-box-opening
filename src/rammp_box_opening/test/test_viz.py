@@ -654,29 +654,33 @@ def test_nothing_is_drawn_or_encoded_for_an_image_nobody_subscribes_to(look_1624
 def test_after_a_press_the_knob_looks_verdict_captions_its_wrist_frame(reach_1623, pink, monkeypatch):
     """The knob look after a press is the aim again (reach_press._aim): its
     AIM line captions its frame, then the AFTER PRESS line its verdict —
-    said after the frame, it replaces the AIM line there. The lid off's
+    said after the frame, it replaces the AIM line there — as ALREADY OPEN
+    does the first aim's frame of a box found open. The lid off's
     lower-case decisions, the press once more and where the lid goes, reach
     the status."""
     now = [5.0]
     monkeypatch.setattr(viz, "_clock", lambda: now[0])
     v, pubs = _viz(pink, wrist=1)
-    tick = _tick(reach_1623, t=5.0)
-    v.put("wrist", tick)
     aim = "AIM: button circle at pixel (292, 239) r 31 px, 50 mm across, +9.0 mm above its own lid; pressing its centre"
+    already = ("ALREADY OPEN: the knob stands 9 mm above its lid — not pressing it, which would shut the box; taking "
+               "the lid off")
     after = ("AFTER PRESS 1: knob UP 9.0 mm — the box is open (1 look); the button 3 mm from where the press was "
              "aimed")
-    for t, line in ((5.5, aim), (6.0, after)):
-        now[0] = t
-        v.said_line("[press_demo] " + line)
-        v.step()
-        assert tick.caption == line and pubs["status"].sent[-1].data == line
-    assert len(pubs["wrist"].sent) == 2  # drawn with each
+    for verdict in (already, after):  # the first aim's frame, then a knob look's
+        tick = _tick(reach_1623, t=now[0])
+        v.put("wrist", tick)
+        for line in (aim, verdict):
+            now[0] += 0.5
+            v.said_line("[press_demo] " + line)
+            v.step()
+            assert tick.caption == line and pubs["status"].sent[-1].data == line
+    assert len(pubs["wrist"].sent) == 4  # each frame drawn with each line
     for line in ("the knob is not up (0.9 mm above the lid): pressing once more — the same press, from the look pose",
                  "lid goes to [0.52, -0.31, 0.213] — 180 mm from the box, beside the box"):
         v.said_line("[press_demo] " + line)
         v.step()
         assert pubs["status"].sent[-1].data == line and tick.caption == after  # no wrist caption: no new frame
-    assert len(pubs["wrist"].sent) == 2
+    assert len(pubs["wrist"].sent) == 4
 
 
 def test_a_viz_failure_never_reaches_the_mission_and_is_said_once(pink, capsys, monkeypatch):

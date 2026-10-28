@@ -28,8 +28,8 @@ each. docs/foxglove/box_opening_perception.json lays them out beside the
 cameras, the segmenter's overlay, TF and the arm (docs/HARDWARE_BRINGUP.md
 §4a).
 
-None of it costs the run anything (owner: not a millisecond slower, never a
-stop for it). A run with it off never imports this module (press_demo's
+None of it stops the run (owner: not a millisecond slower, never a stop
+for it). A run with it off never imports this module (press_demo's
 start_viz and viz_hook); with it on, the mission's thread only starts the
 viz's thread (~0.3 ms), which imports it (~1 ms: no dataclass here) once
 the mission's thread waits and goes on as its worker (run). The mission's
@@ -40,7 +40,11 @@ console's lines go out as they did. Making the publishers, drawing,
 encoding and publishing are that one thread's, and as it shares the
 mission's GIL it works only while the mission's thread waits on the
 driver, a frame or a plan (PERIOD_S, IDLE_RUN_FRAC): never while it aims,
-solves or re-times. An image nobody subscribes to is not drawn or encoded:
+solves or re-times. A mission thread that wakes inside a step no
+checkpoint breaks waits for its end: the marker type's import (3-5 ms, up
+to 17 with the Jetson loaded; once a run, after a quiet second:
+IMPORT_QUIET_S) and a publish (the lid spot's the longest, about 2 ms:
+MAP_STEP). An image nobody subscribes to is not drawn or encoded:
 the newest is kept, and drawn for the first subscriber. stop(), once the
 run is over, has the worker publish what is left (a NO BOX look, the DONE
 line) ungated — not when the run unwinds from a Ctrl+C — and waits for its
@@ -128,7 +132,8 @@ PHASE_RE = r"[A-Z][A-Z-]+(?: [A-Z][A-Z-]+)*"
 _LOWER_PHASES = (("no fix", "LOOK"), ("detect-only done", "DONE"), ("preview ends", "DONE"),
                  ("the knob is not up", "AGAIN"), ("lid goes to", "SPOT"))
 # which console lines caption which image: the one it says after the item —
-# the wrist's, its AIM line, and after a press the knob look's verdict
+# the wrist's, its AIM line, then the box already open (ALREADY OPEN, after
+# the first aim) or, after a press, the knob look's verdict (AFTER PRESS)
 CAPTION_PHASE = {"scene": ("SCENE",), "wrist": ("AIM", "ALREADY OPEN", "AFTER PRESS")}
 # whose button and lid an aim was given (press_demo.aim_button_at_staging's
 # prior_xy and lid_z), by its tag: the scene camera's, but a knob look after
@@ -174,17 +179,18 @@ TEXT_M = 0.018  # a label's height (m)
 # two checkpoints. Measured 2026-10-28 (this Jetson, niced, cores 0-9) on
 # test_reach_lid_off's wall round the box, 1407 of the map's 85 x 85: a
 # point 3.8 us, the markers 6.5 ms in 18 steps of at most 0.45 ms; the
-# publish, one step, holds the GIL 1.6 ms converting the array to C — once
-# a run, as the carry flies, and under the 3.4-3.9 ms the marker type's
-# import keeps a waking mission thread waiting
+# publish, one step, holds the GIL 1.6 ms converting the array to C (1.9 ms
+# beside 25 bare markers, about the rest of a full run's array; those 25
+# alone 0.84 ms) — once a run, as the carry flies, and under the 3-5 ms the
+# marker type's import keeps a waking mission thread waiting
 MAP_STEP = 100
 
 
 def said(line):
     """(phase, text) for a console line the status mirrors, else None: a
     press_demo line that opens with a word in capitals (PHASE_RE), or one of
-    the detect-only report's (_LOWER_PHASES). text is the line without its
-    "[press_demo]"."""
+    the few that open in lower case and decide something (_LOWER_PHASES).
+    text is the line without its "[press_demo]"."""
     if not line.startswith(PREFIX):
         return None
     text = line[len(PREFIX):].strip()
@@ -550,7 +556,8 @@ def wrist_image(tick, model):
     lid height it was given: the scene camera's, or after a press where the
     press was aimed, prior_said) and every hit's press point so far (white
     dots; the fix's agreeing ones green). A frame without a hit draws no
-    button: an older hit's is another frame's. Under it the AIM line, this
+    button: an older hit's is another frame's. Under it the AIM line (then
+    ALREADY OPEN, or after a press the AFTER PRESS one: CAPTION_PHASE), this
     frame's verdict, the lid and the table its hit read."""
     import cv2
 
@@ -841,7 +848,8 @@ class AimTick(_Record):
     (or None) and whose they are (prior_said: SCENE_PRIOR, or PRIOR_WORDS by
     the aim's tag), every hit's press point so far, the aimer once it made
     its fix (done: it changes no more); the console's AIM line once it is
-    said (caption), and whether it is drawn as it stands."""
+    said, then its verdict's (caption: CAPTION_PHASE), and whether it is
+    drawn as it stands."""
 
     __slots__ = ("t", "color", "k", "dist", "cam", "sighting", "hit", "why", "hits", "frames", "need", "t_aim",
                  "lid_z", "prior_xy", "points", "done", "prior_said", "caption", "drawn")
@@ -1249,8 +1257,9 @@ class Viz:
 
     def _said(self, lines):
         """The newest line the status mirrors (said) published; a SCENE,
-        AIM or AFTER PRESS line said after the image it belongs to
-        (CAPTION_PHASE) made that image's caption, to be drawn again."""
+        AIM, ALREADY OPEN or AFTER PRESS line said after the image it
+        belongs to (CAPTION_PHASE) made that image's caption, to be drawn
+        again."""
         from std_msgs.msg import String
 
         last = None
