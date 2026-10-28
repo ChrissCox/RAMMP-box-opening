@@ -1394,7 +1394,9 @@ def test_a_compliant_press_is_one_stroke_held_and_back_up_with_no_look_and_no_gu
     assert len(ctx.client.executed) == 3  # the turn, the stroke (approach and press merged), the rise
     assert all(g is None for g in ctx.client.guards)
     assert ctx.client.gains_sent == [None, dp.COMPLIANT_GAINS, dp.COMPLIANT_GAINS]
-    assert legs["depth:press"].speed == dp.TOUCH_SPEED and legs["depth:approach"].speed == cfg.press_speed
+    # half their speed (owner 2026-10-28): 0.075 and 0.175 for the pink box
+    assert legs["depth:press"].speed == dp.COMPLIANT_STROKE_SLOWDOWN * dp.TOUCH_SPEED == pytest.approx(0.075)
+    assert legs["depth:approach"].speed == dp.COMPLIANT_STROKE_SLOWDOWN * cfg.press_speed == pytest.approx(0.175)
     k = note["stiffness_n_per_m"]
     over = min(max(dp.COMPLIANT_PRESS_N / k, dp.COMPLIANT_OVERSHOOT_M[0]), dp.COMPLIANT_OVERSHOOT_M[1])
     assert note["end_z"] == pytest.approx(COMPLIANT_TOP - cfg.button_travel_m - over, abs=1e-4)
@@ -1957,7 +1959,8 @@ def test_a_compliant_reach_out_flies_its_way_in_as_one_execution(ctx, monkeypatc
         assert lg.guard is None and lg.gains == dp.COMPLIANT_GAINS and lg.plan_free and lg.world.startswith("full"), (
             lg.name, lg.guard, lg.gains, lg.world)
     speeds = {n: FREE_LINE_SPEED for n in way_in[:-2]}
-    speeds.update({"depth:approach": cfg.press_speed, "depth:press": dp.TOUCH_SPEED})
+    speeds.update({"depth:approach": dp.COMPLIANT_STROKE_SLOWDOWN * cfg.press_speed,
+                   "depth:press": dp.COMPLIANT_STROKE_SLOWDOWN * dp.TOUCH_SPEED})
     assert {lg.name: lg.speed for lg in legs} == speeds
     # then the rise back up to where the stroke began, the clear and home: one run, one execution
     assert rec.runs[-1] == (["depth:rise", "depth:clear", "home"], [dp.COMPLIANT_GAINS])
