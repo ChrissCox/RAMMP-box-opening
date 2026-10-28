@@ -1123,9 +1123,9 @@ def test_the_depth_press_checks_the_aim_as_the_wrist_measured_it(ctx, monkeypatc
     the aim 175.9 mm below the lens and the wrist's own depth under the
     fingers 190.0 — 14 mm, inside LOOK_EXPECT_DEPTH_M. The aim's press
     point raised by the wrist's 21.6 mm table offset (ButtonAimer.fix) would
-    read 36 mm off that same depth and be refused. So the depth press gets
-    the aim as the wrist measured it, while the box's world and the
-    compliant press's top go by the raised one."""
+    read 36 mm off that same depth and be refused. So the guarded depth
+    press gets the aim as the wrist measured it, while the box's world and
+    the press's top, guarded or compliant, go by the raised one."""
     from rammp_box_opening.models.container import from_container
 
     import test_reach_press as trp
@@ -1133,8 +1133,9 @@ def test_the_depth_press_checks_the_aim_as_the_wrist_measured_it(ctx, monkeypatc
     measured = (trp.BUTTON[0], trp.BUTTON[1], trp.BUTTON[2] - 0.0216)
     code, _rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=compliant,
                                               first=(trp.BUTTON, 0.4, measured))
-    assert code == 0 and got["compliant"] == compliant
-    assert got["aimed"] == pytest.approx(measured) and got["top_z"] == pytest.approx(trp.BUTTON[2])
+    assert code == 0 and got["top_z"] == pytest.approx(trp.BUTTON[2])
+    if not compliant:  # a compliant press has no look and no guard to judge the aim against
+        assert got["compliant"] is False and got["aimed"] == pytest.approx(measured)
     kw = [kw for kind, kw in ctx.worlds.pushes if kind == "interaction" and kw.get("tag") == "reach"][-1]
     assert from_container(kw["cpose"], ctx.model.button_offset) == pytest.approx(list(trp.BUTTON))
 
