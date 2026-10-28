@@ -23,6 +23,8 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>kinova_gen3_description</exec_depend>
   <exec_depend>realsense2_camera</exec_depend>
+  <!-- the scene segmenter's /perception/object_detections (perception/segmenter_source) -->
+  <exec_depend>rammp_perception_interfaces</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 

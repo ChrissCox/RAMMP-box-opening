@@ -35,6 +35,19 @@ def test_only_an_empty_close_is_ever_learned(state):
     assert fingers.learned_closed() == pytest.approx(0.79)
 
 
+def test_an_empty_close_reads_shut_whichever_reading_was_learned(state):
+    """A close sent to fingers already shut never moves, and fails: what
+    the knuckle reads then says whether they are shut — any reading an
+    empty close gives, whichever one was learned last."""
+    for learned in (None, 0.636, 0.79):
+        if learned is not None:
+            assert fingers.learn_closed(learned)
+        for pos in (0.636, 0.770, 0.793):
+            assert fingers.reads_empty_close(pos), (learned, pos)
+        for pos in (0.41, 0.09, 0.0, None):  # the knob, the box, open, no reading
+            assert not fingers.reads_empty_close(pos), (learned, pos)
+
+
 def test_the_grip_band_holds_the_knob_in_either_gripper_state(state):
     """The band [0.3, 0.55] was measured when an empty close read 0.793, a
     knob grip 0.41. With an empty close at 0.636, the knob may read 0.33 (if

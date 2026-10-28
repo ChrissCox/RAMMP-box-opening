@@ -128,6 +128,9 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
         def __init__(self, *a, **k):
             self.owl = type("O", (), {"enable": lambda s: None})()
 
+        def prime(self):
+            pass
+
         def locate(self, timeout):
             LOCATES.append(timeout)
             return _Fix
