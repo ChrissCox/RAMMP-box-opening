@@ -1332,12 +1332,12 @@ def test_at_rest_the_lens_is_placed_even_when_tf_lags_the_newest_frame(monkeypat
 COMPLIANT_TOP = 0.40  # the button's top under the harness's pads (TF's lid)
 
 
-def _compliant(ctx, monkeypatch, tmp_path, held_up_m):
+def _compliant(ctx, monkeypatch, tmp_path, held_up_m, **kw):
     import json
 
     ctx.client.compliant = True
     result, events, arm, legs, start = _press(ctx, monkeypatch, tmp_path, [], touch_at=None, compliant=True,
-                                              top_z=COMPLIANT_TOP, held_up_m=held_up_m)
+                                              top_z=COMPLIANT_TOP, held_up_m=held_up_m, **kw)
     rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
     note, = [r for r in rows if r.get("leg") == "depth_compliant_press"]
     return result, events, arm, legs, note
@@ -1543,11 +1543,237 @@ def test_the_compliant_stroke_solved_ahead_is_the_one_the_press_flies(ctx, monke
         assert list(legs[name].traj.points[-1].positions) == pytest.approx([float(v) for v in pts[-1]])
     assert stroke.k == pytest.approx(note["stiffness_n_per_m"], abs=0.05)
     assert stroke.end_z == pytest.approx(note["end_z"], abs=5e-5)
-    # ... and the turn's path is the turn the press flew
+    # ... and the turn's path, with the compliant press's leans, is the turn the press flew
     pts, down, short, why = dp.turn_down_path(_Arm(), ctx.model, legs["depth:turn"].traj.points[0].positions,
-                                              rp.CONTACT_TOOL)
+                                              rp.CONTACT_TOOL, dp.COMPLIANT_TURN_SHORT_DEG)
     assert why is None and short == 0.0 and down == pytest.approx(quat)
     assert list(pts[-1]) == pytest.approx(list(legs["depth:turn"].traj.points[-1].positions))
+    assert "lean_deg" not in note  # exactly down: nothing to say
+
+
+def _lean_deg(quat):
+    return float(np.degrees(np.arccos(np.clip(-rp._rot(quat)[2, 2], -1.0, 1.0))))
+
+
+@pytest.mark.parametrize("refused, lean", [(1, 2.0), (2, 5.0), (5, 12.0), (6, 15.0)])
+def test_a_compliant_press_turns_as_far_as_15_deg_short_where_nearer_down_does_not_fly(
+        ctx, monkeypatch, tmp_path, capsys, refused, lean):
+    """Flatbot 2026-10-27 16:23: the slid-in fingertip 0.78 m out, where no
+    hand within 8 deg of straight down is found, and the press stopped "no
+    straight-down hand reaches here" with nothing pressed. A compliant press
+    tries COMPLIANT_TURN_SHORT_DEG, smallest lean first: with the turns up
+    to 10 deg short refused it turns 12 deg short, about the fingertip — the
+    pads' centre where the tilted fingertip stood, over the aim — and
+    strokes straight down from there. From LEAN_SAID_DEG on the console and
+    the run record say the lean."""
+    result, events, arm, legs, note = _compliant(ctx, monkeypatch, tmp_path, held_up_m=0.0, refuse_first=refused)
+    assert events == ["depth:turn", "depth:approach", "depth:press", "depth:rise"]
+    (goal, quat), = arm.turns
+    assert _lean_deg(quat) == pytest.approx(lean, abs=1e-6)
+    R = rp._rot(quat)
+    # the harness's slide ended with the tilted fingertip at (BUTTON xy, 0.46)
+    assert np.asarray(goal) + R @ np.asarray(dp.DOWN_CONTACT_TOOL) == pytest.approx([BUTTON[0], BUTTON[1], 0.46])
+    for name in ("depth:approach", "depth:press"):  # vertical, the lean held
+        end = list(legs[name].traj.points[-1].positions)
+        assert end[:2] == pytest.approx(list(goal[:2])) and end[3:] == pytest.approx(list(quat))
+    assert legs["depth:press"].traj.points[-1].positions[2] < goal[2]
+    out = capsys.readouterr().out
+    assert "TURN: %.0f deg short of straight down (no hand nearer straight down flies here)" % lean in out
+    said = "PRESS (compliant), the hand leaning %.0f deg back toward the arm: straight down" % lean
+    if lean >= dp.LEAN_SAID_DEG:
+        assert said in out and note["lean_deg"] == lean
+    else:
+        assert said not in out and "PRESS (compliant): straight down" in out and "lean_deg" not in note
+
+
+def _detour(arc):
+    """_Arm.walk flying every turn by way of a detour of one joint, `arc(lean)`
+    rad of joint travel in all."""
+
+    def walk(self, q0, xyz, quat, step_m=None, step_rad=None, max_step_rad=None):
+        end = [float(v) for v in xyz] + [float(v) for v in quat]
+        h = 0.5 * (arc(_lean_deg(quat)) - float(np.linalg.norm(np.subtract(end, q0))))
+        self.turns.append((list(xyz), list(quat)))
+        return [list(q0), end, [end[0] + h] + end[1:], end], None
+
+    return walk
+
+
+def test_a_turn_of_more_joint_arc_than_turn_max_arc_rad_is_refused_though_it_flies(ctx, monkeypatch, tmp_path):
+    """The walks in from 16:23's re-aimed look that fly only by swinging
+    joint_1 round run 2.65-3.21 rad of joint arc; every turn in place that
+    flies at the 30 deg tilt flatbot's boxes plan at, 0.49-1.91. A turn in
+    place longer than TURN_MAX_ARC_RAD is refused like one that does not
+    fly — the next lean is tried — and a compliant press none of whose
+    turns is short enough flies nothing. The walk in from the look pose
+    has no such bound."""
+    model = ContainerModel.load(PINK)
+    quat = rp.reach_quat(model, BUTTON[:2], 30)
+    start = rp.tool_for_contact((BUTTON[0], BUTTON[1], 0.46), quat)
+    q = list(start) + list(quat)
+    assert dp.joint_arc([[0.0, 0.0], [3.0, 4.0], [3.0, 0.0]]) == pytest.approx(9.0)
+    assert dp.joint_arc([q]) == 0.0
+    monkeypatch.setattr(_Arm, "walk", _detour(lambda lean: dp.TURN_MAX_ARC_RAD + 0.3))
+    pts, down, short, why = dp.turn_down_path(_Arm(), model, q, rp.CONTACT_TOOL, dp.COMPLIANT_TURN_SHORT_DEG)
+    assert pts is None and why == "; ".join("%.0f deg short: a turn of 2.30 rad of joint arc" % s
+                                            for s in dp.COMPLIANT_TURN_SHORT_DEG)
+    # long at the first leans, within the bound from 8 deg short: turned 8 deg short
+    monkeypatch.setattr(_Arm, "walk", _detour(lambda lean: 2.4 if lean < 7.0 else dp.TURN_MAX_ARC_RAD - 0.05))
+    pts, down, short, why = dp.turn_down_path(_Arm(), model, q, rp.CONTACT_TOOL, dp.COMPLIANT_TURN_SHORT_DEG)
+    assert why is None and short == 8.0 and dp.joint_arc(pts) == pytest.approx(dp.TURN_MAX_ARC_RAD - 0.05)
+    # the walk in from the look pose: as long as it flies
+    monkeypatch.setattr(_Arm, "walk", _detour(lambda lean: 2.7))
+    pts, down, short, why = dp.walk_down_path(_Arm(), model, q, start, quat)
+    assert why is None and short == 0.0 and dp.joint_arc(pts) == pytest.approx(2.7)
+    # a compliant press: no turn short enough, nothing flown
+    ctx.client.compliant = True
+    result, events, _arm, _legs, _s = _press(ctx, monkeypatch, tmp_path, [], touch_at=None, compliant=True,
+                                             top_z=COMPLIANT_TOP)
+    assert events == [] and ctx.client.executed == []
+    assert result.free and result.why == "no straight-down hand reaches here (%s)" % "; ".join(
+        "%.0f deg short: a turn of 2.70 rad of joint arc" % s for s in dp.COMPLIANT_TURN_SHORT_DEG)
+
+
+def _leans_tried(monkeypatch):
+    """_Arm.walk refusing every walk, the lean of each it was asked for kept."""
+    leans = []
+
+    def walk(self, q0, xyz, quat, step_m=None, step_rad=None, max_step_rad=None):
+        leans.append(round(_lean_deg(quat), 6))
+        return None, "IK did not converge 70% of the way"
+
+    monkeypatch.setattr(_Arm, "walk", walk)
+    return leans
+
+
+def test_the_guarded_press_turns_no_further_than_5_deg_short(ctx, monkeypatch, tmp_path):
+    """Its close-up look and DEPTH assume the lens points down along the
+    fingers, and 5 deg short already puts the button 14 mm off the tool
+    axis: the guarded press tries TURN_SHORT_DEG only — (0, 2, 5) — and
+    where none flies it stops with nothing flown. A compliant press there
+    tries every one of COMPLIANT_TURN_SHORT_DEG, in order."""
+    leans = _leans_tried(monkeypatch)
+    result, events, _arm, _l, _s = _press(ctx, monkeypatch, tmp_path, [])
+    assert dp.TURN_SHORT_DEG == (0.0, 2.0, 5.0) and leans == [0.0, 2.0, 5.0]
+    assert events == [] and result.free and result.why.startswith("no straight-down hand reaches here (")
+    assert "8 deg short" not in result.why
+    leans.clear()
+    ctx.client.compliant = True
+    result, events, _arm, _l, _s = _press(ctx, monkeypatch, tmp_path, [], touch_at=None, compliant=True,
+                                          top_z=COMPLIANT_TOP)
+    assert leans == list(dp.COMPLIANT_TURN_SHORT_DEG) and events == [] and result.free
+    # smallest lean first, the guarded ones first of all: what they reach keeps its lean
+    every = dp.COMPLIANT_TURN_SHORT_DEG
+    assert every[:3] == dp.TURN_SHORT_DEG and list(every) == sorted(every) and every[-1] == 15.0
+
+
+def test_the_walk_in_tries_only_the_guarded_leans_in_a_compliant_run_too(ctx, monkeypatch, tmp_path):
+    """From 16:23's re-aimed look the walks 10-15 deg short "fly" only by
+    swinging joint_1 1.6-1.9 rad, the elbow travelling 247-312 mm:
+    walk_in_down, and way_down's walk that proves it, try TURN_SHORT_DEG
+    only and carry no arc bound, in a compliant run too. Only the turn
+    after the slide — way_down's proof of it, the scene camera's button's
+    and the aimed one's — leans further."""
+    import test_reach_press as trp
+
+    from rammp_box_opening.runtime import approach
+
+    tried = []
+    real = dp.turn_walk
+
+    def turn_walk(chain, model, q, tip, shorts=dp.TURN_SHORT_DEG, max_arc_rad=None):
+        tried.append((tuple(shorts), max_arc_rad))
+        return real(chain, model, q, tip, shorts, max_arc_rad)
+
+    monkeypatch.setattr(dp, "turn_walk", turn_walk)
+    turns = []
+
+    def turn(chain, model, q, contact_tool, shorts=dp.TURN_SHORT_DEG):
+        turns.append(tuple(shorts))
+        return _turns_down(chain, model, q, contact_tool, shorts)
+
+    # the fake chain's walks all refuse: the scene button's proof, the aimed
+    # one's, then the flight's walk in — each a walk, then the turn after the slide
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, turn=turn)
+    assert code == 0 and got["compliant"] and got["contact"] == rp.CONTACT_TOOL
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
+    assert tried == [(dp.TURN_SHORT_DEG, None)] * 3
+    assert turns == [dp.COMPLIANT_TURN_SHORT_DEG] * 2
+    # walk_in_down itself, from the look pose: the guarded leans and no others
+    leans = _leans_tried(monkeypatch)
+    arm = _Arm()
+    monkeypatch.setattr(approach, "_chain", lambda: arm)
+    quat, start, _bottom, look = rp.reach_geometry(ctx.model, trp.BUTTON, 30, load_press_demo(PINK).travel_m)
+    ctx.client.live = list(look) + list(quat)
+    pts, down, why = dp.walk_in_down(ctx, start, quat)
+    assert pts is None and down is None and leans == [0.0, 2.0, 5.0]
+    assert why == "; ".join("%.0f deg short: IK did not converge 70%% of the way" % s for s in dp.TURN_SHORT_DEG)
+
+
+def test_on_flatbot_1623s_aimed_button_is_pressed_turning_12_deg_short_after_the_slide(ctx, monkeypatch):
+    """16:23 2026-10-27 replayed on flatbot's URDF: the look the planner
+    took for the scene camera's button, then the re-aim and the slide in to
+    the aimed one as straight lines, the slid-in fingertip 0.780 m out.
+    There the turn with TURN_SHORT_DEG refuses, as it did live ("no
+    straight-down hand reaches here (0 deg short: IK did not converge 73%
+    of the way; ...)"), and so does the walk in from the re-aimed look.
+    With COMPLIANT_TURN_SHORT_DEG it flies 12 deg short: 11 points, every
+    step within TURN_MAX_JUMP_RAD, 1.46 rad of joint arc, about the
+    fingertip — the pads' centre where the fingertip was, no point of the
+    pads nearer the lid than 5 cm. The compliant stroke flies from its end,
+    STIFF's spring ~457 N/m at the pads there."""
+    from rammp_box_opening.constants import HOME
+    from rammp_box_opening.primitives.look import look_joints
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.branches import planner_branch
+    from rammp_box_opening.runtime.kinematics import ArmChain
+
+    chain = ArmChain(path="src/rammp_box_opening/test/data/arm_flatbot_20261021.urdf", root="arm_mount")
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    model = ContainerModel.load(PINK)
+    cfg = load_press_demo(PINK)
+    scene, aimed = (0.7248, -0.2860, 0.3125), (0.7213, -0.2970, 0.3125)
+    quat_s, _start_s, _bottom_s, look_s = rp.reach_geometry(model, scene, 30, cfg.travel_m)
+    # the look pose's joints as client._plan_pose_near picks them
+    q_look = chain.nearest_solution(planner_branch(HOME), look_s, quat_s, seeds=(look_joints(HOME),))
+    assert q_look is not None
+    quat, start, _bottom, look = rp.reach_geometry(model, aimed, 30, cfg.travel_m)
+    move, why = chain.straight_line(q_look, look, quat)  # the re-aim
+    assert why is None, why
+    slide, why = chain.straight_line(move[-1], start, quat)
+    assert why is None, why
+    R, t = chain.fk(slide[-1])
+    tip = np.asarray(t) + np.asarray(R) @ np.asarray(rp.CONTACT_TOOL)
+    assert np.hypot(*tip[:2]) == pytest.approx(0.780, abs=0.001)
+    # what 16:23 had: no turn, and no walk in either
+    pts, _down, _short, why = dp.turn_down_path(chain, model, slide[-1], rp.CONTACT_TOOL, dp.TURN_SHORT_DEG)
+    assert pts is None and why.startswith("0 deg short: IK did not converge"), why
+    pts, _down, _short, why = dp.walk_down_path(chain, model, move[-1], start, quat)
+    assert pts is None, why
+    # a compliant press's leans
+    pts, down, short, why = dp.turn_down_path(chain, model, slide[-1], rp.CONTACT_TOOL, dp.COMPLIANT_TURN_SHORT_DEG)
+    assert why is None and max(dp.TURN_SHORT_DEG) < short <= 15.0, why
+    assert short == 12.0 and len(pts) == 11  # as modelled before this was flown
+    assert dp.joint_arc(pts) <= dp.TURN_MAX_ARC_RAD and dp.joint_arc(pts) == pytest.approx(1.46, abs=0.02)
+    assert max(float(np.abs(np.asarray(b) - np.asarray(a)).max()) for a, b in zip(pts, pts[1:])) <= dp.TURN_MAX_JUMP_RAD
+    R1, t1 = chain.fk(pts[-1])
+    R1 = np.asarray(R1, float)
+    assert np.degrees(rp.hand_lean(R1)) == pytest.approx(12.0, abs=0.05)
+    assert np.linalg.norm(np.asarray(t1) + R1 @ np.asarray(dp.DOWN_CONTACT_TOOL) - tip) < 0.001
+    lowest = []
+    for q in pts:
+        Rq, tq = chain.fk(q)
+        Rq = np.asarray(Rq, float)
+        lowest.append(min(float((np.asarray(tq) + Rq @ np.asarray(p))[2]) for p in (rp.CONTACT_TOOL, dp.DOWN_CONTACT_TOOL)))
+    assert min(lowest) - aimed[2] >= 0.05
+    stroke, why = dp.compliant_stroke(chain, cfg, pts[-1], down, aimed[2])
+    assert why is None, why
+    assert 400.0 <= stroke.k <= 600.0 and [name for name, _p, _s in stroke.legs] == ["depth:approach", "depth:press"]
+    assert stroke.end_z < aimed[2] - cfg.button_travel_m
+    for _name, p, _speed in stroke.legs:  # straight down from the turn's end, the lean held
+        Rp, tp = chain.fk(p[-1])
+        assert list(tp[:2]) == pytest.approx(list(t1[:2]), abs=1e-3)
+        assert np.degrees(rp.hand_lean(np.asarray(Rp, float))) == pytest.approx(12.0, abs=0.1)
 
 
 # ---- a compliant run's clear before home: up as far as the lean needs, and back -----------

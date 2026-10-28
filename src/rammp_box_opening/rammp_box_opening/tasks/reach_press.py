@@ -267,10 +267,13 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     pose to the hand turned straight down over the slide's end `start_xyz`
     (depth_press.walk_in_down; WayDown walked, its end the stroke's start),
     else the slide `slide_pts` held at `quat`, then the TURN about the
-    fingertip (CONTACT_TOOL) where it ends (depth_press.turn_down); then the
-    press stroke from the hand turned down (depth_press.compliant_stroke).
-    The flight solves each again from where the arm stands. Returns
-    (WayDown, StrokePlan, None) or (None, None, why)."""
+    fingertip (CONTACT_TOOL) where it ends (depth_press.turn_down), up to
+    15 deg short of straight down as the compliant press turns
+    (depth_press.COMPLIANT_TURN_SHORT_DEG: way_down serves only that
+    press); then the press stroke from the hand turned down
+    (depth_press.compliant_stroke). The flight solves each again from where
+    the arm stands, trying the same leans. Returns (WayDown, StrokePlan,
+    None) or (None, None, why)."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.tasks import depth_press as dp  # imports this module: not at the top
 
@@ -279,7 +282,8 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     if pts is not None:
         way = dp.WayDown(pts, down, short, True)
     else:
-        pts, down, short, why_turn = dp.turn_down_path(chain, ctx.model, slide_pts[-1], CONTACT_TOOL)
+        pts, down, short, why_turn = dp.turn_down_path(chain, ctx.model, slide_pts[-1], CONTACT_TOOL,
+                                                       dp.COMPLIANT_TURN_SHORT_DEG)
         if pts is None:
             return None, None, "walk in: %s; turn after the slide: %s" % (why_walk, why_turn)
         way = dp.WayDown(pts, down, short, False)
