@@ -1345,6 +1345,16 @@ def test_the_stiffness_at_the_pads_is_the_joint_springs_seen_through_the_arm():
     assert dp.fingertip_stiffness_z(Cartesian(), [0.5, -0.1, 0.4]) == pytest.approx(dp.COMPLIANT_KQ[2])
 
 
+def test_the_press_models_the_spring_its_legs_fly():
+    """The press's stiffness at the pads, its overshoot and press_n are
+    modelled on the profile its legs send, from the one table of the
+    driver's tunings — no hand copy of the driver's numbers to drift."""
+    from rammp_box_opening.constants import GAINS_STIFF, IMPEDANCE_KQ
+
+    assert dp.COMPLIANT_GAINS == GAINS_STIFF
+    assert dp.COMPLIANT_KQ == IMPEDANCE_KQ[GAINS_STIFF] == (160.0,) * 4 + (60.0,) * 3
+
+
 def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx, monkeypatch, tmp_path):
     """The reach-out of a compliant run: no at-rest read, no weight check at
     the look, no stopping guard on the re-aim, the slide in or the way up,

@@ -63,6 +63,20 @@ class LegResult:
     # arm measuring the surface it touched, independent of the camera and
     # of every model constant
     contact_xyz: list = None
+    # how the execution flew: "impedance" or "position", and the driver's
+    # ImpedanceGains profile it was sent with (None in position)
+    mode: str = None
+    gains: int = None
+    # an arrival's error: the live joints the moment the driver called it
+    # arrived against where the trajectory flown ends — the worst joint
+    # (rad, wrap-aware), and the tool frame's offset (mm) and turn (deg) by
+    # the arm's own kinematics. A goal ends when its time does, so in
+    # impedance it is what the spring has not yet caught up. Measured, never
+    # judged: 2026-10-27 16:23 flew at MEDIUM and TF put the tool 32 mm and
+    # 5.3 deg off its commanded look pose, where position runs were 0.0 mm off
+    end_err_rad: float = None
+    end_err_mm: float = None
+    end_err_deg: float = None
     # what tripped the guard (guards.TorqueGuard.trip_report): the joint, its
     # deviation from the baseline in force, and the run-up — so a false trip
     # can be read off the log instead of re-flown
@@ -79,6 +93,33 @@ def _hold(seconds):
     """Hold still (the driver holds its last position). Its own function so
     a test can see the hold without waiting it out."""
     time.sleep(float(seconds))
+
+
+def _arrival_error(live, traj):
+    """(worst joint rad, tool mm, tool deg): the arm at `live` against the
+    end of `traj`, the trajectory flown (LegResult.end_err_*). Joints
+    wrap-aware — HOME's joint_3 sits 4.6 mrad from +-pi, either side of it
+    the same arm — and the tool frame by the arm's own kinematics, which a
+    chain that is not ready leaves None. A measurement only: nothing here
+    may cost the run."""
+    try:
+        end = [float(v) for v in traj.points[-1].positions]
+        live = [float(v) for v in live]
+        rad = max(abs(ang_diff(a, b)) for a, b in zip(live, end))
+    except Exception:  # noqa: BLE001 - nothing to measure against
+        return None, None, None
+    try:
+        from rammp_box_opening.runtime import approach
+        from rammp_box_opening.runtime.kinematics import rotvec
+
+        chain = approach._chain()
+        R1, t1 = chain.fk(end)
+        R2, t2 = chain.fk(live)
+        mm = 1000.0 * float(np.linalg.norm(np.asarray(t1, float) - np.asarray(t2, float)))
+        deg = math.degrees(float(np.linalg.norm(rotvec(np.asarray(R1, float) @ np.asarray(R2, float).T))))
+    except Exception:  # noqa: BLE001 - no chain (no URDF for its root, ...): no tool error
+        mm = deg = None
+    return tuple(None if v is None or not math.isfinite(v) else float(v) for v in (rad, mm, deg))
 
 
 def _path_len(traj):
@@ -947,6 +988,11 @@ class Runner:
             stop_when=lead.stop_when,
             **({} if gains is None else {"gains": gains}),
         )
+        # where the arm is the moment the driver called it arrived, against
+        # the end of what flew: the cached sample, no wait and no settle — a
+        # wait would hide what the spring had not caught up. Logged, never a
+        # gate (a compliant run stops for nothing it reads)
+        end_err = _arrival_error(self.client.joints(), traj) if outcome == "arrived" else (None, None, None)
         if guard is not None:
             info.setdefault("torque_peak", guard.peak)
         if info.get("while_running_error"):
@@ -978,6 +1024,11 @@ class Runner:
             progress=info.get("progress"),
             t_wall=time.monotonic() - t0,
             contact_xyz=contact,
+            mode="impedance" if getattr(self.client, "compliant", False) else "position",
+            gains=info.get("gains"),
+            end_err_rad=end_err[0],
+            end_err_mm=end_err[1],
+            end_err_deg=end_err[2],
             trip=guard.trip_report() if guard is not None else None,
             lookahead=info.get("while_running"),
             flown_traj=traj,

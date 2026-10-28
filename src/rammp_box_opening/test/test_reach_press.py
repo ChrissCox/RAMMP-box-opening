@@ -680,6 +680,29 @@ def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys)
     assert "gravity alone moves joint_4 0.00 Nm along the slide" in capsys.readouterr().out
 
 
+def test_a_compliant_run_says_which_gains_every_move_flies(ctx, monkeypatch, capsys):
+    """Owner 2026-10-27: "impedance mode needs to be firmer". The banner
+    names the tuning in force — the client's compliant_gains — and the
+    client is back in position once the run is over; a guarded run has no
+    banner."""
+    from rammp_box_opening.constants import GAINS_MEDIUM
+
+    during = []
+    monkeypatch.setattr(reach_press, "_reach_press", lambda *a: during.append(ctx.client.compliant) or 0)
+    args = SimpleNamespace(compliant=True, depth_press=True, execute=True)
+    assert reach_press.run_reach_press(None, ctx, None, None, None, args, None, None) == 0
+    out = capsys.readouterr().out
+    assert ("COMPLIANT: every move in the arm's joint impedance, STIFF (Kq 160/60 N·m/rad on joints 1-4/5-7), "
+            "and nothing the run reads stops it") in out
+    ctx.client.compliant_gains = GAINS_MEDIUM
+    reach_press.run_reach_press(None, ctx, None, None, None, args, None, None)
+    assert "impedance, MEDIUM (Kq 80/30 N·m/rad on joints 1-4/5-7), and" in capsys.readouterr().out
+    assert during == [True, True] and not ctx.client.compliant
+    reach_press.run_reach_press(None, ctx, None, None, None, SimpleNamespace(compliant=False, depth_press=True),
+                                None, None)
+    assert "COMPLIANT" not in capsys.readouterr().out and during[-1] is False
+
+
 def test_a_stop_says_what_stopped_the_leg_not_always_something_met():
     """15:34 2026-10-27: the re-aim's guard lost its stream and the STOP
     line said the move met something; nothing had been touched."""

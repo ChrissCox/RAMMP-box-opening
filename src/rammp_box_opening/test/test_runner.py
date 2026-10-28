@@ -1175,3 +1175,123 @@ def test_the_recoil_does_not_extend_along_a_stroke_this_push_did_not_continue(tm
     runner(c, tmp_path).run([push], execute=True)
     q = np.asarray([p.positions for p in c.trajs[-1].points])
     assert q[-1] == pytest.approx(stop, abs=1e-6)  # the push reversed, nothing more
+
+
+# -- an arrival's error: what the spring had not caught up, logged, never judged --
+
+
+class _ArrivesOff(FakeClient):
+    """A compliant client whose arm ends `off` short of the trajectory's end
+    on one joint (or reads `to` there): an impedance goal ends on time, its
+    spring still converging. It reports the gains it would send."""
+
+    def __init__(self, joint=1, off=0.01, to=None):
+        super().__init__()
+        self.compliant = True
+        self._joint, self._off, self._to = joint, off, to
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+        if outcome == "arrived":
+            self.live[self._joint] = self._to if self._to is not None else self.live[self._joint] - self._off
+        info["gains"] = 3 if gains is None else gains
+        return outcome, info
+
+
+class _TwoLink:
+    """The arm's FK stood in for by one periodic in every joint, as the real
+    one is: the tool 0.5 m out along joints 1 and 2, turned about z by
+    joints 1 and 3 and tipped by joint 2."""
+
+    def fk(self, q):
+        import numpy as np
+
+        a, b = q[0] + q[2], q[1]
+        rz = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+        rx = np.array([[1.0, 0.0, 0.0], [0.0, np.cos(b), -np.sin(b)], [0.0, np.sin(b), np.cos(b)]])
+        t = 0.5 * np.array([np.cos(q[0]) * np.cos(b), np.sin(q[0]) * np.cos(b), np.sin(b)])
+        return rz @ rx, t
+
+
+def _rows(tmp_path):
+    import json
+
+    return {r["leg"]: r for r in map(json.loads, next(tmp_path.glob("run-*.jsonl")).read_text().splitlines())}
+
+
+def test_an_arrival_logs_how_far_the_arm_stood_from_the_end_of_what_flew(tmp_path, monkeypatch):
+    """2026-10-27 16:23, MEDIUM: TF put the tool 32 mm and 5.3 deg off its
+    commanded look pose. Every arrival now says how far off it stood, so the
+    log shows what STIFF buys. A merged group logs its one end for every
+    member, as it logs its one t_wall."""
+    import math
+
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    c = _ArrivesOff(joint=1, off=0.01)
+    res = runner(c, tmp_path).run([leg("a", Q0, Q1), leg("b", Q1, Q2)], execute=True)
+    assert len(c.executed) == 1 and res[0].ok
+    rows = _rows(tmp_path)
+    for name in ("a", "b"):
+        row = rows[name]
+        assert row["end_err_rad"] == pytest.approx(0.01, abs=1e-9), name
+        # 0.01 rad of joint 2 tips the 0.5 m tool 5 mm and turns it 0.57 deg
+        assert row["end_err_mm"] == pytest.approx(5.0, rel=1e-3)
+        assert row["end_err_deg"] == pytest.approx(math.degrees(0.01), rel=1e-6)
+        assert row["mode"] == "impedance" and row["gains"] == 3
+
+
+def test_an_arrival_with_no_chain_logs_the_joints_alone_and_the_run_carries_on(tmp_path, monkeypatch):
+    from rammp_box_opening.runtime import approach
+
+    def no_chain():
+        raise RuntimeError("no arm URDF rooted at arm_mount (is /arm/robot_description published?)")
+
+    monkeypatch.setattr(approach, "_chain", no_chain)
+    c = _ArrivesOff(joint=1, off=0.01)
+    res = runner(c, tmp_path).run([leg("a", Q0, Q1, chain=0), leg("b", Q1, Q2, chain=1)], execute=True)
+    assert [r.ok for r in res] == [True, True] and len(c.executed) == 2
+    row = _rows(tmp_path)["a"]
+    assert row["end_err_rad"] == pytest.approx(0.01, abs=1e-9)
+    assert row["end_err_mm"] is None and row["end_err_deg"] is None
+
+
+def test_a_failed_execution_logs_no_arrival_error(tmp_path, monkeypatch):
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    c = _ArrivesOff()
+    c.exec_script = [("failed", {"message": "halted: emergency stop", "progress": 0.4})]
+    res = runner(c, tmp_path).run([leg("a", Q0, Q1)], execute=True)
+    assert res[0].outcome == "failed"
+    row = _rows(tmp_path)["a"]
+    assert row["end_err_rad"] is None and row["end_err_mm"] is None and row["end_err_deg"] is None
+    assert row["mode"] == "impedance" and row["gains"] == 3  # how it flew, still
+
+
+def test_an_arrival_across_the_wrap_is_the_short_way_round(tmp_path, monkeypatch):
+    """HOME's joint_3 sits 4.6 mrad from -pi and reads either side of it: an
+    end at -3.137 with the arm reading +3.140 is 6 mrad off, not 6.28 rad."""
+    import math
+
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    start = [0.0, 0.0, -3.10, 0.0, 0.0, 0.0, 0.0]
+    end = [0.0, 0.0, -3.137, 0.0, 0.0, 0.0, 0.0]
+    c = _ArrivesOff(joint=2, to=3.140)
+    c.live = list(start)
+    res = runner(c, tmp_path).run([leg("a", start, end)], execute=True)
+    assert res[0].ok
+    err = res[0].end_err_rad
+    assert err == pytest.approx(2 * math.pi - 3.140 - 3.137, abs=1e-9) and err < 0.01
+    assert res[0].end_err_deg == pytest.approx(math.degrees(err), rel=1e-6)
+    assert res[0].end_err_mm == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_position_arrival_logs_its_mode_and_no_gains(tmp_path):
+    c = FakeClient()  # no compliant flag: a position run, its arm on the end
+    runner(c, tmp_path).run([leg("a")], execute=True)
+    row = _rows(tmp_path)["a"]
+    assert row["mode"] == "position" and row["gains"] is None and row["end_err_rad"] == 0.0
