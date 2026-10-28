@@ -291,6 +291,36 @@ def test_each_tilt_is_proven_from_the_arms_own_ik_and_only_the_one_that_proves_i
     assert all("%d deg: the stroke (" % t in why for t in reach_press.REACH_TILTS_DEG)
 
 
+def test_a_tilt_proven_from_the_arms_own_ik_whose_look_does_not_plan_is_passed_over(ctx, monkeypatch):
+    """The first tilt proves from the arm's own IK, but its look does not
+    plan (a TRAJOPT_FAIL, or the posture inside something the cameras saw):
+    that tilt is passed over, as a look that did not plan always was, and
+    not kept — it has no look to fly — and the next tilt is proven and
+    planned, with its leg. Where no look plans, each is asked once and every
+    tilt is named."""
+    from rammp_box_opening.runtime import approach
+
+    cfg = load_press_demo(PINK)
+    ctx.model = ContainerModel.load(PINK)
+    monkeypatch.setattr(approach, "_chain", lambda: _IKChain())
+    planned = []
+    monkeypatch.setattr(reach_press, "_plan_motion", _planner(planned, refuse=(30,)))
+    monkeypatch.setattr(reach_press, "way_down", _way_down([], solves=lambda tilt, tip: True))
+    for depth in (True, False):  # the compliant depth press, and the guarded press's tilted stroke
+        planned.clear()
+        looks = []
+        plan, why = reach_press.plan_reach(ctx, cfg, BUTTON, [0.0] * 7, depth=depth, looks=looks)
+        assert why is None and plan.tilt_deg == 35 and plan.look_leg.goal_joints == Q_LOOK, depth
+        assert [t for t, _target in planned] == [30, 35] and looks == [], depth
+    # no look plans: nothing to fly, nothing kept
+    planned.clear()
+    monkeypatch.setattr(reach_press, "_plan_motion", _planner(planned, refuse=reach_press.REACH_TILTS_DEG))
+    looks = []
+    plan, why = reach_press.plan_reach(ctx, cfg, BUTTON, [0.0] * 7, depth=True, looks=looks)
+    assert plan is None and looks == [] and [t for t, _target in planned] == list(reach_press.REACH_TILTS_DEG)
+    assert all("%d deg: the look pose (MotionGenStatus.TRAJOPT_FAIL)" % t in why for t in reach_press.REACH_TILTS_DEG)
+
+
 def test_a_look_planned_to_end_off_its_proof_is_proven_again_from_its_end(ctx, monkeypatch, capsys):
     """The planner's joint plan ends on its goal; its FK-pose fallback, and
     the client's own pose plan, end wherever their IK lands. A look planned
@@ -340,11 +370,13 @@ def test_a_look_planned_to_end_off_its_proof_is_proven_again_from_its_end(ctx, m
 
 def test_a_shifted_press_plans_only_the_look_it_flies_from(ctx, monkeypatch):
     """plan_reach planned none of the looks it kept: plan_shifted_look plans
-    the first whose shifted press flies, once it flies, and none where it
-    does not — that STOP costs the planner nothing. A look that does not
-    plan is passed over for the next, as plan_reach passes one over; one
-    planned to end off the joints it was proven from is proven again from
-    its end."""
+    the smallest tilt's once its shifted press flies, and none where it
+    does not — that STOP costs the planner nothing, even where a larger
+    tilt's press would fly and the smallest's look would not have planned
+    (before, the next was asked then). A look whose press flies but which
+    does not plan is passed over for the next, as plan_reach passes one
+    over; one planned to end off the joints it was proven from is proven
+    again from its end."""
     from rammp_box_opening.runtime import approach
 
     cfg = load_press_demo(PINK)
@@ -375,9 +407,14 @@ def test_a_shifted_press_plans_only_the_look_it_flies_from(ctx, monkeypatch):
     plan, near, why = reach_press.plan_shifted_look(ctx, cfg, looks, BUTTON, [0.0] * 7)
     assert plan is None and near is None and planned == []
     assert why.startswith("at 30 deg: 30 mm nearer the arm: the way down (walk in: ")
+    # ... nor where it flies only from a larger tilt and the smallest's look would not plan: the search ends there
+    monkeypatch.setattr(reach_press, "way_down", _way_down([], lambda tilt, tip: tilt > 30 and off_scene(tilt, tip)))
+    monkeypatch.setattr(reach_press, "_plan_motion", _planner(planned, refuse=(30,)))
+    plan, near, why = reach_press.plan_shifted_look(ctx, cfg, looks, BUTTON, [0.0] * 7)
+    assert plan is None and near is None and planned == []
+    assert why.startswith("at 30 deg: 30 mm nearer the arm: the way down (walk in: ")
     # the smallest tilt's look does not plan: the next one's
     monkeypatch.setattr(reach_press, "way_down", way_down)
-    monkeypatch.setattr(reach_press, "_plan_motion", _planner(planned, refuse=(30,)))
     plan, near, why = reach_press.plan_shifted_look(ctx, cfg, looks, BUTTON, [0.0] * 7)
     assert why is None and plan.tilt_deg == 35 and [t for t, _target in planned] == [30, 35]
     # planned to end elsewhere: proven again from there

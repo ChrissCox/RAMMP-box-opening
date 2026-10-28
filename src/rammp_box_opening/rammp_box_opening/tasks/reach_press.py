@@ -567,13 +567,19 @@ def shifted_way_down(ctx, cfg, look, button, m=PROOF_SHIFT_M):
 
 
 def plan_shifted_look(ctx, cfg, looks, button, q_from, m=PROOF_SHIFT_M):
-    """For a scene button no tilt presses (plan_reach depth=True): the first
-    of its `looks` from which the press reaches one of _shifted_buttons
-    (shifted_way_down), its look leg planned from `q_from` only then —
-    plan_reach plans none of them, so a box nothing presses costs the
-    planner nothing (14:28:12 2026-10-28: four looks planned, none pressed
-    from). A look that does not plan is passed over, as plan_reach passes
-    one over; one planned to end off the joints it was proven from
+    """For a scene button no tilt presses (plan_reach depth=True): the press
+    to one of _shifted_buttons from the smallest tilt of its `looks`
+    (shifted_way_down, as it always was asked), and that look's leg,
+    planned from `q_from` only once the press reaches — plan_reach plans
+    none of them, so a box nothing presses costs the planner nothing
+    (14:28:12 2026-10-28: four looks planned, none pressed from). Where the
+    press reaches but the look does not plan, the next look is asked in its
+    place, as plan_reach passes over a look that does not plan; where the
+    press does not reach, the search ends there, unplanned. Until
+    2026-10-28 a look that did not plan was never kept, so the next one was
+    asked: a kept look that would not have planned now stops the run where
+    a larger tilt's press might have flown — knowing would cost a plan on
+    every such stop. One planned to end off the joints it was proven from
     (LOOK_END_RAD) is proven again from where it ends. Returns (the
     ReachPlan with its look leg planned, SHIFTED's name, None) or (None,
     None, why)."""
@@ -1454,10 +1460,11 @@ def _not_one_execution(ctx, legs):
     chains them and way_in_legs names one gains spec on every one, so it
     should not happen), or the first does not start where the arm stands
     (REUSE_RAD, as _line_from reuses a solved line). After the planner's
-    look leg the way in starts at that leg's planned end, which an
-    impedance arrival leaves a few mm off; the driver would jump to it, and
-    the runner refuses it from DRIFT_REPLAN_RAD on. Leg by leg, each is
-    solved again from where the arm stands."""
+    look leg the way in starts at the joints that leg was planned to
+    (plan_reach's look_joints; the leg ends within LOOK_END_RAD of them),
+    which an impedance arrival leaves a few mm off; the driver would jump
+    to them, and the runner refuses it from DRIFT_REPLAN_RAD on. Leg by
+    leg, each is solved again from where the arm stands."""
     if not legs:
         return "no line to fly"
     if len(merge_groups(legs)) != 1:
@@ -1981,13 +1988,14 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
                 if any(not r.ok for r in res):
                     let_go_part_way(ctx, res)
                     return 1
-                # plan_reach proved the way down from the leg's end: that proof
-                # is the way in. Solved again from the live joints, an
-                # impedance arrival a few mm off the look pose would only add a
-                # re-aim, which the planned move never had. It starts at the
-                # leg's planned end, though, and an impedance arrival read the
-                # moment its goal ends stands mm off it, past REUSE_RAD: this
-                # way in then flies leg by leg (_not_one_execution)
+                # plan_reach proved the way down from the joints the leg was
+                # planned to (look_joints; the leg ends within LOOK_END_RAD of
+                # them): that proof is the way in. Solved again from the live
+                # joints, an impedance arrival a few mm off the look pose would
+                # only add a re-aim, which the planned move never had. It
+                # starts at those joints, though, and an impedance arrival read
+                # the moment its goal ends stands mm off them, past REUSE_RAD:
+                # this way in then flies leg by leg (_not_one_execution)
                 way = WayIn([], plan2, plan2.down, None if plan2.down.walked else plan2.slide_pts, plan2.stroke)
         if way is None:
             # from the look pose, in free air: nothing slid into the box's
