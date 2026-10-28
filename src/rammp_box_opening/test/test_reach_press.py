@@ -486,6 +486,32 @@ def test_an_aim_that_raises_after_the_early_enable_disables_the_scene_owl(ctx, m
     assert calls == ["on", "off"]
 
 
+def test_both_reach_out_aims_take_their_own_budget_and_two_agreeing_hits(monkeypatch):
+    """The look's aim and the guarded run's after-press one both go through
+    _aim: REACH_AIM_S, not the straight-down STAGING_FIX_S whose 2.5 s left
+    16:23 2026-10-27 0.72 s to spare, and a fix on REACH_AIM_HITS agreeing
+    hits. The _flow harness replaces _aim outright, so this calls it."""
+    from rammp_box_opening.tasks import press_demo
+
+    asked = []
+
+    def aim(node, watcher, yaw, **kw):
+        asked.append(kw)
+        kw["out"].update(button_up_mm=0.9, measured_xyz=(0.7213, -0.297, 0.2914))
+        return ((0.7213, -0.297, 0.3095), yaw), "2 of 2 hits agree in 9 frames"
+
+    monkeypatch.setattr(press_demo, "aim_button_at_staging", aim)
+    for tag in ("reach-aim", "reach-after"):
+        got, status, up, measured = reach_press._aim(None, None, 0.6, 0.3125, (0.7248, -0.286), None, tag)
+        assert got == ((0.7213, -0.297, 0.3095), 0.6) and up == 0.9 and measured == (0.7213, -0.297, 0.2914)
+    assert [(k["tag"], k["timeout_s"], k["min_hits"]) for k in asked] == [
+        ("reach-aim", reach_press.REACH_AIM_S, reach_press.REACH_AIM_HITS),
+        ("reach-after", reach_press.REACH_AIM_S, reach_press.REACH_AIM_HITS),
+    ]
+    assert all(k["lid_z"] == 0.3125 and k["prior_xy"] == (0.7248, -0.286) for k in asked)
+    assert reach_press.REACH_AIM_S > press_demo.STAGING_FIX_S and reach_press.REACH_AIM_HITS == 2
+
+
 def _reach_world_button(ctx):
     from rammp_box_opening.models.container import from_container
 

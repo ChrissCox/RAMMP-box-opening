@@ -26,7 +26,9 @@ The lid's height is measured in the frame, not trusted — the scene camera
 has put a lid top 21 mm below table_z + dims.z.
 """
 
+import itertools
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -45,6 +47,12 @@ ANNULUS_TOL_M = 0.012
 ANNULUS_MIN_FRAC = 0.8
 AGREE_M = 0.004  # hits that agree within this (planar) count together
 MIN_HITS = 3
+# A tilted view's aim may fix on two hits that agree (ButtonAimer's min_hits,
+# tasks/reach_press), found among this many newest (agreeing_fix): its hits
+# come rarer than straight down's — three agreeing took 14, 19 and 25 frames
+# on flatbot 2026-10-27 — and at 15:19 the first hit did not agree, so the
+# last-three rule waited for three new ones.
+AIM_WINDOW = 4
 KNOB_MAX_UP_M = 0.025  # a popped knob's top is at most this far above the lid (met at ~10 and at 17.7 mm)
 # The press point is the CENTRE of the seam circle, and nothing overrides
 # it (owner: "make sure the gripper goes to the center of the circle
@@ -709,6 +717,44 @@ def agreeing_median(points, tol=AGREE_M, n=MIN_HITS):
     return tuple(float(v) for v in np.median(last, axis=0))
 
 
+def agreeing_fix(points, above, n=MIN_HITS, window=AIM_WINDOW, tol=AGREE_M):
+    """(xyz, indices): a fix and the hits it is made from, or None.
+
+    n=3 (MIN_HITS): the last three agree pairwise within tol (planar), the
+    fix their median — agreeing_median, the rule every straight-down aim
+    keeps (any n but 2 is the last n). n=2: of the last `window` hits, the
+    newest two that agree within tol and on the knob — their `above` (each
+    hit's above_lid_m) within KNOB_NOISE_M, or one of the two without one —
+    the fix their mean; else the newest three of them that agree pairwise,
+    their median. The knob decides whether the box is open
+    (press_demo.refuse_open_box at 6 mm; shut boxes read +0.4 to +3.7 mm on
+    2026-10-27): two hits say it only when they say it alike, and one
+    outlying reading cannot move the median of three."""
+    n = int(n)
+    if n != 2:
+        xyz = agreeing_median(points, tol=tol, n=n)
+        return None if xyz is None else (xyz, list(range(len(points) - n, len(points))))
+    up = [float("nan")] * len(points) if above is None else [float(v) for v in above]
+    last = range(max(0, len(points) - int(window)), len(points))
+
+    def near(i, j):
+        return math.hypot(points[i][0] - points[j][0], points[i][1] - points[j][1]) <= tol
+
+    def same_knob(i, j):  # a hit without a reading disagrees with none
+        return not (math.isfinite(up[i]) and math.isfinite(up[j])) or abs(up[i] - up[j]) <= KNOB_NOISE_M
+
+    def newest_first(k):  # by the newest hit in them, then the next newest
+        return sorted(itertools.combinations(last, k), key=lambda c: c[::-1], reverse=True)
+
+    for i, j in newest_first(2):
+        if near(i, j) and same_knob(i, j):
+            return tuple(float(v) for v in np.mean(np.asarray([points[i], points[j]], float), axis=0)), [i, j]
+    for c in newest_first(3):
+        if all(near(i, j) for i, j in itertools.combinations(c, 2)):
+            return tuple(float(v) for v in np.median(np.asarray([points[i] for i in c], float), axis=0)), list(c)
+    return None
+
+
 # lid_in_view: the lid is the surface standing the container's height above
 # the table the frame sees most of, judged against THAT table so the wrist
 # mount's height in TF (5 cm off on flatbot, 2026-10-23) cannot move it
@@ -791,23 +837,31 @@ class StillDepth:
 
 
 class ButtonAimer:
-    """Frames from a D405Grabber, still ones only, until MIN_HITS agree.
-    lid_z and prior_xy go to find_button (see there). A tilted view's frame
-    is judged on the depth of the still frames before it too (StillDepth),
-    and its fix's z raised by the wrist's table offset (fix)."""
+    """Frames from a D405Grabber, still ones only, until enough hits agree
+    (agreeing_fix). A tilted view's aim takes `min_hits` (2: two agreeing
+    among the last `window` — the reach-out's look); a straight-down one,
+    where most frames hit, at least MIN_HITS in a row whatever min_hits
+    says. lid_z and prior_xy go to find_button (see there). A tilted view's
+    frame is judged on the depth of the still frames before it too
+    (StillDepth), and its fix's z raised by the wrist's table offset (fix)."""
 
-    def __init__(self, grab, model, table_z, lid_z=None, prior_xy=None):
+    def __init__(self, grab, model, table_z, lid_z=None, prior_xy=None, min_hits=MIN_HITS, window=AIM_WINDOW):
         self.grab = grab
         self.model = model
         self.table_z = float(table_z)
         self.lid_z = None if lid_z is None else float(lid_z)
         self.prior_xy = None if prior_xy is None else (float(prior_xy[0]), float(prior_xy[1]))
+        self.min_hits = int(min_hits)
+        self.window = int(window)
+        self.t0 = time.monotonic()
         self.last_why = None
         self.frames = 0
         self.hits = 0
         self.points = []
         self.above_lid = []
         self.table_offsets = []  # each hit's (accepted, raw) table offset, nan where none (ButtonSighting)
+        self.hit_s = []  # each hit's time since the aimer was built (s)
+        self.oblique = []  # each hit: found by find_button_oblique
         self._last_stamp = None
         self._last_depth_stamp = None  # the depth that last voted (depth_paired)
         self._last_cam = None
@@ -873,15 +927,36 @@ class ButtonAimer:
         self.points.append(s.xyz)
         self.above_lid.append(s.above_lid_m)
         self.table_offsets.append((s.table_offset_m, s.table_offset_raw_m))
+        self.hit_s.append(time.monotonic() - self.t0)
+        self.oblique.append(bool(getattr(s, "oblique", False)))  # a sighting without the flag: straight down
         dt = pair_dt_ms(f)
         if dt is not None:
             self.pair_dt_ms.append(dt)
-        return agreeing_median(self.points) is not None
+        return self.fix() is not None
+
+    def _need(self):
+        """How many agreeing hits make the fix (agreeing_fix's n): min_hits
+        while the newest hit is a tilted view's, else at least MIN_HITS."""
+        if self.oblique and self.oblique[-1]:
+            return self.min_hits
+        return max(self.min_hits, MIN_HITS)
+
+    def fix_hits(self):
+        """The hits the fix is made from (indices into points, above_lid,
+        table_offsets and hit_s), or None without a fix."""
+        got = agreeing_fix(self.points, self.above_lid, self._need(), self.window)
+        return None if got is None else got[1]
+
+    def _judged(self):
+        """The fix's own hits — a pair need not be the last two — or,
+        without a fix, the last _need() of them."""
+        idx = self.fix_hits()
+        return idx if idx is not None else list(range(max(0, len(self.points) - self._need()), len(self.points)))
 
     def button_above_lid_m(self):
         """How far the button stands above its own lid, over the hits the
         fix was made from (median), or None when none of them could say."""
-        vals = [v for v in self.above_lid[-MIN_HITS:] if np.isfinite(v)]
+        vals = [self.above_lid[i] for i in self._judged() if np.isfinite(self.above_lid[i])]
         return float(np.median(vals)) if vals else None
 
     def table_offset_m(self, raw=False):
@@ -891,7 +966,7 @@ class ButtonAimer:
         most that do), else nan — a hit whose offset was not accepted counts
         for nothing. raw: the median of their raw offsets, accepted or not,
         for the aim's note: drift shows there before it fails a run."""
-        pairs = self.table_offsets[-MIN_HITS:]
+        pairs = [self.table_offsets[i] for i in self._judged()]
         if raw:
             vals = [v for _a, v in pairs if np.isfinite(v)]
             return float(np.median(vals)) if vals else float("nan")
@@ -904,25 +979,29 @@ class ButtonAimer:
         return float(np.median(best)) if len(best) >= 2 else float("nan")
 
     def fix(self, measured=False):
-        """The press point: the median of the last MIN_HITS hits when they
-        agree (agreeing_median), else None. Its xy is as measured; its z is
-        RAISED by the wrist's table offset where that is known and below the
-        given table (table_offset_m): the wrist that reads its table 20 mm
-        low reads the lid 20 mm low too. It is never lowered: the compliant
-        press goes by the higher of this and the scene camera's lid
-        (reach_press), and a lowered aim would no longer bound the press
+        """The press point when enough hits agree (agreeing_fix: the median
+        of the last MIN_HITS, or the mean of a tilted view's agreeing pair),
+        else None. Its xy is as measured; its z is RAISED by the wrist's
+        table offset where that is known and below the given table
+        (table_offset_m, over the same hits): the wrist that reads its table
+        20 mm low reads the lid 20 mm low too. It is never lowered: the
+        compliant press goes by the higher of this and the scene camera's
+        lid (reach_press), and a lowered aim would no longer bound the press
         from below should the scene camera's table and lid ever read low.
         measured: the z as the hits measured it — what the wrist's own later
         readings are judged against (reach_press._aim)."""
-        xyz = agreeing_median(self.points)
-        if xyz is None or measured:
-            return xyz
+        got = agreeing_fix(self.points, self.above_lid, self._need(), self.window)
+        if got is None or measured:
+            return None if got is None else got[0]
+        xyz = got[0]
         off = self.table_offset_m()
         if np.isfinite(off) and off < 0.0:
             return (xyz[0], xyz[1], xyz[2] - off)
         return xyz
 
     def status(self):
-        return "%d/%d still frames found the button circle%s" % (
-            self.hits, self.frames, "" if self.last_why is None else " (last reject: %s)" % self.last_why
+        idx = self.fix_hits()
+        return "%d of %d hits agree in %d frames%s" % (
+            0 if idx is None else len(idx), self.hits, self.frames,
+            "" if self.last_why is None else " (last reject: %s)" % self.last_why,
         )

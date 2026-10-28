@@ -419,20 +419,36 @@ def oblique_aim_available():
     return "lid_z" in params and "prior_xy" in params
 
 
+# The tilted look's own budget and fix (press_demo.STAGING_FIX_S and
+# button_aim.MIN_HITS are the straight-down aim's, where most frames hit).
+# Flatbot 2026-10-27: three agreeing hits took 14, 19 and 25 frames
+# (1.38-1.78 s), and at 15:19 the first hit did not agree, so three more
+# were needed. A compliant run aims the moment the look leg arrives, with no
+# at-rest read before it: 16:23's 1.78 s included the settle and left 0.72 s
+# of the 2.5, and a timeout ends the run with nothing pressed. The aim
+# returns on its fix: the longer budget is spent only where it would have
+# timed out.
+REACH_AIM_S = 4.0
+# two agreeing hits among the last four (button_aim.agreeing_fix), as
+# depth_press.look's LOOK_HITS: one outlier no longer costs three hits
+REACH_AIM_HITS = 2
+
+
 def _aim(node, watcher, yaw, lid_z, prior_xy, runner, tag):
     """(got, status, the knob's height above its lid in mm, the press point
-    as the wrist measured it) from aim_button_at_staging. got's z is raised
-    by the wrist's table offset (button_aim.ButtonAimer.fix): the height the
-    arm and the scene camera are compared with. The measured point is the
-    one the wrist's own readings are judged against — the lid after the
-    press, the depth press's depth from over the box — so the wrist's own
-    error cancels, as it did before the raise (flatbot 2026-10-27 15:19:
-    the aim 14 mm off the wrist's depth under the fingers measured, 36 mm
-    raised)."""
+    as the wrist measured it) from aim_button_at_staging, within REACH_AIM_S
+    and on REACH_AIM_HITS agreeing hits. got's z is raised by the wrist's
+    table offset (button_aim.ButtonAimer.fix): the height the arm and the
+    scene camera are compared with. The measured point is the one the
+    wrist's own readings are judged against — the lid after the press, the
+    depth press's depth from over the box — so the wrist's own error
+    cancels, as it did before the raise (flatbot 2026-10-27 15:19: the aim
+    14 mm off the wrist's depth under the fingers measured, 36 mm raised)."""
     from rammp_box_opening.tasks.press_demo import aim_button_at_staging
 
     seen = {}
-    got, status = aim_button_at_staging(node, watcher, yaw, runner=runner, tag=tag, out=seen, lid_z=lid_z, prior_xy=prior_xy)
+    got, status = aim_button_at_staging(node, watcher, yaw, timeout_s=REACH_AIM_S, runner=runner, tag=tag, out=seen,
+                                        lid_z=lid_z, prior_xy=prior_xy, min_hits=REACH_AIM_HITS)
     measured = seen.get("measured_xyz", None if got is None else got[0])
     return got, status, seen.get("button_up_mm"), measured
 
