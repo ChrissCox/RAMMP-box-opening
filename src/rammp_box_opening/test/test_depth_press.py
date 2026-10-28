@@ -761,14 +761,28 @@ def test_a_box_the_press_moved_stops_the_run(ctx, monkeypatch, tmp_path):
 
 
 ARRIVED = ("arrived", {"message": "ok", "progress": 1.0})
+TURNED_DOWN = [1.0, 0.0, 0.0, 0.0]  # tool_frame's z along the world's -z (x, y, z, w): test_reach_press.STRAIGHT_DOWN
 
 
-def _depth_flow(ctx, monkeypatch, tmp_path, press, compliant=False, **kw):
+def _turns_down(chain, model, q, contact_tool, shorts=dp.TURN_SHORT_DEG):
+    """dp.turn_down_path for test_reach_press's fake chain, whose walks all
+    refuse: the turn after the slide flies, exactly down."""
+    return [list(q), [float(v) + 0.01 for v in q]], list(TURNED_DOWN), 0.0, None
+
+
+def _depth_flow(ctx, monkeypatch, tmp_path, press, compliant=False, walk_in=False, turn=_turns_down, **kw):
     """test_reach_press._flow with --depth-press: `press` stands in for
     press_down_from_here (called with the reach's ctx). The fake chain's fk
-    stands at z 0.45 over the aimed button at 0.40."""
-    from test_reach_press import _flow
+    stands at z 0.45 over the aimed button at 0.40. A `compliant` run's
+    press is proven before the arm moves (rp.way_down): the fake chain's
+    walks refuse — unless `walk_in`, then they fly — and the turn after the
+    slide is `turn`'s (dp.turn_down_path)."""
+    from test_reach_press import _Chain, _flow
 
+    if compliant:
+        monkeypatch.setattr(dp, "turn_down_path", turn)
+    if walk_in:
+        monkeypatch.setattr(_Chain, "walk", lambda self, q0, xyz, quat, **k: ([list(q0), [v + 0.01 for v in q0]], None))
     got = {}
     compliant_run = compliant
 
@@ -1457,6 +1471,83 @@ def test_a_guarded_reach_out_is_as_before(ctx, monkeypatch, tmp_path):
         assert rec.legs[n].speed == CONTACT_SPEED and rec.legs[n].world.startswith("interaction"), (
             n, rec.legs[n].speed, rec.legs[n].world)
     assert rec.legs["depth:clear"].speed == CONTACT_SPEED and rec.legs["depth:clear"].guard is not None
+
+
+@pytest.mark.parametrize("walk_in", [False, True])
+def test_a_compliant_press_is_proven_for_the_scene_button_and_again_for_the_aimed_one(ctx, monkeypatch, tmp_path,
+                                                                                      walk_in):
+    """Before the look, from the rest pose, for the scene camera's button;
+    after the aim, before the re-aim, for the aimed one: the walk in from
+    the look pose, else the slide and the turn, then the stroke. The run
+    records say which, and the flight is as before."""
+    import json
+
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, walk_in=walk_in)
+    assert code == 0 and got["compliant"]
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    plan, = [r for r in rows if r["leg"] == "reach_plan"]
+    assert plan["proof"] == "scene" and plan["down"] == {"walked": walk_in, "short_deg": 0.0}
+    way, = [r for r in rows if r["leg"] == "reach_way_in"]
+    assert (way["tilt_deg"], way["walked"], way["short_deg"]) == (rp.REACH_TILTS_DEG[0], walk_in, 0.0)
+    # the fake chain's pads are infinitely stiff: the stroke ends the least overshoot below the button's bottom
+    cfg = load_press_demo(PINK)
+    assert way["end_z"] == pytest.approx(0.40 - cfg.button_travel_m - dp.COMPLIANT_OVERSHOOT_M[0], abs=1e-4)
+    order = [r["leg"] for r in rows]
+    assert order.index("reach_plan") < order.index("reach:look") < order.index("reach_way_in") < order.index(
+        "reach:re-aim")
+
+
+def test_a_compliant_run_whose_aimed_button_no_way_down_reaches_goes_home_from_the_look(ctx, monkeypatch, tmp_path,
+                                                                                        capsys):
+    """16:23 2026-10-27: the aim put the button 12 mm from the scene
+    camera's, and the arm flew the re-aim and a 7.4 s slide in before the
+    turn down was asked for — "no straight-down hand reaches here" — then
+    the clear, home refused INVALID_START, a 15 cm back-off and home. Now
+    the aimed button's way down is solved before the re-aim: where neither
+    the walk in nor the turn after the slide turns the hand down, the arm
+    goes home from the look pose, in free air: no re-aim, no slide in, no
+    clear, no back-off, nothing pressed."""
+    import json
+
+    turns = []
+
+    def scene_only(chain, model, q, contact_tool, shorts=dp.TURN_SHORT_DEG):
+        turns.append(list(q))
+        if len(turns) == 1:  # plan_reach's, for the scene camera's button
+            return _turns_down(chain, model, q, contact_tool, shorts)
+        return None, None, None, "0 deg short: IK did not converge 73% of the way"
+
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, turn=scene_only)
+    assert code == 1 and rec.events == ["reach:look", "aim:reach-aim", "home"] and got == {}
+    assert len(turns) == 2
+    out = capsys.readouterr().out
+    assert ("STOP: no press reaches the aimed button (the way down (walk in: 0 deg short: no turning walk modelled; "
+            "2 deg short: no turning walk modelled; 5 deg short: no turning walk modelled; turn after the slide: 0 deg "
+            "short: IK did not converge 73% of the way)) — nothing was pressed — returning home") in out
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    assert not [r for r in rows if r["leg"] in ("reach_way_in", "home_refused")]
+
+
+def test_the_compliant_stroke_solved_ahead_is_the_one_the_press_flies(ctx, monkeypatch, tmp_path):
+    """compliant_stroke from the hand turned down is press_compliant's own
+    stroke — its legs, their ends and speeds, its stiffness and its end —
+    and turn_down_path is the turn the press flies: what the reach-out
+    solves before the arm moves is what then flies."""
+    result, _events, arm, legs, note = _compliant(ctx, monkeypatch, tmp_path, held_up_m=0.0)
+    (goal, quat), = arm.turns
+    stroke, why = dp.compliant_stroke(arm, load_press_demo(PINK), list(goal) + list(quat), quat, COMPLIANT_TOP)
+    assert why is None and [name for name, _pts, _speed in stroke.legs] == ["depth:approach", "depth:press"]
+    for name, pts, speed in stroke.legs:
+        assert legs[name].speed == speed
+        assert list(legs[name].traj.points[-1].positions) == pytest.approx([float(v) for v in pts[-1]])
+    assert stroke.k == pytest.approx(note["stiffness_n_per_m"], abs=0.05)
+    assert stroke.end_z == pytest.approx(note["end_z"], abs=5e-5)
+    # ... and the turn's path is the turn the press flew
+    pts, down, short, why = dp.turn_down_path(_Arm(), ctx.model, legs["depth:turn"].traj.points[0].positions,
+                                              rp.CONTACT_TOOL)
+    assert why is None and short == 0.0 and down == pytest.approx(quat)
+    assert list(pts[-1]) == pytest.approx(list(legs["depth:turn"].traj.points[-1].positions))
 
 
 # ---- a compliant run's clear before home: up as far as the lean needs, and back -----------
