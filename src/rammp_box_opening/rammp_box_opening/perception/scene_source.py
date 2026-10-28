@@ -204,7 +204,8 @@ def table_around(pts_base, centre_xy, below_z, ring=TABLE_RING_M):
     return float(c[2] - (n[0] * (centre_xy[0] - c[0]) + n[1] * (centre_xy[1] - c[1])) / n[2])
 
 
-def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=False, anchor_rng=None):
+def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=False, anchor_rng=None, sides=(),
+                         side_is_lid=True):
     """Coarse container pose from a camera level with the lid. It sees the
     box's side, never its top face, and the wall behind a round lid falls
     inside the pixel box too (flatbot 2026-10-22: 22 of 252 points, at lid
@@ -217,7 +218,14 @@ def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=Fa
     `partial`: the frame cuts the box off at its side (a round container
     only, scene_fix_from_boxes): what is in view is not centred on it and
     is narrower than it, so the centre is the lid's circle through the arc
-    of its side in view (lid_circle) instead, and no width is asked.
+    of its side in view (lid_circle) instead, and no width is asked;
+    `sides`, the planes of the box's sides the frame does not cut
+    (uncut_sides), which that circle must stay inside, and `side_is_lid`,
+    whether they are the lid's own (lid_circle). A cut box the lid stands
+    over (PARTIAL_OVER_M, inside the box's pixel columns) holds only the
+    holder under it, and is refused; so is a circle that something taller
+    than the lid stands inside (PARTIAL_OVER_PAD_M): its arc took in that
+    thing's side.
 
     `anchor_rng`: `bbox` is the band above a holder box whose front stands
     this far from the camera (holder_front_rng). A lid standing on that
@@ -271,10 +279,21 @@ def box_from_side_points(pts_base, uv, bbox, table_z, model, cam_xyz, partial=Fa
         seed = near[:, :2].mean(axis=0)
         reach = np.linalg.norm(pts_base - cam, axis=1) <= np.percentile(rng, 5) + 2 * half + SIDE_DEPTH_SLACK_M
         around = reach & (np.hypot(pts_base[:, 0] - seed[0], pts_base[:, 1] - seed[1]) <= d + PARTIAL_REACH_M)
+        above = (pts_base[:, 2] > top_z + PARTIAL_OVER_M[0]) & (pts_base[:, 2] <= top_z + PARTIAL_OVER_M[1])
+        cols = (uv[:, 0] >= x0) & (uv[:, 0] <= x1)  # the lid stands on its holder, inside the box's columns
+        over = int((around & cols & above).sum())
+        if over >= MIN_LID_POINTS:
+            return None, ("%d depth points stand %.0f-%.0f mm over its top around it: the box holds what is under the lid, "
+                          "not the lid" % (over, 1000 * PARTIAL_OVER_M[0], 1000 * PARTIAL_OVER_M[1])), n, table_z
         band = pts_base[around & (pts_base[:, 2] > top_z - float(model.lid_dims[2])) & (pts_base[:, 2] <= top_z + 0.005)]
-        centre, why = lid_circle(band, model, cam)
+        centre, why = lid_circle(band, model, cam, sides=sides, side_is_lid=side_is_lid)
         if centre is None:
             return None, why, n, table_z
+        under = reach & (np.hypot(pts_base[:, 0] - centre[0], pts_base[:, 1] - centre[1]) <= 0.5 * d + PARTIAL_OVER_PAD_M)
+        stand = int((under & above).sum())
+        if stand >= MIN_LID_POINTS:
+            return None, ("%d depth points stand %.0f-%.0f mm over its top where the lid's circle is: the arc took in "
+                          "something taller than the lid" % (stand, 1000 * PARTIAL_OVER_M[0], 1000 * PARTIAL_OVER_M[1])), n, table_z
         pose = container_pose_from_top((centre[0], centre[1], top_z), 0.0, model, table_z)  # round: yaw unused
         return pose, (centre[0], centre[1], top_z), n, float(table_z)
     lo, hi = np.percentile((obj[:, :2] - cam[:2]) @ across, [10, 90])
@@ -345,14 +364,153 @@ PARTIAL_REACH_M = 0.02  # beyond one lid diameter from the box's own near points
 PARTIAL_RIVAL_M = 0.035
 PARTIAL_RIVAL_FRAC = 0.85
 PARTIAL_RANSAC_ITERS = 400
+# Not every two places is a slide. Half out of the frame, a lid can show its
+# depth only as a strip along its own silhouette ray (the rest of its side is
+# past the frame's edge, or in the strip beside it where the OAK gives no
+# depth), and the circle tangent to that strip from its other side holds the
+# same points on its hidden back: the lid's mirror across its silhouette,
+# ~100 mm away. On detbench's P4 frames (flatbot 2026-10-23, the canister half
+# off the frame; found 2026-10-27) the mirror holds 62-99 % as many of the
+# band's points as the lid, and more than the lid in most calls at 17:27,
+# where only the rival rule stood between it and a fix 103 mm off. The box's
+# side the frame does not cut is the lid's silhouette, or the holder's around
+# it: the lid stands inside it, the mirror past it. So a circle that runs past
+# that side by more than this is not the box's lid. Over the 2,496 cut-box
+# calls on detbench's P2 and P4 frames (6 box sources, 4 pixel parities, 4 box
+# draws), the circles near the lid that could win (0.85 of the best's points)
+# run up to 22.7 mm past a lid-tight box (the depth smears past the lid's edge
+# and pulls them; in every call one runs 9.8 mm past or less) and stay 4.5+ mm
+# inside a holder's; the mirror runs 30.8+ mm past a holder's, 73+ mm past a
+# lid's.
+PARTIAL_BOX_SLACK_M = 0.020
+# The bound is not only a refusal: where the circle it takes out was the rival
+# of the one it keeps, a "two places" becomes a fix. That is sound only on a
+# lid's worth of arc. With the lid all but out of view, or its sliver in the
+# strip where the OAK gives no depth, the band is the holder's brim tip or the
+# smear behind it, and every circle through it is a guess: the one the box's
+# side keeps is no likelier the lid than the one it takes out. Detbench
+# 2026-10-23 13:32 (the canister ~90 % off the frame, a frame the acceptance
+# skips as difficult): the kept circle held 45 points or fewer and stood 51 mm
+# past the lid's own silhouette, and the stream committed it in 300 of 300 runs
+# where c693865 refused it as two places. So a circle the bound settles two
+# places for must hold this many points. Over detbench's P2-P4 frames (768
+# gate calls: 4 parities, 4 box draws, segmenter and OWL) the circles it
+# settled, all on P4, held 127-167 and were fixed 7-21 mm from the reference;
+# the wrong ones it settled on re-cut frames (the lid cropped 75-80 % out of
+# view with the no-depth strip, or the frame's edge moved 80 px in) held 45-84
+# (found 2026-10-28, review of b2fb875).
+PARTIAL_SETTLE_MIN_POINTS = 100
+# A cut box that holds only the holder under the lid (a "blue bowl" box as it
+# is, an OWL "a pink lid" that boxed the brim) lifts its top at the brim,
+# 13-34 mm under the lid's and inside LID_BAND_M, and the lid's circle fitted
+# to the brim put the box 43-47 mm off on detbench P4 once the mirror was no
+# second place (the rival rule had refused them by chance). The lid then
+# stands over the band: MIN_LID_POINTS this far over the lifted top, inside
+# the band's own reach and disc and the box's own pixel columns, refuse the
+# box. Over the 429 cut boxes of every detbench source on P2 and P4 that reach
+# the circle: a lid's band has at most 12 points there (the two frames whose
+# button stood up included), a brim 18+ mm under the lid 81-300 (the 2
+# shallower brims that pass fix 16 and 20 mm off). The lid stands ON the
+# holder, inside the box's columns; counted over the whole disc, a taller
+# thing beside the box refused a good cut box too (a bottle 80 mm taller 18 cm
+# beside the half-off canister at 17:27; at 14:40 a lid-wide one 27 cm off,
+# where c693865 fixed it 11.6 mm from the reference). Something taller
+# standing right behind the box, inside its columns, still refuses it.
+PARTIAL_OVER_M = (0.020, 0.050)
+# ... and nothing stands that far over the top where the fitted lid is (within
+# its radius and this): the lid is the container's top. When the band took in
+# the side of something taller beside or behind the canister, the circle slid
+# toward it, and that thing stands inside the circle. With the count above
+# kept to the box's columns, review 1's taller cylinders 1-5 cm beside or
+# behind the cut canister (detbench P2/P3/P4, ray-cast into the depth) pulled
+# 17 cut fixes 31-58 mm off that b2fb875 had refused (14 by its whole-disc
+# count); this refuses 14 of them, and 17 fixes within 30 mm. Over all 1,104
+# of those gate calls: offs 48 -> 33 (b2fb875 35, c693865 398), ok 722 -> 710
+# (b2fb875 513); over review 0's 3,782 with a second object: offs 146 -> 143
+# (b2fb875 152), ok 3017 -> 3004 (b2fb875 2431). Nothing changes on detbench's
+# own frames.
+PARTIAL_OVER_PAD_M = 0.010
+# The segmenter candidates (segmenter_source.SceneCand.kind) whose box is its
+# holder's: a cut holder grown over its lid band, and the band above an uncut
+# one. Their sides stand outside the lid's silhouette; every other box (a lid
+# RF-DETR boxed on its holder, a container boxed as it is, an OWL lid box) has
+# the lid's own (lid_circle's side_is_lid).
+HOLDER_SIDE_KINDS = ("grown", "band")
 
 
-def lid_circle(band, model, cam_xyz):
+def pixel_plane(axis, at, pts_base, uv, cam_xyz, R_base_color):
+    """The plane through the camera of the colour pixels whose coordinate
+    `axis` (0: u, 1: v) is `at`, as its base-frame normal n: n . (p - cam) > 0
+    for a point p that projects beyond it (a larger u or v). The image's scale
+    and centre along that axis are read off the cloud itself — its pixels `uv`
+    are its projection into the colour image, u = f x / z + c in the colour
+    optical frame — so no intrinsics are passed in. None when the cloud holds
+    too little."""
+    R = np.asarray(R_base_color, float)
+    step = max(1, len(pts_base) // 2000)
+    pc = (np.asarray(pts_base[::step], float) - np.asarray(cam_xyz, float)) @ R  # the colour optical frame
+    px = np.asarray(uv[::step], float)[:, axis]
+    front = pc[:, 2] > 1e-6
+    if front.sum() < MIN_LID_POINTS:
+        return None
+    f, c = np.polyfit(pc[front, axis] / pc[front, 2], px[front], 1)
+    m = np.zeros(3)
+    m[axis], m[2] = f, c - float(at)
+    return R @ m
+
+
+# the side of a pixel box across from each frame edge: (that side, its axis, its coordinate in the box, +1 when past it is +u/+v)
+_ACROSS = {"left": ("right", 0, 2, 1.0), "right": ("left", 0, 0, -1.0), "top": ("bottom", 1, 3, 1.0), "bottom": ("top", 1, 1, -1.0)}
+
+
+def uncut_sides(box, edges, pts_base, uv, cam_xyz, R_base_color):
+    """The sides of pixel box [x0, y0, x1, y1] across from the frame `edges`
+    that cut it, as planes through the camera (pixel_plane): each a base-frame
+    normal n with n . (p - cam) > 0 for a point past the box. A box the frame
+    cuts at both its sides along an axis has none on it."""
+    sides = []
+    for e in edges:
+        other, axis, k, sign = _ACROSS[e]
+        if other in edges:
+            continue
+        n = pixel_plane(axis, float(box[k]), pts_base, uv, cam_xyz, R_base_color)
+        if n is not None:
+            sides.append(sign * n)
+    return tuple(sides)
+
+
+def past_sides(centres, sides, cam_xyz, z, r):
+    """How far (m, horizontally, at height `z`) each circle of radius `r`
+    centred at `centres` (M x 2, base frame) runs past the furthest of the
+    planes `sides` (uncut_sides); negative when it stays inside them all."""
+    cam = np.asarray(cam_xyz, float)
+    c = np.atleast_2d(np.asarray(centres, float))
+    out = np.full(len(c), -np.inf)
+    for n in sides:
+        n = np.asarray(n, float)
+        h = max(float(np.hypot(n[0], n[1])), 1e-9)
+        out = np.maximum(out, ((c - cam[:2]) @ n[:2] + n[2] * (z - cam[2])) / h + r)
+    return out
+
+
+def lid_circle(band, model, cam_xyz, sides=(), side_is_lid=True):
     """The centre (x, y) of a round lid from the points of its side band a
     level camera sees (`band`, base frame): the circle of the lid's radius
     through the most of them (RANSAC over point pairs, the centre behind the
     pair as the camera sees it), refined on those. Returns ((cx, cy), None)
-    or (None, why)."""
+    or (None, why).
+
+    `sides`: the planes of its box's sides the frame does not cut
+    (uncut_sides). A circle that runs past them by more than
+    PARTIAL_BOX_SLACK_M is no candidate, before the best and its rival are
+    picked. That is not only a refusal: where the circle it takes out was
+    the rival of the best one inside (the lid's mirror, detbench P4), two
+    places become one fix, and then only on PARTIAL_SETTLE_MIN_POINTS.
+    `side_is_lid`: those sides are the lid's own silhouette (the box is the
+    lid, or the container itself), not a holder's around it. Refined past a
+    lid's side, the circle was pulled there by the smear past the silhouette,
+    and the RANSAC circle it was refined from, inside the bound, is the fix;
+    refined past a holder's side, it is refused."""
     r = 0.5 * float(model.lid_dims[0])
     if len(band) < MIN_LID_POINTS:
         return None, "only %d points on the lid's side in view (need %d)" % (len(band), MIN_LID_POINTS)
@@ -374,11 +532,25 @@ def lid_circle(band, model, cam_xyz):
                 cands.append((int(on.sum()), c))
     if not cands:
         return None, "no %.0f mm circle through the lid's side in view" % (2000 * r)
+    beyond = []  # the circles the bound took out
+    if len(sides):
+        z = float(np.median(np.asarray(band, float)[:, 2]))
+        past = past_sides([cc for _k, cc in cands], sides, cam_xyz, z, r)
+        beyond = [kc for kc, p in zip(cands, past) if p > PARTIAL_BOX_SLACK_M]
+        cands = [kc for kc, p in zip(cands, past) if p <= PARTIAL_BOX_SLACK_M]
+        if not cands:
+            return None, "every %.0f mm circle through the lid's side in view runs %.0f+ mm past its box" % (
+                2000 * r, 1000 * PARTIAL_BOX_SLACK_M)
     cands.sort(key=lambda kc: -kc[0])
     best_n, c = cands[0][0], cands[0][1].copy()
     rival = next((k for k, cc in cands if np.linalg.norm(cc - c) > PARTIAL_RIVAL_M), 0)
     if rival >= PARTIAL_RIVAL_FRAC * best_n:
         return None, "the lid's arc in view fits two places %.0f+ mm apart" % (1000 * PARTIAL_RIVAL_M)
+    if best_n < PARTIAL_SETTLE_MIN_POINTS and any(
+            k >= PARTIAL_RIVAL_FRAC * best_n and np.linalg.norm(cc - c) > PARTIAL_RIVAL_M for k, cc in beyond):
+        return None, ("the lid's arc in view fits two places %.0f+ mm apart, one past its box: the %d points of the "
+                      "other are too few to settle it (need %d)" % (1000 * PARTIAL_RIVAL_M, best_n, PARTIAL_SETTLE_MIN_POINTS))
+    picked = c.copy()
     on = np.abs(np.linalg.norm(P - c, axis=1) - r) < PARTIAL_INLIER_M
     for _it in range(30):
         dv = P[on] - c
@@ -387,6 +559,20 @@ def lid_circle(band, model, cam_xyz):
         c = c + step
         if np.linalg.norm(step) < 1e-7:
             break
+    if len(sides):
+        # where the depth runs to the frame's edge (a right-edge cut: the OAK's
+        # no-depth strip is at its left), the smear past the lid's silhouette
+        # pulls the refined circle 20-26 mm past a lid box (detbench P2 frames
+        # re-cut through the lid, as it is and mirrored: 39 of 528 calls); the
+        # circle it was refined from fixes 35 of them 20-29 mm from the
+        # reference, where c693865 put 14 further than 30 mm. A holder's side
+        # stands 18-33 mm outside the lid's circle (P4): past it, the circle is
+        # not the lid.
+        out = float(past_sides(c, sides, cam_xyz, z, r)[0])
+        if out > PARTIAL_BOX_SLACK_M:
+            if not side_is_lid:
+                return None, "the lid's circle in view, refined, runs %.1f mm past its box" % (1000 * out)
+            c = picked
     on = np.abs(np.linalg.norm(P - c, axis=1) - r) < PARTIAL_INLIER_M
     if on.sum() < MIN_LID_POINTS:
         return None, "only %d of the lid's side points lie on a %.0f mm circle" % (int(on.sum()), 2000 * r)
@@ -495,32 +681,38 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
     edge is refused before either lift (FRAME_EDGE_PX) — unless the model
     is round and the frame cuts it at its side (`cam_R`, the camera's axes
     in the base frame, says which image edges are), when the side lift
-    finishes it from the part in view (partial).
+    finishes it from the part in view (partial), inside the box's sides the
+    frame does not cut (uncut_sides).
 
     A candidate's third field, when it has one, is the holder box under a
     lid band (segmenter_source.SceneCand): an uncut one arms the side
-    lift's looks-past refusal (holder_front_rng). `src` names the detector
+    lift's looks-past refusal (holder_front_rng). A SceneCand of a kind in
+    HOLDER_SIDE_KINDS has its holder's sides, not its lid's (lid_circle's
+    `side_is_lid`); an OWL box is the lid's. `src` names the detector
     in every reason. With `rivals`, every OTHER candidate is gated on its
     own too, and the tops that pass more than RIVAL_M from the winner's are
     the fix's `rivals`."""
     tried = []
     clipped = []
-    cands = []  # (score, box, the side edges a round box is finished across or (), the holder that anchors it or None)
+    # (score, box, the side edges a round box is finished across or (), the holder that anchors it or None,
+    # whether the box's sides are its lid's)
+    cands = []
     for c in boxes:
         score, box = c[0], c[1]
         holder = c[2] if len(c) > 2 else None
+        side_is_lid = getattr(c, "kind", None) not in HOLDER_SIDE_KINDS
         edges = frame_edges(box, image_wh) if image_wh is not None else ()
         if not edges:
-            cands.append((score, box, (), holder))
+            cands.append((score, box, (), holder, side_is_lid))
         elif model.round and cam_R is not None and side_cut(edges, cam_R):
-            cands.append((score, box, edges, None))
+            cands.append((score, box, edges, None, side_is_lid))
         else:
             clipped.append((score, box, edges))
             tried.append("it runs off the frame at its %s edge (%s %.2f)" % (" and ".join(edges), src, score))
     got = None
     if table_z is not None:
         lid_z = float(table_z) + float(model.dims[2])
-        for score, box, edges, _holder in cands:
+        for score, box, edges, _holder, _side_is_lid in cands:
             if edges:
                 continue  # only the side lift finishes a box from part of it
             if cam_xyz is not None and not sees_top_face(pts_base, uv, box, lid_z, cam_xyz):
@@ -531,10 +723,12 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
                 break
             tried.append("%s (%s %.2f)" % (top, src, score))
     if got is None and cam_xyz is not None:
-        for score, box, edges, holder in cands:
+        for score, box, edges, holder, side_is_lid in cands:
             anchor = None if holder is None else holder_front_rng(pts_base, uv, holder, cam_xyz)
+            sides = uncut_sides(box, edges, pts_base, uv, cam_xyz, cam_R) if edges else ()
             pose, top, n, tz = box_from_side_points(pts_base, uv, box, side_table_z, model, cam_xyz,
-                                                    partial=bool(edges), anchor_rng=anchor)
+                                                    partial=bool(edges), anchor_rng=anchor, sides=sides,
+                                                    side_is_lid=side_is_lid)
             if pose is not None:
                 got = SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side", tuple(clipped), edges)
                 break
