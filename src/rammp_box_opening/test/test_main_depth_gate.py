@@ -134,6 +134,9 @@ def run_main(monkeypatch, tmp_path, argv, approach, table_extent, depth=None, pu
 
             self.owl = O()
 
+        def prime(self):
+            pass
+
         def locate(self, timeout):
             return _Fix
 

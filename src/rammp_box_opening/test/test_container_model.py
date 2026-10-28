@@ -202,3 +202,49 @@ def test_an_unmeasured_container_may_be_observed_but_not_flown_at():
         refuse_unmeasured(M(), execute=True)
     M.measure_me = False
     refuse_unmeasured(M(), execute=True)
+
+
+PINK = "src/rammp_box_opening/config/containers/ankou_pink.yaml"
+
+
+def test_the_canister_is_found_by_the_segmenter_as_the_food_container_it_stands_in():
+    """ankou_pink names the scene segmenter's class (RF-DETR boxes the blue
+    holder as a COCO bowl, "food container"); the OXOs name none and keep
+    the scene OWL alone. Its OWL is the fallback, at the lower floor."""
+    from rammp_box_opening.models.container import load_press_demo
+
+    pink = load_press_demo(PINK)
+    assert pink.segmenter_classes == ("food container",) and pink.segmenter_box == "holder"
+    assert pink.owl_min_score_scene == pytest.approx(0.05)
+    for name in ("oxo_pop.yaml", "oxo_pop_small.yaml"):
+        oxo = load_press_demo("src/rammp_box_opening/config/containers/" + name)
+        assert oxo.segmenter_classes == () and oxo.segmenter_box == "holder"
+
+
+def _pink_variant(tmp_path, old, new):
+    text = open(PINK).read()
+    assert old in text
+    p = tmp_path / "variant.yaml"
+    p.write_text(text.replace(old, new))
+    return str(p)
+
+
+def test_a_bad_scene_detect_block_is_refused_at_load(tmp_path):
+    from rammp_box_opening.models.container import load_press_demo
+
+    with pytest.raises(ValueError, match="segmenter_box must be 'holder' or 'as_is'"):
+        load_press_demo(_pink_variant(tmp_path, "segmenter_box: holder", "segmenter_box: lid"))
+    with pytest.raises(ValueError, match="segmenter_classes must be a list"):
+        load_press_demo(_pink_variant(tmp_path, "segmenter_classes: [food container]", "segmenter_classes: food container"))
+    with pytest.raises(ValueError, match="segmenter_classes must be a list"):
+        load_press_demo(_pink_variant(tmp_path, "segmenter_classes: [food container]", "segmenter_classes: [food container, '']"))
+    with pytest.raises(ValueError, match="unknown key"):
+        load_press_demo(_pink_variant(tmp_path, "segmenter_classes: [food container]", "segmenter_class: [food container]"))
+    raw = yaml.safe_load(open(PINK))
+    raw["scene_detect"] = ["food container"]
+    listed = tmp_path / "listed.yaml"
+    listed.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="must be a mapping"):
+        load_press_demo(str(listed))
+    none = load_press_demo(_pink_variant(tmp_path, "segmenter_classes: [food container]", "segmenter_classes: []"))
+    assert none.segmenter_classes == ()  # an empty list: no segmenter, the OWL alone
