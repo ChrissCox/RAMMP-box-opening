@@ -701,10 +701,12 @@ def _after_check(node, ctx, runner, watcher, scene_fix, locator, button, lid_bef
 
     m = ctx.model
     if locator is not None:
-        # the first scene bbox takes ~1.2 s (tick + inference): let it come
+        # where the scene OWL must answer (no scene segmenter, or it is
+        # down), its first bbox takes ~1.2 s (tick + inference): let it come
         # while the wrist re-aims (no OWL, no GPU, the arm still at the look
-        # pose); locate() enables again (idempotent) and disables in its finally
-        locator.owl.enable()
+        # pose); locate() enables again (idempotent) and disables in its
+        # finally. A live segmenter keeps the OWL off (SceneLocator.prime)
+        locator.prime()
     try:
         again, status, up_after = _aim(node, watcher, yaw, button[2], button[:2], runner, "reach-after")
     except BaseException:

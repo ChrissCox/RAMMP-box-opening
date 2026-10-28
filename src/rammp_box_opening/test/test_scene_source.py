@@ -1,5 +1,7 @@
-"""Finding the box from the scene camera: depth inside the OWL box, at lid
-height, in base_link."""
+"""Finding the box from the scene camera: depth inside the detector's box,
+at lid height, in base_link."""
+
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -636,10 +638,524 @@ def test_a_scene_camera_whose_tf_still_has_its_frames_upside_down_is_refused():
 
     loc = ss.SceneLocator.__new__(ss.SceneLocator)
     loc.spins = False
-    loc.owl = SimpleNamespace(enable=lambda: None, disable=lambda: None, latest=None)
+    calls = []
+    loc.owl = SimpleNamespace(enable=lambda: calls.append("on"), disable=lambda: calls.append("off"), latest=None)
+    loc.seg = None
+    t = [0.0]
+    loc._clock = lambda: t[0]
+    loc._sleep = lambda s: t.__setitem__(0, t[0] + s)
+    loc.grab = SimpleNamespace(color_stamp=None, color=np.zeros((400, 640, 3), np.uint8), missing=lambda: [])
     loc.ready = lambda: True
     hung = np.eye(4)
     hung[:3, 0], hung[:3, 1], hung[:3, 2] = (0, 1, 0), (0, 0, 1), (1, 0, 0)  # image down points up
     loc.base_to_color = lambda: hung
     assert loc.locate(0.5) is None
     assert "upside down" in loc.last_why and "i_rotation 180" in loc.last_why
+    assert calls[-1] == "off"  # the OWL's latched enable never outlives the call
+
+
+# --- the scene segmenter's boxes through the gate, on upright flatbot frames
+# (test/data/scene_upright_*.npz: the median depth, intrinsics and upright mount
+# of a detbench frame, the food-container boxes RF-DETR-S published on it, the
+# verified holder box and the reference lid top)
+
+_FIXTURES = {}
+
+
+def _upright(name):
+    """(pts_base, uv, table rows z or None, gate kwargs, segmenter objects, the GT holder box, the reference top),
+    as locate() lifts the frame: the stride-2 cloud in the base frame."""
+    if name not in _FIXTURES:
+        from pathlib import Path
+
+        from rammp_box_opening.perception.scene import color_cloud
+
+        z = np.load(Path(__file__).parent / "data" / name)
+        T = z["T_base_color"]
+        pc, uv = color_cloud(z["depth_mm"].astype(float) / 1000.0, z["kd"], z["k"], z["dist"], z["T_color_depth"], stride=2)
+        pts = pc @ T[:3, :3].T + T[:3, 3]
+        tz = table_from_scene_points(pts, uv, 400)
+        kw = dict(cam_xyz=T[:3, 3], side_table_z=None, image_wh=(640, 400), cam_R=T[:3, :3])
+        objs = [("food container", float(o[0]), tuple(float(v) for v in o[1:])) for o in z["seg_objects"]]
+        _FIXTURES[name] = (pts, uv, None if np.isnan(tz) else float(tz), kw, objs, tuple(float(v) for v in z["seg_holder_gt"]),
+                           np.asarray(z["ref_xyz"], float))
+    return _FIXTURES[name]
+
+
+F_162417 = "scene_upright_flatbot_20261027_162417.npz"  # the 10-27 16:24 frame the OWL missed ("saw no box in 15 s")
+F_144302 = "scene_upright_flatbot_20261022_144302.npz"  # P1: something nearer than the canister inside its holder box
+F_133403 = "scene_upright_flatbot_20261023_133403.npz"  # P4: the holder cut by the frame's left edge
+
+
+def test_the_band_above_the_segmenters_holder_box_finds_the_canister_the_owl_missed():
+    """Flatbot 2026-10-27 16:24: the scene OWL saw no box in 15 s (the pale
+    lid under its 0.12 floor). RF-DETR boxed the blue holder at 0.88; as it
+    is, the gate reads its top 55 mm below lid height. The band above it
+    is where the lid stands."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, _gt, ref = _upright(F_162417)
+    raw = scene_fix_from_boxes([(objs[0][1], objs[0][2])], pts, uv, tz, model, **kw)
+    assert raw.pose is None and "from lid height" in raw.tried[0] and "-55 mm" in raw.tried[0]
+    cands = segmenter_candidates(objs, ("food container",), (640, 400))
+    got = scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert got.pose is not None, got.tried
+    assert got.lift == "side" and got.rivals == () and got.n == 299
+    assert np.linalg.norm(np.subtract(got.top, ref)) < 0.015  # measured 8.2 mm
+    assert got.top == pytest.approx((0.6613, -0.2654, 0.3103), abs=0.0005)
+
+
+def test_a_band_that_looks_past_its_holder_is_refused():
+    """A band above some other bowl lifts whatever stands behind it: the GT
+    holder moved sideways, offered alone, as a phantom bowl. The plain band
+    is accepted half a metre from the canister; anchored to its holder's
+    front, the gate sees the nearest thing above it stand far behind it."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, _objs, (x0, y0, x1, y1), ref = _upright(F_162417)
+    for dx, away_mm, behind_mm in ((-120, 473, 317), (180, 439, 168)):
+        (c,) = segmenter_candidates([("food container", 0.5, (x0 + dx, y0, x1 + dx, y1))], ("food container",), (640, 400))
+        plain = scene_fix_from_boxes([(c.score, c.box)], pts, uv, tz, model, **kw)
+        assert plain.pose is not None
+        assert 1000 * np.hypot(plain.top[0] - ref[0], plain.top[1] - ref[1]) == pytest.approx(away_mm, abs=3)
+        anchored = scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", **kw)
+        assert anchored.pose is None
+        why = anchored.tried[-1]
+        assert "looks past" in why and ("stands %d mm behind the holder's front" % behind_mm) in why, why
+
+
+def test_the_looks_past_refusal_never_moves_a_fix():
+    """Flatbot 2026-10-22 14:43 (P1): something nearer than the canister
+    lies inside its holder box. Design 3 cut the side lift's depth slab at
+    the holder's front and put this frame 29 mm off here, 46-52 mm at the
+    other pixel parity; as a refusal only, the anchored band's fix is the
+    plain band's to the millimetre."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, _gt, ref = _upright(F_144302)
+    cands = segmenter_candidates(objs, ("food container",), (640, 400))
+    assert cands[0].holder is not None
+    anchored = scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", **kw)
+    plain = scene_fix_from_boxes([(c.score, c.box) for c in cands], pts, uv, tz, model, **kw)
+    assert anchored.pose is not None and plain.pose is not None
+    assert anchored.top == plain.top
+    assert anchored.top == pytest.approx((0.6734, -0.5822, 0.4009), abs=0.0005)
+    assert np.linalg.norm(np.subtract(anchored.top, ref)) < 0.006  # measured 4.1 mm
+
+
+def test_two_places_that_pass_as_the_container_are_rivals_not_a_fix():
+    """A phantom bowl 180 px to the canister's right on the P1 frame passes
+    the gate even anchored; ranked first, it wins its message — and the
+    canister's own band, passing too 30 cm away, makes the message
+    ambiguous."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, (x0, y0, x1, y1), ref = _upright(F_144302)
+    (phantom,) = segmenter_candidates([("food container", 0.9, (x0 + 180, y0, x1 + 180, y1))], ("food container",), (640, 400))
+    (canister,) = segmenter_candidates(objs, ("food container",), (640, 400))
+    got = scene_fix_from_boxes([phantom, canister], pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert got.pose is not None and tuple(got.box) == tuple(phantom.box)
+    assert len(got.rivals) == 1 and np.linalg.norm(np.subtract(got.rivals[0], ref)) < 0.010
+    alone = scene_fix_from_boxes([phantom, canister], pts, uv, tz, model, src="segmenter", **kw)
+    assert alone.rivals == ()  # only asked for
+
+
+def test_a_holder_the_frame_cuts_is_grown_and_finished_from_its_lid_in_view():
+    """Flatbot 2026-10-23 13:34 (P4): the holder runs off the frame's left
+    edge. Grown upward with its cut edge kept, it reaches the gate's
+    partial lift, which finishes the lid from its arc in view."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, _gt, ref = _upright(F_133403)
+    (c,) = segmenter_candidates(objs, ("food container",), (640, 400))
+    assert c.kind == "grown" and c.holder is None and c.box[0] < 1.0
+    got = scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert got.pose is not None, got.tried
+    assert got.partial == ("left",)
+    assert np.linalg.norm(np.subtract(got.top, ref)) < 0.020  # measured 13.4 mm
+
+
+def test_the_gates_reasons_name_the_detector_they_came_from():
+    from rammp_box_opening.perception.scene_source import off_frame_why, scene_fix_from_boxes
+
+    model = ContainerModel.load(PINK)
+    pts, uv, canister, _tall = _side_scene(np.random.default_rng(4))
+    cap = canister[:, 2] > SIDE_TABLE + model.dims[2] - 0.025
+    box = list(_pixel_box(_project(canister[cap])))
+    w = int(np.ceil(box[2])) + 1
+    cut = scene_fix_from_boxes([(0.88, box)], pts, uv, None, model, cam_xyz=SIDE_CAM, image_wh=(w, 400), src="segmenter")
+    assert cut.tried == ("it runs off the frame at its right edge (segmenter 0.88)",)
+    flatbot = np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    assert off_frame_why(0.88, ("right",), flatbot, src="segmenter").startswith("the segmenter's box (0.88) runs off")
+    assert off_frame_why(0.45, ("right",), flatbot).startswith("the OWL's box (0.45) runs off")
+
+
+# --- the vote ------------------------------------------------------------------
+
+
+def _sighting(source, top, partial=()):
+    from rammp_box_opening.perception.scene_source import Sighting
+
+    return Sighting(source, 0.5, tuple(top), None, 300, tuple(partial), 0.21, "side", (0.0, 0.0, 1.0, 1.0), (0.0, 0.0, 1.0, 1.0))
+
+
+def test_a_scene_fix_needs_two_sightings_that_agree():
+    from rammp_box_opening.perception.scene_source import commit_fix
+
+    a = (0.660, -0.265, 0.310)
+    near = (0.670, -0.265, 0.310)  # 10 mm away
+    far = (0.690, -0.265, 0.310)  # 30 mm away
+    assert commit_fix([_sighting("segmenter", a)], True) == (None, "too few")
+    top, why = commit_fix([_sighting("segmenter", a), _sighting("segmenter", near)], True)
+    assert why is None and top == pytest.approx((0.665, -0.265, 0.310))
+    assert commit_fix([_sighting("segmenter", a), _sighting("segmenter", far)], True) == (None, "disagree")
+    # only the newest two count: an old far sighting does not block
+    top, why = commit_fix([_sighting("segmenter", far), _sighting("owl", a), _sighting("segmenter", near)], True)
+    assert why is None and top == pytest.approx((0.665, -0.265, 0.310))
+
+
+def test_the_owls_box_of_a_cut_lid_needs_the_segmenter_while_it_is_live():
+    """Detbench 163450: the OWL's circle on the cut lid slid 46 mm in 39 % of
+    its commits. While the segmenter is live it must stand beside an OWL cut
+    box; down, the OWL's cut boxes commit as they always did."""
+    from rammp_box_opening.perception.scene_source import commit_fix
+
+    a, b = (0.380, -0.170, 0.305), (0.384, -0.172, 0.305)  # 5 mm apart
+    cut_pair = [_sighting("owl", a, ("left",)), _sighting("owl", b, ("left",))]
+    assert commit_fix(cut_pair, True) == (None, "cut OWL box unconfirmed")
+    assert commit_fix(cut_pair, False)[1] is None
+    assert commit_fix([_sighting("owl", a, ("left",)), _sighting("segmenter", b)], True)[1] is None
+    assert commit_fix([_sighting("owl", a), _sighting("owl", b)], True)[1] is None  # whole boxes need no one
+
+
+# --- locate(), driven by stubs on a test clock --------------------------------
+
+CAM_T0 = 1000.0  # the camera's clock at the test's t = 0
+SCENE_FRAME = "scene_camera_color_optical_frame"
+UPRIGHT = np.array([[0.0, 0.0, 1.0, 0.2], [-1.0, 0.0, 0.0, -0.5], [0.0, -1.0, 0.0, 0.4], [0.0, 0.0, 0.0, 1.0]])
+HOLDER = (157.75, 216.38, 255.62, 260.5)
+SEG_TOP = (0.661, -0.265, 0.310)
+OWL_BOX = (170.0, 195.0, 243.0, 222.0)
+OWL_TOP = (0.664, -0.262, 0.309)
+
+
+def _stamp(t):
+    """The scene camera's newest frame at test time t (15 fps), as a ROS stamp."""
+    ns = int(round((CAM_T0 + np.floor(t * 15 + 1e-9) / 15) * 1e9))
+    return SimpleNamespace(sec=ns // 1_000_000_000, nanosec=ns % 1_000_000_000)
+
+
+class _Owl:
+    """The scene OWL node and its rung: alive (a heartbeat) or not; while
+    enabled, one scripted message per inference, the first 0.7 s after the
+    enable edge, then every 1.3 s."""
+
+    def __init__(self, world, script=(), alive=True):
+        self.world = world
+        self.script = [list(m) for m in script]  # each: [(score, box), ...]
+        self.latest = [0.0, 0.0, 0.0, 0.0, -1.0, 0.0] if alive else None
+        self.box = None
+        self.enabled = False
+        self.ons, self.offs = [], []
+        self._next = None
+
+    def enable(self):
+        if not self.enabled:
+            self._next = self.world.t + 0.7
+        self.enabled = True
+        self.ons.append(round(self.world.t, 3))
+
+    def disable(self):
+        self.enabled = False
+        self.offs.append(round(self.world.t, 3))
+
+    def fresh_box(self):
+        return self.box
+
+    def tick(self, t):
+        if self.enabled and self.latest is not None and self.script and t >= self._next:
+            m = []
+            for score, b in self.script.pop(0):
+                m += [*b, score, t]
+            self.box = self.latest = m
+            self._next += 1.3
+
+
+class _World:
+    """The test's clock, and what the scene camera, the segmenter and the OWL
+    publish on it."""
+
+    def __init__(self, seg_msgs=(), owl_script=(), owl_alive=True, seg_since=0.0, frame_id=SCENE_FRAME):
+        from rammp_box_opening.perception.segmenter_source import SegmenterRung
+
+        self.t = 0.0
+        self.seg_msgs = sorted(seg_msgs, key=lambda m: m[0])  # (arrival t, objects[, frame_id[, wh[, stamp t]]])
+        self.owl = _Owl(self, owl_script, owl_alive)
+
+        class Detected:
+            size = None
+
+        class Node:
+            def create_subscription(self, *a):
+                return None
+
+        self.rung = SegmenterRung(Node(), ("food container",), import_types=lambda: (object, Detected))
+        self.rung.t_subscribed = -float(seg_since)  # subscribed this long before t = 0
+        self.frame_id = frame_id
+        self.grab = SimpleNamespace(color=np.zeros((400, 640, 3), np.uint8), missing=lambda: [], depth_median=lambda: None,
+                                    cloud_in_color_frame=lambda depth=None, stride=1: (np.c_[np.zeros((50, 2)), np.ones(50)], np.zeros((50, 2))))
+        self.deliver()
+
+    def clock(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t = round(self.t + s, 6)
+        self.deliver()
+
+    def deliver(self):
+        from rammp_box_opening.perception.segmenter_source import SegFrame, stamp_ns
+
+        self.grab.color_stamp, self.grab.color_frame_id = _stamp(self.t), self.frame_id
+        while self.seg_msgs and self.seg_msgs[0][0] <= self.t:
+            t, objects, *rest = self.seg_msgs.pop(0)
+            frame_id = rest[0] if rest else SCENE_FRAME
+            wh = rest[1] if len(rest) > 1 else (640, 400)
+            shot = rest[2] if len(rest) > 2 else t - 0.075  # its frame was taken this long before it arrives
+            self.rung.latest = SegFrame(t, stamp_ns(_stamp(shot)), frame_id, wh, tuple(objects), len(objects))
+        self.owl.tick(self.t)
+
+
+def _every(t0, t1, objects, *rest, period=0.2):
+    """The segmenter's messages from t0 to t1, at 5 Hz (rest: frame_id, wh)."""
+    return [(t, objects, *rest) for t in np.arange(t0, t1, period)]
+
+
+def _band(holder):
+    from rammp_box_opening.perception.segmenter_source import lid_band
+
+    return lid_band(holder, (640, 400))[0]
+
+
+def _locator(monkeypatch, world, outcomes, seg=True):
+    """A SceneLocator on the world's stubs, its gate a stand-in: outcomes[box] is a top (the box passes), a dict
+    {top, partial} (it passes, finished from part of it) or a reason (it is refused)."""
+    from rammp_box_opening.models.container import ContainerPose
+    from rammp_box_opening.perception import scene_source as ss
+
+    loc = ss.SceneLocator.__new__(ss.SceneLocator)
+    loc.spins, loc.model, loc.table_z, loc.base_frame, loc.tag_px = False, ContainerModel.load(PINK), None, "arm_mount", None
+    loc.last_why, loc.last_timing, loc.last_boxes, loc.last_seg_state, loc.moved_note = None, {}, {}, None, None
+    loc.seg_box = "holder"
+    loc.grab, loc.owl, loc.seg = world.grab, world.owl, world.rung if seg else None
+    loc._clock, loc._sleep = world.clock, world.sleep
+    loc.ready = lambda: True
+    loc.base_to_color = lambda: UPRIGHT
+    gated = []
+    key = {ss.box_key(k): v for k, v in outcomes.items()}
+
+    def gate(cands, pts, uv, table_z, model, src="OWL", rivals=False, **kw):
+        gated.append((round(world.t, 3), src, len(cands)))
+        tried, passing = [], []
+        for c in cands:
+            o = key[ss.box_key(c[1])]
+            if isinstance(o, str):
+                tried.append("%s (%s %.2f)" % (o, src, c[0]))
+            else:
+                passing.append((c, o if isinstance(o, dict) else {"top": o}))
+        if not passing:
+            return ss.SceneBoxFix(None, None, 0, None, tuple(tried))
+        c, o = passing[0]
+        top = tuple(o["top"])
+        riv = tuple(tuple(p["top"]) for _c, p in passing[1:] if np.hypot(p["top"][0] - top[0], p["top"][1] - top[1]) > ss.RIVAL_M)
+        pose = ContainerPose(xyz=(top[0], top[1], top[2] - 0.121), yaw=0.0)
+        return ss.SceneBoxFix(pose, top, 300, c[1], tuple(tried), 0.19, "side", (), tuple(o.get("partial", ())),
+                              riv if rivals else ())
+
+    monkeypatch.setattr(ss, "scene_fix_from_boxes", gate)
+    return loc, gated
+
+
+def _holder(dx=0.0):
+    return (HOLDER[0] + dx, HOLDER[1], HOLDER[2] + dx, HOLDER[3])
+
+
+def test_the_segmenters_frames_fix_the_box_with_the_owl_never_enabled(monkeypatch):
+    # the frame at 0.1 s was taken before the look; the next two, 4 mm apart, commit their median
+    before = [(0.1, [("food container", 0.88, _holder())])]
+    after = [(t, [("food container", 0.88, _holder(1.0 if i % 2 else 0.0))]) for i, t in enumerate(np.arange(0.3, 3.0, 0.2))]
+    world = _World(seg_msgs=before + after)
+    other = (SEG_TOP[0] + 0.004, SEG_TOP[1], SEG_TOP[2])
+    loc, gated = _locator(monkeypatch, world, {_band(_holder()): SEG_TOP, _band(_holder(1.0)): other})
+    fix = loc.locate(15.0)
+    assert fix is not None, loc.last_why
+    assert fix.source == "segmenter" and fix.n_sightings == 2 and fix.sources == ("segmenter", "segmenter")
+    assert fix.top_xyz == pytest.approx((SEG_TOP[0] + 0.002, SEG_TOP[1], SEG_TOP[2]))
+    assert fix.score == pytest.approx(0.88)
+    assert world.owl.ons == [] and world.owl.offs  # never on the GPU; the latched gate shut all the same
+    assert [g[1] for g in gated] == ["segmenter", "segmenter"]  # the frame from before the look never voted
+    assert loc.last_timing["fix_s"] == pytest.approx(0.5, abs=0.05)
+    assert loc.last_boxes["segmenter"] == [["food container", 0.88, *_holder(1.0)]]
+
+
+def test_a_silent_segmenter_hands_the_look_to_the_owl_at_once(monkeypatch):
+    world = _World(seg_since=5.0, owl_script=[[(0.3, OWL_BOX)], [(0.31, OWL_BOX)]])
+    loc, _gated = _locator(monkeypatch, world, {OWL_BOX: OWL_TOP})
+    fix = loc.locate(15.0)
+    assert fix is not None, loc.last_why
+    assert world.owl.ons[0] <= 0.03  # the first look at the segmenter found it silent
+    assert fix.source == "owl" and fix.sources == ("owl", "owl") and fix.top_xyz == pytest.approx(OWL_TOP)
+    assert loc.last_seg_state == "silent"
+
+
+def test_a_live_segmenter_whose_boxes_are_all_refused_calls_the_owl_after_a_second(monkeypatch):
+    from rammp_box_opening.perception.scene_source import OWL_AFTER_S
+
+    world = _World(seg_msgs=_every(0.1, 10.0, [("food container", 0.88, _holder())]),
+                   owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+    loc, _gated = _locator(monkeypatch, world, {_band(_holder()): "from the side, its top is -55 mm from lid height", OWL_BOX: OWL_TOP})
+    fix = loc.locate(15.0)
+    assert fix is not None and fix.source == "owl" and fix.sources == ("owl", "owl")
+    assert OWL_AFTER_S == 1.0 and world.owl.ons[0] == pytest.approx(OWL_AFTER_S, abs=0.05)
+
+
+def test_a_segmenter_frame_from_before_the_look_never_votes(monkeypatch):
+    # its newest message is fresh, but of a frame no newer than the one the grabber held at the call
+    world = _World(seg_msgs=[(0.0, [("food container", 0.88, _holder())], SCENE_FRAME, (640, 400), -0.05)])
+    loc, gated = _locator(monkeypatch, world, {_band(_holder()): SEG_TOP})
+    assert loc.locate(0.5) is None
+    assert gated == []
+    assert loc.last_why.startswith("scene segmenter: no frame newer than the look in 0.5 s")
+    assert "scene OWL: not asked" in loc.last_why
+
+
+def test_a_segmenter_watching_another_camera_is_down_and_says_which(monkeypatch):
+    wrist = "wrist_camera_color_optical_frame"
+    world = _World(seg_msgs=_every(0.0, 5.0, [("food container", 0.88, _holder())], wrist))
+    loc, gated = _locator(monkeypatch, world, {_band(_holder()): SEG_TOP})
+    assert loc.locate(3.0) is None
+    assert world.owl.ons and world.owl.ons[0] <= 0.03  # its first message, there at the call, says so
+    assert gated == []  # nothing it says is used
+    assert ("it watches '%s', not the scene camera ('%s')" % (wrist, SCENE_FRAME)) in loc.last_why
+    assert loc.last_why.endswith("scene OWL: the scene OWL saw no box in 3.0 s")
+
+
+def test_two_places_in_one_segmenter_frame_are_no_sighting_and_call_the_owl(monkeypatch):
+    other = (100.0, 216.0, 190.0, 260.0)  # a second bowl whose band passes 30 cm away
+    world = _World(seg_msgs=_every(0.1, 10.0, [("food container", 0.88, _holder()), ("food container", 0.6, other)]),
+                   owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+    far = (SEG_TOP[0], SEG_TOP[1] + 0.3, SEG_TOP[2])
+    loc, _gated = _locator(monkeypatch, world, {_band(_holder()): SEG_TOP, _band(other): far, OWL_BOX: OWL_TOP})
+    fix = loc.locate(15.0)
+    assert world.owl.ons[0] == pytest.approx(0.3, abs=0.05)  # at the first ambiguous frame, not a second later
+    assert fix is not None and fix.sources == ("owl", "owl")
+
+
+def test_without_a_segmenter_for_the_container_the_owl_looks_as_it_always_did(monkeypatch):
+    world = _World(owl_alive=False)
+    loc, _gated = _locator(monkeypatch, world, {}, seg=False)
+    assert loc.locate(2.0) is None
+    assert world.owl.ons == [0.0]
+    assert loc.last_why == ("the scene OWL is SILENT (no heartbeat in 2.0 s) — not started, still loading, or not "
+                            "receiving frames: check the launch terminal")
+    world = _World()
+    loc, _gated = _locator(monkeypatch, world, {}, seg=False)
+    assert loc.locate(2.0) is None and loc.last_why == "the scene OWL saw no box in 2.0 s"
+    world = _World(owl_script=[[(0.3, OWL_BOX)]])
+    loc, _gated = _locator(monkeypatch, world, {OWL_BOX: "only 26 depth points inside the box (need 40)"}, seg=False)
+    assert loc.locate(2.0) is None
+    assert loc.last_why == "none of the OWL's 1 candidate(s) is this container: only 26 depth points inside the box (need 40) (OWL 0.30)"
+    world = _World(owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+    loc, _gated = _locator(monkeypatch, world, {OWL_BOX: OWL_TOP}, seg=False)
+    fix = loc.locate(5.0)
+    assert fix is not None and fix.source == "owl" and fix.n_sightings == 2
+
+
+def test_a_segmenter_this_install_cannot_read_leaves_the_owl_to_look_from_the_start(monkeypatch):
+    world = _World(owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+    world.rung.available = False
+    world.rung.why = "rammp_perception_interfaces does not import (no module): this install does not chain ~/ros2_ws/install"
+    loc, _gated = _locator(monkeypatch, world, {OWL_BOX: OWL_TOP})
+    fix = loc.locate(15.0)
+    assert world.owl.ons[0] == 0.0 and fix is not None and fix.sources == ("owl", "owl")
+    world = _World(owl_alive=False)
+    world.rung.available, world.rung.why = False, "its DetectedObject predates rammp-interfaces-ros2#16 (no size)"
+    loc, _gated = _locator(monkeypatch, world, {})
+    assert loc.locate(2.0) is None
+    assert loc.last_why.startswith("scene segmenter: its DetectedObject predates rammp-interfaces-ros2#16")
+    assert "scene OWL: the scene OWL is SILENT" in loc.last_why
+
+
+def test_with_both_detectors_silent_the_look_says_so_for_each(monkeypatch):
+    world = _World(seg_since=5.0, owl_alive=False)
+    loc, _gated = _locator(monkeypatch, world, {})
+    assert loc.locate(2.0) is None
+    assert loc.last_why.startswith("scene segmenter: SILENT: no /perception/object_detections in 1.0 s; select "
+                                   "scene_segmenter: rfdetr in the sheppy profile; scene OWL: the scene OWL is SILENT")
+
+
+def test_when_neither_detector_finds_the_box_both_say_why(monkeypatch):
+    world = _World(seg_msgs=_every(0.1, 10.0, [("food container", 0.88, _holder())]))
+    loc, _gated = _locator(monkeypatch, world, {_band(_holder()): "from the side, its top is -55 mm from lid height"})
+    assert loc.locate(3.0) is None
+    why = loc.last_why
+    assert why.startswith("scene segmenter: none of its ") and "-55 mm from lid height (segmenter 0.88)" in why
+    assert why.endswith("; scene OWL: the scene OWL saw no box in 3.0 s")
+
+
+def test_the_owls_cut_lid_waits_on_the_segmenter_while_it_is_live(monkeypatch):
+    # the segmenter sees no food container at all; the OWL boxes the cut lid twice
+    world = _World(seg_msgs=_every(0.1, 10.0, []), owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+    loc, _gated = _locator(monkeypatch, world, {OWL_BOX: {"top": OWL_TOP, "partial": ("left",)}})
+    assert loc.locate(4.0) is None
+    assert loc.last_why.startswith("scene segmenter: saw no food container in ")
+    world = _World(seg_msgs=_every(0.1, 10.0, [("food container", 0.88, _holder())]), owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+    loc, _gated = _locator(monkeypatch, world, {_band(_holder()): "only 26 depth points inside the box (need 40)",
+                                                OWL_BOX: {"top": OWL_TOP, "partial": ("left",)}})
+    assert loc.locate(4.0) is None
+    assert "the OWL's box of the cut lid is not confirmed by the segmenter's" in loc.last_why
+
+
+def test_the_owl_is_shut_however_the_look_ends(monkeypatch):
+    world = _World(seg_since=5.0)
+    loc, _gated = _locator(monkeypatch, world, {})
+
+    def boom(*a, **k):
+        raise KeyboardInterrupt
+
+    world.owl.script = [[(0.3, OWL_BOX)]]
+    from rammp_box_opening.perception import scene_source as ss
+
+    monkeypatch.setattr(ss, "scene_fix_from_boxes", boom)
+    with pytest.raises(KeyboardInterrupt):
+        loc.locate(5.0)
+    assert world.owl.ons and world.owl.offs and world.owl.offs[-1] >= world.owl.ons[-1]
+
+
+def test_prime_wakes_the_owl_only_where_the_segmenter_cannot_answer(monkeypatch):
+    world = _World(seg_msgs=[(0.0, [])])
+    loc, _gated = _locator(monkeypatch, world, {})
+    loc.prime()
+    assert world.owl.ons == [] and loc.last_seg_state == "live"
+    world = _World(seg_since=0.5)  # just subscribed: no word yet is no failure yet
+    loc, _gated = _locator(monkeypatch, world, {})
+    loc.prime()
+    assert world.owl.ons == [] and loc.last_seg_state == "waiting"
+    world = _World(seg_since=5.0)
+    loc, _gated = _locator(monkeypatch, world, {})
+    loc.prime()
+    assert world.owl.ons == [0.0]
+    world = _World()
+    loc, _gated = _locator(monkeypatch, world, {}, seg=False)
+    loc.prime()
+    assert world.owl.ons == [0.0]
