@@ -141,6 +141,10 @@ class PlannerClient:
         # what the arm does after an arrival stops being that arrival's
         # settle when the next goal goes out (goals_sent)
         self._sent_at = deque(maxlen=self.GOALS_KEPT)
+        # the last execute call's info, filled as it runs: a Ctrl+C's
+        # unwinding hands none back, and the runner keeps the stopped
+        # motion's side file from this (runner._keep_aborted)
+        self.last_execution = None
         # Set on first /joint_states message: 'joint_1..7' on bench,
         # 'arm_joint_1..7' on flatbot (nightly driver renders arm_mount URDF).
         self._active_joints = None
@@ -726,8 +730,8 @@ class PlannerClient:
     # are; how many are has never been measured — the side file's times
     # say) with its fraction (the driver's own trajectory clock) and when it
     # was heard — the newest FEEDBACK_KEEP, a minute of motion (the longest
-    # of 2026-10-28 flew 8.4 s) — for the run record's side file
-    # (runner._keep_flight)
+    # of 2026-10-28 flew 9.2 s, 15:46:37's way in) — for the run record's
+    # side file (runner._keep_flight)
     FEEDBACK_EVERY = 10
     FEEDBACK_KEEP = 6000
 
@@ -772,8 +776,12 @@ class PlannerClient:
         Once the goal goes out, info["sent_at"] is when (time.monotonic()),
         info["sent_traj"] the trajectory sent (dilated where `speed` asked)
         and info["feedback_q"] what flew: every FEEDBACK_EVERY-th feedback
-        as (when it was heard, its fraction, the measured joints)."""
+        as (when it was heard, its fraction, the measured joints). The same
+        info is self.last_execution from the call's start: a Ctrl+C raises
+        through here, once the cancel and the release are out, with
+        nothing returned."""
         info = {"message": "", "progress": 0.0, "torque_peak": None, "gains": None}
+        self.last_execution = info
         if self._abort is not None and self._abort.requested:
             raise KeyboardInterrupt  # aborted before this leg ever started
         if not self._armed:

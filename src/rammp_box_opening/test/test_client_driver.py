@@ -1242,3 +1242,20 @@ def test_every_goal_that_goes_to_the_driver_is_timed():
     assert c.release()
     sent = c.goals_sent()
     assert len(sent) == 2 and t0 <= sent[0] <= info["sent_at"] <= sent[1] <= time.monotonic()
+
+
+def test_a_ctrl_c_leaves_what_went_out_where_the_runner_keeps_it_from(monkeypatch):
+    """A Ctrl+C raises through execute once the cancel and the release are
+    out, with nothing returned: what the call kept is last_execution, from
+    which the runner keeps the stopped motion's side file
+    (runner._keep_aborted). A call stopped before anything went out leaves
+    its own there, nothing sent — never the call before's."""
+    t0 = time.monotonic()
+    c, d, _h = _ctrl_c_mid_goal(monkeypatch)
+    info = c.last_execution
+    assert t0 <= info["sent_at"] <= time.monotonic() and len(d.goals) == 2  # the leg, its release
+    assert list(info["sent_traj"].points[-1].positions) == pytest.approx([v + 0.05 for v in LIVE])
+    assert list(info["feedback_q"]) == []  # this driver sends no feedback
+    with pytest.raises(KeyboardInterrupt):  # the abort flag still up: the next leg never starts
+        c.execute(_traj(MID, [v + 0.05 for v in LIVE]), 1.0)
+    assert c.last_execution is not info and "sent_at" not in c.last_execution

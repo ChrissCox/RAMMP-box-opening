@@ -228,6 +228,34 @@ def test_a_run_whose_scene_camera_finds_no_box_says_so_in_its_record(monkeypatch
     assert rows.index(refused[0]) < len(rows) - 1 and rows[-1]["kind"] == "motion"  # then the home
 
 
+class _Hears(FakeClient):
+    """A client that keeps what it heard and when it sent, as PlannerClient
+    does (nothing heard here): each execution says when it went out, so its
+    arrival's settle is due."""
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        import time
+
+        outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+        info.update(sent_at=time.monotonic(), sent_traj=traj_, feedback_q=[])
+        return outcome, info
+
+    def joint_history(self, since=None):
+        return []
+
+    def goals_sent(self):
+        return []
+
+
+def test_the_last_arrivals_settle_is_noted_as_the_run_ends(monkeypatch, tmp_path):
+    """Nothing after a run's last motion goes out to note its settle: main's
+    exit does (runner.flush), the NO BOX run's home's after its own row, cut
+    where the run ended."""
+    code, _c, rows = run_main(monkeypatch, tmp_path, ["--execute"], _at_staging(), client=_Hears(), found=False)
+    assert code == 2 and rows[-2]["kind"] == "motion"
+    assert rows[-1]["leg"] == "settle" and rows[-1]["cut"] == "run end" and rows[-1]["legs"][-1] == rows[-2]["leg"]
+
+
 def _refused(ctx):
     """The scene approach refused: the run goes home and stops (exit 1),
     right after the start these tests are about."""

@@ -223,7 +223,9 @@ def settle_report(rows, end, signs, window_s, chain=None):
     in time order, the arrival's own reading first at 0 — against `end`,
     the joints the trajectory flown ends at. The settle note's fields:
 
-      samples       the readings after the arrival's own; gap_ms, the
+      samples       the readings after the arrival's own; last_s, when the
+                    last of them was measured (s after the arrival, 0.0
+                    with none): what "for good" holds to; gap_ms, the
                     longest stretch of the window without one (its
                     resolution: the aim spins the node once a frame)
       peak_qd       each joint's fastest |qd| after the arrival (rad/s)
@@ -235,14 +237,19 @@ def settle_report(rows, end, signs, window_s, chain=None):
       within_Nmm_s  when the tool came within N mm (SETTLE_WITHIN_MM) for
                     good; None where the window's last reading is outside
 
-    The tool by `chain` (ArmChain.tool_positions, else fk() row by row);
-    without one its fields are None."""
+    With no reading after the arrival's own (samples 0: nothing spun the
+    node, as after a run's last motion) end_mm and within_Nmm_s are None:
+    nothing says where the tool went, nor that it stayed. The tool by
+    `chain` (ArmChain.tool_positions, else fk() row by row); without one
+    its fields are None."""
     ts = np.asarray([r[0] for r in rows], float)
     qs = np.asarray([r[1] for r in rows], float)
     qds = [r[2] for r in rows[1:] if r[2] is not None]
     past = (np.asarray(signs, float) * _wrapped(qs - np.asarray(end, float))).max(axis=0)
+    seen = len(rows) > 1
     out = {
         "samples": len(rows) - 1,
+        "last_s": round(float(ts[-1]), 3),
         "gap_ms": round(1000.0 * float(np.diff(np.append(ts, max(float(window_s), ts[-1]))).max()), 1),
         "peak_qd": [round(float(v), 3) for v in np.abs(np.asarray(qds, float)).max(axis=0)] if qds else None,
         "past_mrad": [round(1000.0 * float(v), 1) for v in past],
@@ -257,9 +264,9 @@ def settle_report(rows, end, signs, window_s, chain=None):
         except Exception:  # noqa: BLE001 - no tool: the joints still say
             mm = None
     out["max_mm"] = None if mm is None else round(float(mm.max()), 1)
-    out["end_mm"] = None if mm is None else round(float(mm[-1]), 1)
+    out["end_mm"] = None if mm is None or not seen else round(float(mm[-1]), 1)
     for thr in SETTLE_WITHIN_MM:
-        out["within_%gmm_s" % thr] = None if mm is None else _within(ts, mm, thr)
+        out["within_%gmm_s" % thr] = None if mm is None or not seen else _within(ts, mm, thr)
     return out
 
 
@@ -966,7 +973,11 @@ class Runner:
 
         self._note_settle()  # the last arrival's, its window cut by this goal
         t0 = time.monotonic()
-        outcome, info = self.client.execute(traj, 1.0, guard=None, while_running=hook)
+        try:
+            outcome, info = self.client.execute(traj, 1.0, guard=None, while_running=hook)
+        except KeyboardInterrupt:
+            self._keep_aborted([reflex.name], traj, t0)
+            raise
         arrived = (time.monotonic(), time.time())
         ok = outcome == "arrived"
         flew = self._how_it_flew(outcome, info, traj)
@@ -1212,14 +1223,18 @@ class Runner:
         gains = group[0].gains
         self._note_settle()  # the last arrival's, its window cut by this goal
         t0 = time.monotonic()
-        outcome, info = self.client.execute(
-            traj,
-            exec_speed,
-            guard=guard,
-            while_running=while_running,
-            stop_when=lead.stop_when,
-            **({} if gains is None else {"gains": gains}),
-        )
+        try:
+            outcome, info = self.client.execute(
+                traj,
+                exec_speed,
+                guard=guard,
+                while_running=while_running,
+                stop_when=lead.stop_when,
+                **({} if gains is None else {"gains": gains}),
+            )
+        except KeyboardInterrupt:
+            self._keep_aborted([g.name for g in group], traj, t0)
+            raise
         arrived = (time.monotonic(), time.time())
         flew = self._how_it_flew(outcome, info, traj)
         if guard is not None:
@@ -1288,7 +1303,8 @@ class Runner:
     def _keep_flight(self, names, outcome, flew, info, traj, arrived):
         """After an execution of the legs `names` (`traj`, what flew, as
         _how_it_flew's `flew`) the client returned at `arrived`
-        (time.monotonic(), time.time()): its number, its side file next to
+        (time.monotonic(), time.time()) — a Ctrl+C's, raised by then
+        (_keep_aborted): its number, its side file next to
         the run record — <record>.flights/<number>-<first leg>.json, what
         went to the driver point by point and its feedback of what flew
         (_flight_doc) — and, an arrival, its settle, noted when the next goal
@@ -1317,17 +1333,41 @@ class Runner:
             print("[runner] the flight of %s is not kept (%s)" % (names[0], e))
             return None
 
+    def _keep_aborted(self, names, traj, t0):
+        """A Ctrl+C ended the execution of the legs `names` (`traj`) begun at
+        `t0`: the client raises once the cancel and the release are out (its
+        abort path, its backstop) and hands nothing back, so its side file is
+        kept from the call's own info (client.last_execution), its outcome
+        "aborted" — the motion that was stopped is the one most worth
+        reading. Nothing of it went out (no "sent_at" since `t0`): nothing
+        kept. Its legs get no row, as before, and no settle: nothing
+        arrived. Never in the unwinding's way: whatever goes wrong is
+        printed, and the KeyboardInterrupt goes on."""
+        try:
+            info = getattr(self.client, "last_execution", None)
+            if not isinstance(info, dict) or float(info.get("sent_at", t0 - 1.0)) < t0:
+                return
+            arrived = (time.monotonic(), time.time())
+            self._keep_flight(names, "aborted", self._how_it_flew("aborted", info, traj), info, traj, arrived)
+        except Exception as e:  # noqa: BLE001 - a measurement only: the Ctrl+C goes on
+            print("[runner] the flight of %s is not kept (%s)" % (names[0], e))
+
     def _note_settle(self, ending=False):
-        """The last arrival's settle (_keep_flight kept it), noted now: the
-        next goal is about to go out, or the run is over (`ending`, flush).
-        Its window runs from the arrival to SETTLE_WINDOW_S after it, the
-        first goal sent to the driver since (client.goals_sent: an
-        execution, the hold that primes the impedance, a release) or now,
-        whichever comes first — `cut` names which, None the whole window.
-        In it the /joint_states the client heard (joint_history), each
-        placed by its stamp: the arm's settle per joint and at the tool
-        (settle_report), against the end of what flew. Nothing waits for it
-        and nothing gates on it; a client that keeps no history notes none."""
+        """The last arrival's settle (_keep_flight kept it), noted now: this
+        runner's next execution is about to go out, or the run is over
+        (`ending`, flush). Its window runs from the arrival to
+        SETTLE_WINDOW_S after it, the first goal sent to the driver since
+        (client.goals_sent: the hold that primes the impedance, a release)
+        or now, whichever comes first. `cut` names what ended it: "next
+        goal", such a goal; "next execution", this runner's next, about to
+        go out (whether the client's gates then send it or not); "run end",
+        the run's end — and at it any window nothing was heard through to
+        its end (nothing spins the node after the run's last motion); None,
+        the whole window. In it the /joint_states the client heard
+        (joint_history), each placed by its stamp: the arm's settle per
+        joint and at the tool (settle_report), against the end of what
+        flew. Nothing waits for it and nothing gates on it; a client that
+        keeps no history notes none."""
         pend, self._settling = self._settling, None
         history = getattr(self.client, "joint_history", None)
         if pend is None or history is None:
@@ -1336,15 +1376,19 @@ class Runner:
             t0, w0 = pend.arrived
             later = [float(t) for t in getattr(self.client, "goals_sent", list)() if float(t) > t0]
             until = min([t0 + SETTLE_WINDOW_S, time.monotonic()] + later)
-            if until >= t0 + SETTLE_WINDOW_S:
-                cut = None
-            else:
-                cut = "run end" if ending and until not in later else "next goal"
             # a stamp is the driver's clock, time.time()'s: on this one by
             # the arrival's two readings; an unstamped message by when heard
             off = t0 - w0
             heard = sorted((((s.stamp + off if s.stamp else s.t) - t0, s) for s in history(since=t0)), key=lambda r: r[0])
             rows = [(0.0, pend.live, None)] + [(dt, s.q, s.qd) for dt, s in heard if 0.0 < dt <= until - t0]
+            if later and until == min(later):
+                cut = "next goal"
+            elif ending and (until < t0 + SETTLE_WINDOW_S or not any(dt >= until - t0 for dt, _s in heard)):
+                cut = "run end"
+            elif until < t0 + SETTLE_WINDOW_S:
+                cut = "next execution"
+            else:
+                cut = None
             try:
                 from rammp_box_opening.runtime import approach
 
