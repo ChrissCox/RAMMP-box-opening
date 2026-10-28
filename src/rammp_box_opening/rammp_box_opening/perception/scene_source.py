@@ -664,7 +664,7 @@ def box_key(box):
 
 
 def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side_table_z=None, image_wh=None,
-                         cam_R=None, src="OWL", rivals=False):
+                         cam_R=None, src="OWL", rivals=False, lifts=("top", "side")):
     """A detector's candidates (score, [x0, y0, x1, y1][, holder]) best
     first: every candidate lifted to the lid slab (box_from_scene_points)
     when a table height is known (`table_z`) and the camera stands above the
@@ -690,8 +690,9 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
     HOLDER_SIDE_KINDS has its holder's sides, not its lid's (lid_circle's
     `side_is_lid`); an OWL box is the lid's. `src` names the detector
     in every reason. With `rivals`, every OTHER candidate is gated on its
-    own too, and the tops that pass more than RIVAL_M from the winner's are
-    the fix's `rivals`."""
+    own too, through the lift that won only (`lifts`: the views tried),
+    and the tops that pass more than RIVAL_M from the winner's are the
+    fix's `rivals`."""
     tried = []
     clipped = []
     # (score, box, the side edges a round box is finished across or (), the holder that anchors it or None,
@@ -710,7 +711,7 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
             clipped.append((score, box, edges))
             tried.append("it runs off the frame at its %s edge (%s %.2f)" % (" and ".join(edges), src, score))
     got = None
-    if table_z is not None:
+    if table_z is not None and "top" in lifts:
         lid_z = float(table_z) + float(model.dims[2])
         for score, box, edges, _holder, _side_is_lid in cands:
             if edges:
@@ -722,7 +723,7 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
                 got = SceneBoxFix(pose, top, n, box, tuple(tried), float(table_z), "top", tuple(clipped))
                 break
             tried.append("%s (%s %.2f)" % (top, src, score))
-    if got is None and cam_xyz is not None:
+    if got is None and cam_xyz is not None and "side" in lifts:
         for score, box, edges, holder, side_is_lid in cands:
             anchor = None if holder is None else holder_front_rng(pts_base, uv, holder, cam_xyz)
             sides = uncut_sides(box, edges, pts_base, uv, cam_xyz, cam_R) if edges else ()
@@ -745,8 +746,10 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
         for c in boxes:
             if box_key(c[1]) == won:
                 continue
+            # the winner's lift only: alone through both, a tray the top-face
+            # lift refused passes from the side, a second place in every message
             alone = scene_fix_from_boxes([c], pts_base, uv, table_z, model, cam_xyz=cam_xyz, side_table_z=side_table_z,
-                                         image_wh=image_wh, cam_R=cam_R, src=src)
+                                         image_wh=image_wh, cam_R=cam_R, src=src, lifts=(got.lift,))
             if alone.pose is not None and float(np.hypot(alone.top[0] - got.top[0], alone.top[1] - got.top[1])) > RIVAL_M:
                 others.append(tuple(float(v) for v in alone.top))
         if others:
