@@ -53,8 +53,11 @@ The tilt is the smallest of REACH_TILTS_DEG that plans. It stops at 45 deg
 because of the gripper's shape: past that its knuckles, then its palm, come
 down onto the flush lid before the fingertip reaches the button (the URDF's
 collision meshes with the measured 131 mm fingers: 8 mm of lid clearance at
-30 deg, 5.6 at 45, under 3 past 60). The press ends the run: the grip, the
-lift and the set-down are straight-down primitives that reach no further.
+30 deg, 5.6 at 45, under 3 past 60). A guarded press ends the run there. A
+compliant depth press, the default, goes on to take the lid off — the look
+at the knob from the look pose, the press once more where it is not up, the
+grip, the lift, the carry and the set-down (tasks/reach_lid_off) — unless
+--press-only.
 """
 
 import dataclasses
@@ -278,6 +281,50 @@ def reach_geometry(model, button, tilt, travel_m):
     return quat, start, bottom, look
 
 
+def walk_or_turn(ctx, q_look, slide_pts, start_xyz, quat, top_z=None):
+    """way_down's way to the hand turned down over the slide's end
+    `start_xyz`, no stroke: one walk in from the look pose's joints
+    `q_look` (depth_press.walk_down_path), else the turn about the
+    fingertip where the slide `slide_pts` ends (depth_press.turn_down_path,
+    up to 15 deg short: COMPLIANT_TURN_SHORT_DEG) — where that turn does not
+    fly and `top_z` (the button's top, or the lid's) is given, the slide
+    carried on straight down to TURN_LOW_ABOVE_M above it and the turn
+    there (WayDown slide, start_xyz and above_m: the callers fly that
+    slide). The reach-out's lid off comes down to the knob the same way
+    (reach_lid_off.solve_grip_way). Returns (depth_press.WayDown, None) or
+    (None, why)."""
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks import depth_press as dp  # imports this module: not at the top
+
+    chain = approach._chain()
+    pts, down, short, why_walk = dp.walk_down_path(chain, ctx.model, q_look, start_xyz, quat)
+    if pts is not None:
+        return dp.WayDown(pts, down, short, True), None
+    pts, down, short, why_turn = dp.turn_down_path(chain, ctx.model, slide_pts[-1], CONTACT_TOOL,
+                                                   dp.COMPLIANT_TURN_SHORT_DEG)
+    if pts is not None:
+        return dp.WayDown(pts, down, short, False), None
+    whys = ["turn after the slide: %s" % why_turn]
+    if top_z is not None:
+        tip = np.asarray(start_xyz, float) + _rot(quat) @ np.asarray(CONTACT_TOOL)
+        for above in TURN_LOW_ABOVE_M:
+            if float(tip[2]) <= float(top_z) + above + LINE_MIN_M:
+                continue  # the slide already ends this low
+            low = tool_for_contact((float(tip[0]), float(tip[1]), float(top_z) + above), quat)
+            drop, why = chain.straight_line(slide_pts[-1], low, quat)
+            if drop is None:
+                whys.append("slid on down to %.0f mm above the button: %s" % (1000 * above, why))
+                continue
+            pts, down, short, why_turn = dp.turn_down_path(chain, ctx.model, drop[-1], CONTACT_TOOL,
+                                                           dp.COMPLIANT_TURN_SHORT_DEG)
+            if pts is None:
+                whys.append("turned %.0f mm above the button: %s" % (1000 * above, why_turn))
+                continue
+            slide = [list(q) for q in slide_pts] + [list(q) for q in drop[1:]]
+            return dp.WayDown(pts, down, short, False, slide, low, above), None
+    return None, "walk in: %s; %s" % (why_walk, "; ".join(whys))
+
+
 def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     """How the compliant depth press gets from the look pose's joints
     `q_look` to pressing the button whose top is at `top_z`, solved by the
@@ -304,36 +351,10 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     from rammp_box_opening.tasks import depth_press as dp  # imports this module: not at the top
 
     chain = approach._chain()
-    pts, down, short, why_walk = dp.walk_down_path(chain, ctx.model, q_look, start_xyz, quat)
-    slide = slide_pts
-    if pts is not None:
-        way = dp.WayDown(pts, down, short, True)
-    else:
-        pts, down, short, why_turn = dp.turn_down_path(chain, ctx.model, slide_pts[-1], CONTACT_TOOL,
-                                                       dp.COMPLIANT_TURN_SHORT_DEG)
-        whys = ["turn after the slide: %s" % why_turn]
-        tip = np.asarray(start_xyz, float) + _rot(quat) @ np.asarray(CONTACT_TOOL)
-        low, low_above = None, None
-        for above in TURN_LOW_ABOVE_M:
-            if pts is not None:
-                break
-            if float(tip[2]) <= float(top_z) + above + LINE_MIN_M:
-                continue  # the slide already ends this low
-            low = tool_for_contact((float(tip[0]), float(tip[1]), float(top_z) + above), quat)
-            drop, why = chain.straight_line(slide_pts[-1], low, quat)
-            if drop is None:
-                whys.append("slid on down to %.0f mm above the button: %s" % (1000 * above, why))
-                continue
-            pts, down, short, why_turn = dp.turn_down_path(chain, ctx.model, drop[-1], CONTACT_TOOL,
-                                                           dp.COMPLIANT_TURN_SHORT_DEG)
-            if pts is None:
-                whys.append("turned %.0f mm above the button: %s" % (1000 * above, why_turn))
-            else:
-                slide, low_above = [list(q) for q in slide_pts] + [list(q) for q in drop[1:]], above
-        if pts is None:
-            return None, None, "walk in: %s; %s" % (why_walk, "; ".join(whys))
-        lowered = slide is not slide_pts
-        way = dp.WayDown(pts, down, short, False, *((slide, low, low_above) if lowered else ()))
+    way, why = walk_or_turn(ctx, q_look, slide_pts, start_xyz, quat, top_z)
+    if way is None:
+        return None, None, why
+    slide = slide_pts if way.slide is None else way.slide  # it turned lower down: the slide carries on to there
     stroke, why = dp.compliant_stroke(chain, cfg, way.pts[-1] if way.pts else slide[-1], way.quat, top_z)
     if stroke is None:
         return None, None, why
@@ -1558,8 +1579,17 @@ def _way_home(ctx, cfg, runner, stroke, held, q_held, ahead, scene_fix, locator)
 
 def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     """The whole reach-out press from the scene camera's fix. Returns the
-    process exit code: 0 pressed and the knob popped, 1 a failure, the box
-    moved or the knob not up, 2 no button.
+    process exit code: 0 pressed and the knob popped (--press-only: pressed),
+    1 a failure, the box moved or the knob not up, 2 no button, 4 nowhere to
+    set the lid down.
+
+    THE FULL RUN (a compliant --depth-press run without --press-only, the
+    default since 2026-10-28): the lid's spot resolved before anything moves
+    (reach_lid_off.resolve_lid_drop), then from the one-execution way in
+    and the hold on, tasks/reach_lid_off.run_full — back to the look pose,
+    the knob judged there, the press once more where it is not up, the lid
+    off and set down, home: 0 only with the lid set down and the arm home. A
+    box the aim sees already open has its lid taken off unpressed.
 
     COMPLIANT (args.compliant with --depth-press, press_demo's default
     since 2026-10-27): every leg in the driver's joint impedance, under the
@@ -1628,6 +1658,17 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     # the clear, a back-off and home: 20.2 s from the look to home, nothing
     # pressed. This is planning before the arm moves, not a check that stops it.
     proof = soft and depth
+    # The full run (owner 2026-10-28): a compliant depth press goes on to
+    # take the lid off (tasks/reach_lid_off); --press-only stops at the
+    # press. Where the lid goes is resolved before anything moves, by the
+    # staging run's rules, refused (exit 4) where the cameras see no room or
+    # the hand reaches none of it.
+    lid_off = proof and not bool(getattr(args, "press_only", False))
+    if lid_off:
+        from rammp_box_opening.tasks import reach_lid_off
+
+        if not reach_lid_off.resolve_lid_drop(ctx, cfg, runner, watcher, scene_fix):
+            return 4
     looks = [] if proof else None
     # One read: the hold that primes the joint impedance and the look's plan
     # start from the same joints. The first compliant goal after a POSITION
@@ -1700,9 +1741,13 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         return 2
     open_already = refuse_open_box(up_mm)
     if open_already is not None:
-        runner.note("open_box", button_above_lid_mm=round(up_mm, 1))
-        _go_home(ctx, cfg, runner, "STOP: " + open_already)
-        return 1
+        runner.note("open_box", button_above_lid_mm=round(up_mm, 1), opened=lid_off)
+        if not lid_off:
+            _go_home(ctx, cfg, runner, "STOP: " + open_already)
+            return 1
+        # the full run takes an open box's lid off: nothing presses the knob
+        print("[press_demo] ALREADY OPEN: the knob stands %.0f mm above its lid — not pressing it, which would shut "
+              "the box; taking the lid off" % up_mm)
     # The fingers are shut before the arm moves toward the box. press_demo
     # sent press:close before the look, and the runner joins it before a
     # gripper leg or a guarded motion only: a compliant run has neither, so
@@ -1747,6 +1792,18 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         # camera's mount in TF, which is known to be off (76 mm high, 20:04)
         ctx.mission_frames.located(button, "fix")
     world = _interaction_world(ctx, button[2], cfg.travel_m, "reach")
+    if open_already is not None:  # the full run (above): the knob up already, its lid off without a press
+        from rammp_box_opening.tasks import reach_lid_off
+
+        # the lid by the higher of the scene camera's top and the aim's knob
+        # less its height: an estimate the grip errs low from (grip_lid_z)
+        lid_z = max(float(prior_button[2]), float(got[0][2]) - float(up_mm) / 1000.0)
+        try:
+            return reach_lid_off.take_lid_off(ctx, cfg, runner, button, plan.tilt_deg, lid_z,
+                                              "the open box's lid at %.3f" % lid_z)
+        except BaseException:
+            let_go(ctx)
+            raise
     # A compliant run flies the re-aim and the slide in at FREE_LINE_SPEED:
     # CONTACT_SPEED is there so a guard can stop a line in time, and these
     # carry none (16:23 2026-10-27 crawled them 9.9 s at 0.15). Their world
@@ -1805,7 +1862,19 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         # in joint space (into the stroke), taken at rest inside the goal.
         legs = way_in_legs(ctx, cfg, way)
         why_not = _not_one_execution(ctx, legs)
+        if why_not is not None and lid_off:
+            # the full run's way in is one execution: solved again from where
+            # the arm stands (a planned look it arrived a few mrad off), as
+            # its press once more and its grip are (tasks/reach_lid_off)
+            way2, _why2, _kind2 = solve_way_in(ctx, cfg, button, plan2.tilt_deg, ctx.client.joints())
+            legs2 = None if way2 is None else way_in_legs(ctx, cfg, way2)
+            if legs2 is not None and _not_one_execution(ctx, legs2) is None:
+                way, legs, why_not = way2, legs2, None
         if why_not is None:
+            if lid_off:
+                from rammp_box_opening.tasks import reach_lid_off
+
+                return reach_lid_off.run_full(node, ctx, cfg, runner, watcher, way, legs, button, yaw, lid_before)
             return _fly_way_in(ctx, cfg, runner, way, legs, button[2], scene_fix, locator)
         print("[press_demo] the way in does not fly as one execution (%s) — leg by leg, each solved again from where "
               "the arm stands" % why_not)
@@ -1887,7 +1956,12 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             # rest at a leg's end. Not free, press_compliant let go where it stopped
             let_go(ctx)
         runner.finish()
-        return depth_press.finish(ctx, result, homed)
+        code = depth_press.finish(ctx, result, homed)
+        if lid_off:
+            # flown leg by leg, the press is all a full run does: never a success
+            print("[press_demo] STOP: the way in flew leg by leg, which ends at the press — the lid is not taken off")
+            code = max(code, 1)
+        return code
 
     def stop_after_back_out(why, code=1):
         print("[press_demo] STOP: %s" % why)
@@ -1963,5 +2037,6 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             "" if up_after is not None else " (the wrist could not judge it)"))
         return 1
     if not args.press_only:
-        print("[press_demo] the reach-out run ends after the press: the grip and the lift reach no further than straight down did")
+        print("[press_demo] a guarded reach-out run ends after the press: the lid comes off in the compliant run "
+              "(without --guarded)")
     return 0
