@@ -54,11 +54,17 @@ def test_the_fingertip_lands_where_it_is_aimed_and_is_read_back_from_the_tips(mo
     assert tips[2] - tool[2] == pytest.approx(TIP_TO_TOOL_M, abs=1e-9)
 
 
+STRAIGHT_DOWN = np.diag([1.0, -1.0, -1.0])  # tool_frame's z along the world's -z
+
+
 class _Chain:
     """Straight lines that always fly, through two waypoints; no joint
-    limits (ClearMarginFree finds none near)."""
+    limits (ClearMarginFree finds none near). fk stands still, the hand at
+    R: np.eye(3) unless a test says otherwise — a lean of 180 deg, whose
+    sine is ~0, so a test that means straight down sets STRAIGHT_DOWN."""
 
     limits = [(None, None)] * 7
+    R = np.eye(3)
 
     def __init__(self, refuse=()):
         self.refuse = refuse
@@ -75,7 +81,7 @@ class _Chain:
         return None, "no turning walk modelled"  # the depth press's slide in, then its turn
 
     def fk(self, q):
-        return np.eye(3), np.array([0.5, -0.4, 0.45])
+        return np.array(self.R, float), np.array([0.5, -0.4, 0.45])
 
 
 def _tilt_of(quat):
@@ -506,12 +512,19 @@ def test_when_no_straight_line_reaches_the_aimed_look_pose_the_planner_plans_it(
     assert from_container(home["look_cposes"][-1], ctx.model.button_offset) == pytest.approx(list(BUTTON))
 
 
-def test_a_home_refused_from_inside_the_boxs_padded_volume_backs_off_toward_the_arm_first(ctx, monkeypatch, tmp_path):
+def test_a_home_refused_from_inside_the_boxs_padded_volume_backs_off_toward_the_arm_first(ctx, monkeypatch, tmp_path,
+                                                                                          capsys):
     """2026-10-22: the scene camera's box 85 mm off; the aim moved the box
-    under the arm and every plan from the look pose was INVALID_START."""
+    under the arm and every plan from the look pose was INVALID_START. The
+    back-off says what the planner refused: INVALID_START_STATE_JOINT_LIMITS
+    takes it too, and that start is not inside the box's padded volume."""
     code, rec, chain, _h = _flow(ctx, monkeypatch, tmp_path, home_refusals=1,
                                  settled=[AT_REST, ([3.0, 0.0, 0.0, 0.0], Q)])  # a gravity mismatch: home from the look pose
     assert code == 1 and rec.events == ["reach:look", "reach:back-off", "home"]
+    said = capsys.readouterr().out
+    assert ("the planner refused home from here (MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION: the start) — "
+            "backing 15 cm straight off toward the arm first") in said
+    assert "inside the box's padded volume" not in said
     back = rec.legs["reach:back-off"]
     assert back.plan_free and back.guard.trip == "obstruction" and back.guard.gravity is not None
     from rammp_box_opening.constants import FREE_LINE_SPEED
