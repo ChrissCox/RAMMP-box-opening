@@ -582,6 +582,13 @@ class WayDown:
     quat: list  # its attitude at their end
     short_deg: float  # how far short of straight down (walked: TURN_SHORT_DEG; turned: COMPLIANT_TURN_SHORT_DEG)
     walked: bool  # True: one walk from the look pose (walk_in_down), else the turn after the slide
+    # a turn lower than the slide's end (reach_press.TURN_LOW_ABOVE_M): the
+    # slide carried on straight down to there, and the tool where it ends;
+    # None where the hand turns at the slide's own end; `above_m` how far
+    # above the button's top the fingertip stands there
+    slide: list = None
+    start_xyz: list = None
+    above_m: float = None
 
 
 @dataclass

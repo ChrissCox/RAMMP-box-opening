@@ -1435,7 +1435,10 @@ def test_on_flatbot_a_scene_button_out_of_reach_by_a_little_still_flies_the_look
     from rammp_box_opening.tasks import depth_press as dp
 
     if leans == "guarded":
+        # and the turn only at the slide's end, as it was then: lower down
+        # (TURN_LOW_ABOVE_M) both scene buttons are reached as they stand
         monkeypatch.setattr(dp, "COMPLIANT_TURN_SHORT_DEG", dp.TURN_SHORT_DEG)
+        monkeypatch.setattr(reach_press, "TURN_LOW_ABOVE_M", ())
     _chain, cfg, home = _on_flatbot(ctx, monkeypatch)
     looks = []
     plan, _why = reach_press.plan_reach(ctx, cfg, _at(scene), home, depth=True, looks=looks)
@@ -1444,3 +1447,46 @@ def test_on_flatbot_a_scene_button_out_of_reach_by_a_little_still_flies_the_look
     way, why, kind = reach_press.solve_way_in(ctx, cfg, _at(aimed), looks[0].tilt_deg, looks[0].look_leg.goal_joints)
     assert way is not None, (why, kind)
     assert way.move and way.down.walked and way.slide is None and way.stroke.legs
+
+
+# 2026-10-28 14:28:35: the scene camera's button, and the wrist's aim from the look its proof flew
+SCENE_142835 = (0.6030, -0.4942, 0.3123)
+AIMED_142835 = (0.6137, -0.4988, 0.3123)  # the aim's 0.307, pressed from the scene camera's higher top
+
+
+def test_on_flatbot_a_turn_the_slides_end_cannot_reach_is_turned_lower_down(ctx, monkeypatch, tmp_path):
+    """14:28:35 2026-10-28: the scene camera's button proven at 30 deg, the
+    turn after the slide 15 deg short — COMPLIANT_TURN_SHORT_DEG's last —
+    then the aim put the button 12 mm farther out, where no turn at the
+    slide's end flies (joint_4 runs straight 60 mm above the button: the IK
+    does not converge), and the arm went home from the look. The slide now
+    carries on straight down and the hand turns 45 mm above the button:
+    15 deg short, every leg of the way in one the runner flies, the stroke
+    bent as before. Where the slide's own end turns, nothing changes."""
+    from rammp_box_opening.runtime.runner import Runner
+
+    chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    plan, why = reach_press.plan_reach(ctx, cfg, SCENE_142835, home, depth=True)
+    assert why is None and plan.tilt_deg == 30 and not plan.down.walked and plan.down.short_deg == 15.0
+    assert plan.down.slide is None and plan.down.above_m is None  # turned at the slide's end, as the run did
+    q_look = plan.look_leg.goal_joints
+    monkeypatch.setattr(reach_press, "TURN_LOW_ABOVE_M", ())
+    way, why, kind = reach_press.solve_way_in(ctx, cfg, AIMED_142835, 30, q_look)
+    assert way is None and kind == "down" and "15 deg short: IK did not converge 100% of the way" in why, why
+    monkeypatch.undo()
+    chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    way, why, kind = reach_press.solve_way_in(ctx, cfg, AIMED_142835, 30, q_look)
+    assert way is not None, (why, kind)
+    assert not way.down.walked and way.down.short_deg == 15.0 and way.down.above_m == 0.045
+    # the slide flown is the look's slide carried on down: it ends where the turn starts, the fingertip 45 mm up
+    assert way.slide is way.down.slide and way.plan.slide_pts is way.slide
+    assert way.down.pts[0] == pytest.approx(way.slide[-1])
+    R, t = chain.fk(way.slide[-1])
+    tip = np.asarray(t, float) + np.asarray(R, float) @ np.asarray(reach_press.CONTACT_TOOL)
+    assert tip == pytest.approx([AIMED_142835[0], AIMED_142835[1], AIMED_142835[2] + 0.045], abs=5e-4)
+    assert way.plan.start_xyz == pytest.approx([float(v) for v in t], abs=1e-4)  # the line's IK converges to 5e-5
+    assert way.stroke.bent and way.stroke.end_z < AIMED_142835[2] - cfg.button_travel_m
+    runner = Runner(ctx.client, log_dir=tmp_path)
+    legs = reach_press.way_in_legs(ctx, cfg, way)
+    assert [lg.name for lg in legs] == ["reach:re-aim", "reach:slide-in", "depth:turn", "depth:approach", "depth:press"]
+    assert [(lg.name, runner._refusal(lg)) for lg in legs] == [(lg.name, None) for lg in legs]

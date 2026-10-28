@@ -1874,11 +1874,13 @@ def test_a_compliant_run_whose_aimed_button_no_way_down_reaches_goes_home_from_t
 
     code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, turn=scene_only)
     assert code == 1 and rec.events == ["reach:look", "aim:reach-aim", "home"] and got == {}
-    assert len(turns) == 2
+    assert len(turns) == 1 + 1 + len(rp.TURN_LOW_ABOVE_M)  # the scene's; the aimed one's at the slide's end, then lower
     out = capsys.readouterr().out
     assert ("STOP: no press reaches the aimed button (the way down (walk in: 0 deg short: no turning walk modelled; "
             "2 deg short: no turning walk modelled; 5 deg short: no turning walk modelled; turn after the slide: 0 deg "
-            "short: IK did not converge 73% of the way)) — nothing was pressed — returning home") in out
+            "short: IK did not converge 73% of the way; turned 45 mm above the button: 0 deg short: IK did not converge "
+            "73% of the way; turned 35 mm above the button: 0 deg short: IK did not converge 73% of the way)) — nothing "
+            "was pressed — returning home") in out
     rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
     assert not [r for r in rows if r["leg"] in ("reach_way_in", "home_refused")]
 
