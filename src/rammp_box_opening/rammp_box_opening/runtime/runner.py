@@ -253,7 +253,11 @@ def line_profile(leg, params, time_scale=1.0):
     positions are re-timed with the accelerations scaled by speed (not
     speed**2) and the cruise lowered until no sample's path speed exceeds
     the dilated profile's peak: never faster than it flies today, only less
-    time spent getting up to speed and back down."""
+    time spent getting up to speed and back down. Under a speed ceiling (a
+    compliant run's, Runner.retime_params) the profile flies even where it
+    takes the longer: the dilated line eases at 6 x speed**2 and knows no
+    ceiling — at 0.55 a 0.6 rad joint_6 line would run that joint at 0.61
+    rad/s, and above 0.5 its ease is harsher than the compliant one."""
     from rammp_box_opening.runtime.driver import dilate
 
     s = float(leg.speed)
@@ -265,6 +269,8 @@ def line_profile(leg, params, time_scale=1.0):
         traj, _info = retime_group([leg.traj], [cruise], JOINT_VMAX, p)
         peak = _path_speed_peak(traj)
         if peak <= v_max * (1.0 + 1e-6):
+            if p.qd_ceiling is not None:
+                return traj
             return traj if secs(traj.points[-1].time_from_start) < secs(ref.points[-1].time_from_start) else None
         cruise *= 0.98 * v_max / peak
     return None
@@ -301,11 +307,15 @@ class Runner:
         the recoil, in flight and in the preview alike, so what the preview
         shows is what flies; slow mode is the caller's (time_scale). A
         compliant client's (client.compliant) eases out of rest at
-        COMPLIANT_ACCEL and into it at COMPLIANT_DECEL, and no joint is asked
-        past COMPLIANT_QD_CEILING: what the arm follows in the driver's joint
-        impedance (constants). Positions are never touched. A guarded run,
-        which flies in position, keeps self.retime as it is, as every other
-        position run does."""
+        COMPLIANT_ACCEL and into it at COMPLIANT_DECEL, and no interval runs
+        a joint past COMPLIANT_QD_CEILING: what the arm follows in the
+        driver's joint impedance (constants). The flag is read at every
+        call, never kept: press_demo builds the runner before
+        run_reach_press sets it. Positions are never touched. A stroke
+        flown on its own under a contact guard keeps its dilated or warped
+        timing, tuned to the contact (no compliant leg carries a guard). A
+        guarded run, which flies in position, keeps self.retime as it is,
+        as every other position run does."""
         if not getattr(self.client, "compliant", False):
             return self.retime
         return replace(self.retime, accel=COMPLIANT_ACCEL, decel=COMPLIANT_DECEL, qd_ceiling=COMPLIANT_QD_CEILING)

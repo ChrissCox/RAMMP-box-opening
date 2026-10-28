@@ -82,11 +82,12 @@ class RetimeParams:
     time_scale: float = 1.0
     # an ABSOLUTE per-joint speed ceiling, rad/s (None: none), no margin
     # applied: it bounds what a leg's cruise fraction of vmax leaves and is
-    # never scaled by it, so a slow leg it does not bind keeps its speed. As
-    # a smaller vmax it would be 0.3 x 0.9 x itself on a 0.3 line (16:23's
-    # way in 7.25 -> 12.4 s, offline 2026-10-28). A compliant run sets it
-    # (constants.COMPLIANT_QD_CEILING): in the driver's joint impedance the
-    # wrist follows no faster than ~0.54 rad/s
+    # never scaled by it, so a slow leg it does not bind keeps its speed.
+    # Written as a smaller vmax instead (0.5, which the 0.9 margin makes
+    # 0.45 at full speed) it is 0.3 x 0.9 x 0.5 = 0.135 rad/s on a 0.3 line
+    # (16:23's way in 7.25 -> 12.4 s, offline 2026-10-28). A compliant run
+    # sets it (constants.COMPLIANT_QD_CEILING): in the driver's joint
+    # impedance the wrist follows no faster than ~0.54 rad/s
     qd_ceiling: tuple = None
 
 

@@ -1299,6 +1299,132 @@ def test_the_recoil_does_not_extend_along_a_stroke_this_push_did_not_continue(tm
     assert q[-1] == pytest.approx(stop, abs=1e-6)  # the push reversed, nothing more
 
 
+# -- what a run re-times with: a compliant one gentler and under the wrist's ceiling --
+
+
+class _Flown(FakeClient):
+    """Keeps every trajectory sent as the driver gets it. `compliant`: the
+    client's flag (None: it has none, as a position client may not)."""
+
+    def __init__(self, compliant):
+        super().__init__()
+        if compliant is not None:
+            self.compliant = compliant
+        self.flown = []
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        self.flown.append((traj_, speed))
+        return super().execute(traj_, speed, guard, while_running, stop_when, gains)
+
+
+def _wrist_home(n=40):
+    """A transit at full speed whose wrist moves most: joint_6 1 rad."""
+    return _line_leg("home", [0.0] * 7, [0.1, 0.8, 0.3, 0.5, 0.2, 1.0, 0.1], n=n, speed=1.0)
+
+
+def _flown_s(traj_):
+    from rammp_box_opening.runtime.stamps import secs
+
+    return secs(traj_.points[-1].time_from_start)
+
+
+def _wrist_peaks(traj_):
+    """joints 5-7's fastest interval each, as flown (rad/s)."""
+    import numpy as np
+
+    from rammp_box_opening.runtime.stamps import secs
+
+    q = np.asarray([p.positions for p in traj_.points], float)
+    t = np.asarray([secs(p.time_from_start) for p in traj_.points])
+    return (np.abs(np.diff(q, axis=0))[:, 4:] / np.diff(t)[:, None]).max(axis=0)
+
+
+def test_a_compliant_run_retimes_gentler_and_under_the_wrist_ceiling_in_preview_and_flight(tmp_path):
+    """15:45 2026-10-28, RIGID: out of rest the look asked joint_2 for ~4.2
+    rad/s^2 and the arm made ~3; on the way home joint_6 topped out at 0.54
+    rad/s, its command at the clamp, where the re-timer allowed 1.10. A
+    compliant client's runner re-times every unguarded motion at
+    COMPLIANT_ACCEL / COMPLIANT_DECEL under COMPLIANT_QD_CEILING, and its
+    preview shows the time that flies. In the mission's order: press_demo
+    builds the runner on a position client, run_reach_press sets the flag
+    on it and puts it back when the run ends — the runner reads it at every
+    re-timing, so a flag kept from when it was built would fly a compliant
+    run on the position profile."""
+    import numpy as np
+
+    from rammp_box_opening.constants import COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING, JOINT_VMAX
+    from rammp_box_opening.runtime.retime import RetimeParams, retime_group
+
+    c = _Flown(compliant=False)
+    r = runner(c, tmp_path)
+    assert r.retime_params() is r.retime
+    c.compliant = True  # run_reach_press, on the runner press_demo built
+    p = r.retime_params()
+    assert (p.accel, p.decel, p.qd_ceiling) == (COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING)
+    # gentler than the position profile, and a wrist ceiling under the joint cap, so it binds below
+    assert COMPLIANT_ACCEL < RetimeParams().accel and COMPLIANT_DECEL < RetimeParams().decel
+    assert all(top < 0.9 * vmax for top, vmax in zip(COMPLIANT_QD_CEILING[4:], JOINT_VMAX[4:]))
+    assert r.retime == RetimeParams()  # the runner's own profile is not changed by it
+    home = _wrist_home()
+    gentle = RetimeParams(accel=COMPLIANT_ACCEL, decel=COMPLIANT_DECEL, qd_ceiling=COMPLIANT_QD_CEILING)
+    want = retime_group([home.traj], [1.0], JOINT_VMAX, gentle)[1]["duration_s"]
+    table = r.preview([home])
+    res = r.run([home], execute=True)
+    assert res[-1].ok
+    flown, speed = c.flown[-1]
+    assert speed == 1.0 and _flown_s(flown) == pytest.approx(want, abs=1e-9)
+    assert r.last_retime["duration_s"] == pytest.approx(want, abs=1e-9)
+    # whole-nanosecond stamps: an interval at the ceiling reads a few parts in 1e8 over it
+    assert (_wrist_peaks(flown) <= np.asarray(COMPLIANT_QD_CEILING[4:]) * (1 + 1e-6)).all()
+    row = [line for line in table.splitlines() if line.startswith("home")][0]
+    assert float(row.split()[5]) == pytest.approx(want, abs=0.006)
+    # slow mode dilates the compliant profile as it dilates any other
+    r.time_scale = 0.5
+    c.live = [0.0] * 7
+    r.run([_wrist_home()], execute=True)
+    assert _flown_s(c.flown[-1][0]) == pytest.approx(2 * (want - 0.02) + 0.02, rel=1e-6)
+    # the run over, its flag put back: the same runner flies the position profile again
+    r.time_scale = 1.0
+    c.compliant = False
+    assert r.retime_params() is r.retime
+    c.live = [0.0] * 7
+    r.run([_wrist_home()], execute=True)
+    plain = retime_group([home.traj], [1.0], JOINT_VMAX, RetimeParams())[1]["duration_s"]
+    assert plain < want - 0.1 and _flown_s(c.flown[-1][0]) == pytest.approx(plain, abs=1e-9)
+
+
+@pytest.mark.parametrize("compliant", [None, False])
+def test_a_position_or_guarded_run_keeps_the_default_profile_and_no_ceiling(tmp_path, compliant):
+    """A guarded reach-out flies in position (client.compliant False), as
+    home_arm and every other task does: its transits and its merged guarded
+    strokes keep RetimeParams' ease out 6 and in 3 and no wrist ceiling —
+    the arm follows them there (15:41:58's position home: joint_6 at 0.738
+    rad/s, 0.7 mm off on arrival)."""
+    from rammp_box_opening.constants import JOINT_VMAX
+    from rammp_box_opening.runtime.retime import RetimeParams, retime_group
+
+    c = _Flown(compliant)
+    r = runner(c, tmp_path)
+    assert r.retime_params() is r.retime and r.retime == RetimeParams()
+    home = _wrist_home()
+    want = retime_group([home.traj], [1.0], JOINT_VMAX, RetimeParams())[1]["duration_s"]
+    r.run([home], execute=True)
+    flown, _speed = c.flown[-1]
+    assert _flown_s(flown) == pytest.approx(want, abs=1e-9)
+    assert _wrist_peaks(flown).max() > 0.8  # no ceiling: the 0.9 x 1.222 joint cap
+    g = GuardSpec(touch_nm=3.0, trip="press")
+    far = [0.6] * 7
+    legs = [
+        _line_leg("approach", [0.0] * 7, far, chain=0, speed=0.75),
+        _line_leg("press:down", far, [0.75] * 7, chain=0, speed=0.15, guard=g),
+    ]
+    c.live = [0.0] * 7
+    c.exec_script = [("touch", {"message": "trip", "progress": 0.95})]
+    r.run(legs, execute=True)
+    want = retime_group([lg.traj for lg in legs], [0.75, 0.15], JOINT_VMAX, RetimeParams())[1]["duration_s"]
+    assert r.last_retime["duration_s"] == pytest.approx(want, abs=1e-9)
+
+
 # -- an arrival's error: what the spring had not caught up, logged, never judged --
 
 
@@ -1441,110 +1567,3 @@ def test_the_recoil_logs_how_it_flew_and_where_it_ended_like_any_leg(tmp_path, m
     assert recoil["end_err_rad"] == pytest.approx(0.01, abs=1e-9)
     assert recoil["end_err_mm"] == pytest.approx(5.0, rel=1e-3)
     assert press["mode"] == "position" and press["end_err_rad"] is None and press["end_err_mm"] is None
-
-
-# -- what a run re-times with: a compliant one gentler and under the wrist's ceiling --
-
-
-class _Flown(FakeClient):
-    """Keeps every trajectory sent as the driver gets it. `compliant`: the
-    client's flag (None: it has none, as a position client may not)."""
-
-    def __init__(self, compliant):
-        super().__init__()
-        if compliant is not None:
-            self.compliant = compliant
-        self.flown = []
-
-    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
-        self.flown.append((traj_, speed))
-        return super().execute(traj_, speed, guard, while_running, stop_when, gains)
-
-
-def _wrist_home(n=40):
-    """A transit at full speed whose wrist moves most: joint_6 1 rad."""
-    return _line_leg("home", [0.0] * 7, [0.1, 0.8, 0.3, 0.5, 0.2, 1.0, 0.1], n=n, speed=1.0)
-
-
-def _flown_s(traj_):
-    from rammp_box_opening.runtime.stamps import secs
-
-    return secs(traj_.points[-1].time_from_start)
-
-
-def _wrist_peak(traj_):
-    """joints 5-7's fastest interval as flown (rad/s)."""
-    import numpy as np
-
-    from rammp_box_opening.runtime.stamps import secs
-
-    q = np.asarray([p.positions for p in traj_.points], float)
-    t = np.asarray([secs(p.time_from_start) for p in traj_.points])
-    return float((np.abs(np.diff(q, axis=0))[:, 4:] / np.diff(t)[:, None]).max())
-
-
-def test_a_compliant_run_retimes_gentler_and_under_the_wrist_ceiling_in_preview_and_flight(tmp_path):
-    """15:45 2026-10-28, RIGID: out of rest the look asked joint_2 for ~4.2
-    rad/s^2 and the arm made ~3; on the way home joint_6 topped out at 0.54
-    rad/s, its command at the clamp, where the re-timer allowed 1.10. A
-    compliant client's runner re-times every unguarded motion at
-    COMPLIANT_ACCEL / COMPLIANT_DECEL under COMPLIANT_QD_CEILING, and its
-    preview shows the time that flies."""
-    from rammp_box_opening.constants import COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING, JOINT_VMAX
-    from rammp_box_opening.runtime.retime import RetimeParams, retime_group
-
-    c = _Flown(compliant=True)
-    r = runner(c, tmp_path)
-    p = r.retime_params()
-    assert (p.accel, p.decel, p.qd_ceiling) == (COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING)
-    assert (COMPLIANT_ACCEL, COMPLIANT_DECEL) == (3.0, 1.5) and COMPLIANT_QD_CEILING[4:] == (0.45,) * 3
-    assert r.retime == RetimeParams()  # the runner's own profile is not changed by it
-    home = _wrist_home()
-    gentle = RetimeParams(accel=3.0, decel=1.5, qd_ceiling=COMPLIANT_QD_CEILING)
-    want = retime_group([home.traj], [1.0], JOINT_VMAX, gentle)[1]["duration_s"]
-    table = r.preview([home])
-    res = r.run([home], execute=True)
-    assert res[-1].ok
-    flown, speed = c.flown[-1]
-    assert speed == 1.0 and _flown_s(flown) == pytest.approx(want, abs=1e-9)
-    assert r.last_retime["duration_s"] == pytest.approx(want, abs=1e-9)
-    assert _wrist_peak(flown) <= 0.45 * (1 + 1e-6)  # whole-nanosecond stamps
-    row = [line for line in table.splitlines() if line.startswith("home")][0]
-    assert float(row.split()[5]) == pytest.approx(want, abs=0.006)
-    # slow mode dilates the compliant profile as it dilates any other
-    r.time_scale = 0.5
-    c.live = [0.0] * 7
-    r.run([_wrist_home()], execute=True)
-    assert _flown_s(c.flown[-1][0]) == pytest.approx(2 * (want - 0.02) + 0.02, rel=1e-6)
-
-
-@pytest.mark.parametrize("compliant", [None, False])
-def test_a_position_or_guarded_run_keeps_the_default_profile_and_no_ceiling(tmp_path, compliant):
-    """A guarded reach-out flies in position (client.compliant False), as
-    home_arm and every other task does: its transits and its merged guarded
-    strokes keep RetimeParams' ease out 6 and in 3 and no wrist ceiling —
-    the arm follows them there (15:41:58's position home: joint_6 at 0.738
-    rad/s, 0.7 mm off on arrival)."""
-    from rammp_box_opening.constants import JOINT_VMAX
-    from rammp_box_opening.runtime.retime import RetimeParams, retime_group
-
-    c = _Flown(compliant)
-    r = runner(c, tmp_path)
-    assert r.retime_params() is r.retime and r.retime == RetimeParams()
-    home = _wrist_home()
-    want = retime_group([home.traj], [1.0], JOINT_VMAX, RetimeParams())[1]["duration_s"]
-    r.run([home], execute=True)
-    flown, _speed = c.flown[-1]
-    assert _flown_s(flown) == pytest.approx(want, abs=1e-9)
-    assert _wrist_peak(flown) > 0.8  # no ceiling: the 0.9 x 1.222 joint cap
-    g = GuardSpec(touch_nm=3.0, trip="press")
-    far = [0.6] * 7
-    legs = [
-        _line_leg("approach", [0.0] * 7, far, chain=0, speed=0.75),
-        _line_leg("press:down", far, [0.75] * 7, chain=0, speed=0.15, guard=g),
-    ]
-    c.live = [0.0] * 7
-    c.exec_script = [("touch", {"message": "trip", "progress": 0.95})]
-    r.run(legs, execute=True)
-    want = retime_group([lg.traj for lg in legs], [0.75, 0.15], JOINT_VMAX, RetimeParams())[1]["duration_s"]
-    assert r.last_retime["duration_s"] == pytest.approx(want, abs=1e-9)

@@ -417,11 +417,16 @@ def test_a_full_speed_leg_holds_its_wrist_to_the_ceiling_and_a_shoulder_move_fli
         assert np.array_equal(got, want)
 
 
-def test_a_rest_to_rest_interval_keeps_under_the_ceiling_too():
+def test_a_rest_to_rest_interval_averages_under_the_ceiling_too():
     """An interval between two rest samples is timed apart from the profile
     (times_from_profile's triangle, a trapezoid where the cap binds): its
     cap is the ceiling's too, so 1 rad of joint_6 there averages under
-    0.45 rad/s, not under the 1.10 the joint limit alone allows."""
+    0.45 rad/s, not under the 1.10 the joint limit alone allows. Averages:
+    the driver's quintic between two rest samples peaks at 15/8 of that
+    (0.77 rad/s here; 1.58 under the joint cap alone, as before this). The
+    mission's lines and turns are sampled every 2-5 mm and the planner's
+    plans densely, and there the quintic follows each interval's speed
+    within a few per cent (1 % on a straight line)."""
     src = _traj([[0.0] * 7, [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]])
     out, info = retime_group([src], [1.0], JOINT_VMAX, RetimeParams(qd_ceiling=WRIST_CEILING))
     _, _, t = _arrays(out)

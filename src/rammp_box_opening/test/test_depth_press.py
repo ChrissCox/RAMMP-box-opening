@@ -1770,6 +1770,48 @@ def test_a_compliant_reach_out_primes_the_impedance_once_before_the_reach_is_pla
     assert "the driver enters its joint impedance now, while the reach is planned" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("compliant", [False, True])
+def test_a_reach_out_re_times_every_motion_on_its_own_runs_profile(ctx, monkeypatch, tmp_path, compliant):
+    """press_demo builds the runner on a position client; run_reach_press
+    makes the client compliant only then, and puts it back when the run
+    ends. Every motion a compliant reach-out re-times — the look, the way in,
+    the way out — eases at COMPLIANT_ACCEL / COMPLIANT_DECEL under the
+    wrist's COMPLIANT_QD_CEILING (Runner.retime_params reads the flag at
+    each re-timing: a flag kept from when the runner was built would fly
+    the whole run on the position profile); a guarded one, in position,
+    keeps RetimeParams' and no ceiling."""
+    from rammp_box_opening.constants import COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING
+    from rammp_box_opening.runtime import runner as runner_mod
+    from rammp_box_opening.runtime.retime import RetimeParams
+
+    seen = []  # the profile each re-timing is handed: a group's, in flight and preview, and a free-air line's
+    in_line = []
+    real_group, real_line = runner_mod.retime_group, runner_mod.line_profile
+
+    def retime_group(trajs, speeds, vmax, params=RetimeParams()):
+        if not in_line:  # line_profile's own re-timings scale the ease by the line's speed: what it is handed counts
+            seen.append(params)
+        return real_group(trajs, speeds, vmax, params)
+
+    def line_profile(leg, params, time_scale=1.0):
+        seen.append(params)
+        in_line.append(leg)
+        try:
+            return real_line(leg, params, time_scale)
+        finally:
+            in_line.pop()
+
+    monkeypatch.setattr(runner_mod, "retime_group", retime_group)
+    monkeypatch.setattr(runner_mod, "line_profile", line_profile)
+    assert not getattr(ctx.client, "compliant", False)  # as press_demo built its runner
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=compliant)
+    assert code == 0 and got["client_compliant"] is compliant and seen
+    plain = RetimeParams()
+    want = (COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING) if compliant else (plain.accel, plain.decel, None)
+    assert {(p.accel, p.decel, p.qd_ceiling) for p in seen} == {want}
+    assert not ctx.client.compliant  # put back once the run is over
+
+
 def test_a_guarded_reach_out_is_as_before(ctx, monkeypatch, tmp_path):
     from rammp_box_opening.constants import CONTACT_SPEED
 
