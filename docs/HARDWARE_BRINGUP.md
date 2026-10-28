@@ -313,11 +313,13 @@ run for grip and place.
 - A round box the scene frame cuts at its side is finished from its lid's
   arc in view ("cut off at the frame's left edge, ..." in the reasons).
   "... fits two places 35+ mm apart, one past its box: the N points of the
-  other are too few to settle it" → too little of the lid is in view (half
-  of it is plenty): move the box into the frame. "... stand 20-50 mm over
-  its top where the lid's circle is: the arc took in something taller than
-  the lid" → something taller stands right beside or behind the cut box:
-  move it away, or the box into the frame.
+  other are too few to settle it" → too little of the lid is in view to
+  tell it from its mirror (half of it in view is plenty), so that frame
+  gives no sighting. "... stand 20-50 mm over its top where the lid's
+  circle is: the arc took in something taller than the lid" → something
+  taller stands right beside or behind the cut box, so that box is refused
+  and the frame's other boxes are tried. With no fix at all the run goes
+  home and exits 2, as for any scene refusal.
 - "lid spot [x, y] refused by the planner — setting the lid down at [x, y]
   instead" → normal: the first drop spot beside the box could not be
   planned and the next side was used. "STOP before the grip — ... no drop
