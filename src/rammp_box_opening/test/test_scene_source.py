@@ -1202,6 +1202,29 @@ def test_once_the_segmenter_saw_two_places_only_a_pair_with_the_owl_in_it_commit
     assert commit_fix([_sighting("owl", a), _sighting("owl", b)], True, owl_settles=True)[1] is None
 
 
+def test_a_place_the_segmenter_passed_in_two_confirms_the_owls_cut_lid_there():
+    """A segmenter message that passes in two places is no sighting: where
+    every one does, the OWL's cut pair waited on a sighting that never came.
+    One of those places within the vote's tolerance of each of the pair's
+    sightings, as a third sighting would be, confirms the pair; a pair at
+    neither place still waits, and the places never stand in for the OWL
+    that settles which is the container."""
+    from rammp_box_opening.perception.scene_source import commit_fix
+
+    a, b = (0.380, -0.170, 0.305), (0.384, -0.172, 0.305)  # 5 mm apart
+    cut_pair = [_sighting("owl", a, ("left",)), _sighting("owl", b, ("left",))]
+    canister, bowl = (0.390, -0.171, 0.305), (0.380, 0.130, 0.305)  # 10 and 6 mm from the pair; 30 cm away
+    for places in ([canister, bowl], [bowl, canister]):
+        assert commit_fix(cut_pair, True, owl_settles=True, segmenter_places=places)[1] is None
+    assert commit_fix(cut_pair, True, owl_settles=True) == (None, "cut OWL box unconfirmed")
+    off = (0.412, -0.171, 0.305)  # 32 and 28 mm from the pair
+    assert commit_fix(cut_pair, True, owl_settles=True, segmenter_places=[off, bowl]) == (None, "cut OWL box unconfirmed")
+    one = (0.401, -0.171, 0.305)  # 21 mm from a, 17 from b: not where the pair is
+    assert commit_fix(cut_pair, True, owl_settles=True, segmenter_places=[one]) == (None, "cut OWL box unconfirmed")
+    segs = [_sighting("segmenter", a), _sighting("segmenter", b)]
+    assert commit_fix(segs, True, owl_settles=True, segmenter_places=[a, bowl]) == (None, "two places unsettled")
+
+
 # --- locate(), driven by stubs on a test clock --------------------------------
 
 CAM_T0 = 1000.0  # the camera's clock at the test's t = 0
@@ -1585,6 +1608,34 @@ def test_the_owls_cut_lid_waits_on_the_segmenter_only_once_it_has_seen_the_box(m
     loc, _gated = _locator(monkeypatch, world, {_band(_holder()): far, _band(_holder(5.0)): refused, OWL_BOX: cut})
     assert loc.locate(4.0) is None
     assert "the OWL's box of the cut lid is not confirmed by the segmenter's" in loc.last_why
+    assert loc.last_why.endswith("scene OWL: its boxes of the cut lid wait on the segmenter's")
+
+
+def test_a_segmenter_whose_every_frame_passes_two_places_confirms_the_owls_cut_lid_at_one(monkeypatch):
+    """The canister half off the frame (detbench P4, 15 of 37 frames) with a
+    second bowl whose band passes too, 30 cm away: every segmenter frame
+    passes in two places, so none is a sighting, and the OWL's cut boxes used
+    to wait on one for all 15 s (NO BOX, nothing moved). The canister's place
+    in those frames confirms them: owl+owl at the OWL's second box, as with
+    the canister in view. Where neither place is the OWL's, they still wait."""
+    other = (100.0, 216.0, 190.0, 260.0)
+    far = (SEG_TOP[0], SEG_TOP[1] + 0.3, SEG_TOP[2])
+    both = _every(0.1, 20.0, [("food container", 0.88, _holder()), ("food container", 0.6, other)])
+    cut = {"top": OWL_TOP, "partial": ("left",)}
+    world = _World(seg_msgs=both, owl_script=[[(0.3, OWL_BOX)]] * 12)
+    loc, _gated = _locator(monkeypatch, world, {_band(_holder()): {"top": SEG_TOP, "partial": ("left",)}, _band(other): far,
+                                                OWL_BOX: cut})
+    fix = loc.locate(15.0)
+    assert fix is not None, loc.last_why
+    assert fix.sources == ("owl", "owl") and fix.partial and fix.top_xyz == pytest.approx(OWL_TOP)
+    assert np.hypot(fix.top_xyz[0] - SEG_TOP[0], fix.top_xyz[1] - SEG_TOP[1]) < 0.005  # on the canister, not the bowl
+    assert loc.last_timing["fix_s"] == pytest.approx(2.3, abs=0.06)
+    # the segmenter's canister 30 mm from where the OWL's boxes put it: they agree with neither place
+    off = {"top": (OWL_TOP[0] + 0.030, OWL_TOP[1], OWL_TOP[2]), "partial": ("left",)}
+    world = _World(seg_msgs=both, owl_script=[[(0.3, OWL_BOX)]] * 12)
+    loc, _gated = _locator(monkeypatch, world, {_band(_holder()): off, _band(other): far, OWL_BOX: cut})
+    assert loc.locate(15.0) is None
+    assert loc.last_why.startswith("scene segmenter: two places pass as this container")
     assert loc.last_why.endswith("scene OWL: its boxes of the cut lid wait on the segmenter's")
 
 

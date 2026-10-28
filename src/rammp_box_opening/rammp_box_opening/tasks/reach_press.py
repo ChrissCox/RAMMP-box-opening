@@ -273,7 +273,9 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     15 deg short of straight down as the compliant press turns
     (depth_press.COMPLIANT_TURN_SHORT_DEG: way_down serves only that
     press); then the press stroke from the hand turned down
-    (depth_press.compliant_stroke). The aimed button's walk or turn and
+    (depth_press.compliant_stroke). Each of those lines is one the runner
+    flies (depth_press.line_refusal): a walk it refuses is no walk, and the
+    slide and the turn are tried. The aimed button's walk or turn and
     stroke fly as solved, in one execution with the move and the slide
     before them (way_in_legs); only where those legs do not make one
     (_not_one_execution) is each solved again from where the arm stands,
@@ -295,6 +297,13 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     stroke, why = dp.compliant_stroke(chain, cfg, way.pts[-1] if way.pts else slide_pts[-1], way.quat, top_z)
     if stroke is None:
         return None, None, why
+    # the walk or the turn passed the runner's gate in turn_walk; the slide
+    # before a turn and the stroke fly as legs of their own too
+    lines = ([] if way.walked else [("the slide in", slide_pts)]) + [(name, p) for name, p, _speed in stroke.legs]
+    for name, line in lines:
+        why = dp.line_refusal(chain, line)
+        if why is not None:
+            return None, None, "%s: %s" % (name, why)
     return way, stroke, None
 
 
@@ -408,12 +417,19 @@ class WayIn:
 def solve_way_in(ctx, cfg, button, tilt, q_from):
     """The aimed button's whole way in at `tilt` from joints `q_from`, before
     the arm moves toward it: reach_from_here's lines (the move to the look
-    pose, the slide), then way_down from the look pose. Returns (WayIn, None,
-    None) or (None, why, kind): kind 'lines' when the lines do not fly (the
-    planner may plan the move instead), 'down' when the way down does not."""
+    pose — one the runner flies, depth_press.line_refusal — and the slide),
+    then way_down from the look pose. Returns (WayIn, None, None) or (None,
+    why, kind): kind 'lines' when the lines do not fly (the planner may plan
+    the move instead), 'down' when the way down does not."""
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks import depth_press as dp
+
     move, plan, why = reach_from_here(ctx, cfg, button, tilt, need_stroke=False, q=q_from)
     if plan is None:
         return None, why, "lines"
+    why = dp.line_refusal(approach._chain(), move)
+    if why is not None:
+        return None, "the move to its look pose (%s)" % why, "lines"
     down, stroke, why = way_down(ctx, cfg, move[-1] if move else q_from, plan.slide_pts, plan.start_xyz, plan.quat,
                                  float(button[2]))
     if down is None:
@@ -1374,10 +1390,9 @@ def _rise_legs(ctx, stroke, q, world):
     """The way up from a compliant hold, the arm held at joints `q` by the
     button under `stroke`, as the legs that fly it, labelled `world`:
     'depth:rise' back up the stroke to its start (depth_press.rise_back_up)
-    — else, as compliant_rise flies it, a straight line from where the arm
-    stands to there; none when it stands there. Returns (legs, True where
-    it goes back up the stroke, None), or (None, False, why) where no way
-    up flies."""
+    — else a straight line from where the arm stands to there; none when it
+    stands there. Returns (legs, True where it goes back up the stroke,
+    None), or (None, False, why) where no way up flies."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.tasks import depth_press as dp
 
@@ -1417,8 +1432,8 @@ def _rise_then_home(ctx, cfg, runner, up, held, scene_fix, locator):
 def _way_home(ctx, cfg, runner, stroke, held, q_held, ahead, scene_fix, locator):
     """From a compliant hold to home, the arm held at `q_held` by the
     button under `stroke` (the hold's verdict `held`): the rise back up the
-    stroke to its start (depth_press.rise_back_up; else, as compliant_rise
-    flies it, a straight line from where the arm stands), then the clear and
+    stroke to its start (_rise_legs: depth_press.rise_back_up, else a
+    straight line from where the arm stands), then the clear and
     home that plan_way_out planned while the way in flew (`ahead`, its
     (WayOut, why) as the runner's lookahead result), each home leg written
     on the branch of the end of the leg before it (approach.on_branch_of) —

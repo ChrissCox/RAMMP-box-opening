@@ -1380,8 +1380,41 @@ def test_on_flatbot_1519s_scene_button_walks_in_exactly_down_at_30_deg(ctx, monk
     assert plan.stroke.end_z < SCENE_1519[2] - cfg.button_travel_m
 
 
+@pytest.mark.parametrize("button, walked, short", [
+    (_at((0.70, 15.0), 0.26), False, 15.0),
+    (_at((0.70, -20.0)), False, 5.0),
+    (SCENE_1519, True, 0.0),  # a walk in the runner flies: walked as before
+])
+def test_on_flatbot_the_proven_way_in_is_one_the_runner_flies(ctx, monkeypatch, tmp_path, button, walked, short):
+    """The 2026-10-28 merge review of #53 + #55: the proof took any walk in
+    the arm's IK solves, and the runner refuses a leg one of whose joints
+    swings out and back further than its net change and SANITY_MARGIN_RAD
+    (Runner._refusal). Under a lid at 0.26, r 0.70 m az +15 deg, the walk
+    in 5 deg short swings joint_1 0.251 -> 0.687 -> 0.261, 0.437 rad
+    against the gate's 0.361: proven, then refused once the look and the
+    aim had flown ("STOP: the way in did not start (trajectory sanity gate:
+    ...)"), as were 3 of the 119 walks in under the lid at 0.3125 (r
+    0.68-0.72 m, az -20 deg; at r 0.70 the walk 2 deg short). The proofs
+    before the look and before the way in now take only what the runner
+    flies: there the slide and the turn, 15 and 5 deg short. Every leg of
+    the way in passes the runner's gates."""
+    from rammp_box_opening.runtime.runner import Runner
+
+    _chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    plan, why = reach_press.plan_reach(ctx, cfg, button, home, depth=True)
+    assert why is None and plan.tilt_deg == 30
+    way, why, kind = reach_press.solve_way_in(ctx, cfg, button, plan.tilt_deg, plan.look_leg.goal_joints)
+    assert way is not None, (why, kind)
+    assert (way.down.walked, way.down.short_deg) == (plan.down.walked, plan.down.short_deg)  # as proven before the look
+    assert way.down.walked is walked and way.down.short_deg == short and (way.slide is None) is walked
+    runner = Runner(ctx.client, log_dir=tmp_path)
+    legs = reach_press.way_in_legs(ctx, cfg, way)
+    assert [(lg.name, runner._refusal(lg)) for lg in legs] == [(lg.name, None) for lg in legs]
+
+
 @pytest.mark.parametrize("scene, aimed, near, leans", [
-    ((0.700, -22.0), (0.692, -23.6), "to its left", "guarded"),
+    # to its left, the walk in 5 deg short swings joint_1 0.476 rad, past the runner's sanity gate's 0.417
+    ((0.700, -22.0), (0.692, -23.6), "to its right", "guarded"),
     ((0.766, -15.0), (0.757, -16.6), "nearer the arm", "guarded"),
     ((0.700, -22.0), (0.692, -23.6), "nearer the arm", "compliant"),
 ])

@@ -307,7 +307,9 @@ run for grip and place.
   should show ~5 Hz. "two places pass as this container, [x, y] and [x, y],
   and the OWL did not settle which" → the segmenter boxed a second bowl whose
   band also passes; once that is seen, only a pair with an OWL sighting
-  commits. "the OWL's box of the cut lid is not confirmed by the
+  commits, and an OWL pair of a cut lid only at one of the two places (with
+  "scene OWL: its boxes of the cut lid wait on the segmenter's", it was at
+  neither). "the OWL's box of the cut lid is not confirmed by the
   segmenter's" → the segmenter saw the container in this look, but never
   where the OWL's boxes of the cut lid put it; a segmenter that has seen
   nothing confirms nothing, and those boxes commit on their own
