@@ -307,7 +307,11 @@ run for grip and place.
   should show ~5 Hz. "two places pass as this container, [x, y] and [x, y],
   and the OWL did not settle which" → the segmenter boxed a second bowl whose
   band also passes; once that is seen, only a pair with an OWL sighting
-  commits. "it watches '', not the scene camera (...); the mock?" →
+  commits. "the OWL's box of the cut lid is not confirmed by the
+  segmenter's" → the segmenter saw the container in this look, but never
+  where the OWL's boxes of the cut lid put it; a segmenter that has seen
+  nothing confirms nothing, and those boxes commit on their own
+  ("owl+owl"). "it watches '', not the scene camera (...); the mock?" →
   the segmenter runs as sheppy's mock. "does not import" → this install does
   not chain `~/ros2_ws/install` (rammp_perception_interfaces).
 - A round box the scene frame cuts at its side is finished from its lid's
