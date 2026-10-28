@@ -733,8 +733,14 @@ def _stop_home(ctx, cfg, runner, why):
     """STOP from the look pose, in free air: home (reach_press._go_home,
     which lets go of a home stopped part-way) — the one planned from there
     while the way back to it, or the back-out, flew (ctx.home_ahead), where
-    the arm stands where it starts; else planned here. Returns 1."""
+    the arm stands where it starts; else planned here. The run log says
+    which (home_ahead). Returns 1."""
     ahead, ctx.home_ahead = ctx.home_ahead, None
+    if not ahead:
+        # none in hand (off_rad None): that lookahead failed — the runner's
+        # line says why — or a way in, or the grip's way down, did not start
+        # since; home is planned here, at rest, as before
+        runner.note("home_ahead", flown=False, off_rad=None)
     rp._go_home(ctx, cfg, runner, "STOP: %s" % why, ahead=ahead)
     return 1
 

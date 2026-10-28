@@ -432,16 +432,18 @@ def test_the_home_planned_on_the_way_back_flies_only_from_where_it_starts(ctx, m
     ([(BUTTON, 0.4), (UP, 9.0)], AIR, None, (2,), True),
     ([(BUTTON, 0.4), (UP, 9.0)], KNOB_ON, {4: trp.REJECTED}, (), True),
     (NOT_UP_TWICE, KNOB_ON, None, (2,), True),
+    (NOT_UP_TWICE[:3], KNOB_ON, {4: trp.REJECTED}, (), True),
 ], ids=["backed out", "backed out, its home refused", "the grip's way down did not start",
-        "pressed once more, its home refused"])
+        "pressed once more, its home refused", "the way in once more did not start"])
 def test_the_home_planned_on_the_way_back_is_dropped_once_the_arm_moves_on(ctx, monkeypatch, tmp_path, aims, knuckle,
                                                                            ends, refuse, at_rest):
     """The grip's way down to the knob, or a press once more, sends the arm
     off the look pose; it comes back within DRIFT_REPLAN_RAD of where the
     home planned on the way back starts (the fake re-aim is 0.01 rad; a
-    way down that did not start, 0). That home is never flown after: the
-    stop flies the one planned while the arm came back (the back-out's),
-    else one planned where the arm stands."""
+    way down, or in, that did not start, 0). That home is never flown
+    after: the stop flies the one planned while the arm came back (the
+    back-out's), else one planned where the arm stands, the run log saying
+    none was in hand."""
     from rammp_box_opening.constants import DRIFT_REPLAN_RAD
 
     plans = _home_plans(monkeypatch, refuse)
@@ -452,7 +454,8 @@ def test_the_home_planned_on_the_way_back_is_dropped_once_the_arm_moves_on(ctx, 
     assert max(abs(a - b) for a, b in zip(home.traj.points[0].positions, first[0])) <= DRIFT_REPLAN_RAD
     assert home is not first[1][-1] and home is plans[-1][1][-1]
     assert (plans[-1][0] is None) is at_rest  # at rest: from where the arm stands
-    assert [r["flown"] for r in rows if r["leg"] == "home_ahead"] == ([] if at_rest else [True])
+    ahead, = [r for r in rows if r["leg"] == "home_ahead"]
+    assert ahead["flown"] is not at_rest and (ahead["off_rad"] is None) is at_rest  # none in hand: off_rad None
 
 
 # ---- the lid's spot, chosen with the lid lifted: never a refusal ---------------

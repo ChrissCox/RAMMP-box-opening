@@ -901,13 +901,13 @@ def _back_off(ctx, runner, ref=None, why=None, lets_go=True):
 def _planned_ahead(ctx, runner, legs):
     """`legs`, home planned before the arm stood here (_go_home's `ahead`),
     where the arm stands within DRIFT_REPLAN_RAD of where they start — the
-    gap the short way round, as the driver's start gate measures it
-    (driver.start_gap_rad) — as the runner flies any planned leg from
-    there. Else None, said on the console, and _go_home plans home from
-    where the arm stands: a plan from somewhere else is never flown, and
-    the runner's own re-plan of one would skip _home_legs' clear-margin
-    step and _go_home's back-off. In the run log either way (home_ahead).
-    None for none."""
+    gap the short way round, as the start gate in front of the driver
+    measures it (runtime/driver.start_gap_rad) — as the runner flies any
+    planned leg from there. Else None, said on the console, and _go_home
+    plans home from where the arm stands: a plan from somewhere else is
+    never flown, and the runner's own re-plan of one would skip _home_legs'
+    clear-margin step and _go_home's back-off. In the run log either way
+    (home_ahead). None for none."""
     from rammp_box_opening.runtime.driver import start_gap_rad
 
     if not legs:
