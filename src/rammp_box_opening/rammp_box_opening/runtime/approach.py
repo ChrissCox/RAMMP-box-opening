@@ -137,8 +137,9 @@ def on_branch_of(traj, q_ref):
     """A copy of planned trajectory `traj` with each continuous joint
     (branches.CONTINUOUS_JOINTS) moved by the one whole number of turns that
     puts its first point within half a turn of `q_ref`: every difference
-    kept, so the same motion to the arm, whose driver flies the differences
-    — written to continue a path that ends at `q_ref`. The planner is handed
+    kept, so the same motion to the arm, whose driver compares every target
+    with the measurement the short way round (runtime/branches) — written
+    to continue a path that ends at `q_ref`. The planner is handed
     planner_branch(start), HOME's side of the wrap, which can sit a turn from
     a plan-free line's raw end (review 2026-10-27: joint_3 +0.450 against
     -5.833), and a junction between them is a full revolution in one goal

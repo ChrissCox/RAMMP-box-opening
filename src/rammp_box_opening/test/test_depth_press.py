@@ -2320,18 +2320,15 @@ def test_the_held_arm_is_written_on_the_strokes_side_of_the_wrap():
     assert np.asarray(rise) == pytest.approx(np.asarray(dp.rise_back_up(_PadsChain(), stroke, HELD)))
 
 
-def test_on_flatbot_the_way_back_up_from_1623s_hold_only_rises():
+def _flatbot_1623_hold():
     """16:23's aimed button on flatbot's URDF, the hand turned 12 deg short
     after the slide and the compliant stroke solved from there (as in
     test_on_flatbot_1623s_aimed_button_is_pressed_turning_12_deg_short_after_the_slide),
-    the arm held by the button with the pads `over` above the stroke's end:
-    STIFF's joint springs about the commanded end, the pads where they met
-    the button. The held arm stands past DRIFT_REPLAN_RAD from the commanded
-    end, and the stroke's sample nearest it in joint space 20 mm and more
-    below the held pads. The way back up joins the stroke 15-17 mm above
-    them, its step there well inside RISE_FIRST_STEP_MAX_RAD, the pads never
-    lower than held on it."""
-    from rammp_box_opening.constants import DRIFT_REPLAN_RAD, HOME
+    and the arm held by the button with the pads `over` above the stroke's
+    end: STIFF's joint springs about the commanded end, the pads where they
+    met the button. Returns (chain, model, cfg, the aimed button, the
+    stroke, the held joints, pads(q): the pads' position at joints q)."""
+    from rammp_box_opening.constants import HOME
     from rammp_box_opening.primitives.look import look_joints
     from rammp_box_opening.runtime.branches import planner_branch
     from rammp_box_opening.runtime.kinematics import ArmChain
@@ -2367,6 +2364,20 @@ def test_on_flatbot_the_way_back_up_from_1623s_hold_only_rises():
     for _ in range(20):  # the force at the pads that holds them `over` up, where they met the button
         J = jac(held)
         held = q_end + compliance * (J.T @ np.linalg.solve(J @ np.diag(compliance) @ J.T, [0.0, 0.0, stroke.over]))
+    return chain, model, cfg, aimed, stroke, held, pads
+
+
+def test_on_flatbot_the_way_back_up_from_1623s_hold_only_rises():
+    """16:23's press on flatbot's URDF, the arm held by the button
+    (_flatbot_1623_hold). The held arm stands past DRIFT_REPLAN_RAD from the
+    commanded end, and the stroke's sample nearest it in joint space 20 mm
+    and more below the held pads. The way back up joins the stroke 15-17 mm
+    above them, its step there well inside RISE_FIRST_STEP_MAX_RAD, the pads
+    never lower than held on it."""
+    from rammp_box_opening.constants import DRIFT_REPLAN_RAD
+
+    chain, _model, _cfg, _aimed, stroke, held, pads = _flatbot_1623_hold()
+    q_end = np.asarray(stroke.legs[-1][1][-1], float)
     floor = float(pads(held)[2])
     assert floor - float(pads(q_end)[2]) == pytest.approx(stroke.over, abs=0.002)
     assert float(np.abs(held - q_end).max()) > DRIFT_REPLAN_RAD
@@ -2379,6 +2390,77 @@ def test_on_flatbot_the_way_back_up_from_1623s_hold_only_rises():
     step = np.subtract(rise[1], rise[0])
     assert float(np.abs(step).max()) < 0.2
     assert all(float(pads(np.asarray(rise[0]) + s * step)[2]) >= floor for s in np.linspace(0.0, 1.0, 51))
+
+
+def test_on_flatbot_1623s_way_home_from_the_hold_is_one_goal_the_drivers_gate_takes(ctx, monkeypatch, tmp_path):
+    """16:23's press on flatbot's URDF, the arm held by the button
+    (_flatbot_1623_hold), its way out planned from the stroke's start
+    (rp.plan_way_out) with home stood in by what the client hands the
+    planner — planner_branch(start), the rest pose the short way round from
+    there — as a joint line. _way_home sends ONE goal, from the held arm to
+    the rest pose, that the runner's gates and the driver's own
+    (driver.refusal: the start, the velocity limits, the continuity) take:
+    no continuous joint turning round in it, the pads never lower than the
+    spring held them on the way up, and the rise flowing on into the clear
+    (a 143 deg turn in joint space, inside retime's 150 deg reversal). The
+    run record's row for that execution says when each leg began."""
+    import json
+    import math
+
+    from rammp_box_opening.constants import JOINT_VMAX
+    from rammp_box_opening.primitives.core import CONTACT_SHIFT_PAD_M
+    from rammp_box_opening.runtime import approach, driver
+    from rammp_box_opening.runtime.branches import CONTINUOUS_JOINTS, nearest_branch, planner_branch
+    from rammp_box_opening.runtime.legs import Kind, Leg
+    from rammp_box_opening.runtime.runner import Runner
+    from rammp_box_opening.tasks.press_demo import rest_joints
+
+    chain, model, cfg, aimed, stroke, held, pads = _flatbot_1623_hold()
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    ctx.model = model
+    ctx.cpose = rp.cpose_for_button(aimed, np.radians(36.9), model.button_offset)
+    ctx.client.live = [float(v) for v in held]
+    ctx.client.compliant = True
+    ctx.contact_pad = CONTACT_SHIFT_PAD_M  # set before the way in flew
+
+    def plan(ctx_, state, name, target, world, speed):
+        start = planner_branch(state.joints)
+        goal = nearest_branch(target[1], start)
+        pts = [[a + (b - a) * k / 40 for a, b in zip(start, goal)] for k in range(41)]
+        leg = Leg(name=name, kind=Kind.MOTION, traj=approach.line_trajectory(ctx_.client.joint_names, pts), speed=speed,
+                  guard=None, world=world[0], world_path=str(world[1]), chain=state.chain, target=target,
+                  goal_joints=list(pts[-1]))
+        return leg, state
+
+    monkeypatch.setattr(rp, "_plan_motion", plan)
+    way, why = rp.plan_way_out(ctx, cfg, stroke.q0, stroke.quat)
+    assert why is None and way.back_m == pytest.approx(rp.CLEAR_BACK_M), why
+    sent = []
+    real = ctx.client.execute
+
+    def execute(traj, speed, **kw):
+        sent.append(traj)
+        return real(traj, speed, **kw)
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+    pressed = dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=15.0)
+    result, homed = rp._way_home(ctx, cfg, Runner(ctx.client, log_dir=tmp_path), stroke, pressed, list(held),
+                                 (way, None), None, None)
+    assert homed and result.free and len(sent) == 1
+    (goal,) = sent
+    assert driver.refusal(goal, list(held), JOINT_VMAX) is None
+    path = np.asarray([p.positions for p in goal.points], float)
+    assert np.abs(path[0] - held).max() < 1e-9
+    assert all(abs(math.remainder(float(a) - float(b), 2 * math.pi)) < 1e-9 for a, b in zip(path[-1], rest_joints(cfg)))
+    for j in CONTINUOUS_JOINTS:
+        assert float(np.ptp(path[:, j])) < math.pi + 0.5, j  # no whole turn at a junction
+    k0 = next(k for k, q in enumerate(path) if np.abs(q - stroke.q0).max() < 1e-9)  # the stroke's start
+    floor = float(pads(held)[2])
+    assert min(float(pads(q)[2]) for q in path[:k0 + 1]) >= floor - 1e-9
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    flight, = [r for r in rows if r["leg"] == "reach_way_out_flight"]
+    assert flight["legs"] == ["depth:rise", "depth:clear", "home"] and flight["outcome"] == "arrived"
+    assert flight["junction_speeds"][0] >= 0.04  # the rise flows into the clear: no stop between them
 
 
 def _compliant_goal_ends(ctx, monkeypatch, n, outcome=None, info=None, trajs=None):
@@ -2452,6 +2534,15 @@ def test_a_compliant_reach_out_flies_from_the_button_to_home_as_one_execution(ct
     assert out["planned"] and out["legs"] == WAY_OUT and out["rise_on_stroke"] and out["why"] is None
     assert out["clear_back_mm"] == pytest.approx(1000 * rp.CLEAR_BACK_M)
     assert not [r for r in rows if r["leg"] in ("depth_clear", "home_refused")]
+    # its members log the one execution's t_wall alike: the flight row says where each began, as the way in's does
+    flight, = [r for r in rows if r["leg"] == "reach_way_out_flight"]
+    assert flight["legs"] == WAY_OUT and flight["outcome"] == "arrived" and flight["duration_s"] > 0.0
+    fracs = flight["seg_start_fracs"]
+    assert len(fracs) == len(WAY_OUT) and fracs[0] == 0.0 and fracs == sorted(fracs) and fracs[-1] <= 1.0
+    assert flight["stops"] == len([v for v in flight["junction_speeds"] if v < 0.04])
+    member = [r for r in rows if r["leg"] in WAY_OUT and r["kind"] == "motion"]
+    assert [r["leg"] for r in member] == WAY_OUT and len({r["t_wall"] for r in member}) == 1
+    assert round(member[0]["t_wall"], 3) == flight["t_wall"]
     said = capsys.readouterr().out
     assert "ONE MOTION from the button to home: depth:rise, depth:clear, home — up to the stroke's start" in said
 
@@ -2502,6 +2593,8 @@ def test_a_way_home_the_runner_refuses_flies_the_rise_alone_first(ctx, monkeypat
     """The runner's gates refuse the one execution before anything moves
     (its sanity gate on home, say): the pads are still on the button. The
     rise flies on its own first, then home from over the box as before."""
+    import json
+
     from rammp_box_opening.runtime.runner import Runner
 
     real = Runner._refusal
@@ -2523,12 +2616,98 @@ def test_a_way_home_the_runner_refuses_flies_the_rise_alone_first(ctx, monkeypat
     assert [names for names, _g in after[2:]] == [["depth:clear"], ["home"]]
     assert ("the way home did not start (trajectory sanity gate: arm_joint_3 excursion) — up off the button on its "
             "own, then home from over the box") in capsys.readouterr().out
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    assert not [r for r in rows if r["leg"] == "reach_way_out_flight"]  # nothing of it flew
+
+
+def test_a_way_home_refused_as_the_arm_left_the_held_reading_rises_from_where_the_arm_stands(
+        ctx, monkeypatch, tmp_path, capsys):
+    """The runner refuses a plan-free line that no longer starts where the
+    arm stands (DRIFT_REPLAN_RAD): the arm moved after the hold was read,
+    and the one execution never started — the pads still on the button. The
+    rise flown on its own is solved again from where the arm stands: the
+    held reading's would be refused the same way, and the arm would hold
+    there pressing on the button. Then home from over the box, from the
+    stroke's start. A 100 mm stroke on _PadsChain, the arm 0.05 rad off the
+    held reading on joint_4 (which its pads do not follow)."""
+    from conftest import leg as make_leg
+
+    from rammp_box_opening.constants import DRIFT_REPLAN_RAD
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.runner import Runner
+
+    monkeypatch.setattr(approach, "_chain", lambda: _PadsChain())
+    stroke = _stroke_100mm()
+    live = list(HELD)
+    live[3] += DRIFT_REPLAN_RAD + 0.01
+    ctx.client.live = list(live)
+    clear = [list(stroke.q0), [v + 0.01 for v in stroke.q0]]
+    way = rp.WayOut(clear, list(TURNED_DOWN), [make_leg("home", start=clear[-1], end=[0.0] * 7)], rp.CLEAR_BACK_M)
+    runs = []
+
+    class Rec(Runner):
+        def run(self, legs, execute, lookahead=None):
+            out = super().run(legs, execute, lookahead)
+            runs.append(([lg.name for lg in legs], list(legs[0].traj.points[0].positions), [r.outcome for r in out]))
+            return out
+
+    homes = []
+    monkeypatch.setattr(rp, "_home_from_over_box",
+                        lambda ctx_, cfg_, runner_, result: homes.append(list(ctx_.client.joints())) or True)
+    pressed = dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=15.0)
+    result, homed = rp._way_home(ctx, load_press_demo(PINK), Rec(ctx.client, log_dir=tmp_path), stroke, pressed,
+                                 list(HELD), (way, None), None, None)
+    assert homed and result.free and result.why is None
+    (names, start, outcome), (names2, start2, outcome2) = runs
+    assert names == WAY_OUT and start == pytest.approx(HELD) and outcome == ["refused"]
+    assert names2 == ["depth:rise"] and start2 == pytest.approx(live) and outcome2 == ["arrived"]
+    assert homes == [[float(v) for v in stroke.q0]]  # up the stroke to its start, then home from over the box
+    assert "a plan-free line no longer starts where the arm is" in capsys.readouterr().out
+
+
+def test_a_way_home_whose_home_steps_off_a_limit_first_flies_that_step_as_a_goal_of_its_own(
+        ctx, monkeypatch, tmp_path, capsys):
+    """Home planned from the clear's end with a joint too near its limit for
+    the planner starts with home_arm's plan-free step (_home_legs,
+    ClearMarginFree): guarded, under the client's run default, and home
+    after it on the next chain, planned from the step's end — a turn off it
+    on joint_7 here, as planner_branch can leave it. The rise and the clear
+    fly as one goal, the step as one of its own, then home, moved onto the
+    step's end: three goals of one runner.run, the guard kept on the step
+    (it only watches in a compliant run)."""
+    from conftest import leg as make_leg
+
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.guards import GuardSpec
+    from rammp_box_opening.runtime.runner import Runner
+
+    monkeypatch.setattr(approach, "_chain", lambda: _PadsChain())
+    stroke = _stroke_100mm()
+    ctx.client.live = list(HELD)
+    clear = [list(stroke.q0), [v + 0.01 for v in stroke.q0]]
+    stepped = [v + 0.02 for v in clear[-1]]
+    step = make_leg("clear-margin", start=clear[-1], end=stepped, speed=0.15, world="bench",
+                    guard=GuardSpec(touch_nm=4.0, trip="obstruction"))
+    turn = [0.0] * 6 + [2.0 * np.pi]
+    home = make_leg("home", start=list(np.add(stepped, turn)), end=list(np.add([0.0] * 7, turn)), chain=1)
+    way = rp.WayOut(clear, list(TURNED_DOWN), [step, home], rp.CLEAR_BACK_M)
+    pressed = dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=15.0)
+    result, homed = rp._way_home(ctx, load_press_demo(PINK), Runner(ctx.client, log_dir=tmp_path), stroke, pressed,
+                                 list(HELD), (way, None), None, None)
+    assert homed and result.why is None
+    assert ctx.client.gains_sent == [dp.COMPLIANT_GAINS, None, dp.COMPLIANT_GAINS]
+    assert ctx.client.guards[0] is None and ctx.client.guards[1] is not None and ctx.client.guards[2] is None
+    assert step.guard is not None and step.gains is None and home.gains == dp.COMPLIANT_GAINS
+    assert list(home.traj.points[0].positions) == pytest.approx(stepped)  # on the step's end, the turn taken off
+    assert "in 3 goals from the button to home: depth:rise, depth:clear, clear-margin, home" in capsys.readouterr().out
 
 
 def test_a_way_home_that_stops_part_way_holds_the_arm_and_says_in_which_leg(ctx, monkeypatch, tmp_path, capsys):
     """The one execution stopped just after it began: the arm holds where
     it stopped, near the button — no home — and the STOP names the leg in
-    flight."""
+    flight, as the run record's row for that execution does."""
+    import json
+
     _compliant_goal_ends(ctx, monkeypatch, 2, "failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.01})
     code, rec, _chain, _home, _got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True,
                                                  chain=_sinking_chain())
@@ -2536,6 +2715,9 @@ def test_a_way_home_that_stops_part_way_holds_the_arm_and_says_in_which_leg(ctx,
     out = capsys.readouterr().out
     assert "STOP: the way home stopped during depth:rise (PATH_TOLERANCE_VIOLATED) — the arm holds" in out
     assert "did not get home" not in out  # one STOP, the arm held where it stopped
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    flight, = [r for r in rows if r["leg"] == "reach_way_out_flight"]
+    assert flight["legs"] == WAY_OUT and flight["outcome"] == "failed" and flight["seg_start_fracs"][1] > 0.01
 
 
 def test_a_way_home_whose_later_goal_did_not_start_goes_home_from_where_the_arm_stands(
