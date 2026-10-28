@@ -368,11 +368,12 @@ mount, `--press-only` for the press, the full run for the lid.
   not up" → the button did not pop under the spring's push: check the box.
 - "AFTER PRESS N: knob …, and its LID ROSE +M mm — the box is open" → the
   press let the lid go, the button where it was aimed. With the knob UP
-  the grip goes by the lid where it now stands. With the knob flush it is
-  "STOP: the lid rose +M mm (released) but its knob is flush (…)" and
-  home, the box left open: the fingers have nothing to hold, and a
-  released lid is not pressed again (pushing it down may latch it). Lift
-  the lid off by hand, or shut it and run again.
+  the grip goes by the lid where it now stands. With the knob not up
+  (flush) it is "STOP: the lid rose +M mm (released) but its knob is not
+  up (…)" and home, the box left open: the fingers have nothing to hold,
+  and a released lid is not pressed again (pushing it down may latch it).
+  Lift the lid off by hand, or shut it, before the next run: its aim takes
+  a flush knob for a shut box and would press it.
 - "scene camera: … — reaching out to its box anyway" → on the last run
   that recorded a scene-versus-wrist pair the scene camera's box stood
   more than 5 cm from the button the wrist found. Those pairs were

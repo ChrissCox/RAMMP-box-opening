@@ -265,12 +265,14 @@ def test_a_lid_that_rose_with_its_knob_flush_is_neither_gripped_nor_pressed_agai
     knob, = [r for r in rows if r["leg"] == "reach_knob"]
     assert (knob["popped"], knob["lid_rose"], knob["knob_up_mm"], knob["looks"]) == (False, True, knob_mm, 2)
     assert knob["lid_dz_mm"] == pytest.approx(1000 * dz) and knob["shift_mm"] == pytest.approx(1000 * shift)
-    assert knob["stop"].startswith("the lid rose %+.0f mm (released) but its knob is flush" % (1000 * dz))
+    assert knob["stop"].startswith("the lid rose %+.0f mm (released) but its knob is not up" % (1000 * dz))
     assert not [r for r in rows if r["leg"] in ("reach_grip", "reach_grip_result", "lid_spot")]
     out = capsys.readouterr().out
     assert "knob %.1f mm above the lid, and its LID ROSE %+.0f mm — the box is open" % (knob_mm, 1000 * dz) in out
-    assert ("STOP: the lid rose %+.0f mm (released) but its knob is flush (%.1f mm above the lid) — the fingers have "
-            "nothing to hold, so the lid is not taken off; the box is left open" % (1000 * dz, knob_mm)) in out
+    assert ("STOP: the lid rose %+.0f mm (released) but its knob is not up (%.1f mm above the lid) — the fingers have "
+            "nothing to hold, so the lid is not taken off; the box is left open: lift the lid off by hand, or shut it, "
+            "before the next run (which would take it for shut and press it) — returning home"
+            % (1000 * dz, knob_mm)) in out
     assert "pressing once more" not in out and "GRIP" not in out
 
 
@@ -289,8 +291,28 @@ def test_a_lid_that_rose_at_the_press_once_more_with_its_knob_flush_stops_the_ru
     knobs = [(r["press"], r["popped"], r["lid_rose"], r["stop"] is None) for r in rows if r["leg"] == "reach_knob"]
     assert knobs == [(1, False, False, True), (2, False, True, False)]
     out = capsys.readouterr().out
-    assert "pressing once more" in out and "STOP: the lid rose +9 mm (released) but its knob is flush" in out
+    assert "pressing once more" in out and "STOP: the lid rose +9 mm (released) but its knob is not up" in out
     assert "pressed 2 times" not in out and ctx.client.gripper_sent == []
+
+
+@pytest.mark.parametrize("off_mm", [-0.1, 0.0], ids=["just under", "at"])
+def test_a_risen_lid_is_gripped_with_its_knob_up_as_a_shut_one_and_under_that_the_stop_says_not_up(
+        ctx, monkeypatch, tmp_path, capsys, off_mm):
+    """On a risen lid the knob is up where it is on a shut one
+    (press_demo.knob_is_up, KNOB_UP_MIN_MM or more): gripped. Just under,
+    flush or partly up, it is not up: the stop, which says so with the
+    reading."""
+    from rammp_box_opening.tasks.press_demo import KNOB_UP_MIN_MM
+
+    knob_mm, up = KNOB_UP_MIN_MM + off_mm, off_mm >= 0
+    risen = (BUTTON[0], BUTTON[1], BUTTON[2] - 0.0004 + 0.009 + knob_mm / 1000)  # the lid +9 mm on the first aim's -0.4
+    aims = [(BUTTON, 0.4), (risen, knob_mm)] + ([] if up else [(risen, knob_mm)])  # a knob not up is read twice
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims)
+    knob, = [r for r in rows if r["leg"] == "reach_knob"]
+    assert (code, knob["popped"], knob["lid_rose"], knob["stop"] is None) == (0 if up else 1, up, True, up)
+    assert any(n.startswith("grip:") for n in rec.events) == up
+    said = "STOP: the lid rose +9 mm (released) but its knob is not up (%.1f mm above the lid)" % knob_mm
+    assert (said in capsys.readouterr().out) == (not up)
 
 
 @pytest.mark.parametrize("dz", [-0.009, 0.040])

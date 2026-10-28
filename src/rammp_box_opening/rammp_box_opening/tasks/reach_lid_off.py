@@ -107,11 +107,14 @@ KNOB_STROKE_M = 0.0075
 # [0.30, 0.55]), opened and backed out — 11.6 s more over the box after
 # the look, then home, exit 1. A risen lid is gripped only with its knob up
 # (KnobLook.popped); with it flush the run STOPs, home, the box left open,
-# and does not press it again: a released lid stands on its spring 8-10 mm
-# above the top the stroke was built for — at those three boxes'
-# 2876-3034 N/m the same stroke would push 24-29 N harder — and pushing
-# it back down may latch it again (an open OXO pressed was shut,
-# 2026-09-21: press_demo.refuse_open_box; not tried on this canister).
+# and does not press it again: pushing a released lid back down may latch
+# it again (an open OXO pressed was shut, 2026-09-21:
+# press_demo.refuse_open_box; not tried on this canister). Nor does the
+# stroke fit it: the lid stands on its spring 8-10 mm above the top the
+# stroke was built for, and on a lid that does not give the same stroke
+# pushes up to 24-29 N more than the first press's 52-57 N (those three
+# boxes' 2876-3034 N/m; a lid its spring lets back down ends the pads where
+# the first hold did).
 LID_POP_M = (0.004, 0.030)
 # The grip: the closed pads' reference this far under the lid as estimated
 # (grip_lid_z). The 2F-85's pads stand 13.5 mm higher open than shut, and
@@ -502,8 +505,12 @@ def knob_look(node, ctx, runner, watcher, button, yaw, lid_before, press):
     elif dz is not None and not rose and abs(dz) > rp.BOX_LIFTED_M:
         look.stop = "the press moved the box: its lid %+.0f mm — check it is still standing on the table" % (1000 * dz)
     elif rose and not look.popped:
-        look.stop = ("the lid rose %+.0f mm (released) but its knob is flush (%.1f mm above the lid) — the fingers "
-                     "have nothing to hold, so the lid is not taken off; the box is left open" % (1000 * dz, best))
+        # the next run cannot tell: its aim judges the box by the knob alone
+        # (press_demo.refuse_open_box), and to it this one is shut
+        look.stop = ("the lid rose %+.0f mm (released) but its knob is not up (%.1f mm above the lid) — the fingers "
+                     "have nothing to hold, so the lid is not taken off; the box is left open: lift the lid off by "
+                     "hand, or shut it, before the next run (which would take it for shut and press it)"
+                     % (1000 * dz, best))
     runner.note("reach_knob", press=press, found=True, looks=looks, knob_up_mm=None if best is None else round(best, 1),
                 popped=look.popped, shift_mm=round(1000 * shift, 1), lid_dz_mm=None if dz is None else round(1000 * dz, 1),
                 lid_rose=rose, stop=look.stop)
@@ -894,9 +901,10 @@ def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
         lid_z = grip_lid_z(top_z, held_z)
         rose = ""
         if knob.lid_rose:
-            # the knob up on a released lid (flush, knob_look stopped the
-            # run): it stands as much higher as the wrist's two readings
-            # from the look pose differ (their bias cancels)
+            # the knob up on a released lid (with it flush, knob_look
+            # stopped the run): the lid stands as much higher as the
+            # wrist's two readings from the look pose differ (their bias
+            # cancels)
             lid_z += float(knob.lid_dz_m)
             rose = ", %+.0f mm: the lid rose" % (1000 * knob.lid_dz_m)
         return take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, "the lid at %.3f (the press's top %.3f%s%s)" % (
