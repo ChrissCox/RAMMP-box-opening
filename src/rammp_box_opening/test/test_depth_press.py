@@ -1411,6 +1411,250 @@ def test_the_press_models_the_spring_its_legs_fly():
     assert dp.COMPLIANT_KQ == IMPEDANCE_KQ[GAINS_STIFF] == (160.0,) * 4 + (60.0,) * 3
 
 
+# ---- the compliant stroke's bend: the springs push straight down at the button's bottom ------
+
+def _pads_at(chain, q):
+    """The pads (DOWN_CONTACT_TOOL) at joints `q`, from `chain`'s fk alone."""
+    R, t = chain.fk(list(q))
+    return np.asarray(t, float) + np.asarray(R, float) @ np.asarray(dp.DOWN_CONTACT_TOOL, float)
+
+
+def _straight_end(chain, pts, bottom):
+    """The last of a stroke leg's joint points `pts` whose pads stand no
+    lower than `bottom`: where its straight part ends, at the button's
+    bottom — past it a press is bent (dp.stroke_bend)."""
+    return [q for q in pts if _pads_at(chain, q)[2] >= bottom - 1e-4][-1]
+
+
+def _held_at(chain, q_ref, b):
+    """Where STIFF's joint springs about the reference `q_ref` hold a 7-joint
+    arm with the pads pinned at `b` — the driver's law at rest, gravity
+    cancelled: Kq (q - q_ref) = J(q)^T f, the pads at b — solved for f, the
+    button's push on the pads. Its own Jacobian (central differences of
+    `chain`'s fk): nothing of depth_press's model in it. Returns (the held
+    joints, f in world axes)."""
+    kq = np.asarray(dp.COMPLIANT_KQ, float)
+    q_ref = np.asarray(q_ref, float)
+
+    def jac(q):
+        J = np.zeros((3, 7))
+        for i in range(7):
+            d = np.zeros(7)
+            d[i] = 1e-6
+            J[:, i] = (_pads_at(chain, q + d) - _pads_at(chain, q - d)) / 2e-6
+        return J
+
+    q, f = q_ref.copy(), np.zeros(3)
+    for _ in range(30):
+        J = jac(q)
+        f = f + np.linalg.solve(J @ np.diag(1.0 / kq) @ J.T, np.asarray(b, float) - _pads_at(chain, q))
+        q = q_ref + (J.T @ f) / kq
+    assert np.linalg.norm(_pads_at(chain, q) - np.asarray(b, float)) < 1e-7
+    return q, f
+
+
+def _hold_note(ctx, monkeypatch, log_dir, chain, stroke, held):
+    """dp.compliant_hold on `chain` with the arm held at joints `held`, on
+    the button whose top is COMPLIANT_TOP: (its verdict, its run record's
+    depth_compliant_press row)."""
+    import json
+
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.runner import Runner
+
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    ctx.client.settled_efforts = lambda *a, **k: ([0.0] * 4, [float(v) for v in held])
+    result = dp.compliant_hold(ctx, load_press_demo(PINK), Runner(ctx.client, log_dir=log_dir), stroke, COMPLIANT_TOP,
+                               {})
+    rows = [json.loads(line) for line in open(next(log_dir.glob("run-*.jsonl")))]
+    note, = [r for r in rows if r.get("leg") == "depth_compliant_press"]
+    return result, note
+
+
+class _Coupled:
+    """A chain whose pads are A q[:3] — joints 4-7 move nothing — and
+    whose A couples x and z: a push straight down moves its pads sideways
+    too, as flatbot's do (C = A Kq^-1 A^T, not diagonal). Its straight
+    lines end where they are asked to; the hand's axes are the world's."""
+
+    def __init__(self, xz, zx=0.0):
+        self.A = np.array([[1.0, 0.0, xz], [0.0, 1.0, 0.0], [zx, 0.0, 1.0]])
+
+    def fk(self, q):
+        return np.eye(3), self.A @ np.asarray(q[:3], float) - np.asarray(dp.DOWN_CONTACT_TOOL, float)
+
+    def straight_line(self, q0, xyz, quat):
+        q = [float(v) for v in q0]
+        q[:3] = [float(v) for v in np.linalg.solve(self.A, np.asarray(xyz, float) + np.asarray(dp.DOWN_CONTACT_TOOL))]
+        return [[float(v) for v in q0], q], None
+
+
+Q_COUPLED = [0.5, -0.1, 0.5, 0.0, 0.0, 0.0, 0.0]  # where a _Coupled stroke starts: its pads 0.50-0.55 m up
+
+
+@pytest.mark.parametrize("stiffer", [1.0, 4.0])
+def test_a_bent_stroke_ends_where_the_joint_springs_push_straight_down_at_the_buttons_bottom(
+        ctx, monkeypatch, tmp_path, stiffer):
+    """The driver's spring is a joint spring, and on an arm whose pads'
+    compliance couples (_Coupled), a reference driven straight down past
+    the button pushes sideways too. The press leg goes straight down to the
+    button's bottom (q_b), then bends on in joint space to q_end with
+    Kq (q_end - q_b) = -F J_z(q_b)^T: the arm held at the bottom, the
+    springs push F straight down there and nothing sideways, the hold's
+    own reading included. F is COMPLIANT_PRESS_N where the pads' reference
+    then drops within COMPLIANT_OVERSHOOT_M (`stiffer` 4: 634 N/m at the
+    pads, 24 mm), else scaled to its bound (STIFF on this chain: 158 N/m,
+    60 mm). No new leg: the events are as before."""
+    cfg = load_press_demo(PINK)
+    chain = _Coupled(xz=0.25, zx=0.1)
+    kq = stiffer * np.asarray(dp.COMPLIANT_KQ, float)
+    stroke, why = dp.compliant_stroke(chain, cfg, Q_COUPLED, TURNED_DOWN, COMPLIANT_TOP, kq=tuple(kq))
+    assert why is None and stroke.bent and stroke.bend_why is None
+    assert [name for name, _p, _s in stroke.legs] == ["depth:approach", "depth:press"]
+    bottom = COMPLIANT_TOP - cfg.button_travel_m
+    press = stroke.legs[-1][1]
+    q_b = np.asarray(_straight_end(chain, press, bottom), float)
+    assert list(_pads_at(chain, q_b)) == pytest.approx(list(_pads_at(chain, Q_COUPLED)[:2]) + [bottom], abs=1e-9)
+    q_end = np.asarray(stroke.q_end, float)
+    assert list(press[-1]) == pytest.approx(list(q_end), abs=1e-12)  # the press leg's last point
+    # the bend's waypoints: no joint more than BEND_STEP_RAD apart, q_b to q_end on one joint-space line
+    tail = np.asarray(press[max(i for i, q in enumerate(press) if np.abs(np.asarray(q) - q_b).max() < 1e-12):])
+    assert len(tail) >= 3 and np.abs(np.diff(tail, axis=0)).max() <= dp.BEND_STEP_RAD + 1e-12
+    d = q_end - q_b
+    s = (tail - q_b) @ d / (d @ d)
+    assert np.abs(tail - q_b - np.outer(s, d)).max() < 1e-12 and np.all(np.diff(s) > 0) and s[-1] == pytest.approx(1.0)
+    J = np.hstack([chain.A, np.zeros((3, 4))])  # the pads' translation Jacobian, and their compliance through it
+    assert dp.fingertip_jacobian(chain, q_b) == pytest.approx(J, abs=1e-9)
+    assert dp.fingertip_compliance(chain, q_b, tuple(kq)) == pytest.approx(J @ np.diag(1.0 / kq) @ J.T, abs=1e-12)
+    J_z = J[2]  # the pads' height: z + 0.1 x
+    k = 1.0 / float(J_z @ (J_z / kq))
+    assert stroke.k == pytest.approx(k, rel=1e-6)
+    force = k * stroke.over  # the chain is linear: the drop is F C_zz exactly
+    assert force == pytest.approx(min(dp.COMPLIANT_PRESS_N, k * dp.COMPLIANT_OVERSHOOT_M[1]), rel=1e-6)
+    assert kq * (q_end - q_b) == pytest.approx(-force * J_z, abs=1e-9)
+    # the static force at the bottom: straight down, F
+    f = np.linalg.lstsq(dp.fingertip_jacobian(chain, q_b).T, kq * (q_end - q_b), rcond=None)[0]
+    assert f == pytest.approx([0.0, 0.0, -force], abs=1e-9)
+    # the bend moved the pads' reference sideways, as the coupling asks: 0.35 of the drop on this chain
+    aside = np.hypot(*(_pads_at(chain, q_end) - _pads_at(chain, q_b))[:2])
+    assert stroke.bend_m == pytest.approx(aside) and aside == pytest.approx(0.35 * stroke.over / 1.01, rel=1e-6)
+    if stiffer == 1.0:  # the hold reads the springs that fly: COMPLIANT_KQ, held at the bottom
+        result, note = _hold_note(ctx, monkeypatch, tmp_path, chain, stroke, q_b)
+        assert result.felt and result.press_n == pytest.approx(force, abs=1e-6)
+        assert note["press_n"] == pytest.approx(force, abs=0.05) and note["sideways_n"] == 0.0
+        assert note["bent"] and note["bend_mm"] == pytest.approx(1000 * aside, abs=0.05)
+        assert note["held_off_aim_mm"] == [0.0, 0.0] and "bend_why" not in note
+
+
+def test_where_the_pads_compliance_does_not_couple_the_bend_is_straight_down(ctx, monkeypatch, tmp_path):
+    """The harness's arm (_Arm: its joints are the tool's pose) turned
+    straight down: its pads' compliance is diagonal, so the bend's end lies
+    straight below the button's bottom — only the pads' height moves, in
+    joint space too — and the press ends where it did before the bend,
+    the spring there pushing what it did (the compliant press tests above,
+    unchanged)."""
+    _result, _events, arm, legs, note = _compliant(ctx, monkeypatch, tmp_path, held_up_m=0.0)
+    (goal, quat), = arm.turns
+    cfg = load_press_demo(PINK)
+    stroke, why = dp.compliant_stroke(arm, cfg, list(goal) + list(quat), quat, COMPLIANT_TOP)
+    assert why is None and stroke.bent and stroke.bend_m == pytest.approx(0.0, abs=1e-9)
+    q_b = np.asarray(_straight_end(arm, stroke.legs[-1][1], COMPLIANT_TOP - cfg.button_travel_m), float)
+    step = np.asarray(stroke.q_end, float) - q_b
+    assert step[2] == pytest.approx(-stroke.over, abs=1e-9) and np.abs(np.delete(step, 2)).max() < 1e-9
+    assert list(legs["depth:press"].traj.points[-1].positions) == pytest.approx(stroke.q_end)
+    assert note["bent"] and note["bend_mm"] == 0.0 and note["sideways_n"] == 0.0
+
+
+def test_a_bend_past_bend_max_m_flies_straight_and_the_run_says_why(ctx, monkeypatch, tmp_path, capsys):
+    """A bend that would move the pads' reference more than BEND_MAX_M
+    sideways — here 60 mm, the pads' x coupled one to one with their height
+    — is near a degenerate compliance, and in free air the pads would end
+    that far off the button: the press flies straight on down as before
+    the bend, as far below the bottom as the spring there needs, within
+    COMPLIANT_OVERSHOOT_M, and the console and the run record say why. Held
+    at the bottom, that straight reference shoves the pads sideways: the
+    hold says so."""
+    cfg = load_press_demo(PINK)
+    chain = _Coupled(xz=1.0)
+    stroke, why = dp.compliant_stroke(chain, cfg, Q_COUPLED, TURNED_DOWN, COMPLIANT_TOP)
+    assert why is None and not stroke.bent and stroke.bend_m == 0.0
+    assert stroke.bend_why == "a bend would move the pads' reference 60 mm sideways, past BEND_MAX_M's 30"
+    assert [name for name, _p, _s in stroke.legs] == ["depth:approach", "depth:press"]
+    bottom = COMPLIANT_TOP - cfg.button_travel_m
+    assert stroke.over == pytest.approx(dp.COMPLIANT_OVERSHOOT_M[1]) and stroke.end_z == pytest.approx(bottom - 0.06)
+    end = _pads_at(chain, stroke.q_end)
+    assert list(end) == pytest.approx(list(_pads_at(chain, Q_COUPLED)[:2]) + [bottom - 0.06], abs=1e-9)  # straight
+    assert list(stroke.legs[-1][1][-1]) == pytest.approx(stroke.q_end)
+    assert "; not bent: a bend would move the pads' reference 60 mm sideways" in dp.press_text(stroke, cfg)
+    q_b = np.linalg.solve(chain.A, [end[0], end[1], bottom])  # the pads held at the bottom, over the aim
+    result, note = _hold_note(ctx, monkeypatch, tmp_path, chain, stroke, list(q_b) + [0.0] * 4)
+    assert not note["bent"] and note["bend_why"] == stroke.bend_why and note["bend_mm"] == 0.0
+    # held there the springs push 19.2 N down and 9.6 N sideways (A^T f = Kq (q_end - q_b))
+    assert note["press_n"] == pytest.approx(19.2, abs=0.05) and note["sideways_n"] == pytest.approx(9.6, abs=0.05)
+    assert result.felt and "PRESSED with ~19 N, 10 N sideways" in capsys.readouterr().out
+
+
+def test_a_bend_whose_end_leaves_a_joints_limits_flies_straight():
+    """The bend's waypoints are no IK solutions, so no line's limit check
+    sees them: an end outside a joint's limits (within_limits, as the arm's
+    own chain has) is no bend to fly, and the stroke flies straight on
+    down as before the bend."""
+    cfg = load_press_demo(PINK)
+    bottom = COMPLIANT_TOP - cfg.button_travel_m
+
+    class Limited(_Coupled):
+        def within_limits(self, q):
+            return float((self.A @ np.asarray(q[:3], float))[2]) >= bottom - 0.01  # the pads' height, on this chain
+
+    stroke, why = dp.compliant_stroke(Limited(xz=0.25), cfg, Q_COUPLED, TURNED_DOWN, COMPLIANT_TOP)
+    assert why is None and not stroke.bent and stroke.bend_why == "the bend's end is outside a joint's limits"
+    assert stroke.end_z == pytest.approx(bottom - dp.COMPLIANT_OVERSHOOT_M[1])
+    assert list(_pads_at(Limited(xz=0.25), stroke.q_end)[:2]) == pytest.approx(
+        list(_pads_at(Limited(xz=0.25), Q_COUPLED)[:2]), abs=1e-9)  # straight below the aim
+    assert dp.stroke_bend(_Coupled(xz=0.25), Q_COUPLED)[0] is not None  # unlimited, it bends
+
+
+def test_a_bend_is_no_bend_where_the_pads_do_not_move_with_the_joints(monkeypatch):
+    """A chain whose pads stand still whatever its joints (test_reach_press's
+    _Chain) has no compliance to bend along: the stroke flies straight as
+    before the bend, its spring infinitely stiff, the least overshoot."""
+    import test_reach_press as trp
+
+    monkeypatch.setattr(trp._Chain, "R", trp.STRAIGHT_DOWN)
+    cfg = load_press_demo(PINK)
+    stroke, why = dp.compliant_stroke(trp._Chain(), cfg, [0.0] * 7, TURNED_DOWN, 0.40)
+    assert why is None and not stroke.bent and stroke.bend_why == "the pads do not move with the joints here"
+    assert stroke.k == float("inf") and stroke.end_z == pytest.approx(0.40 - cfg.button_travel_m - 0.015)
+    q_end, aside, why = dp.stroke_bend(trp._Chain(), [0.0] * 7)
+    assert q_end is None and aside == 0.0 and why == stroke.bend_why
+
+
+def test_a_hand_already_at_the_buttons_bottom_flies_straight_and_one_below_the_strokes_end_is_refused():
+    """The bend starts where the press leg's straight part meets the
+    button's bottom. A hand whose pads already stand within 5 mm of it, or
+    below it (a wrong top_z, or the hand already in the button), has no
+    such part: bent from where it stands, the springs' reference would be
+    driven that much deeper still. It flies straight on down as before the
+    bend, and pads already below where that stroke ends are refused, as
+    they were before it."""
+    cfg = load_press_demo(PINK)
+    chain = _Coupled(xz=0.25, zx=0.1)
+    bottom = COMPLIANT_TOP - cfg.button_travel_m
+    x, y = _pads_at(chain, Q_COUPLED)[:2]
+    at = list(np.linalg.solve(chain.A, [x, y, bottom + 0.002])) + [0.0] * 4  # the pads 2 mm above the bottom
+    stroke, why = dp.compliant_stroke(chain, cfg, at, TURNED_DOWN, COMPLIANT_TOP)
+    assert why is None and not stroke.bent and stroke.bend_m == 0.0
+    assert stroke.bend_why == ("the pads already stand 2 mm above the button's bottom, with no stroke down to it to "
+                               "bend from")
+    assert [name for name, _p, _s in stroke.legs] == ["depth:press"]
+    # straight on down, as far below the bottom as the spring needs (158 N/m: the 60 mm bound)
+    assert stroke.over == pytest.approx(dp.COMPLIANT_OVERSHOOT_M[1]) and stroke.end_z == pytest.approx(bottom - 0.06)
+    assert list(_pads_at(chain, stroke.q_end)) == pytest.approx([x, y, bottom - 0.06], abs=1e-9)
+    below = list(np.linalg.solve(chain.A, [x, y, bottom - 0.088])) + [0.0] * 4  # 88 mm below it
+    assert dp.compliant_stroke(chain, cfg, below, TURNED_DOWN, COMPLIANT_TOP) == (
+        None, "the pads already stand 28 mm below where the press would end")
+
+
 def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx, monkeypatch, tmp_path):
     """The reach-out of a compliant run: no at-rest read, no weight check at
     the look, no stopping guard on the re-aim, the slide in, the turn, the
@@ -1838,10 +2082,15 @@ def test_a_compliant_press_turns_as_far_as_15_deg_short_where_nearer_down_does_n
     R = rp._rot(quat)
     # the harness's slide ended with the tilted fingertip at (BUTTON xy, 0.46)
     assert np.asarray(goal) + R @ np.asarray(dp.DOWN_CONTACT_TOOL) == pytest.approx([BUTTON[0], BUTTON[1], 0.46])
-    for name in ("depth:approach", "depth:press"):  # vertical, the lean held
-        end = list(legs[name].traj.points[-1].positions)
+    bottom = COMPLIANT_TOP - load_press_demo(PINK).button_travel_m
+    for name in ("depth:approach", "depth:press"):  # vertical, the lean held, to the button's bottom ...
+        pts = [list(p.positions) for p in legs[name].traj.points]
+        end = [q for q in pts if dp._pads_z(arm, q) >= bottom - 1e-9][-1]
         assert end[:2] == pytest.approx(list(goal[:2])) and end[3:] == pytest.approx(list(quat))
-    assert legs["depth:press"].traj.points[-1].positions[2] < goal[2]
+    # ... and the press bent on past it in joint space (dp.stroke_bend), the springs' reference below it: the
+    # fake's pads only drop, its first three joints their own
+    end = list(legs["depth:press"].traj.points[-1].positions)
+    assert end[:2] == pytest.approx(list(goal[:2])) and dp._pads_z(arm, end) < bottom and end[2] < goal[2]
     out = capsys.readouterr().out
     assert "TURN: %.0f deg short of straight down (no hand nearer straight down flies here)" % lean in out
     said = "PRESS (compliant), the hand leaning %.0f deg back toward the arm: straight down" % lean
@@ -1988,7 +2237,8 @@ def test_on_flatbot_1623s_aimed_button_is_pressed_turning_12_deg_short_after_the
     step within TURN_MAX_JUMP_RAD, 1.46 rad of joint arc, about the
     fingertip — the pads' centre where the fingertip was, no point of the
     pads nearer the lid than 5 cm. The compliant stroke flies from its end,
-    STIFF's spring ~457 N/m at the pads there."""
+    straight down to the button's bottom, STIFF's spring ~523 N/m at the
+    pads there (~457 at the turn's end), then bent on."""
     from rammp_box_opening.constants import HOME
     from rammp_box_opening.primitives.look import look_joints
     from rammp_box_opening.runtime import approach
@@ -2036,11 +2286,17 @@ def test_on_flatbot_1623s_aimed_button_is_pressed_turning_12_deg_short_after_the
     stroke, why = dp.compliant_stroke(chain, cfg, pts[-1], down, aimed[2])
     assert why is None, why
     assert 400.0 <= stroke.k <= 600.0 and [name for name, _p, _s in stroke.legs] == ["depth:approach", "depth:press"]
-    assert stroke.end_z < aimed[2] - cfg.button_travel_m
-    for _name, p, _speed in stroke.legs:  # straight down from the turn's end, the lean held
-        Rp, tp = chain.fk(p[-1])
+    bottom = aimed[2] - cfg.button_travel_m
+    assert stroke.end_z < bottom
+    for _name, p, _speed in stroke.legs:  # straight down from the turn's end, the lean held, to the button's bottom
+        Rp, tp = chain.fk(_straight_end(chain, p, bottom))
         assert list(tp[:2]) == pytest.approx(list(t1[:2]), abs=1e-3)
         assert np.degrees(rp.hand_lean(np.asarray(Rp, float))) == pytest.approx(12.0, abs=0.1)
+    # ... then bent on (dp.stroke_bend): the springs' reference 28 mm below the bottom and 14 mm aside, where they
+    # push COMPLIANT_PRESS_N straight down on the pads held at the bottom (_flatbot_1623_hold; 15:19's in
+    # test_on_flatbot_a_bent_press_pushes_straight_down_where_a_straight_one_shoves_the_pads_aside)
+    assert stroke.bent and stroke.bend_why is None and stroke.bend_m == pytest.approx(0.014, abs=0.002)
+    assert stroke.over == pytest.approx(0.028, abs=0.002) and stroke.k == pytest.approx(523.0, abs=10.0)
 
 
 # ---- a compliant run's clear before home: up as far as the lean needs, and back -----------
@@ -2358,14 +2614,12 @@ def test_the_held_arm_is_written_on_the_strokes_side_of_the_wrap():
     assert np.asarray(rise) == pytest.approx(np.asarray(dp.rise_back_up(_PadsChain(), stroke, HELD)))
 
 
-def _flatbot_1623_hold():
-    """16:23's aimed button on flatbot's URDF, the hand turned 12 deg short
-    after the slide and the compliant stroke solved from there (as in
-    test_on_flatbot_1623s_aimed_button_is_pressed_turning_12_deg_short_after_the_slide),
-    and the arm held by the button with the pads `over` above the stroke's
-    end: STIFF's joint springs about the commanded end, the pads where they
-    met the button. Returns (chain, model, cfg, the aimed button, the
-    stroke, the held joints, pads(q): the pads' position at joints q)."""
+def _flatbot_turned_down(scene, aimed):
+    """A compliant reach-out on flatbot's URDF as 10-27's flew: the look the
+    planner took for the scene camera's button `scene`, the re-aim and the
+    slide in to the `aimed` one as straight lines at 30 deg, then the turn
+    down after the slide (COMPLIANT_TURN_SHORT_DEG). Returns (chain, model,
+    cfg, the turn's points, the turned hand's quat)."""
     from rammp_box_opening.constants import HOME
     from rammp_box_opening.primitives.look import look_joints
     from rammp_box_opening.runtime.branches import planner_branch
@@ -2373,7 +2627,6 @@ def _flatbot_1623_hold():
 
     chain = ArmChain(path="src/rammp_box_opening/test/data/arm_flatbot_20261021.urdf", root="arm_mount")
     model, cfg = ContainerModel.load(PINK), load_press_demo(PINK)
-    scene, aimed = (0.7248, -0.2860, 0.3125), (0.7213, -0.2970, 0.3125)
     quat_s, _start_s, _bottom_s, look_s = rp.reach_geometry(model, scene, 30, cfg.travel_m)
     q_look = chain.nearest_solution(planner_branch(HOME), look_s, quat_s, seeds=(look_joints(HOME),))
     quat, start, _bottom, look = rp.reach_geometry(model, aimed, 30, cfg.travel_m)
@@ -2381,47 +2634,105 @@ def _flatbot_1623_hold():
     slide, _why = chain.straight_line(move[-1], start, quat)
     turn, down, _short, why = dp.turn_down_path(chain, model, slide[-1], rp.CONTACT_TOOL, dp.COMPLIANT_TURN_SHORT_DEG)
     assert why is None, why
+    return chain, model, cfg, turn, down
+
+
+def test_on_flatbot_a_bent_press_pushes_straight_down_where_a_straight_one_shoves_the_pads_aside(
+        ctx, monkeypatch, tmp_path):
+    """15:19 2026-10-27 on flatbot's URDF: the hand turned exactly down over
+    the aimed button and the compliant stroke solved from there, the arm
+    held by the button's bottom (_held_at: the driver's joint spring at
+    rest, the pads pinned on the bottom under the aim). Flown straight on
+    down, as before the bend (BEND_MAX_M 0), the springs push the pads
+    16.7 N down and 5.1 N sideways there — free to slide, across the 44 mm
+    button. Bent (dp.stroke_bend), COMPLIANT_PRESS_N straight down and
+    nothing sideways: the held arm is the bend's start (to the straight
+    line's IK tolerance), and the hold (dp.compliant_hold) reads it so. The
+    bend moves the pads' reference 11 mm aside, 32 mm below the bottom, its
+    end 0.046 rad off the bottom's joints; k at the bottom is 467 N/m."""
+    import test_reach_press as trp
+
+    chain, _model, cfg, turn, down = _flatbot_turned_down(trp.SCENE_1519, trp.AIMED_1519)
+    assert rp.hand_lean(rp._rot(down)) < 1e-6  # exactly down
+    bottom = trp.AIMED_1519[2] - cfg.button_travel_m
+    real = dp.BEND_MAX_M
+    pushes, notes = {}, {}
+    for bent in (False, True):
+        monkeypatch.setattr(dp, "BEND_MAX_M", real if bent else 0.0)
+        stroke, why = dp.compliant_stroke(chain, cfg, turn[-1], down, trp.AIMED_1519[2])
+        assert why is None and stroke.bent == bent, why
+        held, f = _held_at(chain, stroke.q_end, [stroke.pad0[0], stroke.pad0[1], bottom])
+        pushes[bent] = -f  # the pads' push on the button
+        (tmp_path / str(bent)).mkdir()
+        result, notes[bent] = _hold_note(ctx, monkeypatch, tmp_path / str(bent), chain, stroke, held)
+        assert result.press_n == pytest.approx(f[2], abs=0.01) and notes[bent]["felt"]
+        assert notes[bent]["sideways_n"] == pytest.approx(np.hypot(*f[:2]), abs=0.06)
+    straight, bent = pushes[False], pushes[True]
+    assert -straight[2] == pytest.approx(16.7, abs=0.3) and np.hypot(*straight[:2]) == pytest.approx(5.1, abs=0.3)
+    assert -bent[2] == pytest.approx(dp.COMPLIANT_PRESS_N, abs=0.05) and np.hypot(*bent[:2]) < 0.05
+    q_b = np.asarray(_straight_end(chain, stroke.legs[-1][1], bottom), float)
+    assert np.abs(held - q_b).max() < 1e-4  # held at the bottom, the arm stands where the bend starts
+    assert notes[True]["press_n"] == pytest.approx(15.0) and notes[True]["sideways_n"] == 0.0
+    assert notes[True]["bent"] and notes[True]["held_off_aim_mm"] == pytest.approx([0.0, 0.0], abs=0.1)
+    assert stroke.k == pytest.approx(467.0, abs=5.0) and stroke.over == pytest.approx(0.032, abs=0.001)
+    assert stroke.bend_m == pytest.approx(0.011, abs=0.001) and notes[True]["bend_mm"] == pytest.approx(11.0, abs=1.0)
+    assert float(np.abs(np.asarray(stroke.q_end) - q_b).max()) == pytest.approx(0.046, abs=0.003)
+    assert ("PRESS (compliant): straight down 72 mm to the button's bottom, its reference on 32 mm below it and 11 mm "
+            "aside, where the springs push ~15 N straight down on the pads held there (467 N/m at the pads); held 0.3 s"
+            ) in dp.press_text(stroke, cfg)
+
+
+def _flatbot_1623_hold():
+    """16:23's aimed button on flatbot's URDF, the hand turned 12 deg short
+    after the slide and the compliant stroke solved from there (as in
+    test_on_flatbot_1623s_aimed_button_is_pressed_turning_12_deg_short_after_the_slide),
+    and the arm held by the button: STIFF's joint springs about the stroke's
+    end (stroke.q_end), the pads pinned where the stroke's straight part met
+    the button's bottom (_held_at). Returns (chain, model, cfg, the aimed
+    button, the stroke, the held joints, pads(q): the pads' position at
+    joints q)."""
+    aimed = (0.7213, -0.2970, 0.3125)
+    chain, model, cfg, turn, down = _flatbot_turned_down((0.7248, -0.2860, 0.3125), aimed)
     stroke, why = dp.compliant_stroke(chain, cfg, turn[-1], down, aimed[2])
     assert why is None, why
 
     def pads(q):
-        R, t = chain.fk(list(q))
-        return np.asarray(t, float) + np.asarray(R, float) @ np.asarray(dp.DOWN_CONTACT_TOOL, float)
+        return _pads_at(chain, q)
 
-    def jac(q):
-        J = np.zeros((3, 7))
-        for i in range(7):
-            d = np.zeros(7)
-            d[i] = 1e-6
-            J[:, i] = (pads(q + d) - pads(q - d)) / 2e-6
-        return J
-
-    q_end = np.asarray(stroke.legs[-1][1][-1], float)
-    compliance = 1.0 / np.asarray(dp.COMPLIANT_KQ, float)
-    held = q_end.copy()
-    for _ in range(20):  # the force at the pads that holds them `over` up, where they met the button
-        J = jac(held)
-        held = q_end + compliance * (J.T @ np.linalg.solve(J @ np.diag(compliance) @ J.T, [0.0, 0.0, stroke.over]))
+    b = pads(_straight_end(chain, stroke.legs[-1][1], aimed[2] - cfg.button_travel_m))
+    held, _f = _held_at(chain, stroke.q_end, b)
     return chain, model, cfg, aimed, stroke, held, pads
 
 
-def test_on_flatbot_the_way_back_up_from_1623s_hold_only_rises():
-    """16:23's press on flatbot's URDF, the arm held by the button
-    (_flatbot_1623_hold). The held arm stands past DRIFT_REPLAN_RAD from the
-    commanded end, and the stroke's sample nearest it in joint space 20 mm
-    and more below the held pads. The way back up joins the stroke 15-17 mm
-    above them, its step there well inside RISE_FIRST_STEP_MAX_RAD, the pads
-    never lower than held on it."""
+@pytest.mark.parametrize("bent", [True, False])
+def test_on_flatbot_the_way_back_up_from_1623s_hold_only_rises(monkeypatch, bent):
+    """16:23's press on flatbot's URDF, the arm held by the button's bottom
+    (_flatbot_1623_hold). Bent (dp.stroke_bend), the held arm IS the
+    stroke's own sample there, where the bend starts — the springs' static
+    balance — 0.035 rad off the commanded end. Flown straight on down, as a
+    bend past BEND_MAX_M flies, it stands past DRIFT_REPLAN_RAD from the
+    commanded end, and the stroke's sample nearest it in joint space 15 mm
+    and more below the held pads. Either way the way back up joins the
+    stroke 15-17 mm above them, its step there well inside
+    RISE_FIRST_STEP_MAX_RAD, the pads never lower than held on it."""
     from rammp_box_opening.constants import DRIFT_REPLAN_RAD
 
+    if not bent:
+        monkeypatch.setattr(dp, "BEND_MAX_M", 0.0)
     chain, _model, _cfg, _aimed, stroke, held, pads = _flatbot_1623_hold()
-    q_end = np.asarray(stroke.legs[-1][1][-1], float)
+    assert stroke.bent == bent
+    q_end = np.asarray(stroke.q_end, float)
+    assert list(q_end) == [float(v) for v in stroke.legs[-1][1][-1]]  # the stroke's last joints
     floor = float(pads(held)[2])
     assert floor - float(pads(q_end)[2]) == pytest.approx(stroke.over, abs=0.002)
-    assert float(np.abs(held - q_end).max()) > DRIFT_REPLAN_RAD
     samples = np.asarray([q for _n, pts, _s in stroke.legs for q in pts], float)
     nearest = samples[int(np.argmin(np.linalg.norm(samples - held, axis=1)))]
-    assert floor - float(pads(nearest)[2]) > 0.020  # joined there, a second press
+    if bent:
+        assert float(np.abs(held - q_end).max()) == pytest.approx(0.035, abs=0.003)
+        assert float(np.abs(nearest - held).max()) < 1e-6  # joined there, no lower first
+    else:
+        assert float(np.abs(held - q_end).max()) > DRIFT_REPLAN_RAD
+        assert floor - float(pads(nearest)[2]) > 0.015  # joined there, a second press (20 mm)
     rise = dp.rise_back_up(chain, stroke, list(held))
     assert rise is not None and rise[-1] == [float(v) for v in stroke.q0]
     assert 0.015 <= float(pads(rise[1])[2]) - floor <= 0.017
