@@ -256,6 +256,43 @@ def test_every_other_run_still_starts_at_its_exact_rest_pose(monkeypatch, tmp_pa
         assert [k.get("tol") for k in HOME_FIRSTS] == [press_demo.AT_REST_RAD], argv
 
 
+def test_the_flags_of_the_one_run(monkeypatch, tmp_path, capsys):
+    """2026-10-28, the staging mode scrapped: --depth-press is accepted,
+    hidden and without effect (older command lines, sheppy's tasks);
+    --no-scene, whose press was the wrist search's, is gone; --detect-only
+    and --wrist-detect are one or the other."""
+    code, _c, _rows = run_main(monkeypatch, tmp_path / "help", ["--help"], _refused)
+    shown = capsys.readouterr().out
+    usage = shown[: shown.index("\n\n")]
+    options = {ln.split()[0].rstrip(",") for ln in shown.splitlines() if ln.strip().startswith("--")}
+    assert code == 0
+    assert {"--press-only", "--guarded", "--detect-only", "--wrist-detect"} <= options
+    assert "--depth-press" not in options and "--depth-press" not in usage and "--no-scene" not in options
+    for i, argv in enumerate((["--no-scene"], ["--detect-only", "--wrist-detect"])):
+        code, _c, _rows = run_main(monkeypatch, tmp_path / str(i), argv, _refused)
+        assert code == 2, argv  # argparse refuses it: nothing started
+        assert ("unrecognized arguments" if i == 0 else "not allowed with") in capsys.readouterr().err
+
+
+def test_the_wrist_mount_observation_flies_the_look_pose_from_the_exact_rest_pose(monkeypatch, tmp_path, capsys):
+    """--wrist-detect (was --detect-only --no-scene): the scene camera is not
+    asked, the run starts at its exact rest pose (AT_REST_RAD), flies the
+    look pose and reports the wrist's fixes there."""
+    from rammp_box_opening.tasks import press_demo
+
+    reports = []
+    monkeypatch.setattr(press_demo, "detect_only_report", lambda *a, **k: reports.append(a[5]))
+    LOCATES.clear()
+    HOME_FIRSTS.clear()
+    REACH_OUTS.clear()
+    code, _c, _rows = run_main(monkeypatch, tmp_path, ["--wrist-detect"], _refused)
+    assert code == 0 and reports == [False]  # a preview: not --execute
+    assert not LOCATES and not REACH_OUTS
+    assert [k.get("tol") for k in HOME_FIRSTS] == [press_demo.AT_REST_RAD]
+    previewed = [ln.split()[0] for ln in capsys.readouterr().out.splitlines() if ln.split()[1:2] == ["motion"]]
+    assert previewed == ["look"]
+
+
 """main()'s shape around the perception thread, read from its source (no
 rclpy): once the thread spins, every exit — a failed startup included — must
 pass through the finally that stops it, or the interpreter tears rclpy down

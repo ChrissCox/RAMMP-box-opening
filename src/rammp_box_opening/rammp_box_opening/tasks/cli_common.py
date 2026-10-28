@@ -82,7 +82,7 @@ def make_parser(desc):
 def refuse_unmeasured(model, execute, measuring=False):
     """An unmeasured container (measure_me: true — geometry estimated, not
     taped) may not be flown at. `measuring` is the observation that
-    measures it (press_demo --detect-only: the look pose and home, in the
+    measures it (press_demo --wrist-detect: the look pose and home, in the
     bench world above the keep-out band, never near the container), which
     the flag must not lock out (2026-09-22: it did)."""
     if execute and model.measure_me and not measuring:

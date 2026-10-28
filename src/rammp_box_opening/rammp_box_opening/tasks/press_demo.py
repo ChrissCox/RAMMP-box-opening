@@ -41,8 +41,8 @@ mode is gone). States logged one line each:
 the reach-out's depth press position-controlled, with its torque guards and
 at-rest checks, as before 2026-10-27, and ends at the press. --detect-only
 reports the scene camera's fixes for 15 s with nothing moving;
---detect-only --no-scene is the wrist-mount calibration observation (the
-look pose, 15 s of the wrist camera's fixes, home). Without --execute the run is
+--wrist-detect is the wrist-mount calibration observation (the look pose,
+15 s of the wrist camera's fixes, home). Without --execute the run is
 previewed up to the look pose.
 
 --execute alone arms it: NO typed confirmation (owner decision
@@ -52,6 +52,7 @@ measure_me worksheet gate still applies. Without --execute nothing is ever
 sent to the driver: the client is not armed.
 """
 
+import argparse
 import math
 import sys
 import threading
@@ -165,7 +166,7 @@ def build_search_leg(ctx, step, start_joints, watcher):
 
 class _NeverStops:
     """A watcher stand-in for a search leg that must fly to the end: the
-    wrist-mount observation (--detect-only --no-scene) parks at the look pose and
+    wrist-mount observation (--wrist-detect) parks at the look pose and
     reports from there, and record_detection_set stands at each pose."""
 
     @staticmethod
@@ -943,9 +944,9 @@ def scene_detect_report(locator, duration_s=DETECT_REPORT_S):
 
 
 def detect_only_report(node, watcher, ctx, cfg, runner, execute):
-    """--detect-only --no-scene, the wrist-mount calibration observation:
-    hold at the look pose reporting every fresh fix (top-face centre, yaw,
-    footprint), then park home.
+    """--wrist-detect, the wrist-mount calibration observation: hold at the
+    look pose reporting every fresh fix (top-face centre, yaw, footprint),
+    then park home.
 
     Place the container at a TAPE-MEASURED spot first; the printed base
     pose vs truth solves the wrist-mount error."""
@@ -1106,12 +1107,10 @@ def main():
         action="store_true",
         help="stop after the press: the reach-out presses, rises and goes home; the lid stays on",
     )
-    ap.add_argument(
-        "--depth-press",
-        action="store_true",
-        help="always on since 2026-10-28 (the reach-out's depth press is press_demo's run); accepted so older "
-        "command lines still parse",
-    )
+    # always on since 2026-10-28 (the reach-out's depth press IS the run):
+    # accepted, and without effect, so older command lines and sheppy's
+    # local tasks still parse
+    ap.add_argument("--depth-press", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument(
         "--guarded",
         action="store_true",
@@ -1119,18 +1118,17 @@ def main():
         "2026-10-27; it ends at the press (no lid off). Without it the run is COMPLIANT "
         "(constants.COMPLIANT_DEFAULT): joint impedance, nothing it reads stops the arm",
     )
-    ap.add_argument(
+    detect = ap.add_mutually_exclusive_group()
+    detect.add_argument(
         "--detect-only",
         action="store_true",
-        help="report the scene camera's fixes for 15 s and exit; nothing moves. "
-        "With --no-scene: the wrist-mount calibration observation (look pose, "
-        "15 s of wrist fixes, home)",
+        help="report the scene camera's fixes for 15 s and exit; nothing moves",
     )
-    ap.add_argument(
-        "--no-scene",
+    detect.add_argument(
+        "--wrist-detect",
         action="store_true",
-        help="with --detect-only: the wrist-mount calibration observation; its wrist-search press is gone "
-        "(2026-10-28)",
+        help="the wrist-mount calibration observation (was --detect-only --no-scene): the arm to the look pose, "
+        "15 s of the wrist camera's fixes printed, home; the scene camera is not used",
     )
     ap.add_argument(
         "--scene-calib",
@@ -1138,13 +1136,6 @@ def main():
         help="scene camera calibration yaml (default: the installed config/camera_scene.yaml)",
     )
     args = ap.parse_args()
-    # --no-scene's press was the wrist search's, gone with the staging run
-    # (2026-10-28); with --detect-only it is still the wrist-mount observation
-    args.wrist_detect = args.detect_only and args.no_scene
-    args.detect_only = args.detect_only and not args.no_scene
-    if args.no_scene and not args.wrist_detect:
-        sys.exit("[press_demo] not starting: --no-scene's wrist-search press is gone (2026-10-28); "
-                 "--detect-only --no-scene is the wrist-mount observation. Nothing moved.")
     # the reach-out reads it (reach_press.run_reach_press): its depth press
     # is the run (owner 2026-10-28), whatever the command line said
     args.depth_press = True
