@@ -12,7 +12,9 @@ thing it got wrong. So from over the box:
   TURN    the hand straight down where it stands, turning about the
           fingertip so it stays over the button (the reach-out's tilted
           hand; at staging it already points down). If no straight-down
-          hand reaches there, it stops.
+          hand reaches there, it stops. A compliant reach-out solves the
+          turn and its stroke before it flies toward the box
+          (reach_press.way_down, from turn_walk and compliant_stroke).
   DEPTH   the wrist camera, looking down along the tool, measures how far
           below its lens the lid is: the button's own ring if it sees it,
           else where the caller aimed the button (the reach-out's tilted
@@ -465,28 +467,85 @@ def turn_target(model, tip, short_deg):
     return quat, np.asarray(tip, float) - rp._rot(quat) @ np.asarray(DOWN_CONTACT_TOOL)
 
 
-def turn_down(ctx, runner, contact_tool, ref):
-    """Turn the hand straight down where it stands, about its fingertip
-    (`contact_tool`, in tool_frame), guarded. Returns (quat, moved, None) —
-    moved False when it already points down — or (None, False, why)."""
-    from rammp_box_opening.runtime import approach
+@dataclass
+class WayDown:
+    """How the hand comes to point straight down over the button, solved
+    before anything flies (reach_press.way_down)."""
 
-    chain = approach._chain()
-    q = ctx.client.joints()
-    R, t = chain.fk(q)
-    R = np.asarray(R, float)
-    tip = np.asarray(t, float) + R @ np.asarray(contact_tool, float)
-    if math.degrees(math.acos(float(np.clip(-R[2, 2], -1.0, 1.0)))) < 1.0:
-        return mat_to_quat_xyzw(R), False, None  # straight down already
+    pts: list  # the joint waypoints that turn it; [] when the hand already points down
+    quat: list  # its attitude at their end
+    short_deg: float  # how far short of straight down (TURN_SHORT_DEG)
+    walked: bool  # True: one walk from the look pose (walk_in_down), else the turn after the slide
+
+
+@dataclass
+class StrokePlan:
+    """The compliant press's stroke from the hand turned down at `q0`
+    (compliant_stroke): `legs` [(name, joint points, speed)], 'depth:approach'
+    at press_speed to TOUCH_SLOW_M above the button's top — none when the
+    hand already stands that low — then 'depth:press' at TOUCH_SPEED to
+    `end_z`, `over` below the button's bottom, where the spring at the pads
+    (`k`, N/m) pushes COMPLIANT_PRESS_N."""
+
+    legs: list
+    k: float
+    over: float
+    end_z: float
+    t0: object  # the tool at q0 (world)
+    pad0: object  # ... and the pads (DOWN_CONTACT_TOOL)
+    q0: list
+    quat: list
+
+
+def turn_walk(chain, model, q, tip, shorts=TURN_SHORT_DEG):
+    """The walk from joints `q` to the straight-down hand with its pads at
+    `tip` (turn_target), each step solved from the last at TURN_STEP_M and
+    TURN_STEP_RAD, no joint jumping more than TURN_MAX_JUMP_RAD between two:
+    `shorts` tried in order. Returns (points, quat, short, None) or (None,
+    None, None, why)."""
     whys = []
-    for short in TURN_SHORT_DEG:
-        quat, goal = turn_target(ctx.model, tip, short)
+    for short in shorts:
+        quat, goal = turn_target(model, tip, short)
         pts, why = chain.walk(q, goal, quat, step_m=TURN_STEP_M, step_rad=TURN_STEP_RAD, max_step_rad=TURN_MAX_JUMP_RAD)
         if pts is not None:
-            break
+            return pts, quat, short, None
         whys.append("%.0f deg short: %s" % (short, why))
-    else:
-        return None, False, "no straight-down hand reaches here (%s)" % "; ".join(whys)
+    return None, None, None, "; ".join(whys)
+
+
+def walk_down_path(chain, model, q, start_xyz, quat, shorts=TURN_SHORT_DEG):
+    """walk_in_down's path from joints `q` (turn_walk's return): to the
+    straight-down hand whose pads stand where the hand at `quat` puts its
+    fingertip (rp.CONTACT_TOOL) at the slide's end `start_xyz`."""
+    tip = np.asarray(start_xyz, float) + rp._rot(quat) @ np.asarray(rp.CONTACT_TOOL)
+    return turn_walk(chain, model, q, tip, shorts)
+
+
+def turn_down_path(chain, model, q, contact_tool, shorts=TURN_SHORT_DEG):
+    """turn_down's path from joints `q`, about the fingertip (`contact_tool`,
+    in tool_frame) where fk puts it: ([], the hand's quat, 0.0, None) when
+    it is within 1 deg of straight down already, else turn_walk's return."""
+    R, t = chain.fk(q)
+    R = np.asarray(R, float)
+    if math.degrees(math.acos(float(np.clip(-R[2, 2], -1.0, 1.0)))) < 1.0:
+        return [], mat_to_quat_xyzw(R), 0.0, None  # straight down already
+    tip = np.asarray(t, float) + R @ np.asarray(contact_tool, float)
+    return turn_walk(chain, model, q, tip, shorts)
+
+
+def turn_down(ctx, runner, contact_tool, ref, q=None):
+    """Turn the hand straight down where it stands (`q`, else the arm's
+    joints), about its fingertip (`contact_tool`, in tool_frame), guarded.
+    Returns (quat, moved, None) — moved False when it already points down —
+    or (None, False, why)."""
+    from rammp_box_opening.runtime import approach
+
+    q = ctx.client.joints() if q is None else q
+    pts, quat, short, why = turn_down_path(approach._chain(), ctx.model, q, contact_tool)
+    if pts is None:
+        return None, False, "no straight-down hand reaches here (%s)" % why
+    if not pts:
+        return quat, False, None  # straight down already
     if short:
         print("[press_demo] TURN: %.0f deg short of straight down (exactly down does not fly here)" % short)
     # in place, the fingertip the pivot: free air, nothing nearer the lid
@@ -497,31 +556,25 @@ def turn_down(ctx, runner, contact_tool, ref):
     return quat, True, None
 
 
-def walk_in_down(ctx, start_xyz, quat):
+def walk_in_down(ctx, start_xyz, quat, q=None):
     """The reach-out's slide in and the TURN as one walk from where the arm
-    stands (its look pose): to the straight-down hand whose pads stand where
-    the hand at `quat` would put its fingertip (rp.CONTACT_TOOL) at the
-    slide's end `start_xyz`, the tool in a straight line, the attitude
-    turning on the way — TURN_SHORT_DEG tried in order, as turn_down.
-    Flatbot, run 20:04's button at 35 deg: 7.7 s at the slide's speed
-    against 12.0 s for the slide and the turn, the fingertip within 0.6 mm
-    of the slide's line and height. Returns (points, the down quat, None)
-    or (None, None, why)."""
+    stands (its look pose; `q`, else the arm's joints): to the straight-down
+    hand whose pads stand where the hand at `quat` would put its fingertip
+    (rp.CONTACT_TOOL) at the slide's end `start_xyz`, the tool in a straight
+    line, the attitude turning on the way — TURN_SHORT_DEG tried in order,
+    as turn_down. Flatbot, run 20:04's button at 35 deg: 7.7 s at the
+    slide's speed against 12.0 s for the slide and the turn, the fingertip
+    within 0.6 mm of the slide's line and height. Returns (points, the down
+    quat, None) or (None, None, why)."""
     from rammp_box_opening.runtime import approach
 
-    chain = approach._chain()
-    q = ctx.client.joints()
-    tip = np.asarray(start_xyz, float) + rp._rot(quat) @ np.asarray(rp.CONTACT_TOOL)
-    whys = []
-    for short in TURN_SHORT_DEG:
-        down, goal = turn_target(ctx.model, tip, short)
-        pts, why = chain.walk(q, goal, down, step_m=TURN_STEP_M, step_rad=TURN_STEP_RAD, max_step_rad=TURN_MAX_JUMP_RAD)
-        if pts is not None:
-            if short:
-                print("[press_demo] TURN: %.0f deg short of straight down (exactly down does not fly here)" % short)
-            return pts, down, None
-        whys.append("%.0f deg short: %s" % (short, why))
-    return None, None, "; ".join(whys)
+    q = ctx.client.joints() if q is None else q
+    pts, down, short, why = walk_down_path(approach._chain(), ctx.model, q, start_xyz, quat)
+    if pts is None:
+        return None, None, why
+    if short:
+        print("[press_demo] TURN: %.0f deg short of straight down (exactly down does not fly here)" % short)
+    return pts, down, None
 
 
 def touch_leg(ctx, cfg, pts, quat, reference, name="depth:touch", speed=None, arrive_ok=False):
@@ -731,6 +784,38 @@ def fingertip_stiffness_z(chain, q, kq=COMPLIANT_KQ):
     return float("inf") if c <= 0.0 else 1.0 / c
 
 
+def compliant_stroke(chain, cfg, q0, quat, top_z, kq=COMPLIANT_KQ):
+    """press_compliant's stroke from the hand turned down at joints `q0`,
+    holding `quat`, onto the button whose top is at `top_z`, as the arm's
+    own kinematics solves it: straight down to TOUCH_SLOW_M above the top,
+    then to the stroke's end below the button's bottom — as far as the
+    spring there (fingertip_stiffness_z under `kq`) needs to push
+    COMPLIANT_PRESS_N, within COMPLIANT_OVERSHOOT_M. Returns (StrokePlan,
+    None) or (None, why)."""
+    q0 = [float(v) for v in q0]
+    R0, t0 = chain.fk(q0)
+    R0, t0 = np.asarray(R0, float), np.asarray(t0, float)
+    pad0 = t0 + R0 @ np.asarray(DOWN_CONTACT_TOOL, float)
+    k = fingertip_stiffness_z(chain, q0, kq)
+    over = min(max(COMPLIANT_PRESS_N / k, COMPLIANT_OVERSHOOT_M[0]), COMPLIANT_OVERSHOOT_M[1])
+    end_z = float(top_z) - float(cfg.button_travel_m) - over
+    slow_from = float(top_z) + TOUCH_SLOW_M
+    if pad0[2] <= end_z:
+        return None, "the pads already stand %.0f mm below where the press would end" % (1000 * (end_z - pad0[2]))
+    legs, q = [], q0
+    for name, z, speed in (("depth:approach", slow_from, cfg.press_speed), ("depth:press", end_z, TOUCH_SPEED)):
+        _R, t = chain.fk(q)
+        tool_z = float(t0[2]) + (z - float(pad0[2]))  # the attitude held: the tool drops as the pads do
+        if float(t[2]) - tool_z < 0.005:
+            continue  # already this low
+        pts, why = chain.straight_line(q, [float(t0[0]), float(t0[1]), tool_z], quat)
+        if pts is None:
+            return None, "the press stroke is not a straight line the arm can fly (%s)" % why
+        legs.append((name, pts, speed))
+        q = pts[-1]
+    return StrokePlan(legs, k, over, end_z, t0, pad0, q0, list(quat)), None
+
+
 def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=None):
     """The COMPLIANT press (COMPLIANT_PRESS_N): from where the hand stands
     over the button, turned down (`turned`, else TURN here), straight down
@@ -750,31 +835,16 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
         if quat is None:
             return DepthPress(free=why.startswith("no straight-down"), why=why)
     chain = approach._chain()
-    q0 = [float(v) for v in ctx.client.joints()]
-    R0, t0 = chain.fk(q0)
-    R0, t0 = np.asarray(R0, float), np.asarray(t0, float)
-    pad0 = t0 + R0 @ np.asarray(DOWN_CONTACT_TOOL, float)
-    k = fingertip_stiffness_z(chain, q0)
-    over = min(max(COMPLIANT_PRESS_N / k, COMPLIANT_OVERSHOOT_M[0]), COMPLIANT_OVERSHOOT_M[1])
-    end_z = float(top_z) - float(cfg.button_travel_m) - over
-    slow_from = float(top_z) + TOUCH_SLOW_M
-    if pad0[2] <= end_z:
-        return DepthPress(free=True, why="the pads already stand %.0f mm below where the press would end" % (
-            1000 * (end_z - pad0[2])))
+    stroke, why = compliant_stroke(chain, cfg, ctx.client.joints(), quat, top_z)
+    if stroke is None:
+        return DepthPress(free=True, why=why)
+    t0, pad0, k, over, end_z = stroke.t0, stroke.pad0, stroke.k, stroke.over, stroke.end_z
     world = _full_world(ctx)
-    legs, q = [], q0
-    for name, z, speed in (("depth:approach", slow_from, cfg.press_speed), ("depth:press", end_z, TOUCH_SPEED)):
-        _R, t = chain.fk(q)
-        tool_z = float(t0[2]) + (z - float(pad0[2]))  # the attitude held: the tool drops as the pads do
-        if float(t[2]) - tool_z < 0.005:
-            continue  # already this low
-        pts, why = chain.straight_line(q, [float(t0[0]), float(t0[1]), tool_z], quat)
-        if pts is None:
-            return DepthPress(free=True, why="the press stroke is not a straight line the arm can fly (%s)" % why)
+    legs = []
+    for name, pts, speed in stroke.legs:
         leg = rp.line_leg(ctx, name, pts, quat, speed, None, world)
         leg.gains = COMPLIANT_GAINS
         legs.append(leg)
-        q = pts[-1]
     print("[press_demo] PRESS (compliant): straight down %.0f mm to %.0f mm below the button's bottom — the spring "
           "pushes ~%.0f N there (%.0f N/m at the pads); held %.1f s, then back up. Nothing stops it but the e-stop"
           % (1000 * (pad0[2] - end_z), 1000 * over, k * over, k, cfg.push_hold_s))
