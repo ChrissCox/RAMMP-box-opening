@@ -42,7 +42,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED, TCP_OFFSET_M
+from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED, GAINS_STIFF, IMPEDANCE_KQ, TCP_OFFSET_M
 from rammp_box_opening.models.container import ContainerPose
 from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
 from rammp_box_opening.primitives.core import CONTACT_SHIFT_PAD_M, _full_world, _push_guard_and_verify
@@ -135,10 +135,12 @@ SLIDE_OK_M = 0.015
 # contact, no check: the arm yields. 15:19's touch tripped at 3.4 Nm on
 # joint 4, ~13.5 N at the pads, and the button went.
 COMPLIANT_PRESS_N = 15.0
-COMPLIANT_GAINS = 3  # ImpedanceGains.PROFILE_STIFF: ~440 N/m at the pads over 15:19's box
-# The driver's joint stiffness under that profile, N·m/rad (kinova-gen3-driver
-# interface/gains.cpp kStiff): the robot's, not the scene's
-COMPLIANT_KQ = (160.0, 160.0, 160.0, 160.0, 60.0, 60.0, 60.0)
+COMPLIANT_GAINS = GAINS_STIFF  # ~440 N/m at the pads over 15:19's box
+# The driver's joint stiffness under that profile, N·m/rad (constants
+# IMPEDANCE_KQ, kinova-gen3-driver interface/gains.cpp): the robot's, not the
+# scene's. Taken from the profile the press legs send, so the stiffness at the
+# pads, the overshoot and press_n always model the spring that flies
+COMPLIANT_KQ = IMPEDANCE_KQ[COMPLIANT_GAINS]
 # how far the stroke's end lies below the button's bottom, whatever the
 # stiffness: never a graze, never a ram
 COMPLIANT_OVERSHOOT_M = (0.015, 0.06)

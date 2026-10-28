@@ -105,8 +105,9 @@ class Leg:
     # path is not that line, and its guard was set for the line
     plan_free: bool = False
     # MOTION legs of a compliant run (PlannerClient.compliant): the driver's
-    # ImpedanceGains profile they fly under; None is the session default
-    # (MEDIUM). A position run never sends one.
+    # ImpedanceGains profile they fly under. None is the client's run default
+    # (PlannerClient.compliant_gains, STIFF); an int names a driver profile
+    # (constants.GAINS_*). A position run never sends one.
     gains: int = None
 
 

@@ -631,13 +631,17 @@ def test_settled_efforts_defaults_keep_the_settle():
     assert params["duration_s"].default == 0.15
 
 
-def _compliant_run(monkeypatch, guard, fresh=True, gains=None):
+def _compliant_run(monkeypatch, guard, fresh=True, gains=None, client_gains=None):
     """A compliant client flying one guarded leg; the result settles after a
-    dozen spins. `fresh`: each spin serves a /joint_states."""
+    dozen spins. `fresh`: each spin serves a /joint_states. `client_gains`:
+    the client's own compliant_gains (else it has none set, as _client
+    builds it, and falls back on constants.COMPLIANT_RUN_GAINS)."""
     h = _ScriptedHandle(_cresp(CancelGoal.Response.ERROR_NONE), _ended(5, -6))
     d = _ScriptedDriver(h)
     c = _client(d)
     c.compliant = True
+    if client_gains is not None:
+        c.compliant_gains = client_gains
     spins = {"n": 0}
 
     def spin(node, timeout_sec=0.0):
@@ -654,12 +658,62 @@ def _compliant_run(monkeypatch, guard, fresh=True, gains=None):
 
 
 def test_a_compliant_leg_flies_in_impedance_under_its_gains(monkeypatch):
-    outcome, _info, h, d = _compliant_run(monkeypatch, None, gains=client_mod.GAINS_STIFF)
+    """Owner 2026-10-27: "impedance mode needs to be firmer". A compliant goal
+    that names no gains flies the run's, STIFF — never the driver's session
+    default, MEDIUM, which every goal of 16:23 flew; one that names a
+    profile flies that one, and so does a client told another run default."""
+    outcome, info, h, d = _compliant_run(monkeypatch, None)
     goal, = d.goals
     assert outcome == "arrived" and goal.control_mode == client_mod.IMPEDANCE
-    assert goal.gains.profile == client_mod.GAINS_STIFF
-    outcome, _info, h, d = _compliant_run(monkeypatch, None)
-    assert d.goals[0].gains.profile == 0  # the session default
+    assert client_mod.COMPLIANT_RUN_GAINS == client_mod.GAINS_STIFF == 3
+    assert goal.gains.profile == 3 and info["gains"] == 3
+    _o, info, _h, d = _compliant_run(monkeypatch, None, gains=client_mod.GAINS_MEDIUM)
+    assert d.goals[0].gains.profile == 2 and info["gains"] == 2
+    _o, info, _h, d = _compliant_run(monkeypatch, None, client_gains=client_mod.GAINS_MEDIUM)
+    assert d.goals[0].gains.profile == 2 and info["gains"] == 2
+    _o, info, _h, d = _compliant_run(
+        monkeypatch, None, gains=client_mod.GAINS_STIFF, client_gains=client_mod.GAINS_SOFT
+    )
+    assert d.goals[0].gains.profile == 3 and info["gains"] == 3  # the leg's own wins
+
+
+def test_a_client_built_for_a_run_flies_stiff(monkeypatch):
+    """PlannerClient.__init__ (the rclpy surface stubbed): position until a
+    run sets compliant, STIFF once it does."""
+
+    class _Node:
+        def __getattr__(self, name):  # create_subscription, create_client, ...
+            return lambda *a, **k: None
+
+    for name in ("ActionClient", "Buffer", "TransformListener"):
+        monkeypatch.setattr(client_mod, name, lambda *a, **k: None)
+    c = client_mod.PlannerClient(_Node())
+    assert c.compliant is False and c.compliant_gains == client_mod.GAINS_STIFF
+
+
+class _Rejected:
+    accepted = False
+
+
+class _RejectingDriver(_Driver):
+    def send_goal_async(self, goal, feedback_callback=None):
+        self.goals.append(goal)
+        return _Future(_Rejected())
+
+
+def test_a_compliant_rejection_names_the_gains_it_sent():
+    d = _RejectingDriver()
+    c = _client(d)
+    c.compliant = True
+    outcome, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert outcome == "failed" and "its STIFF gains refused" in info["message"]
+    c.compliant_gains = client_mod.GAINS_MEDIUM
+    _o, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert "its MEDIUM gains refused" in info["message"]
+    c.compliant = False  # a position goal sends none, so none is named
+    _o, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert info["message"] == "goal rejected by the driver (a stream session open, or a mode change while moving)"
+    assert info["gains"] is None and d.goals[-1].gains.profile == 0
 
 
 def test_a_position_leg_sends_no_gains():
@@ -667,6 +721,25 @@ def test_a_position_leg_sends_no_gains():
     c = _client(d)
     c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, gains=client_mod.GAINS_STIFF)
     assert d.goals[0].control_mode == client_mod.POSITION and d.goals[0].gains.profile == 0
+
+
+def test_the_gains_named_here_are_the_drivers_own_profiles():
+    """constants.GAINS_* are robot-body constants copied from the driver:
+    they must be the profile numbers its interface defines, or a run would
+    fly a tuning other than the one its banner and press model name. A goal
+    that names none is PROFILE_SESSION_DEFAULT, which the driver resolves
+    to MEDIUM."""
+    from rammp_arm_interfaces.msg import ImpedanceGains
+
+    from rammp_box_opening import constants
+
+    assert (constants.GAINS_SOFT, constants.GAINS_MEDIUM, constants.GAINS_STIFF) == (
+        ImpedanceGains.PROFILE_SOFT, ImpedanceGains.PROFILE_MEDIUM, ImpedanceGains.PROFILE_STIFF)
+    assert ExecuteJointTrajectory.Goal().gains.profile == ImpedanceGains.PROFILE_SESSION_DEFAULT
+    assert set(constants.IMPEDANCE_KQ) == set(constants.IMPEDANCE_NAMES) == {1, 2, 3}
+    assert all(len(kq) == len(LIVE) for kq in constants.IMPEDANCE_KQ.values())
+    assert constants.COMPLIANT_RUN_GAINS in constants.IMPEDANCE_KQ
+    assert client_mod.GAINS_STIFF is constants.GAINS_STIFF  # client.GAINS_* still name them
 
 
 def test_a_compliant_guard_watches_and_never_stops_the_leg(monkeypatch):

@@ -60,7 +60,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED, TIP_TO_TOOL_M, TRANSIT_SPEED
+from rammp_box_opening.constants import (
+    COMPLIANT_RUN_GAINS,
+    CONTACT_SPEED,
+    FREE_LINE_SPEED,
+    IMPEDANCE_KQ,
+    IMPEDANCE_NAMES,
+    TIP_TO_TOOL_M,
+    TRANSIT_SPEED,
+)
 from rammp_box_opening.geometry import rotate_about_world_axis
 from rammp_box_opening.models.container import ContainerPose, attitude_quat
 from rammp_box_opening.primitives.core import (
@@ -367,6 +375,15 @@ def unload_guard(model, reference, hang_k):
 def compliant(ctx):
     """A compliant run (PlannerClient.compliant): impedance, nothing stops it."""
     return bool(getattr(ctx.client, "compliant", False))
+
+
+def gains_text(profile):
+    """A driver gains profile as the console names it, e.g. "STIFF (Kq 160/60
+    N·m/rad on joints 1-4/5-7)"."""
+    p = int(profile)
+    kq = IMPEDANCE_KQ.get(p)
+    name = IMPEDANCE_NAMES.get(p, "gains profile %d" % p)
+    return name if kq is None else "%s (Kq %g/%g N·m/rad on joints 1-4/5-7)" % (name, kq[0], kq[4])
 
 
 def free_guard(ctx, reference, hang_k=None):
@@ -794,7 +811,8 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     moved or the knob not up, 2 no button.
 
     COMPLIANT (args.compliant with --depth-press, press_demo's default
-    since 2026-10-27): every leg in the driver's joint impedance, and
+    since 2026-10-27): every leg in the driver's joint impedance, under the
+    client's compliant_gains (STIFF) where a leg names none, and
     nothing the run reads stops the arm — no torque guard, no at-rest read
     or check, no look after the press (depth_press.press_compliant). The
     box's height is the higher of the aim's and the scene camera's (15:19:
@@ -804,8 +822,9 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     was = getattr(ctx.client, "compliant", False)
     if on:
         ctx.client.compliant = True
-        print("[press_demo] COMPLIANT: every move in the arm's joint impedance, and nothing the run reads stops it — "
-              "no torque guard, no at-rest check, no look after the press. The e-stop and Ctrl+C stop it")
+        print("[press_demo] COMPLIANT: every move in the arm's joint impedance, %s, and nothing the run reads stops "
+              "it — no torque guard, no at-rest check, no look after the press. The e-stop and Ctrl+C stop it"
+              % gains_text(getattr(ctx.client, "compliant_gains", COMPLIANT_RUN_GAINS)))
     try:
         return _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator)
     finally:
