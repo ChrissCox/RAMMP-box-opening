@@ -12,8 +12,9 @@ reach (press_demo.staging_out_of_reach):
           the press attitude. The wrist
           camera looks down at the lid from there and aims (the oblique aim,
           perception/button_aim). The box is put where the aim found it and
-          the hand moves to THAT button's look pose along a guarded straight
-          line — the scene camera's box can be 8-10 cm off.
+          the hand moves to THAT button's look pose along a straight line,
+          guarded in a guarded run — the scene camera's box can be 8-10 cm
+          off.
   SLIDE   a plan-free straight line in and down, holding the attitude, to
           REACH_START_M above the aimed button. Guarded at DRAG_NM in a
           guarded run.
@@ -963,9 +964,10 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         if at_look is None:
             return 1
     # With the depth press the slide in also turns the hand straight down,
-    # its pads ending where the tilted fingertip would: one walk, as slow
-    # and as guarded as the slide, never lower than it (tasks/depth_press
-    # walk_in_down). Where no such walk flies, the slide, then the TURN.
+    # its pads ending where the tilted fingertip would: one walk, flown as
+    # the slide is (line_speed, the slide's guard), never lower than it
+    # (tasks/depth_press walk_in_down). Where no such walk flies, the slide,
+    # then the TURN.
     walk, turned = None, None
     if depth:
         from rammp_box_opening.tasks.depth_press import walk_in_down

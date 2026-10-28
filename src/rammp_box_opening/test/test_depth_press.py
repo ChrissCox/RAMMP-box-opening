@@ -1385,6 +1385,24 @@ def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx,
     assert not ctx.client.compliant  # the client is as it was once the run is over
 
 
+def test_a_compliant_walk_in_flies_at_the_free_line_speed_too(ctx, monkeypatch, tmp_path):
+    """Where the slide in turns the hand down on the way (the walk, as at
+    20:04), the walk is the compliant run's slide in: unguarded, at
+    FREE_LINE_SPEED, labelled with the full world, and not refused."""
+    import test_reach_press as trp
+
+    from rammp_box_opening.constants import FREE_LINE_SPEED
+
+    monkeypatch.setattr(trp._Chain, "walk", lambda self, q0, xyz, quat, **k: ([list(q0), [v + 0.01 for v in q0]], None),
+                        raising=False)
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True)
+    assert code == 0 and got["compliant"] and rec.reads == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
+    leg = rec.legs["reach:slide-in"]
+    assert rp._rot(leg.target[2])[2, 2] == pytest.approx(-1.0)  # the walk's: the hand turned straight down
+    assert leg.guard is None and leg.speed == FREE_LINE_SPEED and leg.world.startswith("full"), (leg.speed, leg.world)
+
+
 def test_a_guarded_reach_out_is_as_before(ctx, monkeypatch, tmp_path):
     from rammp_box_opening.constants import CONTACT_SPEED
 
