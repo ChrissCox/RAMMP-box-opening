@@ -298,10 +298,17 @@ vlm:                              # detect.source: vlm — the semantic gate
                                   # scores; the RANKING is what carries.
   owl_min_score: 0.18             # false positives sat at 0.12-0.18 on the
                                   # captures; the true box at 0.235-0.249
-  owl_min_score_scene: 0.12       # the scene camera's floor (was the launch
+  owl_min_score_scene: 0.05       # the scene camera's floor (was the launch
                                   # file's): from a metre the box scores lower,
                                   # and the lid-slab geometry behind it rejects
-                                  # anything that is not this box's top
+                                  # anything that is not this box's top.
+                                  # 0.12 -> 0.05 (2026-10-27): 16:22 and 16:24
+                                  # ("saw no box in 15 s") were floor misses,
+                                  # the pale lid at 0.07-0.10; with no floor at
+                                  # all the gate refused every distractor, and
+                                  # on upright frames the OWL goes from 32/37
+                                  # to 34/37 detbench frames with no wrong fix.
+                                  # The OWL is the FALLBACK here (scene_detect)
   model: claude-opus-5            # measured 2026-09-01: 3.3 s, box dead-on;
                                   # claude-haiku-4-5 was 0.4 s faster and
                                   # boxed the ROBOT'S OWN BASE. Fast loses.
@@ -309,6 +316,12 @@ vlm:                              # detect.source: vlm — the semantic gate
   timeout_s: 20.0                 # API budget; past it the mission falls
                                   # back to plain depth, never stalls
   pad_px: 20                      # bbox padding before it gates the depth
+scene_detect:                     # the scene camera's box, from sheppy's always-on scene_segmenter
+  segmenter_classes: [food container]  # RF-DETR boxes the blue holder as COCO "bowl" = food container: 37/37
+                                  # detbench frames, nothing else boxed as one at the node's 0.25. Never other
+                                  # classes: class-agnostic boxes gave the only wrong fixes (keyboard, TV)
+  segmenter_box: holder           # its box is the HOLDER: the band above it is gated (object geometry: the lid
+                                  # stands on its holder). as_is: the box is the container itself
 detect:
   confirm_in_flight: false        # true: with the scene camera's coarse fix,
                                   # the approach and the guarded descent fly
