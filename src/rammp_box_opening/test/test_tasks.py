@@ -3121,6 +3121,100 @@ def test_the_run_starts_by_going_home_unless_already_there(ctx, tmp_path, capsys
     assert "HOME FIRST" in capsys.readouterr().out
 
 
+# the joint spring's hold after an impedance home: 0.03 rad off at worst, as
+# flatbot 2026-10-27 16:24 printed it (the other joints' offsets are made up),
+# joint_3 read through the driver's wrap
+_HOLD = [0.0, 0.03, -0.006, -0.02, 0.0, 0.012, 0.0]
+
+
+def _held(home):
+    q = [h + d for h, d in zip(home, _HOLD)]
+    q[2] += 2 * math.pi  # -3.143 is past -pi: the driver reports joint_3 there as +3.140
+    return q
+
+
+def _rows(log_dir):
+    import json
+
+    return [json.loads(line) for f in sorted(log_dir.glob("run-*.jsonl")) for line in open(f)]
+
+
+def test_a_compliant_run_starts_from_the_impedance_hold_it_finds(ctx, tmp_path, capsys):
+    """Flatbot 2026-10-27 16:24: the run after the first compliant run found
+    the arm 0.03 rad off HOME (the spring's hold) and flew a POSITION home
+    before anything else: a 0.14 s plan, 0.55 s flown (0.25 s of it the
+    switch out of impedance), the switch back still to come. Within
+    REST_TOL_RAD (main's tolerance for a compliant depth press) it starts
+    from there: nothing planned or flown, the offsets logged."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import HOME, REST_TOL_RAD
+    from rammp_box_opening.tasks import press_demo
+
+    ctx.client.live = _held(HOME)
+    assert press_demo.home_first(ctx, make_runner(ctx.client, tmp_path), True, list(HOME), tol=REST_TOL_RAD)
+    assert ctx.client.executed == [] and ctx.client.joint_targets == [] and ctx.worlds.pushes == []
+    out = capsys.readouterr().out
+    assert "HOME FIRST" not in out
+    assert "0.030 rad from its rest pose — the joint spring's hold after an impedance run; starting from there" in out
+    (note,) = _rows(tmp_path)
+    assert note["leg"] == "start_offset" and note["kind"] == "note"
+    assert note["rad"] == pytest.approx(0.03, abs=1e-4)
+    assert note["per_joint"] == pytest.approx(_HOLD, abs=1e-4)  # wrap-aware, signed live - rest
+
+
+def test_the_same_hold_is_flown_home_with_the_default_tolerance(ctx, tmp_path, capsys):
+    """Every other run (--guarded, no --depth-press, --no-scene) keeps
+    AT_REST_RAD: from the same 0.03 rad, HOME FIRST flies, as before."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import HOME
+    from rammp_box_opening.tasks import press_demo
+
+    ctx.client.live = _held(HOME)
+    assert press_demo.home_first(ctx, make_runner(ctx.client, tmp_path), True, list(HOME))
+    assert len(ctx.client.executed) == 1 and len(ctx.client.joint_targets) == 1
+    assert ctx.client.joint_targets[-1] == pytest.approx(list(HOME), abs=1e-9)
+    assert "HOME FIRST: the arm is 0.03 rad from its rest pose" in capsys.readouterr().out
+    assert [r["leg"] for r in _rows(tmp_path)] == ["home"]  # no start_offset note
+
+
+def test_a_start_beyond_the_compliant_tolerance_goes_home_first_either_way(ctx, tmp_path, capsys):
+    """0.06 rad off is past REST_TOL_RAD too: HOME FIRST flies whichever
+    tolerance the run passed."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import HOME, REST_TOL_RAD
+    from rammp_box_opening.tasks import press_demo
+
+    for i, tol in enumerate((press_demo.AT_REST_RAD, REST_TOL_RAD)):
+        ctx.client.live = list(HOME)
+        ctx.client.live[1] += 0.06
+        log_dir = tmp_path / str(i)
+        assert press_demo.home_first(ctx, make_runner(ctx.client, log_dir), True, list(HOME), tol=tol)
+        assert len(ctx.client.executed) == i + 1, tol
+        assert ctx.client.joint_targets[-1] == pytest.approx(list(HOME), abs=1e-9)
+        out = capsys.readouterr().out
+        assert "HOME FIRST: the arm is 0.06 rad" in out and "spring's hold" not in out, tol
+        assert [r["leg"] for r in _rows(log_dir)] == ["home"], tol
+
+
+def test_the_start_line_tells_a_stiff_hold_from_the_rest_pose(ctx, tmp_path, capsys):
+    """STIFF doubles MEDIUM's Kq, so its hold should sit about 0.015 rad off
+    HOME: past AT_REST_RAD, and printed so — two decimals made it "0.01",
+    AT_REST_RAD's own value, on a start that is not at rest."""
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.constants import HOME, REST_TOL_RAD
+    from rammp_box_opening.tasks import press_demo
+
+    ctx.client.live = list(HOME)
+    ctx.client.live[1] += 0.015
+    assert press_demo.home_first(ctx, make_runner(ctx.client, tmp_path), True, list(HOME), tol=REST_TOL_RAD)
+    assert ctx.client.executed == []
+    assert "the arm rests 0.015 rad from its rest pose" in capsys.readouterr().out
+
+
 def test_a_home_the_bench_world_refuses_moves_nothing_and_names_the_recovery(ctx, tmp_path, capsys):
     """An arm down at the table is home_arm's case (bare-world and
     lift-first fallbacks, the operator's eye on the bench): the run does not

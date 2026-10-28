@@ -90,6 +90,7 @@ class _Watcher:
 
 
 LOCATES = []  # every timeout the scene locator was asked for, in order
+HOME_FIRSTS = []  # the keywords of every home_first call, in order
 
 
 def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
@@ -162,7 +163,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
     monkeypatch.setattr(scene_source, "SceneLocator", _Locator)
     monkeypatch.setattr(scene_calib, "scene_tag_px", lambda p: None)
     monkeypatch.setattr(press_demo, "readiness_refusal", lambda *a, **k: None)
-    monkeypatch.setattr(press_demo, "home_first", lambda *a, **k: True)
+    monkeypatch.setattr(press_demo, "home_first", lambda *a, **k: HOME_FIRSTS.append(k) or True)
     monkeypatch.setattr(press_demo, "MissionFrames", lambda *a, **k: None)
     monkeypatch.setattr(press_demo, "CAPTURES_DIR", tmp_path / "captures")
     monkeypatch.setattr(press_demo, "residuals_path_for", lambda p: tmp_path / "residuals.jsonl")
@@ -250,6 +251,43 @@ def test_the_first_look_for_the_box_keeps_at_it_longer_than_a_re_check(monkeypat
     client.exec_script = [TOUCH]
     run_main(monkeypatch, tmp_path, ["--execute", "--press-only"], _at_staging(), client=client)
     assert LOCATES[0] == press_demo.SCENE_FIRST_LOCATE_S > press_demo.SCENE_LOCATE_S
+
+
+def _refused(ctx):
+    """The scene approach refused: the run goes home and stops (exit 1),
+    right after the start these tests are about."""
+    from rammp_box_opening.tasks.press_demo import SceneApproach
+
+    return SceneApproach(failed=True, status="the approach to staging was refused (IK_FAIL)")
+
+
+def test_a_compliant_depth_press_run_starts_from_the_spring_hold_it_finds(monkeypatch, tmp_path):
+    """Flatbot 2026-10-27 16:24: the run after a compliant run found the arm
+    0.03 rad off HOME, the joint spring's hold, and flew a POSITION home
+    before anything else. A default --depth-press run (compliant, the scene
+    camera's reach-out) takes a start within REST_TOL_RAD as there."""
+    from rammp_box_opening.constants import REST_TOL_RAD
+
+    HOME_FIRSTS.clear()
+    code, _c, _rows = run_main(monkeypatch, tmp_path, ["--execute", "--depth-press"], _refused)
+    assert code == 1
+    assert [k.get("tol") for k in HOME_FIRSTS] == [REST_TOL_RAD]
+
+
+def test_every_other_run_still_starts_at_its_exact_rest_pose(monkeypatch, tmp_path):
+    """--guarded reads its at-rest reference at the rest pose and checks
+    gravity against it; without --depth-press, or with --no-scene, there is
+    no compliant reach-out. All of them keep AT_REST_RAD."""
+    from rammp_box_opening.tasks import press_demo
+
+    # --no-scene's run stops where the others do: its search's first step fails (exit 1)
+    monkeypatch.setattr(press_demo, "search_for_box", lambda *a, **k: (None, "look"))
+    for i, argv in enumerate((["--execute", "--depth-press", "--guarded"], ["--execute"],
+                              ["--execute", "--depth-press", "--no-scene"])):
+        HOME_FIRSTS.clear()
+        code, _c, _rows = run_main(monkeypatch, tmp_path / str(i), argv, _refused)
+        assert code == 1, argv
+        assert [k.get("tol") for k in HOME_FIRSTS] == [press_demo.AT_REST_RAD], argv
 
 
 def test_an_open_box_seen_by_the_re_aim_over_the_button_is_not_pressed(monkeypatch, tmp_path, capsys):
