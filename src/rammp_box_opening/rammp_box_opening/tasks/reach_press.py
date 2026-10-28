@@ -112,8 +112,28 @@ def reach_push_m(cfg, tilt_deg):
 # approach) — and the unload ends there: above a popped knob's 10-25 mm
 REACH_START_M = 0.06
 # Before planning home from over the box, the tool this far above the box's
-# padded cuboid: the finger collision spheres reach 4-6 cm below tool_frame
+# padded cuboid (worlds.planned_top_z). The planner's lowest collision
+# spheres belong to the gripper's base link, not the fingers (rammp_curobo
+# configs/robot_gen3_2f85.yaml: arm_robotiq_85_base_link centres
+# (+-0.045, 0, 0.145) and (0, +-0.045, 0.145), r 0.018 + its
+# collision_sphere_buffer 0.005), 25 mm past tool_frame and
+# HAND_SPHERE_OFF_AXIS_M off its axis. Their lowest point is
+# 0.025 cos(lean) + 0.045 sin(lean) + 0.023 below tool_frame: 48 mm with the
+# hand straight down, which this leaves 12 mm clear; 67 mm at 30 deg, which
+# it leaves 7 mm INSIDE the padded cuboid (2026-10-27 16:23: home refused
+# INVALID_START_STATE_WORLD_COLLISION after the clear, then a 15 cm
+# back-off). The four are symmetric, so the sin term bounds every lean.
 HOME_CLEAR_M = 0.06
+# A compliant run's clear (clear_targets) stands that, plus what the hand's
+# lean hangs those spheres lower (HAND_SPHERE_OFF_AXIS_M: the robot's body,
+# not the scene's), plus CLEAR_EXTRA_M over the padded cuboid, and pulls
+# back toward the arm CLEAR_BACK_M as it rises, else REACH_PULLBACK_M.
+# Straight up, a hand turned down drives joint_6 into its limit (15:19:
+# 0.104 rad, a 1.44 s clear-margin step; 14:33: no line up flew, home was
+# refused START_IN_LIMIT_MARGIN and the arm held over the box).
+HAND_SPHERE_OFF_AXIS_M = 0.045
+CLEAR_EXTRA_M = 0.005
+CLEAR_BACK_M = 0.05
 # The look pose, pulled back toward the arm from the stroke's start: 15-20 cm
 # plans in the full world at both spots, 10 cm does not — the gripper meets
 # the padded container cuboid (planner probe 2026-10-22).
@@ -528,13 +548,15 @@ def _home_legs(ctx, cfg):
                        "(last: %s) — jog the arm clear by hand" % (CLEAR_MARGIN_MAX_STEP_RAD, last))
 
 
-def _back_off(ctx, runner, ref=None):
+def _back_off(ctx, runner, ref=None, why=None):
     """Straight back toward the arm by REACH_PULLBACK_M, level, at the
     hand's own attitude — guarded, like the slide out: out of the
     padded cuboid of a box that is not where the arm's pose was planned
     around, so the planner takes the start again. Guarded against `ref`, a
-    free-air reading the caller already holds, else one read here. False
-    when it cannot be flown or met something."""
+    free-air reading the caller already holds, else one read here. `why`:
+    the planner's refusal of home from here, printed as it said it — not
+    always the box's padded volume (INVALID_START_STATE_JOINT_LIMITS takes
+    the back-off too). False when it cannot be flown or met something."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
 
@@ -545,16 +567,17 @@ def _back_off(ctx, runner, ref=None):
     d = math.hypot(bx, by)
     target = [float(t[0]) - REACH_PULLBACK_M * bx / d, float(t[1]) - REACH_PULLBACK_M * by / d, float(t[2])]
     quat = mat_to_quat_xyzw(R)
-    pts, why = chain.straight_line(q, target, quat)
+    pts, why_line = chain.straight_line(q, target, quat)
     if pts is None:
-        print("[press_demo] the way back off toward the arm is not a straight line the arm can fly (%s)" % why)
+        print("[press_demo] the way back off toward the arm is not a straight line the arm can fly (%s)" % why_line)
         return False
     if not compliant(ctx):
         ref = ref or _settled(ctx, "where the arm stands")
         if ref is None:
             return False
-    print("[press_demo] the planner sees the arm inside the box's padded volume — backing %.0f cm straight off toward "
-          "the arm first" % (100 * REACH_PULLBACK_M))
+    said = ("the planner sees the arm inside the box's padded volume" if why is None
+            else "the planner refused home from here (%s)" % _short(why))
+    print("[press_demo] %s — backing %.0f cm straight off toward the arm first" % (said, 100 * REACH_PULLBACK_M))
     # from free air only (_go_home's callers), level and away from the box
     res = runner.run([line_leg(ctx, "reach:back-off", pts, quat, FREE_LINE_SPEED, free_guard(ctx, ref),
                                _full_world(ctx))], execute=True)
@@ -564,18 +587,19 @@ def _back_off(ctx, runner, ref=None):
 def _go_home(ctx, cfg, runner, why, ref=None):
     """Home from free air (the look pose, or where the run started), planned
     in the full world around the box where it now is. A start the planner
-    sees inside the box's padded cuboid (the box not where the pose was
-    planned around: the scene camera 85 mm off, 2026-10-22) backs straight
-    off toward the arm first (guarded against `ref` when given). Every
-    refusal is in the run log. False — the arm holds — when the plan is
-    refused or a move fails."""
+    refuses INVALID_START — inside the box's padded cuboid (the box not
+    where the pose was planned around: the scene camera 85 mm off,
+    2026-10-22), or INVALID_START_STATE_JOINT_LIMITS, which the same test
+    takes — backs straight off toward the arm first (guarded against `ref`
+    when given), the refusal printed. Every refusal is in the run log.
+    False — the arm holds — when the plan is refused or a move fails."""
     if why:
         print("[press_demo] %s — returning home" % why)
     try:
         legs = _home_legs(ctx, cfg)
     except RuntimeError as e:
         runner.note("home_refused", why=str(e)[:300])
-        if "INVALID_START" not in str(e) or not _back_off(ctx, runner, ref):
+        if "INVALID_START" not in str(e) or not _back_off(ctx, runner, ref, why=str(e)):
             print("[press_demo] home plan refused (%s) — the arm holds; home it with sheppy's home_arm" % _short(e))
             return False
         try:
@@ -588,21 +612,105 @@ def _go_home(ctx, cfg, runner, why, ref=None):
     return all(r.ok for r in res)
 
 
+def hand_lean(R):
+    """How far the hand at attitude `R` (tool_frame in the world) leans off
+    straight down (rad), as depth_press.turn_down measures it."""
+    return math.acos(float(np.clip(-float(np.asarray(R, float)[2, 2]), -1.0, 1.0)))
+
+
+def clear_targets(ctx, R, t):
+    """Where a compliant run's clear takes the tool from (R, t) over the
+    box, in the order they are tried: HOME_CLEAR_M + CLEAR_EXTRA_M over the
+    box's padded cuboid, higher by what the hand's lean hangs the planner's
+    lowest gripper spheres lower (HAND_SPHERE_OFF_AXIS_M sin(lean)) — so
+    they clear it by 17 mm or more at any lean — and never lower than the
+    hand; and back toward the arm along the box's bearing, CLEAR_BACK_M,
+    then REACH_PULLBACK_M: where 16:23's planner took home after its 15 cm
+    back-off."""
+    from rammp_box_opening.worlds import planned_top_z
+
+    want = (planned_top_z(ctx.model, ctx.cpose) + HOME_CLEAR_M + HAND_SPHERE_OFF_AXIS_M * math.sin(hand_lean(R))
+            + CLEAR_EXTRA_M)
+    z = max(float(t[2]), want)
+    bx, by = float(ctx.cpose.xyz[0]), float(ctx.cpose.xyz[1])
+    d = math.hypot(bx, by)
+    return [[float(t[0]) - b * bx / d, float(t[1]) - b * by / d, z] for b in (CLEAR_BACK_M, REACH_PULLBACK_M)]
+
+
+def _near_a_limit(ctx, q):
+    """The joints `q` holds too near a limit for home to plan from without
+    _home_legs' clear-margin step (primitives.ClearMarginFree.near, whose
+    goal does not enter it), as text; "" when none is."""
+    return ", ".join("%s %.3f rad from its limit" % jr for jr in ClearMarginFree(q).near(ctx, q))
+
+
+def _clear_up_and_back(ctx, runner, R, t):
+    """_clear_over_box for a compliant run: up and back toward the arm to
+    the first of clear_targets whose straight line flies and leaves every
+    joint room for home to plan from (_near_a_limit), else the first whose
+    line flies — unguarded, at FREE_LINE_SPEED. Flatbot's URDF, 15:19's box
+    pressed from the scene camera's top (0.3111), turned down: the 50 mm
+    line ends with arm_joint_6 0.160 rad from its limit, the 150 mm one
+    0.368. True when there (or already high enough), None when no line
+    flies (the back-off is the fallback), False — the arm holds — when the
+    leg failed."""
+    from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
+
+    targets = clear_targets(ctx, R, t)
+    if float(t[2]) >= targets[0][2]:
+        return True
+    quat = mat_to_quat_xyzw(R)
+    up, lean = targets[0][2] - float(t[2]), math.degrees(hand_lean(R))
+    chosen, whys = None, []
+    for target in targets:
+        back = math.hypot(target[0] - float(t[0]), target[1] - float(t[1]))
+        pts, why = _line(ctx, target, quat)
+        if pts is None:
+            whys.append("%.0f mm back: %s" % (1000 * back, why))
+            continue
+        if not pts:
+            return True
+        near = _near_a_limit(ctx, pts[-1])
+        if chosen is None or not near:
+            chosen = (pts, back)
+        if not near:
+            break
+        whys.append("%.0f mm back: %s at its end" % (1000 * back, near))
+    if chosen is None:
+        runner.note("depth_clear", flown=False, up_mm=round(1000 * up, 1), lean_deg=round(lean, 1), why="; ".join(whys))
+        return None
+    pts, back = chosen
+    print("[press_demo] up %.0f mm and %.0f mm back toward the arm (the hand leaning %.0f deg), clear of the box's "
+          "padded volume, before home" % (1000 * up, 1000 * back, lean))
+    # up and away from the box, toward the look pose the hand came in from
+    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, FREE_LINE_SPEED, None, _full_world(ctx))], execute=True)
+    if any(not r.ok for r in res):
+        print("[press_demo] STOP: the way up from over the box %s — the arm holds; check the box" % _stopped_by(res))
+        return False
+    runner.note("depth_clear", flown=True, up_mm=round(1000 * up, 1), back_mm=round(1000 * back, 1),
+                lean_deg=round(lean, 1), why="; ".join(whys) or None)
+    return True
+
+
 def _clear_over_box(ctx, runner, ref):
     """From over the box, before its home is planned: straight up until the
     tool stands HOME_CLEAR_M above the box's cuboid as the planner pads it
-    (worlds.planned_top_z) — the fingers' collision spheres reach 4-6 cm
-    below tool_frame, and a start among them is refused (20:04: INVALID_START
-    twice, the arm held over the box). Slow, drag- and hang-guarded against
-    the free-air `ref` in a guarded run; unguarded at FREE_LINE_SPEED when
-    compliant. True when there (or already clear), None when no straight
-    line up flies from here (the back-off is the fallback), False — the arm
-    holds — when it met something."""
+    (worlds.planned_top_z) — the gripper base's collision spheres reach 48
+    mm below tool_frame straight down, and a start among them is refused
+    (20:04: INVALID_START twice, the arm held over the box). Slow, drag- and
+    hang-guarded against the free-air `ref`: the hang's reference,
+    tip_load_at the line's start, holds only along a short vertical line.
+    A compliant run goes up as far as the hand's lean needs and back toward
+    the arm instead (_clear_up_and_back). True when there (or already
+    clear), None when no straight line flies from here (the back-off is the
+    fallback), False — the arm holds — when it met something."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
     from rammp_box_opening.worlds import planned_top_z
 
     R, t = approach._chain().fk(ctx.client.joints())
+    if compliant(ctx):
+        return _clear_up_and_back(ctx, runner, R, t)
     want = planned_top_z(ctx.model, ctx.cpose) + HOME_CLEAR_M
     if float(t[2]) >= want:
         return True
@@ -614,8 +722,7 @@ def _clear_over_box(ctx, runner, ref):
     if not pts:
         return True
     print("[press_demo] up %.0f mm, clear of the box's padded volume, before home" % (1000 * (want - float(t[2]))))
-    speed = FREE_LINE_SPEED if compliant(ctx) else CONTACT_SPEED
-    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, speed, free_guard(ctx, ref, tip_load_at(pts[0])),
+    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, CONTACT_SPEED, drag_guard(ref, tip_load_at(pts[0])),
                                _full_world(ctx))], execute=True)
     if any(not r.ok for r in res):
         print("[press_demo] STOP: the way up from over the box %s — the arm holds; check the box" % _stopped_by(res))

@@ -779,6 +779,9 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
           "pushes ~%.0f N there (%.0f N/m at the pads); held %.1f s, then back up. Nothing stops it but the e-stop"
           % (1000 * (pad0[2] - end_z), 1000 * over, k * over, k, cfg.push_hold_s))
     res = runner.run(legs, execute=True)
+    # the stroke meets the box by design: from here every world (home's
+    # too) pads it for a shove, as _touch_lid's contact does
+    ctx.contact_pad = CONTACT_SHIFT_PAD_M
     if any(not r.ok for r in res):
         return DepthPress(free=False, why="the press stroke stopped (%s) — the arm holds" % res[-1].detail)
     # held where the spring left it, pressing: the hold IS the reading
