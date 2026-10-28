@@ -869,3 +869,174 @@ def test_an_execute_after_the_primer_returns_its_own_result():
     assert list(primer.trajectory.points[-1].positions) == pytest.approx(LIVE)
     assert list(look.trajectory.points[-1].positions) == pytest.approx(end)
     assert not d.futures[0].done()  # the primer's own answer: never come, never waited on
+
+
+# -- a compliant stop lets go: the impedance reference moved to where the arm stands ----------
+
+MID = [v + 0.02 for v in LIVE]  # where the arm stands when the Ctrl+C lands, part-way
+
+
+def _ctrl_c_mid_goal(monkeypatch, compliant=True, flag=True, fresh=True, gains=None):
+    """One leg flown by a client (compliant, else in position) under
+    `gains`, Ctrl+C landing on the third spin with the arm at MID: through
+    the abort flag (`flag`; SIGINT mid-goal only sets it), else raised from
+    the spin, as rclpy's own handler does in a CLI that keeps it. With
+    `fresh` False, /joint_states stopped a second before. The cancel is
+    taken and the goal ends CANCELED. Returns (client, driver, handle) once
+    execute has raised the KeyboardInterrupt."""
+    h = _ScriptedHandle(_cresp(CancelGoal.Response.ERROR_NONE), _ended(5, -6))
+    if flag:
+        c, _flag, handler = _abort_client(h)
+    else:
+        c, handler = _client(_ScriptedDriver(h)), None
+    c.compliant = compliant
+    spins = {"n": 0}
+
+    def spin(node, timeout_sec=0.0):  # a /joint_states message per spin, unless it stopped
+        spins["n"] += 1
+        c._eff_at = time.monotonic() if fresh or spins["n"] < 3 else min(c._eff_at, time.monotonic() - 1.0)
+        if not fresh:
+            time.sleep(0.005)
+        if spins["n"] == 3:
+            c._q = list(MID)
+            if handler is None:
+                raise KeyboardInterrupt
+            handler(2, None)
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    with pytest.raises(KeyboardInterrupt):
+        c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, gains=gains)
+    return c, c._execute, h
+
+
+@pytest.mark.parametrize("flag, gains, held_under", [
+    (True, None, client_mod.GAINS_STIFF),  # the client's run default
+    (False, client_mod.GAINS_SOFT, client_mod.GAINS_SOFT),  # the backstop's cancel, a leg under its own gains
+], ids=["abort flag", "backstop"])
+def test_a_compliant_ctrl_c_lets_the_spring_go_where_the_arm_stands(monkeypatch, flag, gains, held_under):
+    """With the stop-the-arm checks off, Ctrl+C and the e-stop are the only
+    stops, and a cancel moves nothing in the driver's joint impedance: it
+    pulls on toward the cancelled goal's last reference, its velocity and
+    acceleration feed-forward still on (kinova-gen3-driver 94736cd
+    supervisor.cpp:278-296), the arm overshooting by centimetres at speed
+    or pushing on into the box. After the cancel — the abort flag's,
+    confirmed, or the backstop's, unconfirmed — exactly one more goal goes
+    out: a hold at the joints the arm stands at, at rest, LATEST_WINS (a
+    queued one would wait behind a goal whose cancel did not land), under
+    the cancelled goal's own gains (none would be MEDIUM, twice STIFF's
+    sag)."""
+    from rammp_box_opening.constants import JOINT_VMAX
+
+    c, d, h = _ctrl_c_mid_goal(monkeypatch, flag=flag, gains=gains)
+    assert h.cancels == 1
+    leg, rel = d.goals
+    assert leg.control_mode == client_mod.IMPEDANCE and leg.preemption == client_mod.QUEUE
+    assert rel.control_mode == client_mod.IMPEDANCE == 1 and rel.preemption == client_mod.LATEST_WINS == 1
+    assert rel.gains == leg.gains and rel.gains is not leg.gains and rel.gains.profile == held_under
+    assert rel.sender_id == "rammp_box_opening" and list(rel.trajectory.joint_names) == NAMES
+    points = rel.trajectory.points
+    assert [list(p.positions) for p in points] == [MID, MID]  # where the arm stands, not where the leg went
+    for p in points:
+        assert list(p.velocities) == [0.0] * 7 and list(p.accelerations) == [0.0] * 7
+    assert [_secs(p) for p in points] == pytest.approx(list(client_mod.PlannerClient.RELEASE_TIMES_S))
+    assert _secs(points[0]) > 0.0 and client_mod.driver.refusal(rel.trajectory, MID, JOINT_VMAX) is None
+
+
+def test_no_release_goes_out_on_a_frozen_joint_stream(monkeypatch, capsys):
+    """/joint_states stopped a second before the Ctrl+C: a LATEST_WINS hold
+    at that sample would pull the arm back to where it stood then. None
+    goes out, and the console says the spring was not let go."""
+    _c, d, h = _ctrl_c_mid_goal(monkeypatch, fresh=False)
+    assert h.cancels == 1 and len(d.goals) == 1
+    assert "no fresh /joint_states: not released" in capsys.readouterr().out
+
+
+def test_a_position_ctrl_c_sends_no_release(monkeypatch):
+    """Never for a POSITION goal: there is no spring to let go, and an
+    IMPEDANCE hold would switch the driver's mode under the arm."""
+    c, d, h = _ctrl_c_mid_goal(monkeypatch, compliant=False)
+    assert h.cancels == 1 and [g.control_mode for g in d.goals] == [client_mod.POSITION]
+    assert c.release() is False and len(d.goals) == 1  # nor when asked: the last goal sent was POSITION
+
+
+def _flowing(monkeypatch, c):
+    """/joint_states flowing: every spin serves `c` a fresh message."""
+
+    def spin(node, timeout_sec=0.0):
+        c._eff_at = time.monotonic()
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+
+
+def test_one_release_per_goal_sent(monkeypatch):
+    """The Ctrl+C's release is followed by the run's own (reach_press.let_go,
+    unwinding): nothing more goes out. A goal sent after it, the primer
+    too, is one a release may follow again."""
+    c, d, _h = _ctrl_c_mid_goal(monkeypatch)
+    assert len(d.goals) == 2
+    assert c.release() is False and len(d.goals) == 2
+    d = _Driver()
+    c = _client(d)
+    c.compliant = True
+    _flowing(monkeypatch, c)
+    c.compliant_gains = client_mod.GAINS_MEDIUM
+    assert c.prime_compliant() is True
+    assert c.release() is True and c.release() is False
+    assert c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, gains=client_mod.GAINS_STIFF)[0] == "arrived"
+    assert c.release() is True and c.release() is False
+    modes = [(g.control_mode, g.preemption, g.gains.profile) for g in d.goals]
+    assert modes == [(1, 0, 2), (1, 1, 2), (1, 0, 3), (1, 1, 3)]  # primer, its release, the leg, its release
+
+
+def test_an_unarmed_client_sends_no_release(monkeypatch):
+    """The motion latch (--execute) gates the release too: an unarmed client
+    sends nothing, whatever it sent before it was disarmed."""
+    d = _Driver()
+    c = _client(d)
+    c.compliant = True
+    _flowing(monkeypatch, c)
+    assert c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)[0] == "arrived" and len(d.goals) == 1
+    c._armed = False
+    assert c.release() is False and len(d.goals) == 1
+    c._armed = True  # the latch was all that held it
+    assert c.release() is True and len(d.goals) == 2
+
+
+def test_a_release_that_fails_never_costs_the_ctrl_c_it_rides_on(monkeypatch, capsys):
+    """A release runs while a Ctrl+C unwinds: whatever goes wrong in it, here
+    its send raising, is printed and swallowed, never raised over the
+    KeyboardInterrupt press_demo exits 130 on, and it latches nothing."""
+
+    def send(self, goal, feedback_callback=None):
+        if self.goals:  # the leg went out; its release does not
+            raise RuntimeError("the context is not valid")
+        self.goals.append(goal)
+        return _Future(self.handle)
+
+    monkeypatch.setattr(_ScriptedDriver, "send_goal_async", send)
+    c, d, h = _ctrl_c_mid_goal(monkeypatch)  # the KeyboardInterrupt all the same
+    assert h.cancels == 1 and len(d.goals) == 1 and c._released is False
+    assert "[client] not released (the context is not valid) — check the arm" in capsys.readouterr().out
+
+
+class _TakesOneDriver(_Driver):
+    """Takes the first goal and turns down every one after it."""
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        if not self.goals:
+            return super().send_goal_async(goal, feedback_callback)
+        self.goals.append(goal)
+        return _Future(_Rejected())
+
+
+def test_a_release_the_driver_did_not_take_is_tried_again(monkeypatch, capsys):
+    """A hold the driver turned down let nothing go: the next release (the
+    run's own, reach_press.let_go, after the client's) sends it again."""
+    d = _TakesOneDriver()
+    c = _client(d)
+    c.compliant = True
+    _flowing(monkeypatch, c)
+    assert c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)[0] == "arrived"
+    assert c.release() is False and c.release() is False
+    assert [g.preemption for g in d.goals] == [client_mod.QUEUE, client_mod.LATEST_WINS, client_mod.LATEST_WINS]
+    assert capsys.readouterr().out.count("not released: the driver did not take the hold") == 2

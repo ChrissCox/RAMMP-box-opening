@@ -14,6 +14,7 @@ velocity limits, timing — is checked here (runtime/driver.py), and nothing
 moves at all unless this client was armed by --execute.
 """
 
+import copy
 import sys
 import time
 from collections import namedtuple
@@ -66,6 +67,7 @@ _GRIPPER_JOINT_HINTS = ("robotiq", "knuckle", "finger")
 POSITION = 0
 IMPEDANCE = 1
 QUEUE = 0
+LATEST_WINS = 1  # replaces the goal running, and any queued behind it, at once (release only)
 # ImpedanceGains.profile: the driver's named joint-impedance tunings,
 # GAINS_SOFT / GAINS_MEDIUM / GAINS_STIFF (constants.py, with their Kq)
 
@@ -121,6 +123,12 @@ class PlannerClient:
         # (constants.COMPLIANT_RUN_GAINS, STIFF); the driver's own is MEDIUM
         self.compliant_gains = COMPLIANT_RUN_GAINS
         self._primer = None  # prime_compliant's goal, sent and never waited on
+        # the last goal sent, as release() needs it: its control_mode and a
+        # copy of its gains; whether a release has gone out since
+        self._last_mode = None
+        self._last_gains = None
+        self._released = False
+        self._release_goal = None  # release()'s goal, kept referenced, never waited on
         # the driver publishes /joint_states best-effort (SensorDataQoS): a
         # reliable subscription would match nothing and hear nothing
         node.create_subscription(
@@ -546,7 +554,91 @@ class PlannerClient:
         goal.gains.profile = int(getattr(self, "compliant_gains", COMPLIANT_RUN_GAINS))
         goal.preemption = QUEUE
         goal.sender_id = "rammp_box_opening"
+        self._note_sent(goal)
         self._primer = self._execute.send_goal_async(goal)  # kept referenced; never waited on
+        return True
+
+    def _note_sent(self, goal):
+        """Keep what release() needs of `goal`, about to be sent: its
+        control_mode and a copy of its gains. Nothing has let it go yet."""
+        self._last_mode = int(goal.control_mode)
+        self._last_gains = copy.deepcopy(goal.gains)
+        self._released = False
+
+    # release()'s hold: as prime_compliant's, two points at the arm's joints,
+    # the first past t=0 (check_like_executor refuses a first point at 0)
+    RELEASE_TIMES_S = (0.02, 0.05)
+
+    def release(self):
+        """Let the joint spring go: the driver's impedance reference moved to
+        where the arm stands, at rest, so it pushes on nothing. True when the
+        driver took it.
+
+        A cancel resets the driver's executor and writes no target: its
+        joint impedance goes on commanding the last reference it was given,
+        with that target's velocity and acceleration feed-forward
+        (kinova-gen3-driver 94736cd, supervisor.cpp's cancel and
+        joint_impedance_mode.cpp's compute). Nothing there lets go by
+        itself: the mode has no watchdog (cmd_timeout_s 0), arbitration is
+        disabled, and only a halt (the e-stop) holds the measured joints.
+        So a compliant press stopped on the button pushes on into the box
+        toward its reference 27-72 mm below the button's top (the pink box's
+        12 mm travel and COMPLIANT_OVERSHOOT_M) for as long as the driver
+        runs, and a goal cancelled at speed overshoots: the damper's stale
+        velocity alone stands joint 1 2·zeta·sqrt(M/Kq) past the reference
+        per rad/s it was moving at, 0.085 rad elbow up under MEDIUM (Kq 80,
+        zeta 0.5, M 0.573 kg·m²; 0.084 under STIFF), centimetres at the hand.
+
+        Sent only by an armed client after an IMPEDANCE goal that no release
+        has followed, from a fresh /joint_states sample (GUARD_STALE_S): a
+        stale one would pull the arm back to where it was. Not gated by the
+        abort flag, which a Ctrl+C has already set: this moves nothing, it
+        only replaces the reference. LATEST_WINS: a goal whose cancel did
+        not land is displaced at once, where a queued release would be
+        promoted after it and pull the arm back to this snapshot. Under the
+        last goal's own gains: without them the driver's session default,
+        MEDIUM, would take over from STIFF and double the sag."""
+        if not self._armed or getattr(self, "_last_mode", None) != IMPEDANCE or getattr(self, "_released", False):
+            return False
+        try:
+            live = self._fresh_joints(max_age=self.GUARD_STALE_S)
+            if live is None:
+                print("[client] no fresh /joint_states: not released — the joint spring still pulls toward the "
+                      "reference it was stopped at; check the arm")
+                return False
+            hold = JointTrajectory()
+            hold.joint_names = list(self.joint_names)
+            for t in self.RELEASE_TIMES_S:
+                p = JointTrajectoryPoint()
+                p.positions = list(live)
+                p.velocities = [0.0] * len(live)
+                p.accelerations = [0.0] * len(live)
+                set_stamp(p.time_from_start, t)
+                hold.points.append(p)
+            why = driver.refusal(hold, live, JOINT_VMAX)
+            if why:
+                print("[client] not released (%s) — check the arm" % why)
+                return False
+            if not self._execute.wait_for_server(timeout_sec=0.5):
+                print("[client] not released: execute_joint_trajectory does not answer — check the arm")
+                return False
+            goal = ExecuteJointTrajectory.Goal()
+            goal.trajectory = hold
+            goal.control_mode = IMPEDANCE
+            goal.gains = self._last_gains
+            goal.preemption = LATEST_WINS
+            goal.sender_id = "rammp_box_opening"
+            # no abort: after a Ctrl+C the flag is already set
+            send = spin_until_done(self.node, self._execute.send_goal_async(goal), 2.0)
+        except Exception as e:  # noqa: BLE001 - a release must never cost the unwinding it rides on
+            print("[client] not released (%s) — check the arm" % e)
+            return False
+        if send is None or not send.accepted:
+            print("[client] not released: the driver did not take the hold — check the arm")
+            return False
+        self._release_goal = send
+        self._released = True
+        print("[client] released: the joint spring now holds where the arm stands")
         return True
 
     def execute(self, traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
@@ -558,7 +650,10 @@ class PlannerClient:
         STIFF), and nothing it reads stops it: a guard only watches — its
         would-be trip is in info["would_trip"], a silent stream is skipped —
         and the leg runs to its end. The arm yields instead; the e-stop and
-        Ctrl+C remain. info["gains"] is the profile sent, None in position.
+        Ctrl+C remain, and a Ctrl+C's cancel is followed by a release: the
+        spring then holds where the arm stands, not toward the cancelled
+        goal's reference (release). info["gains"] is the profile sent, None
+        in position.
 
         `speed` dilates the trajectory's time base (the driver has no speed
         scale of its own); 1.0 flies it as planned or re-timed. Nothing is
@@ -619,6 +714,7 @@ class PlannerClient:
             info["gains"] = spec
         goal.preemption = QUEUE  # never displace a goal that is still settling
         goal.sender_id = "rammp_box_opening"
+        self._note_sent(goal)
 
         def _fb(msg):
             info["progress"] = float(msg.feedback.fraction_complete)
@@ -727,8 +823,14 @@ class PlannerClient:
                 # escalation land here; try the cancel, promise nothing
                 spin_until_done(self.node, send.cancel_goal_async(), 3.0)
                 print("\nCtrl+C — cancel sent (unconfirmed; check the arm)")
+                if compliant:
+                    self.release()  # LATEST_WINS: it displaces the goal too, if the cancel did not land
                 raise
             if aborted:
+                if compliant:
+                    # the cancel left the spring pulling toward the goal's
+                    # last reference, its feed-forward still on: let it go
+                    self.release()
                 raise KeyboardInterrupt  # unwind AFTER the confirmed cancel
         except BaseException:
             unwinding = True

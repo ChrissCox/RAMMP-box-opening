@@ -1122,15 +1122,19 @@ def compliant_rise(ctx, runner, stroke, held):
     lean held: 'depth:rise', a straight line from where the arm stands, at
     FREE_LINE_SPEED (compliant_line, labelled with the full world). Returns
     the hold's verdict `held` (compliant_hold's), free False with why when
-    the way up does not fly — the arm holds."""
+    the way up does not fly — the arm holds, let go (rp.let_go): on the
+    button, its springs would push on toward the stroke's end, and part-way
+    up toward the rise's next point."""
     t0, quat = stroke.t0, stroke.quat
     up, why = rp._line(ctx, [float(t0[0]), float(t0[1]), float(t0[2])], quat)
     if up is None:
+        rp.let_go(ctx)
         return dataclasses.replace(held, free=False,
                                    why="the way up is not a straight line the arm can fly (%s) — the arm holds" % why)
     if up:
         res = runner.run([compliant_line(ctx, "depth:rise", up, quat, FREE_LINE_SPEED, _full_world(ctx))], execute=True)
         if any(not r.ok for r in res):
+            rp.let_go(ctx)
             return dataclasses.replace(held, free=False,
                                        why="the way up stopped (%s) — the arm holds" % res[-1].detail)
     return held
@@ -1193,7 +1197,11 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     compliant_stroke, compliant_hold and compliant_rise: a compliant
     reach-out flies the same stroke as the end of its one-execution way in
     (reach_press.way_in_legs) and calls this only where that does not
-    fly."""
+    fly. From the stroke's start until the rise ends a stop lets go
+    (rp.let_go): the stroke stopped part-way, the way up refused or
+    stopped (compliant_rise), anything raised. A stroke that did not start
+    moved nothing: the arm stands over the button in free air, free to go
+    home, and nothing is let go."""
     from rammp_box_opening.runtime import approach
 
     if top_z is None:
@@ -1210,13 +1218,28 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     world = _full_world(ctx)
     legs = [compliant_line(ctx, name, pts, quat, speed, world) for name, pts, speed in stroke.legs]
     print("[press_demo] %s" % press_text(stroke, cfg))
-    res = runner.run(legs, execute=True)
-    # the stroke meets the box by design: from here every world (home's
-    # too) pads it for a shove, as _touch_lid's contact does
-    ctx.contact_pad = CONTACT_SHIFT_PAD_M
-    if any(not r.ok for r in res):
-        return DepthPress(free=False, why="the press stroke stopped (%s) — the arm holds" % res[-1].detail)
-    return compliant_rise(ctx, runner, stroke, compliant_hold(ctx, cfg, runner, stroke, top_z, seen))
+    try:
+        res = runner.run(legs, execute=True)
+        if len(res) == 1 and not res[0].ok and (res[0].outcome == "refused" or not res[0].progress):
+            # nothing moved: the runner's gates refused the stroke, or the
+            # driver or the client's own gates its goal before it flew. A
+            # stroke with no legs (the pads already within 5 mm of its end,
+            # compliant_stroke) flies nothing and has no result: it goes on
+            # to the hold and the rise
+            return DepthPress(free=True, why="the press stroke did not start (%s) — nothing was pressed"
+                              % (res[0].detail or res[0].outcome))
+        # the stroke meets the box by design: from here every world (home's
+        # too) pads it for a shove, as _touch_lid's contact does
+        ctx.contact_pad = CONTACT_SHIFT_PAD_M
+        if any(not r.ok for r in res):
+            rp.let_go(ctx)  # stopped part-way down, or on the button
+            return DepthPress(free=False, why="the press stroke stopped (%s) — the arm holds" % res[-1].detail)
+        return compliant_rise(ctx, runner, stroke, compliant_hold(ctx, cfg, runner, stroke, top_z, seen))
+    except BaseException:
+        # a Ctrl+C in the hold's read lands with no goal in flight (abort.py
+        # raises at once): the springs would push on into the box
+        rp.let_go(ctx)
+        raise
 
 
 @dataclass
