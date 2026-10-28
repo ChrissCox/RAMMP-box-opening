@@ -381,13 +381,15 @@ def test_a_camera_that_sees_the_top_face_keeps_the_top_face_lift(model):
     assert got.pose is not None and got.lift == "top"
 
 
-def _tray_scene(model):
-    """_scene with a 19x9 cm tray at lid height beside the box: (pts, uv,
-    the tray's pixel box, the box's)."""
+def _tray_scene(model, centre=(0.345, 0.295), along=(1.0, 0.0)):
+    """_scene with a 19x9 cm tray at lid height beside the box, its long
+    side `along`: (pts, uv, the tray's pixel box, the box's)."""
     rng = np.random.default_rng(5)
     pts, uv = _scene(model, rng=rng)
     lid_z = TABLE_Z + model.dims[2]
-    tray = np.c_[rng.uniform(0.25, 0.44, 1200), rng.uniform(0.25, 0.34, 1200), lid_z + rng.normal(0, 0.004, 1200)]
+    d = np.asarray(along, float) / np.linalg.norm(along)
+    a, b = rng.uniform(-0.095, 0.095, 1200), rng.uniform(-0.045, 0.045, 1200)
+    tray = np.c_[centre[0] + a * d[0] - b * d[1], centre[1] + a * d[1] + b * d[0], lid_z + rng.normal(0, 0.004, 1200)]
     tray_uv = np.c_[(tray[:, 1] + 0.5) * 1000, (0.8 - tray[:, 0]) * 1000]
     pts = np.vstack([pts, tray]); uv = np.vstack([uv, tray_uv])
     tray_box = [tray_uv[:, 0].min() - 5, tray_uv[:, 1].min() - 5, tray_uv[:, 0].max() + 5, tray_uv[:, 1].max() + 5]
@@ -428,6 +430,44 @@ def test_a_tray_the_top_face_lift_refused_is_no_rival_from_the_side(model):
     assert got.rivals[0][:2] == pytest.approx((0.60, 0.25), abs=0.01)
 
 
+def test_a_rival_the_top_face_lift_skipped_is_gated_from_the_side_one_it_refused_never(model):
+    """Review of e0cbacc (2026-10-28): gated by the top-face lift only, a
+    top winner's rivals lost every candidate that lift skips, though the
+    side is its view. From 5.5 cm over the lid the camera sees the box's
+    and the tray's top faces (0.47 m off), not the other container's
+    (0.65 m off): the tray the top-face lift refuses is still no rival,
+    the other container it never judged is one, from the side."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    pts, uv, tray_box, true_box = _tray_scene(model)
+    other_box = list(_bbox_around(pts, uv, (0.60, 0.25), half=0.06))
+    cam = np.array([0.0, 0.0, TABLE_Z + model.dims[2] + 0.055])
+    got = scene_fix_from_boxes([(0.26, tray_box), (0.255, true_box), (0.2, other_box)], pts, uv, TABLE_Z, model,
+                               cam_xyz=cam, rivals=True)
+    assert got.box == true_box and got.lift == "top", got.tried
+    assert got.top_refused == ((0.26, tray_box),)
+    assert len(got.rivals) == 1 and got.rivals[0][:2] == pytest.approx((0.60, 0.25), abs=0.01), got.rivals
+
+
+def test_known_limit_a_far_tray_too_low_a_view_for_its_top_face_is_a_rival_from_the_side(model):
+    """A pinned limit, the price of the test above: the 19x9 cm tray
+    running along the view 0.8 m off, from 6 cm over the lid, is too far
+    off for its top face, so only the side lift weighs it, and that never
+    measures how far a container runs along the view. It passes there, a
+    false second place: no sighting from the message, the safe failure,
+    as #43 had it. From 12 cm over the lid its top face is seen, refused,
+    and no rival."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    pts, uv, tray_box, true_box = _tray_scene(model, centre=(0.47, 0.30), along=(0.07, 0.80))
+    for rise, n_rivals in ((0.06, 1), (0.12, 0)):
+        cam = np.array([0.40, -0.5, TABLE_Z + model.dims[2] + rise])
+        got = scene_fix_from_boxes([(0.26, tray_box), (0.255, true_box)], pts, uv, TABLE_Z, model, cam_xyz=cam,
+                                   rivals=True)
+        assert got.box == true_box and got.lift == "top", got.tried
+        assert len(got.rivals) == n_rivals, (rise, got.rivals)
+
+
 def test_a_second_canister_from_the_side_is_still_a_rival():
     """A side lift wins only where every candidate failed or skipped the
     top-face lift, so its rivals are gated from the side as they were: a
@@ -449,6 +489,53 @@ def test_a_second_canister_from_the_side_is_still_a_rival():
         assert len(got.rivals) == 1 and got.rivals[0][:2] == pytest.approx((0.80, -0.30), abs=0.012), got.rivals
         one = scene_fix_from_boxes([(0.6, lid), (0.5, tall_box)], pts, uv, table_z, model, cam_xyz=SIDE_CAM, rivals=True)
         assert one.box == lid and one.rivals == ()
+
+
+def _canisters_from_above(rng, far, rise=0.08, cut_u=np.inf):
+    """Two pink canisters on SIDE_TABLE, at (0.55, -0.5) and `far`, from a
+    camera `rise` over their lids where SIDE_CAM stands, looking along +x:
+    (pts, uv, the two lid boxes, the camera), the frame ending at column
+    `cut_u`."""
+    model = ContainerModel.load(PINK)
+    lid_z, r = SIDE_TABLE + model.dims[2], 0.0525
+    cam = np.array([SIDE_CAM[0], SIDE_CAM[1], lid_z + rise])
+    table = np.c_[rng.uniform(0.45, 1.25, 8000), rng.uniform(-0.95, -0.1, 8000), SIDE_TABLE + rng.normal(0, 0.003, 8000)]
+    cans = []
+    for c in ((0.55, -0.5), far):
+        table = table[np.hypot(table[:, 0] - c[0], table[:, 1] - c[1]) > r + 0.01]
+        a, d = rng.uniform(0, 2 * np.pi, 600), r * np.sqrt(rng.uniform(0, 1, 600))
+        top = np.c_[c[0] + d * np.cos(a), c[1] + d * np.sin(a), lid_z + rng.normal(0, 0.002, 600)]
+        cans.append(np.vstack([_cylinder_front(c, r, SIDE_TABLE, lid_z, 1500, rng, cam=cam), top]))
+    wall = np.c_[np.full(4000, 1.30), rng.uniform(-0.95, -0.1, 4000), rng.uniform(0.30, 0.90, 4000)]
+    pts = np.vstack([table] + cans + [wall])
+    uv = _project(pts, cam=cam)
+    lids = [_project(c[c[:, 2] > lid_z - 0.025], cam=cam) for c in cans]
+    boxes = [_pixel_box(lid[lid[:, 0] < cut_u]) for lid in lids]
+    keep = uv[:, 0] < cut_u
+    return pts[keep], uv[keep], [[x0, y0, min(x1, cut_u - 1.0), y1] for x0, y0, x1, y1 in boxes], cam
+
+
+def test_a_canister_too_far_off_for_its_top_face_is_a_rival_from_the_side():
+    """Review of e0cbacc (2026-10-28): gated by the top-face lift only, a
+    top winner's rivals lost every candidate that lift skips — too far off
+    for the camera to see its top face, or cut at the frame's edge — though
+    the side is its view: a phantom near the camera that won from the top
+    would commit with the canister behind it never weighed. From 8 cm over
+    the lids the near one shows its top face (0.35 m off), the far one does
+    not (0.9 m off); both lift from the side as the side pass would."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+
+    model = ContainerModel.load(PINK)
+    pts, uv, (near, far), cam = _canisters_from_above(np.random.default_rng(4), (1.1, -0.3))
+    got = scene_fix_from_boxes([(0.6, near), (0.5, far)], pts, uv, SIDE_TABLE, model, cam_xyz=cam, rivals=True)
+    assert got.box == near and got.lift == "top" and got.top_refused == (), got.tried
+    assert len(got.rivals) == 1 and got.rivals[0][:2] == pytest.approx((1.10, -0.30), abs=0.012), got.rivals
+    # cut at the frame's edge, it is finished from its lid in view (partial)
+    pts, uv, (near, far), cam = _canisters_from_above(np.random.default_rng(4), (1.1, -0.72), cut_u=392)
+    got = scene_fix_from_boxes([(0.6, near), (0.5, far)], pts, uv, SIDE_TABLE, model, cam_xyz=cam, rivals=True,
+                               image_wh=(392, 400), cam_R=SIDE_R)
+    assert got.box == near and got.lift == "top", got.tried
+    assert len(got.rivals) == 1 and got.rivals[0][:2] == pytest.approx((1.10, -0.72), abs=0.012), got.rivals
 
 
 def test_a_camera_level_with_the_lid_takes_the_side_lift():
