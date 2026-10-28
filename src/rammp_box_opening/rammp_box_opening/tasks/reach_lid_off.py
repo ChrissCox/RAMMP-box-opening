@@ -89,6 +89,14 @@ KNOB_RECHECK_AIMS = 1
 # 2026-10-28 14:26 and 14:30 met it 7.6 and 7.4 mm below their touches. A
 # compliant press that popped the knob held the pads on it there.
 KNOB_STROKE_M = 0.0075
+# A released lid RISES: on 2026-10-28 16:15:19 and 16:15:52 the press let
+# the pink canister's lid go and the wrist read it 9.6 and 9.4 mm higher
+# than before the press, the button 6 and 3 mm from where it was aimed, its
+# knob 7.8 and then 0.9 mm above the lid. Both runs stopped "the press moved
+# the box" (BOX_LIFTED_M) and went home with the box open. A lid this much
+# higher with the button where it was (depth_press.SLIDE_OK_M) is the box
+# open; lower, or higher than this, is still the box moved.
+LID_POP_M = (0.004, 0.030)
 # The grip: the closed pads' reference this far under the lid as estimated
 # (grip_lid_z). The 2F-85's pads stand 13.5 mm higher open than shut, and
 # 2.3 mm higher closed on the 44 mm knob (flatbot's URDF: the knuckle at
@@ -423,12 +431,13 @@ class KnobLook:
     lid_dz_m: float = None  # the lid, by the wrist's own two readings
     status: str = ""
     stop: str = None  # why the run stops here: the box not found, or moved
+    lid_rose: bool = False  # the lid rose LID_POP_M with the button where it was: released
 
     @property
     def popped(self):
         from rammp_box_opening.tasks.press_demo import knob_is_up
 
-        return self.found and knob_is_up(self.up_mm)
+        return self.found and (knob_is_up(self.up_mm) or self.lid_rose)
 
 
 def knob_look(node, ctx, runner, watcher, button, yaw, lid_before, press):
@@ -461,16 +470,23 @@ def knob_look(node, ctx, runner, watcher, button, yaw, lid_before, press):
     shift = rp.judge_box_moved(button, got[0])
     lid_after = rp._lid_z(measured[2], up)
     dz = None if lid_before is None or lid_after is None else lid_after - lid_before
-    look = KnobLook(True, best, shift, dz, status)
+    rose = dz is not None and LID_POP_M[0] <= dz <= LID_POP_M[1] and shift <= dp.SLIDE_OK_M
+    look = KnobLook(True, best, shift, dz, status, lid_rose=rose)
     runner.note("reach_knob", press=press, found=True, looks=looks, knob_up_mm=None if best is None else round(best, 1),
-                popped=look.popped, shift_mm=round(1000 * shift, 1), lid_dz_mm=None if dz is None else round(1000 * dz, 1))
+                popped=look.popped, shift_mm=round(1000 * shift, 1), lid_dz_mm=None if dz is None else round(1000 * dz, 1),
+                lid_rose=rose)
+    if rose:
+        verdict = "%s, and its LID ROSE %+.0f mm — the box is open" % (
+            "UP %.1f mm" % best if look.popped and best is not None and best >= 0 else "not up", 1000 * dz)
+    else:
+        verdict = "UP %.1f mm — the box is open" % best if look.popped else (
+            "%.1f mm above the lid" % best if best is not None else "not judged")
     print("[press_demo] AFTER PRESS %d: knob %s (%d look%s); the button %.0f mm from where the press was aimed%s" % (
-        press, "UP %.1f mm — the box is open" % best if look.popped else (
-            "%.1f mm above the lid" % best if best is not None else "not judged"), looks, "" if looks == 1 else "s",
-        1000 * shift, "" if dz is None else ", its lid %+.0f mm" % (1000 * dz)))
+        press, verdict, looks, "" if looks == 1 else "s",
+        1000 * shift, "" if dz is None or rose else ", its lid %+.0f mm" % (1000 * dz)))
     if shift > dp.SLIDE_OK_M:
         look.stop = "the press MOVED the box %.0f mm — check it is still standing on the table" % (1000 * shift)
-    elif dz is not None and abs(dz) > rp.BOX_LIFTED_M:
+    elif dz is not None and not rose and abs(dz) > rp.BOX_LIFTED_M:
         look.stop = "the press moved the box: its lid %+.0f mm — check it is still standing on the table" % (1000 * dz)
     return look
 
@@ -847,8 +863,14 @@ def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
             runner.note("reach_way_in", press=press + 1, tilt_deg=way.plan.tilt_deg, walked=way.down.walked,
                         short_deg=way.down.short_deg, k=round(way.stroke.k, 1), end_z=round(way.stroke.end_z, 4))
         lid_z = grip_lid_z(top_z, held_z)
-        return take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, "the lid at %.3f (the press's top %.3f%s)" % (
-            lid_z, top_z, "" if held_z is None else ", the pads held at %.3f" % held_z))
+        rose = ""
+        if knob.lid_rose:
+            # the released lid stands as much higher as the wrist's two
+            # readings from the look pose differ (their bias cancels)
+            lid_z += float(knob.lid_dz_m)
+            rose = ", %+.0f mm: the lid rose" % (1000 * knob.lid_dz_m)
+        return take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, "the lid at %.3f (the press's top %.3f%s%s)" % (
+            lid_z, top_z, "" if held_z is None else ", the pads held at %.3f" % held_z, rose))
     except BaseException:
         rp.let_go(ctx)
         raise
