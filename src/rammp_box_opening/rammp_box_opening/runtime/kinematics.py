@@ -318,6 +318,36 @@ class ArmChain:
             if self.within_limits(c) and all(abs(c[i]) <= PLANNER_CONTINUOUS_LIMIT_RAD for i in CONTINUOUS_JOINTS)
         ]
 
+    def past_reach_m(self, xyz, quat_xyzw):
+        """How far past everything this arm reaches the tool pose (xyz,
+        quat_xyzw) puts the joint before the last (m; at or below 0 where
+        it may be reached). The tool is rigid after the last joint, so the
+        pose puts that joint where it is, and the one before it — joint_6,
+        the wrist — to within the last link's offset off the last axis. The
+        second joint's origin turns on a circle about the first's axis, and
+        no joint values put the two further apart than the links between
+        them laid end to end. Past that, no joint values, inside the limits
+        or not, hold the tool there: no IK solves it, the arm's own or the
+        planner's. A bound, not the reach: the arm runs out sooner (its
+        limits, its links' offsets), so it only says what nothing reaches.
+
+        Flatbot's URDF: the wrist 0.2875 m back from tool_frame along the
+        tool's axis, and at most 0.741 m from the point on joint_1's axis
+        the shoulder turns about (20000 random postures: 0.736)."""
+        R0, t0, a0 = self._segs[0][:3]
+        t1 = self._segs[1][1]
+        Rl, tl, al = self._segs[-1][:3]
+        Rt, tt = self._tail
+        par = float(a0 @ t1) * a0  # the second origin along the first axis; off it, the circle's radius
+        u = Rl @ al  # the last axis, in the frame the last link hangs from
+        along = float(tl @ u)
+        # the joint before the last, from tool_frame in tool_frame: fixed up to the last link's offset off its axis
+        w = Rt.T @ tt + self.tool_from_tip + along * (Rt.T @ al)
+        wrist = np.asarray(xyz, float) - np.asarray(quat_to_mat(*quat_xyzw), float) @ w
+        reach = (float(np.linalg.norm(t1 - par)) + sum(float(np.linalg.norm(s[1])) for s in self._segs[2:-1])
+                 + float(np.linalg.norm(tl - along * u)))
+        return float(np.linalg.norm(wrist - (t0 + R0 @ par))) - reach
+
     def straight_line(self, q_start, xyz_end, quat_xyzw, step_m=STEP_M):
         """Joint waypoints from q_start along the straight line from
         tool_frame's current position to xyz_end, holding quat_xyzw.

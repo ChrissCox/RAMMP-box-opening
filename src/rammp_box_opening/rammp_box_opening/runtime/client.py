@@ -106,6 +106,30 @@ def spin_until_done(node, future, timeout_s, abort=None):
     return future.result()
 
 
+def pose_goal_joints(xyz, quat_xyzw, start_joints):
+    """The joints a pose goal from `start_joints` is planned to
+    (PlannerClient._plan_pose_near): of the arm's own IK solutions for
+    tool_frame at (xyz, quat_xyzw), the one quickest to fly to from the
+    start (kinematics.ArmChain.nearest_solution), walked from there or else
+    from the look above HOME — or None, where it finds none or the
+    kinematics fail, and the pose goes to the planner as a pose. The
+    reach-out asks first, to prove its press from these joints before the
+    planner is asked for the look (tasks/reach_press.plan_reach); asked
+    again with the same numbers the chain answers from its last answer
+    (nearest_solution), so the plan request that follows is the one it
+    always was."""
+    if not start_joints:
+        return None
+    try:
+        from rammp_box_opening.constants import HOME
+        from rammp_box_opening.primitives.look import look_joints
+        from rammp_box_opening.runtime.approach import _chain
+
+        return _chain().nearest_solution(planner_branch(start_joints), xyz, quat_xyzw, seeds=(look_joints(HOME),))
+    except Exception:  # a kinematics problem must never cost the plan
+        return None
+
+
 class PlannerClient:
     # a pending gripper setpoint is re-sent this often: the topic is
     # best-effort and latest-wins, so one lost message must not strand a
@@ -404,20 +428,11 @@ class PlannerClient:
         4.7 s approach to a box on the left, bench 2026-09-25). The planner
         still plans and collision-checks the path; when no solution is found
         or its plan fails, the pose goes to it as before."""
-        if start_joints:
-            try:
-                from rammp_box_opening.constants import HOME
-                from rammp_box_opening.primitives.look import look_joints
-                from rammp_box_opening.runtime.approach import _chain
-
-                start = planner_branch(start_joints)
-                q_goal = _chain().nearest_solution(start, xyz, quat_xyzw, seeds=(look_joints(HOME),))
-            except Exception:  # a kinematics problem must never cost the plan
-                q_goal = None
-            if q_goal is not None:
-                res = self.plan_to_joints(q_goal, start_joints)
-                if res is not None and res.success:
-                    return res
+        q_goal = pose_goal_joints(xyz, quat_xyzw, start_joints)
+        if q_goal is not None:
+            res = self.plan_to_joints(q_goal, start_joints)
+            if res is not None and res.success:
+                return res
         return self._no_long_way(self._plan_pose_once(xyz, quat_xyzw, start_joints), start_joints)
 
     # A plan is re-planned when an equivalent end is at least this much quicker

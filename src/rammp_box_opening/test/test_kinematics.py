@@ -70,6 +70,28 @@ def test_an_unreachable_line_is_refused_with_a_reason(chain):
     assert pts is None and why
 
 
+def test_the_reach_bound_never_refuses_a_pose_the_arm_holds():
+    """past_reach_m on flatbot's URDF: the tool pose any joint values hold
+    reads at or inside the reach — the arm stretched straight within 6 mm
+    of it, its links' offsets — and the same tool 0.5 m further out, joint_6
+    moved straight away from the shoulder, reads 0.5 m further past."""
+    arm = ArmChain(path=FLATBOT_URDF, root="arm_mount")
+    rng = np.random.default_rng(0)
+    worst = -1.0
+    for q in rng.uniform(-math.pi, math.pi, (2000, 7)):
+        R, t = arm.fk(q)
+        worst = max(worst, arm.past_reach_m(t, mat_to_quat_xyzw(R)))
+    assert worst <= 0.0
+    R, t = arm.fk([0.0] * 7)  # every link in line
+    assert -0.006 < arm.past_reach_m(t, mat_to_quat_xyzw(R)) <= 0.0
+    R, t = arm.fk(HOME)
+    quat = mat_to_quat_xyzw(R)
+    p = arm.points(HOME)
+    away = (p[5] - p[1]) / np.linalg.norm(p[5] - p[1])  # joint_6's origin, from joint_2's
+    assert arm.past_reach_m(t + 0.5 * away, quat) == pytest.approx(arm.past_reach_m(t, quat) + 0.5, abs=1e-3)
+    assert float(np.linalg.norm(p[-1] - p[5])) == pytest.approx(0.2875, abs=5e-4)  # the wrist, back from tool_frame
+
+
 def test_the_same_reach_question_twice_is_walked_once(monkeypatch):
     """The staging's reach proof and the planner client ask nearest_solution
     the same thing back to back (2026-10-22): the second is answered from
