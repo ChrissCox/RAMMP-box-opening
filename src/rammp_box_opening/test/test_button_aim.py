@@ -73,6 +73,57 @@ def test_hits_must_agree_before_they_aim():
     assert m is not None and m[0] == pytest.approx(0.501) and m[1] == pytest.approx(0.0)
 
 
+def test_a_fix_is_three_in_a_row_or_a_tilted_views_newest_agreeing_pair():
+    """agreeing_fix: n=3 is agreeing_median's rule, the last three. n=2 is
+    the newest pair of the last AIM_WINDOW hits that agree, on the knob too
+    (a hit without a knob reading agrees), else three of them that agree;
+    a hit older than the window agrees with nothing."""
+    from rammp_box_opening.perception.button_aim import AIM_WINDOW, agreeing_fix
+
+    a, b = (0.5, -0.16, 0.29), (0.5, -0.15, 0.29)  # 10 mm apart
+    nan = float("nan")
+    assert agreeing_fix([b, a, a, a], None, 3) == (agreeing_median([b, a, a, a]), [1, 2, 3])
+    assert agreeing_fix([a, a, b, a], [0.0] * 4, 3) is None  # three in a row, as ever
+    assert agreeing_fix([a], [0.0], 2) is None and agreeing_fix([a, b], [0.0, 0.0], 2) is None
+    assert agreeing_fix([a, a, a], [0.0, 0.0, 0.0], 2) == (a, [1, 2])  # the newest pair
+    assert agreeing_fix([a, a], [nan, 0.004], 2) == (a, [0, 1])
+    assert AIM_WINDOW == 4
+    assert agreeing_fix([a, b, (0.6, 0.0, 0.29), (0.7, 0.0, 0.29), a], [0.0] * 5, 2) is None
+
+
+def test_two_of_four_fixes_wherever_three_in_a_row_would_and_never_later():
+    """The tilted aim's rule (agreeing_fix, n=2) on random streams of hits,
+    three in ten up to 2 cm off, half the knob readings a shut box's and
+    half anywhere from -2 to +12 mm: wherever the last three agree it has
+    fixed, at that hit or sooner — two hits can only shorten an aim — its
+    first fix holds the newest hit (the aim returns on it), and a pair it
+    fixes on reads the knob alike."""
+    import random
+
+    from rammp_box_opening.perception.button_aim import KNOB_NOISE_M, agreeing_fix
+
+    rng = random.Random(7)
+    sooner = 0
+    for _ in range(1000):
+        pts, up, first = [], [], None
+        for k in range(8):
+            if rng.random() < 0.3:
+                pts.append((0.5 + rng.uniform(-0.02, 0.02), -0.16 + rng.uniform(-0.02, 0.02), 0.29))
+            else:
+                pts.append((0.5 + rng.gauss(0.0, 0.0015), -0.16 + rng.gauss(0.0, 0.0015), 0.29))
+            up.append(rng.gauss(0.002, 0.0015) if rng.random() < 0.5 else rng.uniform(-0.002, 0.012))
+            got = agreeing_fix(pts, up, 2)
+            if first is None and got is not None:
+                first, idx = k, got[1]
+                assert k in idx
+                assert len(idx) == 3 or abs(up[idx[0]] - up[idx[1]]) <= KNOB_NOISE_M
+            if agreeing_median(pts) is not None:
+                assert first is not None and first <= k
+                sooner += first < k
+                break
+    assert sooner > 100
+
+
 MISSED = Path(__file__).parent / "data" / "wrist_aim_pressed_right_20260921.npz"
 
 
@@ -341,15 +392,17 @@ def render(cam, rot, boxes, table_z, button_bgr=DARK, dist=None, seed=0, ss=3):
 _FRAMES = {}
 
 
-def reach_out_frame(m, incidence_deg, lid_drop=0.0, up=0.0, button_bgr=DARK, dist=None):
+def reach_out_frame(m, incidence_deg, lid_drop=0.0, up=0.0, button_bgr=DARK, dist=None, table_drop=None):
     """(colour, depth, cam, rot, true button top) for the pink box at
-    BUTTON_XY, its lid `lid_drop` below the model's height (the prior)."""
-    key = (incidence_deg, lid_drop, up, button_bgr, None if dist is None else tuple(dist))
+    BUTTON_XY, its lid `lid_drop` below the model's height (the prior), its
+    table `table_drop` below FLAT_TABLE_Z (default: BOX_H under the lid)."""
+    key = (incidence_deg, lid_drop, up, button_bgr, None if dist is None else tuple(dist), table_drop)
     if key not in _FRAMES:
         height = {29: 0.315, 39: 0.295}[incidence_deg]
         lid_z = _h0(m) - lid_drop
+        table_z = lid_z - BOX_H if table_drop is None else FLAT_TABLE_Z - table_drop
         cam, rot = reach_out_pose((*BUTTON_XY, lid_z + up), incidence_deg, height)
-        color, depth = render(cam, rot, [(BUTTON_XY, lid_z, up)], lid_z - BOX_H, button_bgr, dist)
+        color, depth = render(cam, rot, [(BUTTON_XY, lid_z, up)], table_z, button_bgr, dist)
         _FRAMES[key] = (color, depth, cam, rot, np.r_[BUTTON_XY, lid_z + up])
     return _FRAMES[key]
 
@@ -413,6 +466,126 @@ def test_the_reach_out_aim_measures_a_lid_below_its_prior(pink, inc):
     # the same frame with the true height as the prior: the same press point
     s2, why = find_button(color, depth, OAK_K, rot, cam, FLAT_TABLE_Z, pink, lid_z=b[2], prior_xy=tuple(b[:2]))
     assert why is None and np.hypot(s2.xyz[0] - s.xyz[0], s2.xyz[1] - s.xyz[1]) < 0.002
+
+
+def _no_table_offset(*a):
+    return float("nan"), float("nan")
+
+
+@pytest.mark.parametrize("inc,table_drop", [(29, 0.028), (39, 0.018)])
+def test_the_lid_is_judged_against_the_table_the_wrist_sees(pink, inc, table_drop, monkeypatch):
+    """Flatbot 2026-10-27: since its repair the wrist reads every height
+    ~20 mm low, its own table 18.1-21.6 mm below the scene camera's, and
+    the live aims cleared the 35 mm prior-height gate by 2.7-13 mm. Here
+    the wrist's table is 18-28 mm low and its lid 37 mm low, 9-19 mm lower
+    still: judged against the prior alone it is refused, "lid ring -37 mm
+    from its prior height". Against the table the frame sees, the lid is
+    9-19 mm off and the button is aimed, its press point as measured. (28 mm
+    seen at 39 deg is past the xy bound: test_an_offset_the_press_xy_...)"""
+    from rammp_box_opening.perception import button_aim
+
+    color, depth, cam, rot, b = reach_out_frame(pink, inc, lid_drop=0.037, table_drop=table_drop)
+    s, why = find_button(color, depth, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
+    assert why is None, why
+    assert np.hypot(s.xyz[0] - b[0], s.xyz[1] - b[1]) < 0.002
+    assert s.table_offset_m == pytest.approx(-table_drop, abs=0.003) and s.table_offset_raw_m == s.table_offset_m
+    assert s.xyz[2] == pytest.approx(b[2], abs=0.003) and s.lid_z_m == pytest.approx(b[2], abs=0.003)
+    with monkeypatch.context() as mp:
+        mp.setattr(button_aim, "_table_offset", _no_table_offset)  # as it was
+        s0, why0 = find_button(color, depth, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
+    assert s0 is None and "lid ring -37 mm from its prior height" in why0, why0
+
+
+@pytest.mark.parametrize("inc", [29, 39])
+def test_a_lid_low_over_its_own_table_is_still_refused(pink, inc):
+    """The lid alone 40 mm under its prior, its table where it was given: no
+    common offset to take out, and that lid is no lid of this box."""
+    color, depth, cam, rot, b = reach_out_frame(pink, inc, lid_drop=0.040, table_drop=0.0)
+    s, why = find_button(color, depth, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
+    assert s is None and "lid ring -40 mm from its prior height" in why, why
+
+
+def test_the_prior_cut_slides_a_circle_over_the_heights_the_gates_allow():
+    """With a table offset the gates allow a lid around h0 moved by it, and
+    the cut on the prior slides each circle over that band, not h0's."""
+    from rammp_box_opening.perception.button_aim import LID_PRIOR_TOL_M, TOP_RESIDUAL_MAX_M, _prior_miss_m
+
+    h0, cam = 0.42, np.array([0.60, 0.0, 0.70])
+    s, c0, g = 1000.0, 100.0, np.array([0.80, 0.0, h0])  # the circle at the grid's centre, on h0 at g
+
+    def at(h):  # that circle slid along the rays to h
+        return (cam + (g - cam) * (cam[2] - h) / (cam[2] - h0))[:2]
+
+    lowest = h0 - 0.030 - LID_PRIOR_TOL_M - TOP_RESIDUAL_MAX_M  # a lid the gates allow 30 mm under h0
+    assert _prior_miss_m(c0, c0, s, c0, g, h0, cam, at(lowest), h0 - 0.030) == pytest.approx(0.0, abs=1e-9)
+    assert _prior_miss_m(c0, c0, s, c0, g, h0, cam, at(lowest)) == pytest.approx(
+        np.hypot(*(at(lowest) - at(h0 - LID_PRIOR_TOL_M - TOP_RESIDUAL_MAX_M))), abs=1e-9)
+
+
+def test_the_table_offset_is_the_mode_of_the_heights_below_half_the_box():
+    """_table_offset on a rectified grid the size of the live ones: the
+    table is the mode of the heights below half the box — not the lid above
+    that, its side spread over every height between, nor the floor past the
+    table's edge. Read and taken out while its bounds hold, read but not
+    taken out past them, and neither with too little table in view."""
+    from rammp_box_opening.perception.button_aim import TABLE_MIN_CELLS, TABLE_SUBSAMPLE, _table_offset
+
+    h0, table_z, n = 0.311, 0.214, 351
+    rng = np.random.default_rng(3)
+
+    def grid(table_at, keep=1.0, only=None):
+        z = table_at + rng.normal(0.0, 0.002, (n, n))  # the table, 2 mm of noise
+        z[:, :100] -= 0.30  # the floor past its edge, as noisy
+        z[150:260, 150:260] = h0 - 0.022  # the lid, 22 mm low
+        z[260:290, 150:260] = np.linspace(h0 - 0.022, table_at, 30)[:, None]  # its near side
+        z[rng.random((n, n)) > keep] = np.nan  # holes
+        if only is not None:  # nothing in view but an only x only patch of table
+            z[:] = np.nan
+            z[:only, 120 : 120 + only] = table_at
+        lifted = np.full((n, n, 3), np.nan, np.float32)
+        lifted[..., 2] = z
+        return lifted
+
+    off, raw = _table_offset(grid(table_z - 0.020), h0, table_z, 30.0)
+    assert raw == pytest.approx(-0.020, abs=0.001) and off == raw
+    off, raw = _table_offset(grid(table_z - 0.020, keep=0.4), h0, table_z, 30.0)  # holes are no height
+    assert off == pytest.approx(-0.020, abs=0.001)
+    off, raw = _table_offset(grid(table_z - 0.035), h0, table_z, 10.0)  # 6 mm in xy, but past TABLE_OFFSET_MAX_M
+    assert np.isnan(off) and raw == pytest.approx(-0.035, abs=0.001)
+    off, raw = _table_offset(grid(table_z - 0.025), h0, table_z, 45.0)  # 25 mm in xy at 45 deg
+    assert np.isnan(off) and raw == pytest.approx(-0.025, abs=0.001)
+    assert _table_offset(grid(table_z - 0.025), h0, table_z, 35.0)[0] == pytest.approx(-0.025, abs=0.001)  # 17.5
+    side = int(np.ceil(np.sqrt(TABLE_MIN_CELLS))) * TABLE_SUBSAMPLE  # just enough table, subsampled
+    assert _table_offset(grid(table_z + 0.010, only=side), h0, table_z, 30.0)[0] == pytest.approx(0.010, abs=1e-6)
+    few = _table_offset(grid(table_z + 0.010, only=side - 2 * TABLE_SUBSAMPLE), h0, table_z, 30.0)
+    assert np.isnan(few[0]) and np.isnan(few[1])
+
+
+def test_an_offset_the_press_xy_cannot_carry_is_not_taken_out(pink, monkeypatch):
+    """What a common offset cannot say is whether the wrist's depth is off
+    (the press xy, slid along the rays by the measured heights, then off by
+    tan(incidence) x the offset) or its pose in TF (the xy right). Past
+    TABLE_OFFSET_XY_MAX_M of that the offset is not taken out. A depth that
+    reads 45 mm long at 39 deg puts the table 29 mm low: 0.81 x 29 = 24 mm,
+    refused as it was — taken out, the press would go 29 mm off the
+    button's centre, past its 22 mm radius."""
+    from rammp_box_opening.perception import button_aim
+
+    color, depth, cam, rot, b = reach_out_frame(pink, 39)
+    biased = np.where(depth > 0, depth + 0.045, 0.0).astype(np.float32)
+    s, why = find_button(color, biased, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
+    assert s is None and "prior height" in why and "not taken out" in why, why
+    with monkeypatch.context() as mp:
+        mp.setattr(button_aim, "TABLE_OFFSET_XY_MAX_M", 1.0)
+        s1, why1 = find_button(color, biased, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
+    assert why1 is None, why1
+    assert s1.table_offset_m == pytest.approx(-0.029, abs=0.003)
+    assert np.hypot(s1.xyz[0] - b[0], s1.xyz[1] - b[1]) > BUTTON_R
+    # the 29 deg case's 28 mm seen at 39 deg (42.8 at the prior, 37 mm above
+    # the lid): 0.93 x 28 = 26 mm, not taken out
+    color, depth, cam, rot, b = reach_out_frame(pink, 39, lid_drop=0.037, table_drop=0.028)
+    s, why = find_button(color, depth, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
+    assert s is None and "lid ring -37 mm from its prior height" in why and "not taken out" in why, why
 
 
 @pytest.mark.parametrize(
@@ -552,7 +725,8 @@ def test_the_reach_out_aim_refuses_honestly(pink):
     assert s is None and "too little depth" in why
     far = np.where(depth > 0, depth + 0.08, 0.0).astype(np.float32)  # every surface 6 cm low
     s, why = aim(d=far, prior_xy=tuple(b[:2]))
-    assert s is None and "none the button" in why and "prior height" in why
+    # its table too, and no offset that large is taken out (TABLE_OFFSET_MAX_M)
+    assert s is None and "none the button" in why and "prior height" in why and "not taken out" in why
     # 55 deg at the button: judged there, after the circle is found
     cam55, rot55 = reach_out_pose(b, 55, 0.20, off_deg=0.0)
     c55, d55 = render(cam55, rot55, [(BUTTON_XY, b[2], 0.0)], b[2] - BOX_H)
@@ -742,6 +916,73 @@ def test_the_button_refused_at_1404_for_too_little_depth_is_aimed(pink):
     assert np.hypot(s.xyz[0] - prior[0], s.xyz[1] - prior[1]) < 0.05  # the scene camera's box, 3 cm off
 
 
+def _reach_frame(name):
+    """A flatbot reach-out frame fixture: (colour, depth, k, rot, cam, dist,
+    table_z, lid_z, prior_xy) — the table, lid and button the aim was given
+    (the run's scene_fix and reach_plan notes)."""
+    import cv2
+
+    f = np.load(Path(__file__).parent / "data" / name)
+    return (cv2.imdecode(f["color_png"], cv2.IMREAD_COLOR), f["depth_mm"].astype(np.float32) / 1000.0, f["k"],
+            f["rot_cam"], f["trans_cam"], f["dist"], float(f["table_z"]), float(f["lid_z"]),
+            tuple(float(v) for v in f["prior_xy"]))
+
+
+@pytest.mark.parametrize("name,want", [
+    ("wrist_reach_aim_flatbot_20261027_1519.npz", -0.0216),
+    ("wrist_reach_aim_flatbot_20261027_1623.npz", -0.0181),
+])
+def test_the_live_reach_out_aims_read_their_table_20_mm_low(pink, name, want, monkeypatch):
+    """Flatbot 2026-10-27 15:19 and 16:23, the aim frames from the look pose.
+    The wrist read its own table 21.6 and 18.1 mm below the scene camera's
+    and its lid rings 22 mm below the scene's lid, 12-13 mm inside the 35
+    mm gate; judged against the table they see, 31-35 mm inside it. The
+    press point stays as measured. The aimer's fix stands it that much
+    higher: 0.310, where the 15:19 touch met the lid at 0.3122 and the
+    logged aims said 0.2881 and 0.2914."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import button_aim, depth_source
+
+    color, depth, k, rot, cam, dist, table_z, lid_z, prior = _reach_frame(name)
+    s, why = find_button(color, depth, k, rot, cam, table_z, pink, dist=dist, lid_z=lid_z, prior_xy=prior)
+    assert s is not None and s.oblique, why
+    assert s.table_offset_m == pytest.approx(want, abs=0.003) and s.table_offset_raw_m == s.table_offset_m
+    assert abs(s.lid_z_m - lid_z) > 0.020  # inside the gate by under 15 mm, as it was
+    assert abs(s.lid_z_m - (lid_z + s.table_offset_m)) < 0.006  # by 29 mm or more now
+    with monkeypatch.context() as mp:
+        mp.setattr(button_aim, "_table_offset", _no_table_offset)
+        s0, why0 = find_button(color, depth, k, rot, cam, table_z, pink, dist=dist, lid_z=lid_z, prior_xy=prior)
+    assert s0 is not None and s0.xyz == s.xyz, why0  # the gates moved, not the press point
+    # the aimer on MIN_HITS still frames of it: the fix raised by the offset they agree on
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g, offset_s=None, stamp=None: (rot, cam))
+    g = SimpleNamespace(color=color, depth=depth, k=k, dist=dist, color_stamp=None)
+    aimer = button_aim.ButtonAimer(g, pink, table_z, lid_z=lid_z, prior_xy=prior)
+    for i in range(1, button_aim.MIN_HITS + 1):
+        g.color_stamp = SimpleNamespace(sec=i, nanosec=0)
+        fixed = aimer.tick()
+    assert fixed, aimer.status()
+    assert aimer.table_offset_m() == pytest.approx(s.table_offset_m, abs=1e-6)
+    assert aimer.fix(measured=True) == pytest.approx(s.xyz, abs=1e-6)
+    fx = aimer.fix()
+    assert fx[:2] == pytest.approx(s.xyz[:2], abs=1e-6) and fx[2] == pytest.approx(0.310, abs=0.005)
+
+
+def test_the_1259_look_with_the_scene_camera_9cm_high_is_still_refused(pink):
+    """Flatbot 2026-10-27 12:59, a reach-out look while the scene camera read
+    9 cm high: its table at 0.303 and its lid at 0.406, the wrist's table
+    106 mm below that. No offset that large is taken out: refused as it
+    was, and the refusal says what the table read."""
+    import re
+
+    color, depth, k, rot, cam, dist, table_z, lid_z, prior = _reach_frame("wrist_reach_look_flatbot_20261027_1259.npz")
+    s, why = find_button(color, depth, k, rot, cam, table_z, pink, dist=dist, lid_z=lid_z, prior_xy=prior)
+    assert s is None and "prior height" in why, why
+    got = re.search(r"the table in view ([+-]\d+) mm from the one given, not taken out", why)
+    assert got is not None, why
+    assert int(got.group(1)) == pytest.approx(-106, abs=3)
+
+
 def test_still_frames_fuse_their_depth_and_a_moved_camera_starts_again():
     """A tilted view's aim judges each frame on the depth of the still frames
     before it too: holes in one frame are filled from the others, per pixel,
@@ -901,7 +1142,9 @@ def test_the_aimer_hands_its_priors_to_every_aim(pink, monkeypatch):
     monkeypatch.setattr(button_aim, "find_button", spy)
     g = SimpleNamespace(color=color, depth=depth, k=OAK_K, dist=None, color_stamp=None)
     prior = (b[0] + 0.06, b[1] - 0.05)
-    aimer = button_aim.ButtonAimer(g, pink, FLAT_TABLE_Z, lid_z=b[2] + 0.01, prior_xy=prior)
+    # the table this box stands on: the fix is then the one measured (a
+    # table off it raises the fix: test_the_aimer_raises_its_fix_...)
+    aimer = button_aim.ButtonAimer(g, pink, b[2] - BOX_H, lid_z=b[2] + 0.01, prior_xy=prior)
     fixed = False
     for i in range(1, button_aim.MIN_HITS + 1):  # parked: the first frame votes too (FIRST_LOOKBACK_S)
         g.color_stamp = SimpleNamespace(sec=i, nanosec=0)
@@ -912,6 +1155,31 @@ def test_the_aimer_hands_its_priors_to_every_aim(pink, monkeypatch):
     fx = aimer.fix()
     assert np.hypot(fx[0] - b[0], fx[1] - b[1]) < 0.002 and fx[2] == pytest.approx(b[2], abs=0.003)
     assert aimer.last_sighting.oblique
+
+
+def test_a_tilted_aim_on_two_hits_fixes_on_its_second_frame(pink, monkeypatch):
+    """The reach-out's aimer (min_hits=2, tasks/reach_press) on the 39 deg
+    view: no fix after the first still frame, a fix after the second, on
+    those two hits — where the last-three rule takes a third."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import button_aim, depth_source
+
+    color, depth, cam, rot, b = reach_out_frame(pink, 39, lid_drop=0.021)
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g, offset_s=None, stamp=None: (rot, cam))
+    g = SimpleNamespace(color=color, depth=depth, k=OAK_K, dist=None, color_stamp=None)
+    aimer = button_aim.ButtonAimer(g, pink, b[2] - BOX_H, lid_z=b[2] + 0.01, prior_xy=(b[0] + 0.06, b[1] - 0.05),
+                                   min_hits=2)
+    got = []
+    for i in range(1, 3):
+        g.color_stamp = SimpleNamespace(sec=i, nanosec=0)
+        got.append(aimer.tick())
+    assert got == [False, True], aimer.status()
+    assert aimer.last_sighting.oblique and aimer.fix_hits() == [0, 1]
+    fx = aimer.fix()
+    assert np.hypot(fx[0] - b[0], fx[1] - b[1]) < 0.002 and fx[2] == pytest.approx(b[2], abs=0.003)
+    assert abs(aimer.button_above_lid_m()) < 0.003
+    assert aimer.status().startswith("2 of 2 hits agree in 2 frames")
 
 
 def _full_frame_d2(h, w, u, v, r_max):
@@ -1020,7 +1288,8 @@ def aimer_env(monkeypatch):
 
     def fake_find(*a, **kw):
         found.append(1)
-        return SimpleNamespace(xyz=(0.5, -0.16, 0.40), above_lid_m=0.0), None
+        return SimpleNamespace(xyz=(0.5, -0.16, 0.40), above_lid_m=0.0, table_offset_m=float("nan"),
+                               table_offset_raw_m=float("nan")), None
 
     monkeypatch.setattr(button_aim, "find_button", fake_find)
     g = SimpleNamespace(color=np.zeros((4, 4, 3), np.uint8), depth=np.ones((4, 4), np.float32),
@@ -1183,6 +1452,133 @@ def test_the_first_frames_lookback_honours_the_stamp_offset(aimer_env):
     aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
     _paired_frames(aimer, g, 1)
     assert [c[0] for c in calls] == [None, pytest.approx(0.03 - button_aim.FIRST_LOOKBACK_S)]
+
+
+NAN = float("nan")
+
+
+@pytest.mark.parametrize("offsets,raised,agreed,raw", [
+    ([(-0.020, -0.020), (-0.021, -0.021), (-0.019, -0.019)], 0.020, -0.020, -0.020),  # all three agree
+    ([(-0.020, -0.020), (NAN, -0.045), (-0.022, -0.022)], 0.021, -0.021, -0.022),  # two; one not taken out
+    ([(-0.020, -0.020), (NAN, -0.045), (NAN, -0.046)], 0.0, NAN, -0.045),  # one taken out is not two
+    ([(-0.010, -0.010), (-0.020, -0.020), (-0.030, -0.030)], 0.0, NAN, -0.020),  # none within 4 mm of another
+    ([(0.015, 0.015), (0.016, 0.016), (0.015, 0.015)], 0.0, 0.015, 0.015),  # read high: never lowered
+    ([(NAN, NAN)] * 3, 0.0, NAN, NAN),  # no table in view (and every straight-down sighting)
+])
+def test_the_aimer_raises_its_fix_by_an_agreed_table_offset_and_never_lowers_it(aimer_env, monkeypatch, offsets,
+                                                                                raised, agreed, raw):
+    """The fix's z goes up by the wrist's table offset when two of its hits
+    agree on one within TABLE_AGREE_M, and never down: the compliant press
+    goes by the higher of it and the scene camera's lid, and a lowered aim
+    would no longer bound the press from below. A hit whose offset was not
+    taken out counts for nothing; its raw offset is still reported."""
+    from rammp_box_opening.perception import button_aim
+    from rammp_box_opening.perception.button_aim import ButtonSighting
+
+    g, model, poses, calls, found = aimer_env
+    script = list(offsets)
+
+    def scripted(*a, **kw):
+        off, off_raw = script.pop(0)
+        return ButtonSighting(xyz=(0.5, -0.16, 0.290), uv=(320.0, 200.0), r_px=30.0, range_m=0.30, diameter_m=0.044,
+                              oblique=True, table_offset_m=off, table_offset_raw_m=off_raw), None
+
+    monkeypatch.setattr(button_aim, "find_button", scripted)
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z)
+    assert _paired_frames(aimer, g, button_aim.MIN_HITS)[-1] and not script
+    assert aimer.fix() == pytest.approx((0.5, -0.16, 0.290 + raised), abs=1e-9)
+    assert aimer.fix(measured=True) == pytest.approx((0.5, -0.16, 0.290), abs=1e-9)
+    assert aimer.table_offset_m() == pytest.approx(agreed, abs=1e-9, nan_ok=True)
+    assert aimer.table_offset_m(raw=True) == pytest.approx(raw, abs=1e-9, nan_ok=True)
+
+
+def _scripted_hits(monkeypatch, script):
+    """find_button returning the oblique sightings `script` lists, in turn:
+    (xyz, above_lid_m, (accepted, raw) table offset)."""
+    from rammp_box_opening.perception import button_aim
+    from rammp_box_opening.perception.button_aim import ButtonSighting
+
+    def scripted(*a, **kw):
+        xyz, up, (off, raw) = script.pop(0)
+        return ButtonSighting(xyz=xyz, uv=(320.0, 200.0), r_px=30.0, range_m=0.30, diameter_m=0.044, above_lid_m=up,
+                              oblique=True, table_offset_m=off, table_offset_raw_m=raw), None
+
+    monkeypatch.setattr(button_aim, "find_button", scripted)
+
+
+def test_a_tilted_aim_fixes_on_two_agreeing_hits_of_its_last_four(aimer_env, monkeypatch):
+    """Flatbot 2026-10-27 15:19: the reach-out aim's first hit did not agree,
+    and the last-three rule waited for three more. On two hits (min_hits=2)
+    a tilted view's hits [A, A + 10 mm, A + 1 mm] fix on the first and the
+    third, at their mean, and the knob, the table offset and the status are
+    those two hits' — not the last two's or the last three's."""
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    script = [
+        ((0.500, -0.160, 0.290), 0.0010, (-0.020, -0.020)),
+        ((0.500, -0.150, 0.290), 0.0090, (-0.030, -0.030)),  # 10 mm off
+        ((0.501, -0.160, 0.292), 0.0020, (-0.022, -0.022)),
+    ]
+    _scripted_hits(monkeypatch, script)
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z, min_hits=2)
+    assert _paired_frames(aimer, g, 3) == [False, False, True] and not script
+    assert aimer.fix_hits() == [0, 2]
+    assert aimer.fix(measured=True) == pytest.approx((0.5005, -0.160, 0.291), abs=1e-9)
+    # the offset hits 1 and 3 agree on raises it; the last two (-30, -22 mm) agree on none
+    assert aimer.table_offset_m() == pytest.approx(-0.021, abs=1e-9)
+    assert aimer.fix() == pytest.approx((0.5005, -0.160, 0.312), abs=1e-9)
+    assert aimer.table_offset_m(raw=True) == pytest.approx(-0.021, abs=1e-9)  # the last three's: -22 mm
+    # the knob: 1.5 mm, where the last two read 5.5 mm and the last three 2.0
+    assert aimer.button_above_lid_m() == pytest.approx(0.0015, abs=1e-9)
+    assert aimer.status().startswith("2 of 3 hits agree in 3 frames")
+    assert len(aimer.hit_s) == 3 and aimer.hit_s == sorted(aimer.hit_s) and aimer.hit_s[0] >= 0.0
+
+
+def test_two_hits_that_read_the_knob_apart_wait_for_a_third(aimer_env, monkeypatch):
+    """Whether the box is open (press_demo.refuse_open_box at 6 mm) must not
+    rest on one outlying knob reading: two hits whose knobs read more than
+    KNOB_NOISE_M apart are no fix, and a third that pairs with neither makes
+    one of all three — their median, the knob's too."""
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    nan2 = (float("nan"), float("nan"))
+    script = [
+        ((0.500, -0.160, 0.290), 0.0005, nan2),
+        ((0.501, -0.160, 0.291), 0.0070, nan2),  # 6.5 mm apart: "open" on its own
+        ((0.500, -0.159, 0.292), 0.0035, nan2),  # 3.0 and 3.5 mm from those: a pair with neither
+    ]
+    _scripted_hits(monkeypatch, script)
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z, min_hits=2)
+    assert _paired_frames(aimer, g, 2) == [False, False]
+    assert aimer.fix() is None and aimer.status().startswith("0 of 2 hits agree in 2 frames")
+    g.color_stamp = g.depth_stamp = _st(3 * 0.08)
+    assert aimer.tick() and not script
+    assert aimer.fix_hits() == [0, 1, 2]
+    assert aimer.fix() == pytest.approx((0.500, -0.160, 0.291), abs=1e-9)
+    assert aimer.button_above_lid_m() == pytest.approx(0.0035, abs=1e-9)
+
+
+def test_a_straight_down_aim_still_needs_three_hits_in_a_row(aimer_env, monkeypatch):
+    """min_hits=2 is a tilted view's: straight-down sightings (no oblique
+    flag) still fix on the last three agreeing, as every staging aim has."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    a, b = (0.5, -0.16, 0.40), (0.5, -0.15, 0.40)
+    script = [a, a, b, a, a, a]
+
+    def scripted(*args, **kw):
+        return SimpleNamespace(xyz=script.pop(0), above_lid_m=0.0, table_offset_m=float("nan"),
+                               table_offset_raw_m=float("nan")), None
+
+    monkeypatch.setattr(button_aim, "find_button", scripted)
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z, min_hits=2)
+    assert _paired_frames(aimer, g, 6) == [False] * 5 + [True] and not script
+    assert aimer.fix_hits() == [3, 4, 5] and aimer.fix() == pytest.approx(a)
 
 
 # lid_in_view: a camera straight down (its x along base +y, y along +x, as

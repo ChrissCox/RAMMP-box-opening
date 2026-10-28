@@ -3185,6 +3185,24 @@ def test_detect_only_reports_the_scene_cameras_fixes_with_nothing_moving(monkeyp
     assert "NO BOX — scene camera streams missing: depth" in out
 
 
+def test_the_scene_line_names_the_detector_and_the_sightings_behind_the_fix(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from rammp_box_opening.tasks import press_demo
+
+    seg = SimpleNamespace(score=0.881, source="segmenter", n_sightings=2, sources=("segmenter", "segmenter"))
+    assert press_demo.scene_source_label(seg) == "SEG 0.88, 2 sightings (segmenter+segmenter)"
+    mixed = SimpleNamespace(score=0.31, source="owl", n_sightings=2, sources=("segmenter", "owl"))
+    assert press_demo.scene_source_label(mixed) == "OWL 0.31, 2 sightings (segmenter+owl)"
+    assert press_demo.scene_source_label(SimpleNamespace(score=0.44)) == "OWL 0.44, 1 sighting (owl)"  # an older fix
+    f = tmp_path / "residuals.jsonl"
+    fix = _SceneFix((0.6, -0.26, 0.19), 0.0, (0.6, -0.26, 0.31))
+    fix.source = "segmenter"
+    press_demo.record_residual(fix, (0.61, -0.26, 0.31), 0.0, path=f)
+    assert json.loads(f.read_text())["source"] == "segmenter"
+
+
 def test_the_lid_is_set_down_on_the_table_the_camera_measured():
     """Flatbot: no surveyed bench, so no fixed set-down zone either — the
     lid goes beside the box on the table measured this run, whole."""
@@ -3240,6 +3258,138 @@ def test_the_staging_aim_builds_its_aimer_the_straight_down_way_when_no_reach_ou
     assert got is None and "still frames" in status and made == [{}]
     press_demo.aim_button_at_staging(None, w, 0.0, timeout_s=0, lid_z=0.2, prior_xy=(0.8, 0.0))
     assert made[-1] == {"lid_z": 0.2, "prior_xy": (0.8, 0.0)}
+    press_demo.aim_button_at_staging(None, w, 0.0, timeout_s=0, lid_z=0.2, prior_xy=(0.8, 0.0), min_hits=2)
+    assert made[-1] == {"lid_z": 0.2, "prior_xy": (0.8, 0.0), "min_hits": 2}
+
+
+def test_the_aim_judges_frames_back_to_back_and_waits_only_when_none_is_new(monkeypatch, capsys):
+    """Flatbot 2026-10-27: a 20 ms sleep after every tick, the 45-75 ms ones
+    that judged a tilted frame too, held the reach-out aims to 10.1-14.0 of
+    the wrist OAK's 15 frames a second. A tick that took a frame, a hit or
+    not, is followed by the next at once; one that took none sleeps —
+    nothing new, or a colour frame whose depth has not landed, which the
+    next tick tries again. The fix comes back as it did, and the AIM line
+    and the note say which hits agreed and when each came."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import button_aim
+    from rammp_box_opening.tasks import press_demo
+
+    events, made = [], []
+
+    class Aimer:
+        """Ticks as scripted (each takes a frame or not); the last fixes, on
+        its first and third hits."""
+
+        last_why = None
+
+        def __init__(self, grab, model, table_z, **kw):
+            made.append(kw)
+            self.frames = self.hits = 0
+            self.hit_s, self.above_lid, self.pair_dt_ms = [], [], []
+            self.script = ["took frame 1", "nothing new", "frame 2's colour without its depth", "took frame 2",
+                           "took frame 3, the camera moving", "took frame 4"]
+            self.last_sighting = SimpleNamespace(uv=(320.0, 200.0), r_px=30.0, diameter_m=0.0441, oblique=True,
+                                                 disc_fill=0.8)
+
+        def tick(self):
+            what = self.script.pop(0)  # IndexError: ticked on past the fix
+            events.append(what)
+            if what.startswith("took"):
+                self.frames += 1
+                if "moving" not in what:
+                    self.hits += 1
+                    self.hit_s.append(0.07 * self.frames)
+                    self.above_lid.append({1: 0.0012, 2: float("nan"), 3: 0.0014}[self.hits])
+            return not self.script
+
+        def fix(self, measured=False):
+            return (0.7213, -0.297, 0.2914) if measured else (0.7213, -0.297, 0.3095)
+
+        def fix_hits(self):
+            return [0, 2]
+
+        def button_above_lid_m(self):
+            return 0.0013
+
+        def table_offset_m(self, raw=False):
+            return float("nan")
+
+        def status(self):
+            return "2 of 3 hits agree in 4 frames"
+
+    monkeypatch.setattr(button_aim, "ButtonAimer", Aimer)
+    monkeypatch.setattr(press_demo, "_spin_detect", lambda node: None)
+    monkeypatch.setattr(press_demo.time, "sleep", lambda s: events.append("sleep"))
+    notes = []
+    runner = SimpleNamespace(note=lambda leg, **kw: notes.append((leg, kw)))
+    grab = SimpleNamespace(color=None, depth=None, k=None, color_stamp=None)  # no frame for the capture
+    w = SimpleNamespace(grab=grab, model=None, table_z=0.2139)
+    out = {}
+    got, status = press_demo.aim_button_at_staging(None, w, 0.6, timeout_s=5.0, runner=runner, tag="reach-aim", out=out,
+                                                   lid_z=0.3125, prior_xy=(0.7248, -0.286), min_hits=2)
+    assert events == ["took frame 1", "nothing new", "sleep", "frame 2's colour without its depth", "sleep",
+                      "took frame 2", "took frame 3, the camera moving", "took frame 4"]
+    assert made == [{"lid_z": 0.3125, "prior_xy": (0.7248, -0.286), "min_hits": 2}]
+    assert got == ((0.7213, -0.297, 0.3095), 0.6) and status == "2 of 3 hits agree in 4 frames"
+    assert w.last_aim == got[0]
+    assert out == {"button_up_mm": pytest.approx(1.3), "measured_xyz": (0.7213, -0.297, 0.2914)}
+    assert "pressing its centre; 2 of 3 hits agree (4 frames, " in capsys.readouterr().out
+    ((leg, kw),) = notes
+    assert leg == "reach-aim" and (kw["hits"], kw["frames"]) == (3, 4)
+    assert kw["agreeing"] == [0, 2] and kw["hit_s"] == [0.07, 0.14, 0.28] and kw["above_lid_mm"] == [1.2, None, 1.4]
+
+
+@pytest.mark.parametrize("off,off_raw,z,words,off_mm,raw_mm", [
+    (-0.0216, -0.0216, 0.3101, "the wrist reads its table -22 mm from the scene's, the button's top raised 22 mm",
+     -21.6, -21.6),
+    (float("nan"), -0.0452, 0.2885, "the wrist reads its table -45 mm from the scene's (not taken out)", None, -45.2),
+])
+def test_the_aim_says_and_keeps_the_wrists_table_offset(monkeypatch, capsys, off, off_raw, z, words, off_mm, raw_mm):
+    """Flatbot 2026-10-27 15:19: the wrist read its table 21.6 mm below the
+    scene camera's, and its aim 0.2885 where the touch met the lid at 0.3122.
+    The AIM line says what the wrist read, the press point's z is raised by
+    an offset taken out, and the note keeps the z measured and the offset
+    as read even when it was not taken out: drift shows before it fails."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from rammp_box_opening.perception import button_aim, depth_source
+    from rammp_box_opening.tasks import press_demo
+
+    frames = [0]
+
+    def snapshot():  # a new still frame each read
+        frames[0] += 1
+        st = SimpleNamespace(sec=frames[0], nanosec=0)
+        return SimpleNamespace(color=np.zeros((4, 4, 3), np.uint8), color_stamp=st, depth=np.ones((4, 4), np.float32),
+                               depth_stamp=st, k=np.eye(3), dist=None)
+
+    rot, cam = np.diag([1.0, -1.0, -1.0]), np.array([0.536, -0.144, 0.574])
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g, offset_s=None, stamp=None: (rot, cam))
+    seen = button_aim.ButtonSighting(
+        xyz=(0.661, -0.1969, 0.2885), uv=(277.0, 163.2), r_px=31.6, range_m=0.36, diameter_m=0.0501, above_lid_m=0.001,
+        lid_z_m=0.2895, incidence_deg=25.4, oblique=True, disc_fill=0.72, table_offset_m=off, table_offset_raw_m=off_raw)
+    monkeypatch.setattr(button_aim, "find_button", lambda *a, **kw: (seen, None))
+    monkeypatch.setattr(press_demo, "_spin_detect", lambda node: None)
+    notes = []
+    runner = SimpleNamespace(note=lambda leg, **kw: notes.append((leg, kw)))
+    grab = SimpleNamespace(snapshot=snapshot, color=None, depth=None, k=None, color_stamp=None, stamp_offset_s=0.0)
+    w = SimpleNamespace(grab=grab, model=SimpleNamespace(dims=(0.105, 0.105, 0.121), button_diameter_m=0.044),
+                        table_z=0.2143)
+    out = {}
+    got, _status = press_demo.aim_button_at_staging(None, w, 0.0, timeout_s=5.0, runner=runner, tag="reach-aim",
+                                                    out=out, lid_z=0.3111, prior_xy=(0.6754, -0.1812))
+    assert got is not None and got[0] == pytest.approx((0.661, -0.1969, z), abs=1e-4)
+    assert w.last_aim == pytest.approx(got[0])  # the press point the press goes on (aim_source)
+    # ... and the caller is told it as the wrist measured it (reach_press._aim)
+    assert out["measured_xyz"] == pytest.approx((0.661, -0.1969, 0.2885), abs=1e-6)
+    assert out["button_up_mm"] == pytest.approx(1.0)
+    assert words in capsys.readouterr().out
+    ((leg, kw),) = notes
+    assert leg == "reach-aim" and kw["press_xyz"] == [0.661, -0.1969, z] and kw["measured_z"] == 0.2885
+    assert (kw["table_offset_mm"], kw["table_offset_raw_mm"]) == (off_mm, raw_mm)
 
 
 def test_staging_reach_is_judged_by_the_arms_own_kinematics(ctx, monkeypatch):
