@@ -484,11 +484,13 @@ class PlannerClient:
         return getattr(cresp, "return_code", None) in self._CANCEL_TAKEN
 
     # prime_compliant's hold: two points at the arm's joints, the first past
-    # t=0 (check_like_executor refuses a first point at 0), over 50 ms in.
-    # The reach-out's look goes out ~0.5 s after it (its plan 0.34 s, the
-    # lines 0.06, the note 0.05), and the hold is done ~0.3 s after it is
-    # sent (mode_settle_s 0.25 s, then 0.05): it never holds the look back.
-    # A 0.75 s hold would have kept it waiting 0.28-0.5 s.
+    # t=0 (check_like_executor refuses a first point at 0), the last 50 ms
+    # in. It is done ~0.3 s after it is sent (mode_settle_s 0.25 s, then
+    # 0.05). The reach-out's look goes out ~0.5 s after it: the look's plan
+    # (0.34 s at 15:34 and 16:23 2026-10-27), the compliant proof's slide and
+    # way down (0.09-0.16 s for those two boxes, timed offline on flatbot's
+    # URDF), then 48 ms from the plan's note to the look (16:23). So the hold
+    # never holds the look back; a 0.75 s one would keep it waiting ~0.5 s.
     PRIME_TIMES_S = (0.02, 0.05)
 
     def prime_compliant(self, q=None):

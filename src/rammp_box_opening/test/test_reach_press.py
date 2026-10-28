@@ -870,7 +870,8 @@ def test_a_scene_button_no_tilt_presses_even_30_mm_off_stops_before_anything_mov
     before it asked for the turn down, which no IK reaches there. Now the
     proof refuses at the rest pose: every tilt is named, then the button
     PROOF_SHIFT_M nearer the arm and to either side, at the smallest
-    tilt's look, and nothing is sent to the arm."""
+    tilt's look, and nothing is sent to the arm but the hold where it
+    stands that primes its joint impedance (client.prime_compliant)."""
     asked = []
     code, rec, _chain, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked))
     assert code == 1 and rec.events == [] and ctx.client.executed == [] and got == {}

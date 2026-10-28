@@ -838,6 +838,23 @@ def test_only_an_armed_compliant_client_with_no_abort_requested_primes():
     assert d.goals == []
 
 
+def test_no_hold_goes_out_on_a_frozen_joint_stream_or_without_the_driver(monkeypatch):
+    """The hold is judged against the live arm, as every goal is
+    (driver.refusal): where /joint_states has gone quiet (no sample newer
+    than GUARD_STALE_S, and the spins serve none) none goes out, though it
+    would hold the caller's own read; nor where the driver's action does not
+    answer. The look then pays the switch itself, as before the primer."""
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", lambda node, timeout_sec=0.0: time.sleep(0.01))
+    d = _SilentDriver()
+    frozen = _priming(d)
+    frozen._eff_at = time.monotonic() - 1.0  # the last sample a second old
+    assert frozen.prime_compliant(list(LIVE)) is False
+    gone = _SilentDriver()
+    gone.wait_for_server = lambda timeout_sec=None: False
+    assert _priming(gone).prime_compliant() is False
+    assert d.goals == [] and gone.goals == []
+
+
 def test_an_execute_after_the_primer_returns_its_own_result():
     """The primer's goal is never answered here; the look after it is, and
     that answer is the look's."""
