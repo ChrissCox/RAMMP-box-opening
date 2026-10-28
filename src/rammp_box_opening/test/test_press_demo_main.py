@@ -1,7 +1,7 @@
 """press_demo.main() driven end to end with every ROS, camera and planner
 edge faked: no rclpy.init, nothing talks to DDS or the arm. run_main is the
-seam; the scene camera's approach (approach_from_scene) is scripted per
-test, and everything the run writes lands in tmp_path."""
+seam; the reach-out (reach_press.run_reach_press) is scripted per test, and
+everything the run writes lands in tmp_path."""
 
 import json
 import sys
@@ -13,12 +13,6 @@ PINK = "src/rammp_box_opening/config/containers/ankou_pink.yaml"
 BENCH = "src/rammp_box_opening/config/world_bench.yaml"
 BOX_XY = (0.45, -0.10)
 TOUCH = ("touch", {"message": "contact", "progress": 0.97, "torque_peak": 3.2})
-
-
-class IkFail:
-    success = False
-    message = "MotionGenStatus.IK_FAIL"
-    trajectory = None
 
 
 class _Node:
@@ -94,10 +88,10 @@ HOME_FIRSTS = []  # the keywords of every home_first call, in order
 REACH_OUTS = []  # the scene fixes handed to the reach-out
 
 
-def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
-    """press_demo.main() with `approach(ctx)` standing in for
-    approach_from_scene (returns a SceneApproach), and `centre` for
-    centre_over_button when given. Returns (exit code, client, run-log rows)."""
+def run_main(monkeypatch, tmp_path, argv, approach, client=None):
+    """press_demo.main() with `approach(ctx)` standing in for the reach-out:
+    its result's `failed` decides the exit code. Returns (exit code, client,
+    run-log rows)."""
     import faulthandler
 
     import rclpy.executors
@@ -169,12 +163,6 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
     monkeypatch.setattr(press_demo, "CAPTURES_DIR", tmp_path / "captures")
     monkeypatch.setattr(press_demo, "residuals_path_for", lambda p: tmp_path / "residuals.jsonl")
     monkeypatch.setattr(press_demo, "dump_wrist_frame", lambda w, t: None)
-
-    def fake_approach(node, ctx, cfg, runner, watcher, execute, scene_fix, lookahead=True):
-        ctx.cpose = scene_fix.pose
-        return approach(ctx)
-
-    monkeypatch.setattr(press_demo, "approach_from_scene", fake_approach)
     from rammp_box_opening.tasks import reach_press
 
     def fake_reach_out(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
@@ -186,8 +174,6 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None, centre=None):
         return 1 if getattr(got, "failed", False) else 0
 
     monkeypatch.setattr(reach_press, "run_reach_press", fake_reach_out)
-    if centre is not None:
-        monkeypatch.setattr(press_demo, "centre_over_button", centre)
     real_init = worlds_mod.WorldStore.__init__
     monkeypatch.setattr(
         worlds_mod.WorldStore, "__init__", lambda self, path, out_dir=None: real_init(self, path, out_dir=tmp_path / "worlds")
@@ -206,31 +192,14 @@ def _at_staging(button_up_mm=0.0):
     the first aim landing on the button (no pre-planned descent)."""
 
     def approach(ctx):
+        from types import SimpleNamespace
+
         from rammp_box_opening.models.container import from_container
-        from rammp_box_opening.tasks.press_demo import SceneApproach
 
         b = from_container(ctx.cpose, ctx.model.button_offset)
-        return SceneApproach(got=((b[0], b[1], b[2]), 0.0), preplanned=None, status="3/3", button_up_mm=button_up_mm)
+        return SimpleNamespace(got=((b[0], b[1], b[2]), 0.0), preplanned=None, status="3/3", button_up_mm=button_up_mm)
 
     return approach
-
-
-def _no_centre(node, ctx, cfg, runner, watcher, execute, got):
-    ctx.cpose = watcher.to_container_pose(got)
-    return got, 0, 0.0
-
-
-def _legs(rows):
-    return [r["leg"] for r in rows]
-
-
-def _off_by(monkeypatch, *offs):
-    """The tool stands offs[i] (m) from over the button before aim i+1,
-    the last one from then on."""
-    from rammp_box_opening.tasks import press_demo
-
-    offs = list(offs)
-    monkeypatch.setattr(press_demo, "_off_button", lambda ctx, cfg: offs.pop(0) if len(offs) > 1 else offs[0])
 
 
 def test_the_first_look_for_the_box_keeps_at_it_longer_than_a_re_check(monkeypatch, tmp_path):
@@ -251,9 +220,9 @@ def test_the_first_look_for_the_box_keeps_at_it_longer_than_a_re_check(monkeypat
 def _refused(ctx):
     """The scene approach refused: the run goes home and stops (exit 1),
     right after the start these tests are about."""
-    from rammp_box_opening.tasks.press_demo import SceneApproach
+    from types import SimpleNamespace
 
-    return SceneApproach(failed=True, status="the approach to staging was refused (IK_FAIL)")
+    return SimpleNamespace(failed=True, status="the approach to staging was refused (IK_FAIL)")
 
 
 def test_a_compliant_depth_press_run_starts_from_the_spring_hold_it_finds(monkeypatch, tmp_path):
@@ -271,37 +240,20 @@ def test_a_compliant_depth_press_run_starts_from_the_spring_hold_it_finds(monkey
 
 def test_every_other_run_still_starts_at_its_exact_rest_pose(monkeypatch, tmp_path):
     """--guarded reads its at-rest reference at the rest pose and checks
-    gravity against it; with --no-scene there is no compliant reach-out.
-    Both keep AT_REST_RAD. A bare --execute is the compliant depth press
-    since 2026-10-28, as --depth-press was: it takes REST_TOL_RAD."""
+    gravity against it: it keeps AT_REST_RAD. A bare --execute is the
+    compliant depth press since 2026-10-28, as --depth-press was: it takes
+    REST_TOL_RAD."""
     from rammp_box_opening.constants import REST_TOL_RAD
     from rammp_box_opening.tasks import press_demo
 
-    # --no-scene's run stops where the others do: its search's first step fails (exit 1)
-    monkeypatch.setattr(press_demo, "search_for_box", lambda *a, **k: (None, "look"))
     HOME_FIRSTS.clear()
     code, _c, _rows = run_main(monkeypatch, tmp_path / "bare", ["--execute"], _refused)
     assert code == 1 and [k.get("tol") for k in HOME_FIRSTS] == [REST_TOL_RAD]
-    for i, argv in enumerate((["--execute", "--depth-press", "--guarded"],
-                              ["--execute", "--depth-press", "--no-scene"])):
+    for i, argv in enumerate((["--execute", "--depth-press", "--guarded"],)):
         HOME_FIRSTS.clear()
         code, _c, _rows = run_main(monkeypatch, tmp_path / str(i), argv, _refused)
         assert code == 1, argv
         assert [k.get("tol") for k in HOME_FIRSTS] == [press_demo.AT_REST_RAD], argv
-
-
-def test_a_refused_chained_press_plan_stops_with_a_stop_line(monkeypatch, tmp_path, capsys):
-    """The chained approach + descent (a search fix, not at staging: the
-    dry run's path) refused: the same honest stop."""
-    from rammp_box_opening.tasks import press_demo
-
-    monkeypatch.setattr(press_demo, "search_for_box", lambda *a, **k: (((BOX_XY[0], BOX_XY[1], 0.094), 0.0), None))
-    client = FakeClient()
-    client.plans = [IkFail()]  # approach:staging
-    code, _c, _rows = run_main(monkeypatch, tmp_path, ["--no-scene", "--press-only"], _at_staging(), client=client)
-    out = capsys.readouterr().out
-    assert code == 1
-    assert "STOP before the press" in out and "IK_FAIL" in out and "returning home" in out
 
 
 """main()'s shape around the perception thread, read from its source (no

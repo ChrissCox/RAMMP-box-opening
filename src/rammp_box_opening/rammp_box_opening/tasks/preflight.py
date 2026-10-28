@@ -9,10 +9,10 @@ parent frame; another program that moves this arm on the graph (both of
 which press_demo --execute refuses on); no gripper reported; a wrist
 camera stream the mission reads silent (colour, camera_info, and the
 ALIGNED depth, which only exists with align_depth.enable:=true).
-WARN (exit unaffected — the mission has a fallback): no TF for the scene
-camera where TF places it (flatbot), a silent scene camera stream (it
-searches with the wrist instead), an owl_detector not running, or running
-but deaf (no frame reaching it).
+WARN (exit unaffected): no TF for the scene camera where TF places it
+(flatbot), a silent scene camera stream (the mission then finds no box and
+stops before the arm moves toward one: the wrist no longer searches), an
+owl_detector not running, or running but deaf (no frame reaching it).
 Report-only: the gripper's position.
 
 Preflight never moves anything: its client is not armed.
@@ -64,7 +64,7 @@ def camera_topics(store=None):
     scene_dinfo = sns + scfg.get("depth_info_topic_suffix", "/depth/camera_info")
 
     wrist_fix = "is sheppy's wrist_camera node up and the camera powered?"
-    scene_fix = "the mission will search with the wrist instead — is sheppy's scene_camera node up?"
+    scene_fix = "without it the mission finds no box and stops — is sheppy's scene_camera node up?"
     depth_fix = "the wrist camera must publish aligned depth (D405: align_depth.enable:=true; OAK-D: spatial alignment enabled)"
     return [
         (wrist_color, True, wrist_fix),

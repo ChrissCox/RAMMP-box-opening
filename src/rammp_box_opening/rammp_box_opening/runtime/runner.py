@@ -174,8 +174,9 @@ def _restore_execution_profile(leg):
     if w is not None:
         fast, slow_speed, slow_frac = w[:3]
         # a 4th element: seconds into the slow zone the guard takes its
-        # baseline AND arms (press_demo.fly_free_air_fast: a slow zone that
-        # starts from rest, where the warp's own rule would baseline still)
+        # baseline AND arms (the staging press's free-air descent set it,
+        # until 2026-10-28: a slow zone that starts from rest, where the
+        # warp's own rule would baseline still)
         settle_s = w[3] if len(w) > 3 else None
         warped, arm_frac = warp_trajectory(leg.traj, slow_frac, fast, slow_speed)
         if arm_frac is None:

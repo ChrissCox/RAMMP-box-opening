@@ -6,28 +6,23 @@ nothing merges across it, and what follows it is LAZY — planned by the
 Runner from the live arm once the guard has stopped it.
 
 Ctx.last_pose / last_world track the most recent commanded tool pose and
-the world it was planned against, so pose-relative primitives (Lift,
-Retreat) need no pose argument of their own.
+the world it was planned against.
 """
 
 import time
 from dataclasses import dataclass
 
 from rammp_box_opening.constants import (
-    JOINT_VMAX,
     PLANNER_LIMIT_MARGIN_RAD,
     TCP_OFFSET_M,
     TIP_TO_TOOL_M,
     CONTACT_SPEED,
     GRIPPER_CMD_OPEN,
-    HOME,
     TRANSIT_SPEED,
 )
-from rammp_box_opening.models.container import from_container
 from rammp_box_opening.runtime.guards import (
     GuardSpec,
     in_band,
-    time_fraction_at_path_fraction,
 )
 from rammp_box_opening.runtime.legs import Kind, Leg
 
@@ -253,28 +248,6 @@ def _gripper_leg(
         join_before_motion=join_before_motion,
         send_with_previous_motion=send_with_previous_motion,
     )
-
-
-class Lift:
-    """Planned ascent by dz from the last commanded pose. No grip-band check
-    here: a verify would close the lift's merge group and cost a dead stop
-    before the carry — the slip check sits at the set-down (Place)."""
-
-    def __init__(self, dz, name="lift", speed=CONTACT_SPEED):
-        self.dz = float(dz)
-        self.name = name
-        self.speed = float(speed)
-
-    def plan(self, ctx, state):
-        if ctx.last_pose is None:
-            raise RuntimeError("lift needs a preceding pose-directed leg")
-        xyz, quat = ctx.last_pose
-        target = [xyz[0], xyz[1], xyz[2] + self.dz]
-        world = ctx.last_world or _full_world(ctx)
-        leg, state = _plan_motion(
-            ctx, state, self.name, ("pose", target, list(quat)), world, self.speed
-        )
-        return [leg], state
 
 
 class Place:
@@ -622,161 +595,6 @@ class ClearMarginFree:
                 return
 
 
-class Retreat:
-    """Vertical disengage by dz from the last commanded pose. Planned
-    against the interaction world (a full-world plan would start inside
-    the container cuboid after contact). Lazy after a touch: the Runner
-    plans it from live once the guard has stopped the arm, and a failed
-    post-touch replan stops the mission with the arm holding — there is
-    no plan-free fallback."""
-
-    def __init__(self, dz, name="retreat", speed=CONTACT_SPEED, lazy=False):
-        self.dz = float(dz)
-        self.name = name
-        self.speed = float(speed)
-        self.lazy = lazy  # follows an expected touch: planned at execution
-
-    def plan(self, ctx, state):
-        if ctx.last_pose is None:
-            raise RuntimeError("retreat needs a preceding pose-directed leg")
-        xyz, quat = ctx.last_pose
-        target = [xyz[0], xyz[1], xyz[2] + self.dz]
-        world = ctx.last_world or _full_world(ctx)
-        leg, state = _plan_motion(
-            ctx,
-            state,
-            self.name,
-            ("pose", target, list(quat)),
-            world,
-            self.speed,
-            lazy=self.lazy,
-        )
-        return [leg], state
-
-
-# The last stretch of every press comes STRAIGHT down this far: a diagonal
-# descent touches the button before its lateral convergence finishes (10 mm
-# off-centre at 20 mm height from a 199 mm start — the edge presses of
-# 2026-09-01). runtime/approach.py builds it as the arm's own straight line.
-PRESS_APPROACH_M = 0.06
-
-
-def press_stroke(ctx, state, cfg, name="press:down"):
-    """The TOUCH: one guarded stroke from staging toward travel_m below the
-    button, stopping at first contact (cfg.contact_nm). Returns (leg, state).
-
-    A single hard stroke pressed the button flush and then compressed the
-    whole container until the torque built up (video, 2026-09-03): a force
-    the button can only produce by bottoming out must not be what ends the
-    stroke. So this stage only FINDS the surface — the arm's fingertip TF
-    at the trip is the button's true top — and press_push completes the
-    press a bounded distance from there.
-
-    A trip counts only near where contact is EXPECTED: one well above the
-    button struck something else, and full travel with no trip found no
-    surface. Both are failures. Contact is expected after
-    staging/(staging+travel) of the stroke's PATH, but execution progress
-    is a TIME fraction and the two differ on any real velocity profile —
-    so the expectation lives in leg.retime, re-evaluated on whatever
-    trajectory actually flies (a replan, a merged group's profile)."""
-    m = ctx.model
-    button = from_container(ctx.cpose, m.button_offset)
-    quat = m.press_quat(button)
-    world = _interaction_world(ctx, button[2], cfg.travel_m, "button")
-    ctx.last_world = world
-    guard = GuardSpec(
-        touch_nm=cfg.contact_nm,
-        trip="touch",
-        # a light threshold must not judge the launch transient; a warped
-        # caller raises this to its slow-zone rebaseline (_apply_warp)
-        arm_after=0.25,
-    )
-    expect = {"frac": 1.0}  # TIME fraction; set by retime below
-
-    def verify(v):
-        expected = expect["frac"]
-        if v.outcome == "touch":
-            if v.progress is not None and v.progress < expected - 0.15:
-                return False, (
-                    "guard tripped EARLY at %.0f%% of the stroke (contact "
-                    "expected ~%.0f%%) — struck something above the button"
-                    % (v.progress * 100, expected * 100)
-                )
-            peak = "" if v.torque_peak is None else " at %.1f Nm" % v.torque_peak
-            return True, "surface found%s" % peak
-        if v.outcome == "arrived":
-            return False, (
-                "no surface within %.0f mm below the estimated button — the "
-                "fix is high or the box moved" % (cfg.travel_m * 1000)
-            )
-        return False, "touch %s" % v.outcome
-
-    # press_offset_xy: a base-frame trim for where the closed pads actually
-    # meet the lid relative to the tool axis (a jammed-and-freed gripper can
-    # leave a few mm of offset — the 2026-09-03 miss and hit were the same
-    # stroke aimed 1.5 mm apart). Zero by default; dialled at the bench.
-    target = [
-        button[0] + cfg.press_offset_xy[0],
-        button[1] + cfg.press_offset_xy[1],
-        tcp_z(button[2] - cfg.travel_m),
-    ]
-    press, state = _plan_motion(
-        ctx,
-        state,
-        name,
-        ("pose", target, quat, PRESS_APPROACH_M),
-        world,
-        cfg.press_speed,
-        guard=guard,
-        invalidates=True,
-        verify=verify,
-    )
-
-    def retime(traj):
-        # a replan swaps the trajectory — the expected-contact fraction
-        # must follow the one actually flown (review 2026-09-02)
-        expect["frac"] = time_fraction_at_path_fraction(traj, press.contact_path_frac)
-
-    press.contact_path_frac = cfg.staging_m / (cfg.staging_m + cfg.travel_m)
-    press.retime = retime
-    retime(press.traj)
-    return press, state
-
-
-def press_push(ctx, state, cfg, contact_xyz, world, name="press:push"):
-    """The PUSH stage: from the measured first contact, drive the
-    fingertips button_travel_m further — position-bounded — with the
-    old trip threshold left only as a backstop.
-
-    contact_xyz is the fingertip TF the runner read when the touch
-    tripped: the arm's own measurement of where the button top is, in
-    the frame it is commanded in (via TIP_TO_TOOL_M) — no camera, no
-    dims.z, no TCP constant in this chain. Arriving at the bound IS the
-    press (the button latches inside its travel); a trip means the push
-    met a stop early, which is also a press.
-    """
-    m = ctx.model
-    button = from_container(ctx.cpose, m.button_offset)
-    quat = m.press_quat(button)
-    tip_z = float(contact_xyz[2])
-    tool_at_contact = tip_z - TIP_TO_TOOL_M
-    bottom = tool_at_contact - cfg.button_travel_m
-    xy = ctx.last_pose[0][:2] if ctx.last_pose else [button[0], button[1]]
-    guard, verify = _push_guard_and_verify(m, cfg)
-
-    return _plan_motion(
-        ctx,
-        state,
-        name,
-        ("pose", [float(xy[0]), float(xy[1]), float(bottom)], quat, 0.0),
-        world,
-        cfg.press_speed,
-        guard=guard,
-        invalidates=True,
-        verify=verify,
-    )
-
-
 def _push_guard_and_verify(m, cfg, depth_m=None):
     """The push's backstop and its verdict; `depth_m` the push's own bound
     when it is not button_travel_m (the reach-out's shallower push)."""
@@ -792,94 +610,3 @@ def _push_guard_and_verify(m, cfg, depth_m=None):
         return False, "push %s" % v.outcome
 
     return guard, verify
-
-
-# The FK push is flown only when the arm's own kinematics put the live tool
-# within this much of where the fingertip TF says the contact was, plus the
-# push: farther means the chain and TF disagree (wrong root, wrong URDF) and
-# a line "button_travel_m below the contact" is not that — the planner, in
-# its own model, plans the push instead (press_push)
-PUSH_FK_SLACK_M = 0.005
-PUSH_MIN_M = 0.001  # a push shorter than this is not flown: the arm is already at its bound
-
-
-def press_push_from_touch(ctx, state, cfg, touch_leg, live, contact_xyz, world):
-    """The PUSH as the arm's own straight line straight down from the live
-    stop to exactly button_travel_m below the MEASURED contact (fingertip
-    TF, via TIP_TO_TOOL_M), holding the live attitude: no planner call
-    while the fingers sit on the button (the planner round trip was ~0.5 s
-    of pressing at contact_nm, 2026-09-04). Re-timed at press_speed.
-
-    It used to be cut from what was left of the touch's own trajectory by a
-    bench joint-arc constant: that stopped wherever the touch stroke ended
-    (travel_m below the PREDICTED button, 3 mm past the push on the pink
-    canister) and the constant was 7-24 % short on flatbot, so a contact a
-    few mm low flew 7.5-11 mm and was still reported a full 12 mm push.
-
-    Returns (leg, state) or None — at or past its bound already, a line the
-    arm cannot fly, or a chain that disagrees with TF — and the caller then
-    plans it (press_push)."""
-    import numpy as np
-
-    from rammp_box_opening.runtime import approach
-    from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
-    from rammp_box_opening.runtime.retime import RetimeParams, positions_to_traj, retime_group
-
-    m = ctx.model
-    tool_at_contact = float(contact_xyz[2]) - TIP_TO_TOOL_M
-    bottom = tool_at_contact - cfg.button_travel_m
-    chain = approach._chain()
-    R, t = chain.fk(live)
-    left = float(t[2]) - bottom
-    if left < PUSH_MIN_M or left > cfg.button_travel_m + PUSH_FK_SLACK_M:
-        return None
-    quat = mat_to_quat_xyzw(np.asarray(R, float))
-    pts, _why = chain.straight_line(live, [float(t[0]), float(t[1]), bottom], quat)
-    if pts is None:
-        return None
-    names = touch_leg.traj.joint_names if touch_leg is not None and touch_leg.traj is not None else ctx.client.joint_names
-    traj, _ = retime_group(
-        [positions_to_traj(names, pts)],
-        [cfg.press_speed],
-        JOINT_VMAX,
-        RetimeParams(),
-    )
-    guard, verify = _push_guard_and_verify(m, cfg)
-    button = from_container(ctx.cpose, m.button_offset)
-    press_quat = m.press_quat(button)
-    xy = ctx.last_pose[0][:2] if ctx.last_pose else [button[0], button[1]]
-    world_name, world_path = world
-    leg = Leg(
-        name="press:push",
-        kind=Kind.MOTION,
-        traj=traj,
-        speed=1.0,  # the profile is baked in
-        guard=guard,
-        world=world_name,
-        world_path=str(world_path),
-        chain=state.chain,
-        target=("pose", [float(t[0]), float(t[1]), bottom], list(quat), 0.0),
-        goal_joints=[float(v) for v in pts[-1]],
-        verify=verify,
-        plan_s=0.0,
-        # the arm's own line: a planner path is not it (runner never re-plans it)
-        plan_free=True,
-    )
-    ctx.last_pose = ([float(xy[0]), float(xy[1]), bottom], list(press_quat))
-    return leg, PlanState(joints=[float(v) for v in pts[-1]], chain=state.chain + 1)
-
-
-class Home:
-    """Return to the rest joints (factory HOME, or the look pose when the
-    mission rests tool-down) via plan_to_joints (spec §5). Lazy when it
-    follows a lazy retreat (its start is unknown until then)."""
-
-    def __init__(self, joints=None):
-        self.joints = list(HOME if joints is None else joints)
-
-    def plan(self, ctx, state):
-        world = _full_world(ctx)
-        leg, state = _plan_motion(
-            ctx, state, "home", ("joints", list(self.joints)), world, TRANSIT_SPEED
-        )
-        return [leg], state

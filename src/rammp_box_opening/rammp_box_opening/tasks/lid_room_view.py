@@ -20,9 +20,9 @@ publish-point tool (/clicked_point; in the 2D top-down view, so the click
 lands where it looks), or pass --box X Y. A click stays the box until the
 next one, and outranks the cameras' detectors.
 
-Only the scene camera: the mission adds the wrist's look from staging,
-which needs the arm to fly there. What this shows is what the mission would
-choose WITHOUT the wrist's view, so it refuses more: the scene camera,
+Only the scene camera, as the mission itself since 2026-10-28
+(reach_lid_off.resolve_lid_drop; the scrapped staging run added the wrist's
+look from staging, which needed the arm to fly there). The scene camera,
 14 cm above the table, cannot vouch for the table it sees edge-on beside
 the box (flatbot 2026-10-23 17:57: no spot from the scene camera alone).
 """

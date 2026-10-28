@@ -71,7 +71,7 @@ from rammp_box_opening.tasks import reach_press as rp
 # 2026-10-28), then STOP.
 PRESSES = 2
 # A knob the look reads down is looked at once more before it is judged
-# (depth_press.knob_up_after's recheck): pressing a knob that popped shuts
+# (as the staging run's after-look was): pressing a knob that popped shuts
 # the box again, and the oblique aim read a flush button 0.9-3.7 mm up on
 # 2026-10-27/28's looks, hits apart by up to 7.5 mm.
 KNOB_RECHECK_AIMS = 1
@@ -163,7 +163,7 @@ def resolve_lid_drop(ctx, cfg, runner, watcher, scene_fix):
     the scene camera sees standing on the table (room_map,
     clear_lid_drops), what it sees kept clear of every motion planned
     (adopt_seen); without its points, beside the box in the set-down zone
-    (box_relative_lid_drop). Nothing in the environment is configured. Of
+    (lid_drop_candidates). Nothing in the environment is configured. Of
     those, the first the hand reaches straight down (drop_reachable) is
     ctx.lid_drop, and it and the spots after it ctx.lid_drops. False — and
     why, printed; nothing has moved — where there is none."""
@@ -191,8 +191,8 @@ def resolve_lid_drop(ctx, cfg, runner, watcher, scene_fix):
             return False
     else:
         zone = pd.drop_zone(m, ctx.worlds)
-        # every spot beside the box, best first (box_relative_lid_drop's is
-        # the first), as the staging run's place fell through them
+        # every spot beside the box, best first, as the staging run's place
+        # fell through them
         drops = [ContainerPose(xyz=tuple(float(v) for v in xyz), yaw=0.0)  # the hand unturned
                  for xyz, _side in pd.lid_drop_candidates(m, cpose, table_z, zone=zone)]
         if not drops:
@@ -314,9 +314,9 @@ def knob_look(node, ctx, runner, watcher, button, yaw, lid_before, press):
     """From the look pose after press number `press`: the oblique aim at
     the aimed `button` (reach_press._aim, the knob's height above its own
     lid), once more where it reads the knob down or finds no button
-    (KNOB_RECHECK_AIMS) — the highest reading the verdict, as
-    depth_press.knob_up_after's. A box the press slid farther than the
-    staging grip takes (depth_press.SLIDE_OK_M) or whose lid the wrist
+    (KNOB_RECHECK_AIMS) — the highest reading the verdict, as the staging
+    run's after-look's was. A box the press slid farther than the staging
+    grip took (depth_press.SLIDE_OK_M) or whose lid the wrist
     reads BOX_LIFTED_M off its reading before (`lid_before`) moved: STOP."""
     from rammp_box_opening.tasks.press_demo import knob_is_up
 
