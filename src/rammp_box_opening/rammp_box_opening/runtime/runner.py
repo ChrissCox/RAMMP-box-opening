@@ -1074,9 +1074,11 @@ class Runner:
         what the spring had not caught up. Logged, never a gate (a compliant
         run stops for nothing it reads)."""
         rad, mm, deg = _arrival_error(self.client.joints(), traj) if outcome == "arrived" else (None, None, None)
+        gains = info.get("gains")
         return {
             "mode": "impedance" if getattr(self.client, "compliant", False) else "position",
-            "gains": info.get("gains"),
+            # a profile's number, or a custom spec's name (constants.GAINS_RIGID)
+            "gains": getattr(gains, "name", gains),
             "end_err_rad": rad,
             "end_err_mm": mm,
             "end_err_deg": deg,
