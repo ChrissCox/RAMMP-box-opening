@@ -54,7 +54,6 @@ def _node(monkeypatch, calls):
     n._proc = n._model = None
     n.cfg = types.SimpleNamespace(owl_queries=["box"])
     n.min_score = 0.1
-    n._upside_down = False
     n.camera = "scene"
     monkeypatch.setattr(n, "get_clock", lambda: _Clock(), raising=False)
     monkeypatch.setattr(owl_node, "owl_detect", lambda *a, **k: calls.append(1) or [(0.5, (1, 2, 3, 4))])

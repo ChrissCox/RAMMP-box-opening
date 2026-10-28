@@ -156,6 +156,22 @@ def test_a_mission_that_saw_nothing_keeps_nothing_and_a_miss_is_never_an_empty_s
     doc = json.loads((rec.close(exit_code=2) / "truth.json").read_text())
     assert doc["truth_suspect"] is True and doc["truth_xyz"] is None
     assert doc["scene_why"].startswith("the scene OWL") and doc["exit_code"] == 2
+    assert doc["scene_source"] is None and doc["scene_boxes"] == {}
+
+
+def test_a_mission_keeps_which_detector_found_the_box_and_the_boxes_it_gated(tmp_path):
+    """The raw boxes of the last message the locate gated, per detector: a
+    live run replays exactly (SceneLocator.last_boxes)."""
+    from rammp_box_opening.detection_set import MissionFrames
+
+    rec = MissionFrames(tmp_path, "ankou_pink.yaml", 0.05, now=0)
+    boxes = {"segmenter": [["food container", 0.88, 157.75, 216.38, 255.62, 260.5]], "owl": [[0.31, 170.0, 195.0, 243.0, 222.0]]}
+    rec.scene(scene_frame_arrays(), fix_xyz=[0.661, -0.265, 0.31], score=0.88, source="segmenter", boxes=boxes)
+    boxes["segmenter"].clear()  # the locator's next look: what the mission kept does not change with it
+    doc = json.loads((rec.close(exit_code=0) / "truth.json").read_text())
+    assert doc["scene_source"] == "segmenter" and doc["scene_owl"] == 0.88  # the score behind the fix, for the evaluator
+    assert doc["scene_boxes"] == {"segmenter": [["food container", 0.88, 157.75, 216.38, 255.62, 260.5]],
+                                  "owl": [[0.31, 170.0, 195.0, 243.0, 222.0]]}
 
 
 _CONFIG = __import__("pathlib").Path(__file__).resolve().parents[1] / "config"

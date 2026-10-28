@@ -13,7 +13,8 @@ depth_info_topic_suffix: /depth/camera_info
 # publishes TF frames as scene_camera_color_* (not rgb_camera_*).
 link_frame: scene_camera_color_optical_frame
 color_frame: scene_camera_color_optical_frame
-# Flatbot's scene OAK hangs upside down (a 180° roll in rammp-deployments'
-# transforms/cameras.yaml): owl_detector turns its frames upright for OWLv2,
-# and SceneLocator refuses to locate when TF says the camera hangs otherwise.
-upside_down: true
+# Flatbot's scene OAK hangs upside down, and since rammp-deployments #133
+# (2026-10-27) the driver rotates its colour and depth 180° on the device
+# (i_rotation) under the upright mount in transforms/cameras.yaml: frames
+# arrive upright and nothing here turns them. SceneLocator refuses a camera
+# whose TF still has its frames upside down.
