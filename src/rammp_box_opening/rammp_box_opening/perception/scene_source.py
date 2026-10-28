@@ -818,15 +818,17 @@ class Sighting:
     det_box: tuple  # the detector's own box (the holder under a band)
 
 
-def commit_fix(sightings, segmenter_saw, n=VOTE_N, tol=VOTE_TOL_M, owl_settles=False):
+def commit_fix(sightings, segmenter_saw, n=VOTE_N, tol=VOTE_TOL_M, owl_settles=False, segmenter_places=()):
     """(top, None) when the newest `n` sightings agree pairwise within `tol`
     — their median (d405.stable_fix) — else (None, why), why one of "too
     few", "disagree", "cut OWL box unconfirmed" and "two places unsettled".
 
     `segmenter_saw`: the segmenter is live and has seen the container in
     this look (a sighting, or a message that passed in two places). The
-    OWL's box of a cut lid (a partial lift) then counts only with a
-    segmenter sighting beside it: the segmenter can confirm it, so it must.
+    OWL's box of a cut lid (a partial lift) then counts only with the
+    segmenter beside it: a segmenter sighting in the pair, or one of
+    `segmenter_places` within `tol` of each of the pair's sightings, as a
+    third sighting would be. The segmenter can confirm it, so it must.
     Down, or live but blind (no food container, or every band refused), it
     confirms nothing, and the OWL's cut boxes commit on their own. Before
     the cut lid's arc was bounded by its box's uncut side, the OWL's circle
@@ -834,6 +836,15 @@ def commit_fix(sightings, segmenter_saw, n=VOTE_N, tol=VOTE_TOL_M, owl_settles=F
     any live segmenter; a blind one then left all 15 cut frames unfixed.
     Bounded, those commits land 12-14 mm off and all 15 commit
     (detbench/spec blind_stream).
+
+    `segmenter_places`: the tops of the places this look's segmenter
+    messages passed in two (SceneBoxFix.top and .rivals). Such a message is
+    no sighting, so with only a sighting to confirm it, a look whose every
+    frame passed two places — the canister half off the frame, beside a
+    second bowl whose band passes too — held the OWL's cut pair until it
+    timed out: NO BOX, nothing moved (the 2026-10-28 merge review of #43 +
+    #57). On detbench's 15 cut frames every segmenter fix of the canister
+    lies within 17.8 mm of each sighting of every OWL cut pair that agrees.
 
     `owl_settles`: a segmenter message of this look passed in two places
     (SceneBoxFix.rivals). Two later segmenter sightings that agree on one of
@@ -847,9 +858,9 @@ def commit_fix(sightings, segmenter_saw, n=VOTE_N, tol=VOTE_TOL_M, owl_settles=F
     if top is None:
         return None, "disagree"
     pair = sightings[-n:]
-    if segmenter_saw and any(s.partial and s.source == "owl" for s in pair) and not any(
-        s.source == "segmenter" for s in pair
-    ):
+    beside = any(s.source == "segmenter" for s in pair) or any(
+        all(np.linalg.norm(np.subtract(p, s.top)) <= tol for s in pair) for p in segmenter_places)
+    if segmenter_saw and any(s.partial and s.source == "owl" for s in pair) and not beside:
         return None, "cut OWL box unconfirmed"
     if owl_settles and not any(s.source == "owl" for s in pair):
         return None, "two places unsettled"
@@ -1002,7 +1013,7 @@ class SceneLocator:
             # look, only a pair with an OWL sighting in it commits (commit_fix)
             owl_settles = False
             sightings = []
-            unconfirmed = False  # an OWL pair on a cut lid was held back for want of a segmenter sighting
+            unconfirmed = False  # an OWL pair on a cut lid was held back: nothing the segmenter saw stood beside it
             off_frame = None  # (score, edges, R_base_color, src) of the best candidate cut by the frame's edge
             state = seg_args = m_seg = None
             found = None
@@ -1119,10 +1130,12 @@ class SceneLocator:
                         source, float(c[0]), tuple(float(v) for v in got.top), got.pose, int(got.n), tuple(got.partial),
                         float(got.table_z), got.lift, key, key if det is None else box_key(det),
                     ))
-                    # a live segmenter confirms a cut OWL box only once it has seen the container in this look
+                    # a live segmenter confirms a cut OWL box only once it has seen the container in this look:
+                    # a sighting beside it, or a place one of its messages passed in two (commit_fix)
                     seg_saw = state == "live" and (
                         bool(ambiguous["segmenter"]) or any(s.source == "segmenter" for s in sightings))
-                    top, why = commit_fix(sightings, seg_saw, owl_settles=owl_settles)
+                    places = [p for at, riv in ambiguous["segmenter"] for p in (at, *riv)]
+                    top, why = commit_fix(sightings, seg_saw, owl_settles=owl_settles, segmenter_places=places)
                     unconfirmed = unconfirmed or why == "cut OWL box unconfirmed"
                     if top is not None:
                         found = (top, sightings[-VOTE_N:], pts_base, uv, got, T_base_color)
