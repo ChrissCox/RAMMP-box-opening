@@ -2,12 +2,28 @@
 
 MOTION legs merge into one re-timed execution (runtime/retime.py) only when
 dynamically valid: same planning chain (B planned from A's predicted
-endpoint), and nothing after a contact — a guarded leg may END a group,
-never sit inside one. `world` is a checked precondition, never a merge key.
+endpoint), B's first waypoint where A's last one is (MERGE_GAP_RAD on every
+joint, the numbers as written), one ImpedanceGains spec for the execution
+(the same Leg.gains: the goal carries one), and nothing after a contact — a
+guarded leg may END a group, never sit inside one. `world` is a checked
+precondition, never a merge key.
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
+
+# The most any joint of B's first waypoint may differ from A's last for the
+# two to fly as ONE trajectory. The numbers as written, never wrapped:
+# retime_group (concat_paths) and the driver's quintic both interpolate the
+# raw positions, so a whole turn of a continuous joint between two legs is a
+# full revolution at the junction. Review 2026-10-27, offline: a plan-free
+# line built from the arm's joints ended at joint_3 +0.450; the home planned
+# from it, the planner handed planner_branch of that end, started at -5.833.
+# The two merged, joint_3 swept 9.03 rad, and driver.refusal passed it. The
+# planner's float32 output starts ~1e-7 off the start it is handed, and
+# line_trajectory keeps a line's first and last points exactly, so a leg
+# built from the one before it is well inside this.
+MERGE_GAP_RAD = 1e-3
 
 
 class Kind(Enum):
@@ -111,6 +127,19 @@ class Leg:
     gains: int = None
 
 
+def _joined(a, b):
+    """Does `b` start where `a` ends: every joint of its first waypoint
+    within MERGE_GAP_RAD of `a`'s last? A lazy leg has no trajectory to
+    compare yet; for it the rule that a lazy leg merges only with another
+    lazy one decides (can_merge). The runner asks again once a group is
+    planned at flight, lazy or re-planned, and splits it where they do not
+    meet (runner.run)."""
+    if a.traj is None or b.traj is None:
+        return True
+    end, start = a.traj.points[-1].positions, b.traj.points[0].positions
+    return all(abs(float(x) - float(y)) <= MERGE_GAP_RAD for x, y in zip(end, start))
+
+
 def can_merge(a, b):
     """May `b` join the execution `a` ends?
 
@@ -129,6 +158,14 @@ def can_merge(a, b):
         # a planned lead never merges with a lazy tail (or vice versa):
         # a group profile cannot chain a trajectory that does not exist yet
         and (a.traj is None) == (b.traj is None)
+        # ...and b starts where a ends: the group flies as one trajectory,
+        # so a gap between them is flown as one interval of it that no
+        # planner checked (a whole turn: a full revolution)
+        and _joined(a, b)
+        # one goal flies one ImpedanceGains spec (runner._run_motion sends
+        # the group's): legs under different gains fly as goals of their
+        # own. None, the client's run default, is not any profile a leg names
+        and a.gains == b.gains
         # a contact ENDS its execution: never merge past one
         and a.guard is None
         and a.verify is None  # a verify CLOSES its merge group
