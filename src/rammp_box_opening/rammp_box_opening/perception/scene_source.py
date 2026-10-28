@@ -478,12 +478,12 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
     return SceneBoxFix(None, None, 0, None, tuple(tried), clipped=tuple(clipped))
 
 
-def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6, upside_down=False):
+def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6):
     """The table height the scene depth shows, from a plane fit over the
-    lower part of the view (the image's top rows for a camera hung upside
-    down); nan when there is no clean plane. Logged beside the surveyed
-    height so a wrong survey, or a knocked camera, shows up in every run."""
-    low = uv[:, 1] < (1.0 - row_frac) * image_h if upside_down else uv[:, 1] > row_frac * image_h
+    lower part of the (upright) view; nan when there is no clean plane.
+    Logged beside the surveyed height so a wrong survey, or a knocked
+    camera, shows up in every run."""
+    low = uv[:, 1] > row_frac * image_h
     if low.sum() < 500:
         return float("nan")
     # a few thousand points are plenty for a table plane, and this number
@@ -533,7 +533,6 @@ class SceneLocator:
         # external_static_tf), read as base_frame <- the camera's link
         self.T_base_link = None if T_base_link is None else np.asarray(T_base_link, dtype=float)
         self.base_frame = base_frame
-        self.upside_down = bool((scene_cfg or {}).get("upside_down", False))
         self.grab = SceneGrabber(node, keep=3, need_depth=True, scene_cfg=scene_cfg)
         self.owl = OwlRung(node, cfg, camera="scene")
         self.last_why = None
@@ -592,13 +591,13 @@ class SceneLocator:
                 if t_ready is None:
                     t_ready = time.monotonic()
                     self.last_timing["streams_s"] = round(t_ready - t0, 2)
-                    # OWL turns the frame by the config's word; TF has the mount's
-                    hangs = image_upside_down(self.base_to_color())
-                    if hangs is not None and hangs != self.upside_down:
+                    # the OWL needs upright frames, and nothing here turns them:
+                    # a camera hung upside down rotates them on the device
+                    if image_upside_down(self.base_to_color()):
                         self.last_why = (
-                            "TF hangs the scene camera %s but its config says upside_down: %s — "
-                            "the OWL would look at its frames the wrong way up"
-                            % ("upside down" if hangs else "upright", "true" if self.upside_down else "false")
+                            "TF has the scene camera's frames upside down — the OWL needs them upright: "
+                            "rotate them on the device (the OAK driver's color/depth i_rotation 180, "
+                            "rammp-deployments #133) with the upright mount in TF"
                         )
                         return None
                     # is the calibration's tag where it was? Said, never
@@ -639,7 +638,7 @@ class SceneLocator:
                 # refusal: the side lift reads the table around each box)
                 top_table_z = self.table_z
                 if top_table_z is None:
-                    measured = table_from_scene_points(pts_base, uv, self.grab.color.shape[0], upside_down=self.upside_down)
+                    measured = table_from_scene_points(pts_base, uv, self.grab.color.shape[0])
                     top_table_z = None if np.isnan(measured) else measured
                 got = scene_fix_from_boxes(
                     [(c[4], c[:4]) for c in cands], pts_base, uv, top_table_z, self.model,
@@ -681,7 +680,7 @@ class SceneLocator:
             table_seen = (
                 got.table_z
                 if got.lift == "side"
-                else table_from_scene_points(pts_base, uv, self.grab.color.shape[0], upside_down=self.upside_down)
+                else table_from_scene_points(pts_base, uv, self.grab.color.shape[0])
             )
             # no survey: the table the box was found on is the one the
             # planner must know about (WorldStore.table_extent)
