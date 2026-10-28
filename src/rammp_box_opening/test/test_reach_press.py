@@ -386,7 +386,7 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
     # the scene OWL's enables/disables, each with how many events came before it
     owl = SimpleNamespace(enable=lambda: rec.owl.append(("on", len(rec.events))),
                           disable=lambda: rec.owl.append(("off", len(rec.events))))
-    locator = SimpleNamespace(owl=owl, locate=lambda s: (rec.events.append("scene"), seen[scene_after])[1])
+    locator = SimpleNamespace(owl=owl, prime=owl.enable, locate=lambda s: (rec.events.append("scene"), seen[scene_after])[1])
     args = SimpleNamespace(execute=True, press_only=True)
     code = reach_press.run_reach_press(None, ctx, cfg, runner, SimpleNamespace(), args, fix, locator)
     return code, rec, chain, home
@@ -475,7 +475,7 @@ def test_an_aim_that_raises_after_the_early_enable_disables_the_scene_owl(ctx, m
     ctx.model = ContainerModel.load(PINK)
     calls = []
     owl = SimpleNamespace(enable=lambda: calls.append("on"), disable=lambda: calls.append("off"))
-    locator = SimpleNamespace(owl=owl, locate=lambda s: calls.append("scene"))
+    locator = SimpleNamespace(owl=owl, prime=owl.enable, locate=lambda s: calls.append("scene"))
 
     def aim(node, watcher, yaw, lid_z, prior_xy, runner_, tag):
         assert tag == "reach-after"
