@@ -979,8 +979,10 @@ class Runner:
             )
 
         guard = make_guard()
-        # a compliant run's impedance tuning: the group's, when a leg names one
-        gains = next((g.gains for g in group if getattr(g, "gains", None) is not None), None)
+        # a compliant run's impedance tuning: the group's one gains value
+        # (legs.can_merge merges only legs under the same one), sent when it
+        # names a profile; with None the client flies its run default
+        gains = group[0].gains
         t0 = time.monotonic()
         outcome, info = self.client.execute(
             traj,

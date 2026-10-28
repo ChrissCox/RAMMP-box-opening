@@ -24,6 +24,40 @@ def test_merged_group_is_one_execution(tmp_path):
     assert len(c.executed) == 1  # merged: one goal
 
 
+def test_legs_that_do_not_meet_fly_as_two_executions(tmp_path):
+    """b starts 0.1 rad from where a ends. One trajectory would fly that gap
+    as a jump between two of its samples (legs.MERGE_GAP_RAD). Two goals
+    instead, and the second, no longer starting where the arm is, is planned
+    again from there."""
+    c = FakeClient()
+    legs = [leg("a", Q0, Q1, chain=0), leg("b", Q2, [0.3] * 7, chain=0)]
+    res = runner(c, tmp_path).run(legs, execute=True)
+    assert all(r.ok for r in res)
+    assert len(c.executed) == 2
+    assert c.exec_starts[1] == Q1  # from where a left the arm, not from b's own start
+
+
+def test_legs_under_different_gains_fly_as_two_executions(tmp_path):
+    """A goal carries one ImpedanceGains spec. A merged group used to fly
+    under the first gains any member named, so a leg under the run default
+    (None) flew its neighbour's. Now each spec flies as its own goal, and a
+    group under one spec sends it once."""
+    from rammp_box_opening.constants import GAINS_STIFF
+
+    c = FakeClient()
+    a, b = leg("a", Q0, Q1, chain=0), leg("b", Q1, Q2, chain=0)
+    b.gains = GAINS_STIFF
+    res = runner(c, tmp_path).run([a, b], execute=True)
+    assert all(r.ok for r in res)
+    assert len(c.executed) == 2
+    assert c.gains_sent == [None, GAINS_STIFF]
+    c = FakeClient()
+    a, b = leg("a", Q0, Q1, chain=0), leg("b", Q1, Q2, chain=0)
+    a.gains = b.gains = GAINS_STIFF
+    runner(c, tmp_path).run([a, b], execute=True)
+    assert len(c.executed) == 1 and c.gains_sent == [GAINS_STIFF]
+
+
 def test_unguarded_leg_requires_full_world(tmp_path):
     c = FakeClient()
     res = runner(c, tmp_path).run(
