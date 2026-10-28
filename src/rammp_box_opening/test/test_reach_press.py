@@ -751,7 +751,10 @@ def test_a_gravity_model_that_does_not_fit_the_arm_stops_before_any_guarded_line
     assert code == 1 and rec.events == ["reach:look", "home"]
 
 
-def test_without_the_oblique_aim_nothing_moves(ctx, monkeypatch, tmp_path):
+@pytest.mark.parametrize("soft", [False, True])
+def test_without_the_oblique_aim_nothing_moves(ctx, monkeypatch, tmp_path, soft):
+    """Nor, in a compliant run, is the joint impedance primed: this refusal
+    comes first, and its "nothing moved" stays true."""
     from rammp_box_opening.models.container import ContainerPose
     from rammp_box_opening.perception import button_aim
     from rammp_box_opening.runtime.runner import Runner
@@ -765,12 +768,15 @@ def test_without_the_oblique_aim_nothing_moves(ctx, monkeypatch, tmp_path):
     cfg = load_press_demo(PINK)
     ctx.model = ContainerModel.load(PINK)
     fix = SimpleNamespace(pose=ContainerPose(xyz=(BUTTON[0], BUTTON[1], BUTTON[2] - 0.121), yaw=0.0), top_xyz=BUTTON)
-    code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None,
-                                       SimpleNamespace(execute=True, press_only=True), fix, None)
-    assert code == 1 and not ctx.client.executed
+    args = SimpleNamespace(execute=True, press_only=True, compliant=soft, depth_press=soft)
+    code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None, args, fix, None)
+    assert code == 1 and not ctx.client.executed and ctx.client.primes == []
 
 
-def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("soft", [False, True])
+def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys, soft):
+    """Guarded, or compliant with its press proven: the preview flies
+    nothing, and primes no joint impedance either."""
     from rammp_box_opening.models.container import ContainerPose
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.runner import Runner
@@ -784,11 +790,15 @@ def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys)
         goal_joints=[0.0] * 7, name=n, traj=None, speed=sp, world="full", kind=None, guard=None, warp=None,
         plan_s=0.0, plan_server_s=None, waypoint=None, target=t, verify=None), s))
     monkeypatch.setattr(Runner, "preview", lambda self, legs: "preview")
+    if soft:
+        monkeypatch.setattr(reach_press, "way_down", _way_down([], solves=lambda tilt, tip: True))
     fix = SimpleNamespace(pose=ContainerPose(xyz=(BUTTON[0], BUTTON[1], BUTTON[2] - 0.121), yaw=0.0), top_xyz=BUTTON)
-    code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None,
-                                       SimpleNamespace(execute=False, press_only=True), fix, None)
-    assert code == 0 and not ctx.client.executed
-    assert "gravity alone moves joint_4 0.00 Nm along the slide" in capsys.readouterr().out
+    args = SimpleNamespace(execute=False, press_only=True, compliant=soft, depth_press=soft)
+    code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None, args, fix, None)
+    assert code == 0 and not ctx.client.executed and ctx.client.primes == []
+    out = capsys.readouterr().out
+    assert "gravity alone moves joint_4 0.00 Nm along the slide" in out
+    assert ("COMPLIANT: every move" in out) is soft and "enters its joint impedance" not in out
 
 
 def test_a_compliant_run_says_which_gains_every_move_flies(ctx, monkeypatch, capsys):
@@ -864,6 +874,9 @@ def test_a_scene_button_no_tilt_presses_even_30_mm_off_stops_before_anything_mov
     asked = []
     code, rec, _chain, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked))
     assert code == 1 and rec.events == [] and ctx.client.executed == [] and got == {}
+    # the joint impedance was primed while the proof was planned: a hold
+    # where the arm stands, which the run leaves it in
+    assert ctx.client.primes == [[0.0] * 7]
     out = capsys.readouterr().out
     assert ("STOP: no reach-out press for the scene camera's box — no tilt turns the hand down and strokes there, "
             "nor with the button 30 mm nearer the arm or to either side (30 deg: the way down (walk in: ") in out

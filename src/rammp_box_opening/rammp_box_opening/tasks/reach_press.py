@@ -1479,7 +1479,19 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     # pressed. This is planning before the arm moves, not a check that stops it.
     proof = soft and depth
     looks = [] if proof else None
-    plan, why = plan_reach(ctx, cfg, prior_button, ctx.client.joints(), depth=proof, looks=looks)
+    # One read: the hold that primes the joint impedance and the look's plan
+    # start from the same joints. The first compliant goal after a POSITION
+    # one waits out the driver's switch (mode_settle_s 0.25 s) and starts on
+    # a spring still fading in (gain_ramp_s 0.5 s): 16:23 2026-10-27's look
+    # took 1.857 s against its 1.60 s preview, and no compliant leg after it
+    # ran more than 3 ms over its own. The hold (client.prime_compliant) pays
+    # both while the reach is planned. A preview and a guarded run send none.
+    q0 = ctx.client.joints()
+    if args.execute and soft:
+        prime = getattr(ctx.client, "prime_compliant", None)
+        if prime is not None and prime(q0):
+            print("[press_demo] the driver enters its joint impedance now, while the reach is planned")
+    plan, why = plan_reach(ctx, cfg, prior_button, q0, depth=proof, looks=looks)
     proven = "scene" if proof and plan is not None else None
     if plan is None and proof and looks:
         near, why_near = shifted_way_down(ctx, cfg, looks[0], prior_button)

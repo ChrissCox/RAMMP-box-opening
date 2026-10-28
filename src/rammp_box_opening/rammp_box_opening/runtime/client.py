@@ -26,6 +26,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 # Interface packages are installed in the driver/planner containers and in
 # ros2_ws on the bench, but may not be available on a fresh flatbot host.
@@ -57,6 +58,7 @@ from rammp_box_opening.constants import (  # noqa: F401 - GAINS_* are re-exporte
 from rammp_box_opening.runtime import driver
 from rammp_box_opening.runtime.approach import plan_with_vertical_approach
 from rammp_box_opening.runtime.branches import joint_time, nearest_branch, planner_branch
+from rammp_box_opening.runtime.stamps import set_stamp
 
 _GRIPPER_JOINT_HINTS = ("robotiq", "knuckle", "finger")
 
@@ -118,6 +120,7 @@ class PlannerClient:
         # the ImpedanceGains profile a compliant goal that names none flies
         # (constants.COMPLIANT_RUN_GAINS, STIFF); the driver's own is MEDIUM
         self.compliant_gains = COMPLIANT_RUN_GAINS
+        self._primer = None  # prime_compliant's goal, sent and never waited on
         # the driver publishes /joint_states best-effort (SensorDataQoS): a
         # reliable subscription would match nothing and hear nothing
         node.create_subscription(
@@ -479,6 +482,70 @@ class PlannerClient:
         if getattr(wrapped, "status", None) == GoalStatus.STATUS_CANCELED:
             return True
         return getattr(cresp, "return_code", None) in self._CANCEL_TAKEN
+
+    # prime_compliant's hold: two points at the arm's joints, the first past
+    # t=0 (check_like_executor refuses a first point at 0), over 50 ms in.
+    # The reach-out's look goes out ~0.5 s after it (its plan 0.34 s, the
+    # lines 0.06, the note 0.05), and the hold is done ~0.3 s after it is
+    # sent (mode_settle_s 0.25 s, then 0.05): it never holds the look back.
+    # A 0.75 s hold would have kept it waiting 0.28-0.5 s.
+    PRIME_TIMES_S = (0.02, 0.05)
+
+    def prime_compliant(self, q=None):
+        """Put the driver in its joint impedance now, holding the arm where it
+        stands, so the first compliant goal after a POSITION one neither waits
+        for the switch nor starts on a half-faded spring. True when the hold
+        went out.
+
+        A goal in another control_mode than the one the driver runs waits
+        mode_settle_s (0.25 s) before it is submitted, and on entry the mode
+        fades its spring, its damper and its M·qdd feedforward in over
+        gain_ramp_s (0.5 s), whether or not a trajectory runs
+        (kinova-gen3-driver supervisor.cpp, joint_impedance_mode.cpp on_enter
+        and compute). Flatbot 2026-10-27 16:23: the look, that run's first
+        compliant goal, took 1.857 s against its 1.60 s preview, and no
+        compliant leg after it ran more than 3 ms over its own (15:34's
+        position look: 1.451 s against 1.45). Sent while the reach is
+        planned, the hold has paid both by the time the look goes out. After
+        it the mode holds its last point; a look sent while it still runs is
+        queued behind it (QUEUE) and promoted gaplessly.
+
+        Sent only by an armed, compliant client with no abort requested,
+        under its compliant_gains, from a fresh /joint_states sample
+        (GUARD_STALE_S) and through the gates every goal passes
+        (driver.refusal): it holds `q`, the read the caller's plan starts
+        from, else that sample. Nothing waits for the goal's acceptance or
+        its result: the planning that follows spins the node, and the next
+        execute() waits on its own goal only."""
+        if not self._armed or not bool(getattr(self, "compliant", False)):
+            return False
+        if self._abort is not None and self._abort.requested:
+            return False
+        live = self._fresh_joints(max_age=self.GUARD_STALE_S)
+        if live is None:
+            return False
+        held = list(live) if q is None else [float(v) for v in q]
+        hold = JointTrajectory()
+        hold.joint_names = list(self.joint_names)
+        for t in self.PRIME_TIMES_S:
+            p = JointTrajectoryPoint()
+            p.positions = list(held)
+            p.velocities = [0.0] * len(held)
+            p.accelerations = [0.0] * len(held)
+            set_stamp(p.time_from_start, t)
+            hold.points.append(p)
+        if driver.refusal(hold, live, JOINT_VMAX):
+            return False
+        if not self._execute.wait_for_server(timeout_sec=0.2):
+            return False
+        goal = ExecuteJointTrajectory.Goal()
+        goal.trajectory = hold
+        goal.control_mode = IMPEDANCE
+        goal.gains.profile = int(getattr(self, "compliant_gains", COMPLIANT_RUN_GAINS))
+        goal.preemption = QUEUE
+        goal.sender_id = "rammp_box_opening"
+        self._primer = self._execute.send_goal_async(goal)  # kept referenced; never waited on
+        return True
 
     def execute(self, traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
         """Run one trajectory on the driver; outcome 'arrived' | 'touch' | 'failed'.

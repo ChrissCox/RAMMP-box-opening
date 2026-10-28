@@ -1480,12 +1480,50 @@ def test_a_compliant_walk_in_flies_at_the_free_line_speed_too(ctx, monkeypatch, 
     assert leg.guard is None and leg.speed == FREE_LINE_SPEED and leg.world.startswith("full"), (leg.speed, leg.world)
 
 
+def test_a_compliant_reach_out_primes_the_impedance_once_before_the_reach_is_planned(ctx, monkeypatch, tmp_path,
+                                                                                    capsys):
+    """Flatbot 2026-10-27 16:23: the look, the run's first compliant goal,
+    took 1.857 s against its 1.60 s preview — the driver's switch out of
+    POSITION and its spring fading in under the look. The hold that primes
+    the joint impedance goes out once, before the reach is planned, at the
+    very read the look's plan starts from: the hold's reference is the
+    look's first waypoint."""
+    reads = []
+    real_joints = ctx.client.joints
+
+    def joints():  # until the arm first moves, each read its own sample, 0.1 mrad on from the last
+        q = real_joints()
+        if ctx.client.executed:
+            return q
+        reads.append([v + 1e-4 * (len(reads) + 1) for v in q])
+        return list(reads[-1])
+
+    monkeypatch.setattr(ctx.client, "joints", joints)
+    planned = []
+    real_plan = rp.plan_reach
+
+    def plan_reach(ctx_, cfg, button, q_from, *a, **k):
+        planned.append((list(q_from), len(ctx_.client.primes)))
+        return real_plan(ctx_, cfg, button, q_from, *a, **k)
+
+    monkeypatch.setattr(rp, "plan_reach", plan_reach)
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True)
+    assert code == 0 and got["client_compliant"]
+    q0, = ctx.client.primes
+    assert q0 in reads  # one read ...
+    first_from, primed_by_then = planned[0]
+    assert primed_by_then == 1 and first_from == q0  # ... primed before the reach is planned from it
+    assert list(rec.legs["reach:look"].traj.points[0].positions) == q0  # the look starts at the hold
+    assert "the driver enters its joint impedance now, while the reach is planned" in capsys.readouterr().out
+
+
 def test_a_guarded_reach_out_is_as_before(ctx, monkeypatch, tmp_path):
     from rammp_box_opening.constants import CONTACT_SPEED
 
     code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped)
     # at rest, at the look, at the look again, over the button, and over the box for the home
     assert code == 0 and not got["compliant"] and rec.reads == 5
+    assert ctx.client.primes == []  # every leg in POSITION: no joint impedance to prime
     assert rec.legs["reach:slide-in"].guard is not None
     # toward the box slow enough for its guard to stop it, in the interaction world
     for n in ("reach:re-aim", "reach:slide-in"):

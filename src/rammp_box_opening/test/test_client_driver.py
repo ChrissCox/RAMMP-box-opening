@@ -171,6 +171,7 @@ def _client(driver=None, armed=True):
     c._abort = None
     c._armed = armed
     c._execute = driver if driver is not None else _Driver()
+    c._active_joints = None  # no /joint_states names yet: joint_names is the bench's
     c._q = list(LIVE)
     c._eff = [0.0] * 7
     c._eff_at = time.monotonic()
@@ -753,3 +754,101 @@ def test_a_compliant_guard_watches_and_never_stops_the_leg(monkeypatch):
 def test_a_compliant_leg_flies_on_through_a_silent_stream(monkeypatch):
     outcome, _info, h, _d = _compliant_run(monkeypatch, _Guard(), fresh=False)
     assert outcome == "arrived" and h.cancels == 0
+
+
+# -- the hold that primes the joint impedance (prime_compliant) ----------------
+
+
+class _SilentDriver(_Driver):
+    """Takes every goal and answers none of them, until `answering`: then
+    each is accepted and arrives at once, as _Driver's. A primer that waited
+    on its goal would hang here."""
+
+    def __init__(self):
+        super().__init__()
+        self.futures = []
+        self.answering = False
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        if self.answering:
+            return super().send_goal_async(goal, feedback_callback)
+        self.goals.append(goal)
+        self.futures.append(_Pending())
+        return self.futures[-1]
+
+
+def _priming(driver, armed=True):
+    c = _client(driver, armed=armed)
+    c.compliant = True
+    return c
+
+
+def test_the_impedance_is_primed_by_a_hold_where_the_arm_stands_and_nothing_waits_on_it(monkeypatch):
+    """Flatbot 2026-10-27 16:23: the look, the run's first compliant goal,
+    took 1.857 s against its 1.60 s preview — the driver's 0.25 s switch out
+    of POSITION, then its spring fading in under the look. The primer is ONE
+    impedance goal, queued as every goal is, holding the arm where it stands
+    under the run's gains; the call spins nothing and waits for neither the
+    goal's acceptance nor its result: the planning that follows serves it."""
+    from rammp_box_opening.constants import JOINT_VMAX
+
+    d = _SilentDriver()
+    c = _priming(d)
+    c._active_joints = ["arm_joint_%d" % i for i in range(1, 8)]  # flatbot's /joint_states names
+    spins = []
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", lambda node, timeout_sec=0.0: spins.append(timeout_sec))
+    monkeypatch.setattr(client_mod, "spin_until_done", lambda *a, **k: pytest.fail("the primer waited on its goal"))
+    assert c.prime_compliant() is True
+    goal, = d.goals
+    assert spins == [] and c._primer is d.futures[0] and not d.futures[0].done()
+    assert goal.control_mode == client_mod.IMPEDANCE and goal.preemption == client_mod.QUEUE
+    assert goal.gains.profile == client_mod.GAINS_STIFF and goal.sender_id == "rammp_box_opening"
+    hold = goal.trajectory
+    assert list(hold.joint_names) == c._active_joints
+    assert [_secs(p) for p in hold.points] == pytest.approx(list(client_mod.PlannerClient.PRIME_TIMES_S))
+    assert client_mod.PlannerClient.PRIME_TIMES_S == (0.02, 0.05)
+    for p in hold.points:  # two identical points at the live joints, at rest
+        assert list(p.positions) == pytest.approx(LIVE)
+        assert list(p.velocities) == [0.0] * 7 and list(p.accelerations) == [0.0] * 7
+    assert client_mod.driver.refusal(hold, LIVE, JOINT_VMAX) is None
+    # why the first point is not at t=0: the gates every goal passes refuse it
+    assert "non-monotonic" in client_mod.driver.refusal(_traj(LIVE, LIVE, times=(0.0, 0.05)), LIVE, JOINT_VMAX)
+    # the caller's own read is the one held, under whichever gains the run flies
+    q = [v + 0.01 for v in LIVE]
+    c.compliant_gains = client_mod.GAINS_MEDIUM
+    assert c.prime_compliant(q) is True
+    for p in d.goals[-1].trajectory.points:
+        assert list(p.positions) == pytest.approx(q)
+    assert d.goals[-1].gains.profile == client_mod.GAINS_MEDIUM
+    # ... within the start gate of the live arm, as any goal's first waypoint
+    assert c.prime_compliant([LIVE[0] + 0.1] + LIVE[1:]) is False and len(d.goals) == 2
+    assert spins == []
+
+
+def test_only_an_armed_compliant_client_with_no_abort_requested_primes():
+    from rammp_box_opening.runtime.abort import AbortFlag
+
+    d = _SilentDriver()
+    assert _priming(d, armed=False).prime_compliant() is False  # no --execute
+    assert _client(d).prime_compliant() is False  # a position client: --guarded, home_arm
+    aborted = _priming(d)
+    aborted._abort = AbortFlag()
+    aborted._abort.requested = True  # Ctrl+C while the scene camera looked
+    assert aborted.prime_compliant() is False
+    assert d.goals == []
+
+
+def test_an_execute_after_the_primer_returns_its_own_result():
+    """The primer's goal is never answered here; the look after it is, and
+    that answer is the look's."""
+    d = _SilentDriver()
+    c = _priming(d)
+    assert c.prime_compliant()
+    d.answering = True
+    end = [v + 0.05 for v in LIVE]
+    outcome, info = c.execute(_traj(LIVE, end), 1.0)
+    assert outcome == "arrived" and info["message"] == "arrived" and info["gains"] == client_mod.GAINS_STIFF
+    primer, look = d.goals
+    assert list(primer.trajectory.points[-1].positions) == pytest.approx(LIVE)
+    assert list(look.trajectory.points[-1].positions) == pytest.approx(end)
+    assert not d.futures[0].done()  # the primer's own answer: never come, never waited on
