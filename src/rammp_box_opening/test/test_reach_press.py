@@ -135,18 +135,29 @@ def test_a_tilt_whose_stroke_the_arm_cannot_fly_straight_is_passed_over(ctx, mon
     assert plan is not None and plan.tilt_deg == 35
 
 
+DOWN_QUAT = [1.0, 0.0, 0.0, 0.0]  # STRAIGHT_DOWN as a quaternion (x, y, z, w)
+
+
 def _way_down(asked, solves=lambda tilt, tip: False):
     """reach_press.way_down for the fake chain: each ask kept as (tilt, the
     xy under the slid-in fingertip — the button's —, top_z); `solves(tilt,
-    fingertip)` says where the hand turns down and strokes. A refusal reads
-    as 16:23's did."""
+    fingertip)` says where the hand turns down and strokes: the turn in
+    place where the slide ends, then the press stroke from its end, each a
+    step on from the last as _Chain's lines are, the spring 440 N/m. A
+    refusal reads as 16:23's did."""
+    from rammp_box_opening.tasks import depth_press as dp
 
     def way_down(ctx_, cfg_, q_look, slide, start, quat, top_z):
         tip = np.asarray(start, float) + np.asarray(quat_to_mat(*quat), float) @ np.asarray(reach_press.CONTACT_TOOL)
         asked.append((_tilt_of(quat), [float(tip[0]), float(tip[1])], float(top_z)))
         if solves(_tilt_of(quat), tip):
-            down = SimpleNamespace(walked=False, short_deg=0.0)
-            return down, SimpleNamespace(k=440.0, end_z=float(top_z) - 0.03), None
+            turn = [[float(v) for v in slide[-1]], [float(v) + 0.01 for v in slide[-1]]]
+            down = dp.WayDown(turn, list(DOWN_QUAT), 0.0, False)
+            t0 = np.array([0.5, -0.4, 0.45])  # the fake fk's
+            stroke = dp.StrokePlan([("depth:press", [turn[-1], [v + 0.01 for v in turn[-1]]], dp.TOUCH_SPEED)], 440.0,
+                                   0.03 - cfg_.button_travel_m, float(top_z) - 0.03, t0,
+                                   t0 + STRAIGHT_DOWN @ np.asarray(dp.DOWN_CONTACT_TOOL), turn[-1], list(DOWN_QUAT))
+            return down, stroke, None
         return None, None, ("walk in: 0 deg short: a joint jump of 0.19 rad 44% of the way — near a singularity; "
                             "turn after the slide: 0 deg short: IK did not converge 73% of the way")
 
@@ -380,6 +391,7 @@ class _Rec:
         self.legs = {}  # name -> the last leg of that name
         self.owl = []  # the scene OWL's ("on"/"off", events before it)
         self.reads = 0  # at-rest reads (client.settled_efforts)
+        self.runs = []  # per runner.run: (its legs' names, the gains each execution it took was sent)
 
 
 def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4), scene_after="same", settled=None,
@@ -426,7 +438,10 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
             for lg in legs:
                 rec.events.append(lg.name)
                 rec.legs[lg.name] = lg
-            return super().run(legs, execute, lookahead)
+            sent = len(getattr(self.client, "gains_sent", []))
+            out = super().run(legs, execute, lookahead)
+            rec.runs.append(([lg.name for lg in legs], getattr(self.client, "gains_sent", [])[sent:]))
+            return out
 
     runner = R(ctx.client, log_dir=tmp_path)
     aims = [first, after]
@@ -805,8 +820,11 @@ def test_a_stop_says_what_stopped_the_leg_not_always_something_met():
 def _depth_press_flow(ctx, monkeypatch, tmp_path, way_down, compliant=True, **kw):
     """_flow with --depth-press — compliant, as press_demo runs by default
     since 2026-10-27, unless `compliant` is False (--guarded) — the way down
-    `way_down`'s, the press itself faked. Returns _flow's, and what the
-    press was handed ({} when it was not called)."""
+    `way_down`'s, the press itself faked: the guarded press, and a compliant
+    one's hold at the end of its one-execution way in, which judges it at
+    the aimed button the box was put at (ctx.cpose). Returns _flow's, and
+    what the press was handed ({} when it was not called)."""
+    from rammp_box_opening.models.container import from_container
     from rammp_box_opening.tasks import depth_press as dp
 
     got = {}
@@ -816,7 +834,12 @@ def _depth_press_flow(ctx, monkeypatch, tmp_path, way_down, compliant=True, **kw
         got.update(aimed=aimed, top_z=top_z, compliant=compliant)
         return dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=14.0)
 
+    def hold(ctx_, cfg_, runner_, stroke, top_z, seen):
+        got.update(aimed=from_container(ctx_.cpose, ctx_.model.button_offset), top_z=top_z, compliant=True)
+        return dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=14.0)
+
     monkeypatch.setattr(dp, "press_down_from_here", press)
+    monkeypatch.setattr(dp, "compliant_hold", hold)
     monkeypatch.setattr(reach_press, "way_down", way_down)
     kw.setdefault("touch", ("arrived", {"message": "ok", "progress": 1.0}))  # no TF stroke: the 4th motion is the clear
     args = SimpleNamespace(execute=True, press_only=True, depth_press=True, compliant=compliant)
@@ -854,8 +877,11 @@ def test_a_scene_button_the_press_reaches_30_mm_off_flies_the_look_and_the_aimed
     (test_on_flatbot_a_scene_button_out_of_reach_by_a_little_still_flies_the_look):
     no tilt presses it, 30 mm nearer the arm the press reaches — and the
     aim, 9 mm nearer and 21 mm aside, too. The look flies, and the aimed
-    button's own way down, solved after the aim, takes the press in."""
+    button's own way down, solved after the aim, takes the press in — the
+    re-aim, the slide in, the turn and the stroke as one execution."""
     import json
+
+    from rammp_box_opening.tasks import depth_press as dp
 
     u = np.asarray(BUTTON[:2]) / np.hypot(*BUTTON[:2])
     aimed = (BUTTON[0] - 0.02 * u[0], BUTTON[1] - 0.02 * u[1], BUTTON[2])
@@ -864,7 +890,9 @@ def test_a_scene_button_the_press_reaches_30_mm_off_flies_the_look_and_the_aimed
     code, rec, _chain, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked, off_scene),
                                                    first=(aimed, 0.4))
     assert code == 0
-    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
+    way_in = ["reach:re-aim", "reach:slide-in", "depth:turn", "depth:press"]
+    assert rec.events == ["reach:look", "aim:reach-aim", *way_in, "depth:clear", "home"]
+    assert (way_in, [dp.COMPLIANT_GAINS]) in rec.runs
     assert got["aimed"] == pytest.approx(aimed) and got["top_z"] == pytest.approx(BUTTON[2]) and got["compliant"]
     out = capsys.readouterr().out
     assert ("the press does not reach the scene camera's button itself (30 deg: the way down (walk in: ") in out
@@ -885,19 +913,51 @@ def test_where_no_straight_line_reaches_the_aimed_look_pose_the_planned_one_brin
     """The planner plans the move to the aimed button's look pose where no
     straight line flies there, as before; plan_reach proves the way down
     from that leg's end, which is where the arm then stands — no second
-    solve, no re-aim after it."""
+    solve, no re-aim after it: from there the slide in, the turn and the
+    stroke fly as one execution."""
     import json
+
+    from rammp_box_opening.tasks import depth_press as dp
 
     asked = []
     chain = _Chain(refuse=[lambda xyz, quat: xyz[2] > 0.52])  # the move to the look pose (0.54), not the slide (0.47)
     code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked, lambda tilt, tip: True),
                                                chain=chain)
     assert code == 0 and got["aimed"] == pytest.approx(BUTTON)
-    assert rec.events == ["reach:look", "aim:reach-aim", "reach:look", "reach:slide-in", "depth:clear", "home"]
+    way_in = ["reach:slide-in", "depth:turn", "depth:press"]
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:look", *way_in, "depth:clear", "home"]
+    assert (way_in, [dp.COMPLIANT_GAINS]) in rec.runs
     assert [t for t, _xy, _z in asked] == [30, 30]  # the scene button's, then the planned look's for the aimed one
     rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
     way, = [r for r in rows if r["leg"] == "reach_way_in"]
     assert way["tilt_deg"] == 30 and way["walked"] is False
+
+
+def test_a_planned_look_the_arm_stands_off_flies_its_way_in_leg_by_leg(ctx, monkeypatch, tmp_path, capsys):
+    """After the planner's look leg the way in starts at that leg's planned
+    end. An arrival a few mrad off it (impedance) is not jumped from: the
+    way in flies leg by leg, each line solved again from where the arm
+    stands, as before the one execution — the slide in from the live
+    joints, then the press, which turns and strokes from there."""
+    chain = _Chain(refuse=[lambda xyz, quat: xyz[2] > 0.52])  # the move to the look pose (0.54), not the slide (0.47)
+    real = ctx.client.execute
+
+    def execute(traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        out = real(traj, speed, guard=guard, while_running=while_running, stop_when=stop_when, gains=gains)
+        if len(ctx.client.executed) == 2:  # the planned look for the aimed button: 5 mrad short on joint_2
+            ctx.client.live[1] -= 0.005
+        return out
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+    code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down([], lambda tilt, tip: True),
+                                               chain=chain)
+    assert code == 0 and got["compliant"] and got["aimed"] == pytest.approx(BUTTON)  # the press, handed the aim
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:look", "reach:slide-in", "depth:clear", "home"]
+    assert "the way in does not fly as one execution (the arm stands 0.005 rad from where reach:slide-in starts)" in (
+        capsys.readouterr().out)
+    slide = rec.legs["reach:slide-in"]
+    assert list(slide.traj.points[0].positions) == pytest.approx([0.05, 0.045] + [0.05] * 5)  # from the live joints
+    assert (["reach:slide-in"], [None]) in rec.runs and slide.gains is None  # a goal of its own, as before
 
 
 def test_where_neither_a_line_nor_a_planned_look_brings_the_aimed_button_a_way_down_the_arm_goes_home_from_the_look(

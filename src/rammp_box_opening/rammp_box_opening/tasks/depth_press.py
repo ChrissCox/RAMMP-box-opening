@@ -16,7 +16,8 @@ thing it got wrong. So from over the box:
           to 15 (COMPLIANT_TURN_SHORT_DEG) — it stops. A compliant
           reach-out solves the turn and its stroke before it flies toward
           the box (reach_press.way_down, from turn_walk and
-          compliant_stroke).
+          compliant_stroke), and flies them in the same execution as its
+          re-aim and its slide in (reach_press.way_in_legs).
   DEPTH   the wrist camera, looking down along the tool, measures how far
           below its lens the lid is: the button's own ring if it sees it,
           else where the caller aimed the button (the reach-out's tilted
@@ -864,6 +865,84 @@ def compliant_stroke(chain, cfg, q0, quat, top_z, kq=COMPLIANT_KQ):
     return StrokePlan(legs, k, over, end_z, t0, pad0, q0, list(quat)), None
 
 
+def compliant_line(ctx, name, pts, quat, speed, world):
+    """A compliant press's plan-free line (rp.line_leg), unguarded, under
+    COMPLIANT_GAINS named on the leg: the spring the press is modelled on
+    (COMPLIANT_KQ), and the one gains spec legs.can_merge asks of legs that
+    fly as one execution."""
+    leg = rp.line_leg(ctx, name, pts, quat, speed, None, world)
+    leg.gains = COMPLIANT_GAINS
+    return leg
+
+
+def _lean_deg(quat):
+    """How far short of straight down the hand at `quat` presses (deg, to 0.1)."""
+    return round(math.degrees(rp.hand_lean(rp._rot(quat))), 1)
+
+
+def press_text(stroke, cfg):
+    """What the console says of a compliant stroke (compliant_stroke's)
+    before it flies: how far down, past the button's bottom, with what
+    spring, held how long — and the lean, from LEAN_SAID_DEG on."""
+    lean = _lean_deg(stroke.quat)
+    return ("PRESS (compliant)%s: straight down %.0f mm to %.0f mm below the button's bottom — the spring "
+            "pushes ~%.0f N there (%.0f N/m at the pads); held %.1f s, then back up. Nothing stops it but the e-stop"
+            % (", the hand leaning %.0f deg back toward the arm" % lean if lean >= LEAN_SAID_DEG else "",
+               1000 * (stroke.pad0[2] - stroke.end_z), 1000 * stroke.over, stroke.k * stroke.over, stroke.k,
+               cfg.push_hold_s))
+
+
+def compliant_hold(ctx, cfg, runner, stroke, top_z, seen):
+    """The compliant press's hold at the end of its stroke (`stroke`,
+    compliant_stroke's) on the button whose top is at `top_z`: held
+    push_hold_s where the spring left the pads, pressing — the hold IS the
+    reading. What it pressed with is the pads' height off the stroke's end
+    times the stiffness there; COMPLIANT_FELT_N or more is a press, and
+    seen["touch_xyz"] is where the pads were held. The run record
+    (depth_compliant_press) and the console say it. Returns the verdict: a
+    DepthPress, free, judged False (a compliant press does not look)."""
+    from rammp_box_opening.runtime import approach
+
+    k, end_z = stroke.k, stroke.end_z
+    held = ctx.client.settled_efforts(duration_s=0.15, settle_s=max(0.0, float(cfg.push_hold_s) - 0.15))
+    qh = held[1] if held is not None else ctx.client.joints()
+    Rh, th = approach._chain().fk(qh)
+    pad = np.asarray(th, float) + np.asarray(Rh, float) @ np.asarray(DOWN_CONTACT_TOOL, float)
+    force = k * max(0.0, float(pad[2]) - end_z)
+    felt = force >= COMPLIANT_FELT_N
+    if felt:
+        seen["touch_xyz"] = tuple(round(float(v), 5) for v in pad)  # where the pads were held, pressing
+    facts = dict(top_z=round(float(top_z), 4), end_z=round(end_z, 4), held_pad_xyz=[round(float(v), 4) for v in pad],
+                 stiffness_n_per_m=round(k, 1), press_n=round(force, 1), felt=felt)
+    lean = _lean_deg(stroke.quat)
+    if lean >= LEAN_SAID_DEG:
+        facts["lean_deg"] = lean
+    runner.note("depth_compliant_press", **facts)
+    print("[press_demo] %s: the pads held %.0f mm above the stroke's end, %.0f mm %s the button's top" % (
+        "PRESSED with ~%.0f N" % force if felt else "NOTHING PRESSED (%.0f N)" % force, 1000 * (pad[2] - end_z),
+        1000 * abs(float(top_z) - pad[2]), "below" if pad[2] < float(top_z) else "above"))
+    return DepthPress(free=True, contact=felt, felt=felt, judged=False, press_n=force)
+
+
+def compliant_rise(ctx, runner, stroke, held):
+    """From the hold back up to where the stroke began (stroke.t0), the
+    lean held: 'depth:rise', a straight line from where the arm stands, at
+    FREE_LINE_SPEED (compliant_line, labelled with the full world). Returns
+    the hold's verdict `held` (compliant_hold's), free False with why when
+    the way up does not fly — the arm holds."""
+    t0, quat = stroke.t0, stroke.quat
+    up, why = rp._line(ctx, [float(t0[0]), float(t0[1]), float(t0[2])], quat)
+    if up is None:
+        return dataclasses.replace(held, free=False,
+                                   why="the way up is not a straight line the arm can fly (%s) — the arm holds" % why)
+    if up:
+        res = runner.run([compliant_line(ctx, "depth:rise", up, quat, FREE_LINE_SPEED, _full_world(ctx))], execute=True)
+        if any(not r.ok for r in res):
+            return dataclasses.replace(held, free=False,
+                                       why="the way up stopped (%s) — the arm holds" % res[-1].detail)
+    return held
+
+
 def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=None):
     """The COMPLIANT press (COMPLIANT_PRESS_N): from where the hand stands
     over the button, turned down (`turned`, else TURN here), straight down
@@ -873,7 +952,11 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     where the spring held the pads: the pads' height off the stroke's end,
     times the stiffness there. Its TURN may stop up to 15 deg short of
     straight down (COMPLIANT_TURN_SHORT_DEG): the pads' centre still over
-    the button, the stroke still vertical. Nothing it reads stops it."""
+    the button, the stroke still vertical. Nothing it reads stops it. The
+    stroke, the hold and the rise are compliant_stroke, compliant_hold and
+    compliant_rise: a compliant reach-out flies the same stroke as the end
+    of its one-execution way in (reach_press.way_in_legs) and calls this
+    only where that does not fly."""
     from rammp_box_opening.runtime import approach
 
     if top_z is None:
@@ -884,58 +967,19 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
         quat, _moved, why = turn_down(ctx, runner, contact_tool, None, shorts=COMPLIANT_TURN_SHORT_DEG)
         if quat is None:
             return DepthPress(free=why.startswith("no straight-down"), why=why)
-    chain = approach._chain()
-    stroke, why = compliant_stroke(chain, cfg, ctx.client.joints(), quat, top_z)
+    stroke, why = compliant_stroke(approach._chain(), cfg, ctx.client.joints(), quat, top_z)
     if stroke is None:
         return DepthPress(free=True, why=why)
-    t0, pad0, k, over, end_z = stroke.t0, stroke.pad0, stroke.k, stroke.over, stroke.end_z
     world = _full_world(ctx)
-    legs = []
-    for name, pts, speed in stroke.legs:
-        leg = rp.line_leg(ctx, name, pts, quat, speed, None, world)
-        leg.gains = COMPLIANT_GAINS
-        legs.append(leg)
-    lean = round(math.degrees(rp.hand_lean(rp._rot(quat))), 1)  # how far short of straight down it presses
-    leaning = lean >= LEAN_SAID_DEG
-    print("[press_demo] PRESS (compliant)%s: straight down %.0f mm to %.0f mm below the button's bottom — the spring "
-          "pushes ~%.0f N there (%.0f N/m at the pads); held %.1f s, then back up. Nothing stops it but the e-stop"
-          % (", the hand leaning %.0f deg back toward the arm" % lean if leaning else "", 1000 * (pad0[2] - end_z),
-             1000 * over, k * over, k, cfg.push_hold_s))
+    legs = [compliant_line(ctx, name, pts, quat, speed, world) for name, pts, speed in stroke.legs]
+    print("[press_demo] %s" % press_text(stroke, cfg))
     res = runner.run(legs, execute=True)
     # the stroke meets the box by design: from here every world (home's
     # too) pads it for a shove, as _touch_lid's contact does
     ctx.contact_pad = CONTACT_SHIFT_PAD_M
     if any(not r.ok for r in res):
         return DepthPress(free=False, why="the press stroke stopped (%s) — the arm holds" % res[-1].detail)
-    # held where the spring left it, pressing: the hold IS the reading
-    held = ctx.client.settled_efforts(duration_s=0.15, settle_s=max(0.0, float(cfg.push_hold_s) - 0.15))
-    qh = held[1] if held is not None else ctx.client.joints()
-    Rh, th = chain.fk(qh)
-    pad = np.asarray(th, float) + np.asarray(Rh, float) @ np.asarray(DOWN_CONTACT_TOOL, float)
-    force = k * max(0.0, float(pad[2]) - end_z)
-    felt = force >= COMPLIANT_FELT_N
-    if felt:
-        seen["touch_xyz"] = tuple(round(float(v), 5) for v in pad)  # where the pads were held, pressing
-    facts = dict(top_z=round(float(top_z), 4), end_z=round(end_z, 4), held_pad_xyz=[round(float(v), 4) for v in pad],
-                 stiffness_n_per_m=round(k, 1), press_n=round(force, 1), felt=felt)
-    if leaning:
-        facts["lean_deg"] = lean
-    runner.note("depth_compliant_press", **facts)
-    print("[press_demo] %s: the pads held %.0f mm above the stroke's end, %.0f mm %s the button's top" % (
-        "PRESSED with ~%.0f N" % force if felt else "NOTHING PRESSED (%.0f N)" % force, 1000 * (pad[2] - end_z),
-        1000 * abs(float(top_z) - pad[2]), "below" if pad[2] < float(top_z) else "above"))
-    up, why = rp._line(ctx, [float(t0[0]), float(t0[1]), float(t0[2])], quat)
-    if up is None:
-        return DepthPress(free=False, contact=felt, felt=felt, judged=False, press_n=force,
-                          why="the way up is not a straight line the arm can fly (%s) — the arm holds" % why)
-    if up:
-        leg = rp.line_leg(ctx, "depth:rise", up, quat, FREE_LINE_SPEED, None, world)
-        leg.gains = COMPLIANT_GAINS
-        res = runner.run([leg], execute=True)
-        if any(not r.ok for r in res):
-            return DepthPress(free=False, contact=felt, felt=felt, judged=False, press_n=force,
-                              why="the way up stopped (%s) — the arm holds" % res[-1].detail)
-    return DepthPress(free=True, contact=felt, felt=felt, judged=False, press_n=force)
+    return compliant_rise(ctx, runner, stroke, compliant_hold(ctx, cfg, runner, stroke, top_z, seen))
 
 
 @dataclass
