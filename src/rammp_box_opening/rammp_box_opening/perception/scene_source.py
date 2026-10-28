@@ -336,6 +336,7 @@ class SceneBoxFix:
     # with rivals=True: the tops of the OTHER candidates that pass on their
     # own more than RIVAL_M from the winner's — two places, not one box
     rivals: tuple = ()
+    tried_boxes: tuple = ()  # the box (the candidate's own object) each of `tried` refused: what perception/viz reads
 
 
 # An OWL box this close to the frame's edge has its container running off
@@ -692,7 +693,9 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
     in every reason. With `rivals`, every OTHER candidate is gated on its
     own too, and the tops that pass more than RIVAL_M from the winner's are
     the fix's `rivals`."""
-    tried = []
+    # (why, the candidate's own box) for each refusal, in order: one list, so
+    # SceneBoxFix's tried and tried_boxes never come apart (_tried)
+    refused = []
     clipped = []
     # (score, box, the side edges a round box is finished across or (), the holder that anchors it or None,
     # whether the box's sides are its lid's)
@@ -708,7 +711,7 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
             cands.append((score, box, edges, None, side_is_lid))
         else:
             clipped.append((score, box, edges))
-            tried.append("it runs off the frame at its %s edge (%s %.2f)" % (" and ".join(edges), src, score))
+            refused.append(("it runs off the frame at its %s edge (%s %.2f)" % (" and ".join(edges), src, score), box))
     got = None
     if table_z is not None:
         lid_z = float(table_z) + float(model.dims[2])
@@ -719,9 +722,10 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
                 continue
             pose, top, n = box_from_scene_points(pts_base, uv, box, table_z, model)
             if pose is not None:
-                got = SceneBoxFix(pose, top, n, box, tuple(tried), float(table_z), "top", tuple(clipped))
+                got = SceneBoxFix(pose, top, n, box, table_z=float(table_z), lift="top", clipped=tuple(clipped),
+                                  **_tried(refused))
                 break
-            tried.append("%s (%s %.2f)" % (top, src, score))
+            refused.append(("%s (%s %.2f)" % (top, src, score), box))
     if got is None and cam_xyz is not None:
         for score, box, edges, holder, side_is_lid in cands:
             anchor = None if holder is None else holder_front_rng(pts_base, uv, holder, cam_xyz)
@@ -730,15 +734,17 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
                                                     partial=bool(edges), anchor_rng=anchor, sides=sides,
                                                     side_is_lid=side_is_lid)
             if pose is not None:
-                got = SceneBoxFix(pose, top, n, box, tuple(tried), tz, "side", tuple(clipped), edges)
+                got = SceneBoxFix(pose, top, n, box, table_z=tz, lift="side", clipped=tuple(clipped), partial=edges,
+                                  **_tried(refused))
                 break
             if edges:
                 clipped.append((score, box, edges))
-                tried.append("from the side, cut off at the frame's %s edge, %s (%s %.2f)" % (" and ".join(edges), top, src, score))
+                why = "from the side, cut off at the frame's %s edge, %s (%s %.2f)" % (" and ".join(edges), top, src, score)
+                refused.append((why, box))
             else:
-                tried.append("from the side, %s (%s %.2f)" % (top, src, score))
+                refused.append(("from the side, %s (%s %.2f)" % (top, src, score), box))
     if got is None:
-        return SceneBoxFix(None, None, 0, None, tuple(tried), clipped=tuple(clipped))
+        return SceneBoxFix(None, None, 0, None, clipped=tuple(clipped), **_tried(refused))
     if rivals and len(boxes) > 1:
         won = box_key(got.box)
         others = []
@@ -752,6 +758,11 @@ def scene_fix_from_boxes(boxes, pts_base, uv, table_z, model, cam_xyz=None, side
         if others:
             got = replace(got, rivals=tuple(others))
     return got
+
+
+def _tried(refused):
+    """SceneBoxFix's tried and tried_boxes from the gate's (why, box) pairs."""
+    return {"tried": tuple(why for why, _box in refused), "tried_boxes": tuple(box for _why, box in refused)}
 
 
 def table_from_scene_points(pts_base, uv, image_h, row_frac=0.6):
@@ -913,6 +924,7 @@ class SceneLocator:
         self.last_why = None
         self.last_timing = {}
         self.last_boxes = {}  # source -> the raw boxes of the last message locate() gated (the detection set keeps them)
+        self.last_judged = {}  # source -> (its candidates, SceneBoxFix, colour frame, T_base_color): what viz draws
         self.last_seg_state = None  # the segmenter's state when locate() or prime() last looked
         self._clock, self._sleep = time.monotonic, time.sleep  # tests drive them
         # where the calibration saw the cabinet's tag (scene_calib.scene_tag_px):
@@ -985,6 +997,7 @@ class SceneLocator:
         t0 = clock()
         self.last_timing = {}  # where a locate's seconds went (the SCENE line prints it)
         self.last_boxes = {}
+        self.last_judged = {}
         # only frames newer than the newest one held now: those kept from
         # before the call (before a press, say) must not vote
         since = stamp_ns(getattr(g, "color_stamp", None))
@@ -1111,6 +1124,7 @@ class SceneLocator:
                         side_table_z=self.table_z, image_wh=(w, h), cam_R=T_base_color[:3, :3], src=label, rivals=True,
                     )
                     tried[source].extend(got.tried)
+                    self.last_judged[source] = (cands, got, g.color, T_base_color)  # what perception/viz draws
                     for score, _box, edges in got.clipped:
                         if off_frame is None or score > off_frame[0]:
                             off_frame = (score, edges, T_base_color[:3, :3], label)

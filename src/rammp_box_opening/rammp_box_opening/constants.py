@@ -15,6 +15,22 @@ def state_dir(env=None):
     return Path(env.get("RAMMP_BOX_OPENING_STATE") or Path.home() / ".ros" / "rammp_box_opening")
 
 
+VIZ_ENV = "RAMMP_BOX_OPENING_VIZ"  # 1 (or on, true, yes): a Foxglove view of the run (perception/viz)
+
+
+def viz_enabled(env=None):
+    """Whether a run draws its perception for Foxglove (perception/viz):
+    only where $RAMMP_BOX_OPENING_VIZ says 1 (or on, true, yes). Off by
+    default: it has not yet been watched on the robot (2026-10-28), and its
+    one step no checkpoint breaks, the marker type's ~27 ms import (a
+    mission thread waking inside it waited up to ~3.5 ms for the GIL),
+    lands once a run in the mission's first quiet second, which may be a
+    motion. Off, a run is what it was without it. Here, not in viz: a run
+    with it off never imports that module (press_demo.start_viz)."""
+    env = os.environ if env is None else env
+    return str(env.get(VIZ_ENV, "")).strip().lower() in ("1", "on", "true", "yes")
+
+
 # Gen3 home joints in controller order (flatbot, new_adapter_plate_v3, 2026-10-21).
 # joint_3 sits AT -pi (every comparison uses ang_diff; -pi and +pi are equivalent).
 HOME = [0.067, -1.897, -3.137, -2.269, -0.211, -0.683, 1.725]
