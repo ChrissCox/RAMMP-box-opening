@@ -3099,6 +3099,146 @@ def test_a_way_home_whose_later_goal_did_not_start_goes_home_from_where_the_arm_
             "the box") in out
 
 
+# ---- a compliant stop lets go: the springs hold where the arm stands ------------------------
+# With the stop-the-arm checks off, Ctrl+C and the e-stop are the only stops, and the driver lets
+# go of nothing itself: a cancel keeps its joint impedance pulling toward the last reference, its
+# feed-forward on (kinova-gen3-driver 94736cd supervisor.cpp:278-296), and no watchdog lets go
+# (cmd_timeout_s 0). client.release moves that reference to where the arm stands (rp.let_go).
+
+def _releases(ctx):
+    """Every release the run asks of the fake client, as how many goals it
+    had executed by then."""
+    asked = []
+    ctx.client.release = lambda: asked.append(len(ctx.client.executed)) or True
+    return asked
+
+
+def test_a_ctrl_c_in_the_compliant_hold_lets_go_once_and_still_stops_the_run(ctx, monkeypatch, tmp_path):
+    """Ctrl+C while the hold reads (settled_efforts) lands with no goal in
+    flight: abort.py raises at once, and press_demo exits 130. The springs
+    would push on into the box toward the stroke's end, 27-72 mm below the
+    button's top, for as long as the driver runs. The press lets go once,
+    after the turn and the stroke, and the Ctrl+C still ends the run."""
+    asked = _releases(ctx)
+    real_hold = dp.compliant_hold
+
+    def hold(ctx_, cfg, runner, stroke, top_z, seen):
+        def ctrl_c(*a, **k):
+            raise KeyboardInterrupt
+
+        ctx_.client.settled_efforts = ctrl_c
+        return real_hold(ctx_, cfg, runner, stroke, top_z, seen)
+
+    monkeypatch.setattr(dp, "compliant_hold", hold)
+    ctx.client.compliant = True
+    with pytest.raises(KeyboardInterrupt):
+        _press(ctx, monkeypatch, tmp_path, [], touch_at=None, compliant=True, top_z=COMPLIANT_TOP)
+    assert asked == [2]  # the turn and the stroke flown, no rise
+
+
+@pytest.mark.parametrize("way_up", ["no line", "stopped"])
+def test_a_compliant_press_whose_way_up_does_not_fly_lets_go_once(ctx, monkeypatch, tmp_path, way_up):
+    """The button held the pads 50 mm above the stroke's end, and no way up
+    flies: no straight line from the held arm (compliant_rise's `up is
+    None`), or the rise stopped part-way. The arm holds, free False, and
+    lets go once: after the hold, or after the rise that stopped."""
+    asked = _releases(ctx)
+    if way_up == "no line":
+        monkeypatch.setattr(rp, "_line", lambda ctx_, xyz, quat: (None, "IK did not converge 40% of the way"))
+        why = "the way up is not a straight line the arm can fly (IK did not converge 40% of the way) — the arm holds"
+    else:
+        ctx.client.exec_script = [ARRIVED, ARRIVED, ("failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.4})]
+        why = "the way up stopped (PATH_TOLERANCE_VIOLATED) — the arm holds"
+    result, events, _arm, _legs, note = _compliant(ctx, monkeypatch, tmp_path, held_up_m=0.05)
+    assert note["felt"] and not result.free and result.why == why and dp.exit_code(result) == 1
+    assert asked == ([2] if way_up == "no line" else [3])
+    assert events[-1] == ("depth:press" if way_up == "no line" else "depth:rise")
+
+
+@pytest.mark.parametrize("refused_by", ["the runner", "the driver"])
+def test_a_compliant_stroke_that_did_not_start_lets_nothing_go_and_the_arm_may_go_home(ctx, monkeypatch, tmp_path,
+                                                                                         refused_by):
+    """The runner's gates refused the stroke, or the driver turned its goal
+    down (no progress): nothing moved, and the hand stands over the button
+    in free air where the turn left it. Nothing to let go of, no hold read,
+    no shove to pad the box for, and free: home still runs
+    (press_down_from_here's callers)."""
+    from rammp_box_opening.runtime.runner import Runner
+
+    asked = _releases(ctx)
+    if refused_by == "the runner":
+        real = Runner._refusal
+        why = "trajectory sanity gate: arm_joint_6 inside its limit margin"
+        monkeypatch.setattr(Runner, "_refusal", lambda self, leg: why if leg.name == "depth:press" else real(self, leg))
+    else:
+        why = "goal rejected by the driver"
+        ctx.client.exec_script = [ARRIVED, ("failed", {"message": why, "progress": 0.0})]  # the turn, the stroke
+    ctx.client.compliant = True
+    result, events, arm, _legs, _start = _press(ctx, monkeypatch, tmp_path, [], touch_at=None, compliant=True,
+                                                top_z=COMPLIANT_TOP)
+    assert result.free and result.why == "the press stroke did not start (%s) — nothing was pressed" % why
+    assert asked == [] and arm.reads == [] and ctx.contact_pad == 0.0
+    assert events == ["depth:turn", "depth:approach", "depth:press"]  # handed over, nothing after
+    assert dp.exit_code(result) == 1
+
+
+def test_a_compliant_stroke_that_stopped_part_way_lets_go_once_and_holds(ctx, monkeypatch, tmp_path):
+    """The stroke's goal failed half-way down: the springs pull on toward
+    its next point, maybe on the button already. The arm holds, free
+    False, the box padded for a shove; it lets go once, and no hold is
+    read."""
+    from rammp_box_opening.primitives.core import CONTACT_SHIFT_PAD_M
+
+    asked = _releases(ctx)
+    ctx.client.exec_script = [ARRIVED, ("failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.5})]
+    ctx.client.compliant = True
+    result, events, arm, _legs, _start = _press(ctx, monkeypatch, tmp_path, [], touch_at=None, compliant=True,
+                                                top_z=COMPLIANT_TOP)
+    assert not result.free and result.why == "the press stroke stopped (PATH_TOLERANCE_VIOLATED) — the arm holds"
+    assert asked == [2] and arm.reads == [] and ctx.contact_pad == CONTACT_SHIFT_PAD_M
+    assert events == ["depth:turn", "depth:approach", "depth:press"]
+
+
+@pytest.mark.parametrize("ends, code, asked_after", [
+    ("the way in stopped part-way", 1, [2]),  # the look, then the way in: stopped 60% of the way
+    ("the way home stopped", 1, [3]),  # ... the way in, the hold, then the way home, just begun
+    ("the way in did not start", 1, []),  # at the look pose, at rest: home from there
+    ("home", 0, []),  # pressed and home: nothing let go after it, nor between its goals
+], ids=["way in stopped", "way home stopped", "way in not started", "home"])
+def test_a_compliant_reach_out_lets_go_where_it_stopped_loaded_or_part_way_and_nowhere_else(
+        ctx, monkeypatch, tmp_path, ends, code, asked_after):
+    """A way in stopped part-way leaves the springs pulling toward the next
+    point of a path cut short, maybe over the box; a way home stopped, toward
+    the stroke's end below the button or the rise's next point. Each lets go
+    once, and the arm holds there. Where nothing moved, or the run got home,
+    the arm stands at rest at a leg's end in free air: a release there would
+    only add its own sag (none in run_reach_press's finally)."""
+    asked = _releases(ctx)
+    if ends == "the way in stopped part-way":
+        _way_in_ends(ctx, monkeypatch, "failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.6})
+    elif ends == "the way in did not start":
+        _way_in_ends(ctx, monkeypatch, "failed", {"message": "goal rejected by the driver", "progress": 0.0})
+    elif ends == "the way home stopped":
+        _compliant_goal_ends(ctx, monkeypatch, 2, "failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.01})
+    got, _rec, _chain, _home, _got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True,
+                                                 chain=_sinking_chain())
+    assert got == code and asked == asked_after
+
+
+def test_a_ctrl_c_in_a_compliant_reach_outs_hold_lets_go_once_and_still_stops_the_run(ctx, monkeypatch, tmp_path):
+    """The one-execution reach-out's hold, between its way in and its way
+    home: a Ctrl+C there lets go once, after the way in, and still ends the
+    run, the client restored."""
+    asked = _releases(ctx)
+
+    def ctrl_c(ctx_):
+        raise KeyboardInterrupt  # in the hold's read: no goal in flight, abort.py raises at once
+
+    with pytest.raises(KeyboardInterrupt):
+        _depth_flow(ctx, monkeypatch, tmp_path, ctrl_c, compliant=True, chain=_sinking_chain())
+    assert asked == [2] and not ctx.client.compliant
+
+
 @pytest.mark.parametrize("rooms, back", [
     ((0.160, 0.368), rp.REACH_PULLBACK_M),  # 15:19's box turned down at the scene camera's 0.3111 (flatbot's URDF)
     ((0.264, 0.444), rp.CLEAR_BACK_M),  # ... at the wrist aim's 0.2881: the first leaves room

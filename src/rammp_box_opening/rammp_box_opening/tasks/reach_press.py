@@ -567,6 +567,17 @@ def compliant(ctx):
     return bool(getattr(ctx.client, "compliant", False))
 
 
+def let_go(ctx):
+    """A compliant stop lets go: the driver's joint spring holds where the
+    arm stands (PlannerClient.release), no longer pulling it toward the
+    reference it was stopped at — below the button, or the next point of a
+    path cut short. Only where the arm is loaded or was stopped part-way:
+    between legs in free air the reference is a leg's end, the arm at rest
+    there, and a release would only add its own sag. A client with no
+    release lets nothing go."""
+    getattr(ctx.client, "release", lambda: None)()
+
+
 def gains_text(profile):
     """A driver gains profile as the console names it, e.g. "STIFF (Kq 160/60
     N·m/rad on joints 1-4/5-7)"."""
@@ -1212,8 +1223,10 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
     way home from it (_way_home): the rise back up the stroke, the clear
     and home, one execution where they meet. A way in that did not start
     goes home from the look pose; one that stopped part-way holds the arm
-    there, its STOP naming the leg in flight. Returns the process exit
-    code."""
+    there, its STOP naming the leg in flight. From the way in's start to
+    where the way home ends, a stop lets go (let_go): the way in stopped
+    part-way, the way home stopped, anything raised. Returns the process
+    exit code."""
     from rammp_box_opening.tasks import depth_press as dp
 
     names = [lg.name for lg in legs]
@@ -1227,40 +1240,55 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
     # while the way in flies, so it is padded before it flies
     pad = ctx.contact_pad
     ctx.contact_pad = CONTACT_SHIFT_PAD_M
-    # The way home from the stroke's start, where the rise back up ends. The
-    # end the lookahead is handed, the stroke's bottom inside the padded box,
-    # is no start for it, and is left unused
-    res = runner.run(legs, execute=True, lookahead=lambda _end: plan_way_out(ctx, cfg, way.stroke.q0, way.stroke.quat))
-    ahead = runner.lookahead_result  # every run() resets it
-    last = res[-1]
-    flown = all(r.ok for r in res)
-    # The runner's report of the group it re-timed (last_retime) is this
-    # execution's only where the runner went on to fly it, and so handed
-    # back what flew (LegResult.flown_traj): a refusal before that — its
-    # gates, a plan-free start the arm has left — leaves the report of the
-    # last group that flew, the look's.
-    tried = last.flown_traj is not None
-    retimed = _note_flight(runner, "reach_way_in_flight", names, last) if tried else {}
-    # nothing moved where the runner refused the execution, nor where the
-    # client reports no progress for it: the driver rejected the goal, or
-    # the client's own gates refused it before sending
-    moved = flown or (tried and bool(last.progress))
+    try:
+        # The way home from the stroke's start, where the rise back up ends.
+        # The end the lookahead is handed, the stroke's bottom inside the
+        # padded box, is no start for it, and is left unused
+        res = runner.run(legs, execute=True,
+                         lookahead=lambda _end: plan_way_out(ctx, cfg, way.stroke.q0, way.stroke.quat))
+        ahead = runner.lookahead_result  # every run() resets it
+        last = res[-1]
+        flown = all(r.ok for r in res)
+        # The runner's report of the group it re-timed (last_retime) is this
+        # execution's only where the runner went on to fly it, and so handed
+        # back what flew (LegResult.flown_traj): a refusal before that — its
+        # gates, a plan-free start the arm has left — leaves the report of
+        # the last group that flew, the look's.
+        tried = last.flown_traj is not None
+        retimed = _note_flight(runner, "reach_way_in_flight", names, last) if tried else {}
+        # nothing moved where the runner refused the execution, nor where the
+        # client reports no progress for it: the driver rejected the goal, or
+        # the client's own gates refused it before sending
+        moved = flown or (tried and bool(last.progress))
+        if flown:
+            runner.note("reach_slid_in", turned_down=way.down.walked, residual_nm=None)
+            seen = {}
+            held = dp.compliant_hold(ctx, cfg, runner, way.stroke, top_z, seen)
+            result, homed = _way_home(ctx, cfg, runner, way.stroke, held,
+                                      seen.get("held_joints") or ctx.client.joints(), ahead, scene_fix, locator)
+    except BaseException:
+        # A Ctrl+C in the hold's read lands with no goal in flight (abort.py
+        # raises at once) and press_demo exits 130: the springs would push on
+        # into the box toward the stroke's end, 27-72 mm below the button's
+        # top, for as long as the driver runs
+        let_go(ctx)
+        raise
     if not moved:
-        ctx.contact_pad = pad  # nothing came near the box: no shove to pad it for
+        # from the look pose, in free air: nothing came near the box — no
+        # shove to pad it for, and nothing to let go of
+        ctx.contact_pad = pad
+        _go_home(ctx, cfg, runner, "STOP: the way in did not start (%s) — nothing was pressed"
+                 % (last.detail or last.outcome))
+        return 1
     if not flown:
-        if not moved:
-            # from the look pose, in free air: nothing came near the box
-            _go_home(ctx, cfg, runner, "STOP: the way in did not start (%s) — nothing was pressed"
-                     % (last.detail or last.outcome))
-            return 1
         print("[press_demo] STOP: the way in stopped during %s (%s) — the arm holds"
               % (_phase_at(names, retimed.get("seg_start_fracs") or [0.0], last.progress), last.detail or last.outcome))
+        let_go(ctx)
         return 1
-    runner.note("reach_slid_in", turned_down=way.down.walked, residual_nm=None)
-    seen = {}
-    held = dp.compliant_hold(ctx, cfg, runner, way.stroke, top_z, seen)
-    result, homed = _way_home(ctx, cfg, runner, way.stroke, held, seen.get("held_joints") or ctx.client.joints(), ahead,
-                              scene_fix, locator)
+    if not result.free:
+        # the way home stopped (_way_home): the arm holds on the button — no
+        # way up flies — or where the rise or the one execution stopped
+        let_go(ctx)
     runner.finish()
     return dp.finish(ctx, dataclasses.replace(result, touch_xyz=seen.get("touch_xyz")), homed)
 
