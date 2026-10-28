@@ -50,11 +50,18 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rammp_box_opening.constants import CONTACT_SPEED, FREE_LINE_SPEED, GAINS_STIFF, IMPEDANCE_KQ, TCP_OFFSET_M
+from rammp_box_opening.constants import (
+    CONTACT_SPEED,
+    FREE_LINE_SPEED,
+    GAINS_STIFF,
+    IMPEDANCE_KQ,
+    SANITY_MARGIN_RAD,
+    TCP_OFFSET_M,
+)
 from rammp_box_opening.models.container import ContainerPose
 from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
 from rammp_box_opening.primitives.core import CONTACT_SHIFT_PAD_M, _full_world, _push_guard_and_verify
-from rammp_box_opening.runtime.guards import GuardSpec
+from rammp_box_opening.runtime.guards import GuardSpec, sanity_violations
 from rammp_box_opening.tasks import reach_press as rp
 
 DOWN_CONTACT_TOOL = (0.0, 0.0, TCP_OFFSET_M)  # the closed pads straight down, in tool_frame (the straight-down press's)
@@ -604,13 +611,35 @@ def joint_arc(pts):
     return float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum()) if len(p) > 1 else 0.0
 
 
+def line_refusal(chain, pts):
+    """Why the runner refuses to fly the plan-free line through joint
+    waypoints `pts`, in its own words, or None: Runner._refusal's
+    trajectory sanity gate (guards.sanity_violations, SANITY_MARGIN_RAD) on
+    the trajectory rp.line_leg flies them as. Runner.run gates each leg on
+    its own trajectory before anything moves, merged into one execution or
+    not, and a proof proves only what it flies: flatbot's URDF, r 0.70 m
+    az +15 deg under a lid at 0.26, the walk in 5 deg short swings joint_1
+    0.251 -> 0.687 -> 0.261, 0.437 rad against the gate's 0.361, and the
+    way in proven with it was refused once the look and the aim had flown
+    (merge review 2026-10-28: 3 of 119 walks in under the lid at 0.3125)."""
+    from rammp_box_opening.runtime import approach
+
+    if len(pts) < 2:
+        return None  # no line: nothing to fly
+    # the arm's chain names its joints as the driver does; the test fakes name none
+    names = getattr(chain, "joint_names", None) or ["joint_%d" % (i + 1) for i in range(len(pts[0]))]
+    bad = sanity_violations(approach.line_trajectory(names, pts), SANITY_MARGIN_RAD)
+    return "trajectory sanity gate: " + "; ".join(bad) if bad else None
+
+
 def turn_walk(chain, model, q, tip, shorts=TURN_SHORT_DEG, max_arc_rad=None):
     """The walk from joints `q` to the straight-down hand with its pads at
     `tip` (turn_target), each step solved from the last at TURN_STEP_M and
     TURN_STEP_RAD, no joint jumping more than TURN_MAX_JUMP_RAD between two
     — nor, with `max_arc_rad`, the whole walk longer than that in joint
-    space (joint_arc): `shorts` tried in order. Returns (points, quat,
-    short, None) or (None, None, None, why)."""
+    space (joint_arc) — and one the runner flies (line_refusal): `shorts`
+    tried in order. Returns (points, quat, short, None) or (None, None,
+    None, why)."""
     whys = []
     for short in shorts:
         quat, goal = turn_target(model, tip, short)
@@ -619,7 +648,9 @@ def turn_walk(chain, model, q, tip, shorts=TURN_SHORT_DEG, max_arc_rad=None):
         if arc is not None and arc > max_arc_rad:
             pts, why = None, "a turn of %.2f rad of joint arc" % arc
         if pts is not None:
-            return pts, quat, short, None
+            why = line_refusal(chain, pts)
+            if why is None:
+                return pts, quat, short, None
         whys.append("%.0f deg short: %s" % (short, why))
     return None, None, None, "; ".join(whys)
 
@@ -1118,21 +1149,26 @@ def compliant_hold(ctx, cfg, runner, stroke, top_z, seen):
 
 
 def compliant_rise(ctx, runner, stroke, held):
-    """From the hold back up to where the stroke began (stroke.t0), the
-    lean held: 'depth:rise', a straight line from where the arm stands, at
-    FREE_LINE_SPEED (compliant_line, labelled with the full world). Returns
-    the hold's verdict `held` (compliant_hold's), free False with why when
-    the way up does not fly — the arm holds, let go (rp.let_go): on the
-    button, its springs would push on toward the stroke's end, and part-way
-    up toward the rise's next point."""
-    t0, quat = stroke.t0, stroke.quat
-    up, why = rp._line(ctx, [float(t0[0]), float(t0[1]), float(t0[2])], quat)
+    """From the hold back up to where the stroke began: 'depth:rise' from
+    where the arm stands back up the stroke (rise_back_up), else a straight
+    line to its start (stroke.t0), the lean held — reach_press._rise_legs,
+    as the one-execution way home rises — at FREE_LINE_SPEED
+    (compliant_line, labelled with the full world). A bent stroke's end is
+    no IK solution: in free air the hand stands there 3-6 deg off the
+    attitude the stroke held, and a straight line's first 2 mm step takes
+    that whole turn (flatbot's URDF: 0.11-0.13 rad at 15:19's and 16:23's
+    boxes, refused past MAX_STEP_RAD 0.76 m out). Returns the hold's
+    verdict `held` (compliant_hold's), free False with why when the way up
+    does not fly — the arm holds, let go (rp.let_go): on the button, its
+    springs would push on toward the stroke's end, and part-way up toward
+    the rise's next point."""
+    up, _on_stroke, why = rp._rise_legs(ctx, stroke, ctx.client.joints(), _full_world(ctx))
     if up is None:
         rp.let_go(ctx)
         return dataclasses.replace(held, free=False,
                                    why="the way up is not a straight line the arm can fly (%s) — the arm holds" % why)
     if up:
-        res = runner.run([compliant_line(ctx, "depth:rise", up, quat, FREE_LINE_SPEED, _full_world(ctx))], execute=True)
+        res = runner.run(up, execute=True)
         if any(not r.ok for r in res):
             rp.let_go(ctx)
             return dataclasses.replace(held, free=False,
