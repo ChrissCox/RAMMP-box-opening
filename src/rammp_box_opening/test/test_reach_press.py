@@ -383,10 +383,10 @@ class _Rec:
 
 
 def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4), scene_after="same", settled=None,
-          touch=None, contact=BUTTON, home_refusals=0, args=None, chain=None):
+          touch=None, contact=BUTTON, home_refusals=0, run_args=None, chain=None):
     """Run run_reach_press with the arm, the cameras and the planner faked
-    (`args`: press_demo's, a guarded TF press by default; `chain`, a
-    _Chain). Returns (exit code, the record, the chain, home plan's cpose
+    (`run_args`: press_demo's args, a guarded TF press by default; `chain`,
+    a _Chain). Returns (exit code, the record, the chain, home plan's cpose
     and pad)."""
     from conftest import leg as make_leg
 
@@ -461,8 +461,8 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
     owl = SimpleNamespace(enable=lambda: rec.owl.append(("on", len(rec.events))),
                           disable=lambda: rec.owl.append(("off", len(rec.events))))
     locator = SimpleNamespace(owl=owl, locate=lambda s: (rec.events.append("scene"), seen[scene_after])[1])
-    args = args or SimpleNamespace(execute=True, press_only=True)
-    code = reach_press.run_reach_press(None, ctx, cfg, runner, SimpleNamespace(), args, fix, locator)
+    args = SimpleNamespace(execute=True, press_only=True)
+    code = reach_press.run_reach_press(None, ctx, cfg, runner, SimpleNamespace(), run_args or args, fix, locator)
     return code, rec, chain, home
 
 
@@ -820,7 +820,7 @@ def _depth_press_flow(ctx, monkeypatch, tmp_path, way_down, compliant=True, **kw
     monkeypatch.setattr(reach_press, "way_down", way_down)
     kw.setdefault("touch", ("arrived", {"message": "ok", "progress": 1.0}))  # no TF stroke: the 4th motion is the clear
     args = SimpleNamespace(execute=True, press_only=True, depth_press=True, compliant=compliant)
-    return (*_flow(ctx, monkeypatch, tmp_path, args=args, **kw), got)
+    return (*_flow(ctx, monkeypatch, tmp_path, run_args=args, **kw), got)
 
 
 def test_a_scene_button_no_tilt_presses_even_30_mm_off_stops_before_anything_moves(ctx, monkeypatch, tmp_path, capsys):
