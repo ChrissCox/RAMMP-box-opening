@@ -96,6 +96,27 @@ KNOB_SPLIT_M = 0.006  # disc this far above its lid: two circles the centroid te
 # consecutive frames — and the reach-out aims after a 0.46 s at-rest read
 FIRST_LOOKBACK_S = 0.2
 OBLIQUE_WINDOW = 3.0  # of the circle's rectified radius: the cells a candidate's gates read
+# The lid's prior height is judged against the table THIS frame sees. Since
+# its repair the wrist reads every height ~20 mm low (flatbot 2026-10-27: its
+# own table 18.0-21.3 mm below the scene camera's in the four reach-out
+# aims, its lid rings 22-32 mm below the scene's lid), and the live aims
+# cleared LID_PRIOR_TOL_M by only 2.7-13.0 mm: a slightly worse day refuses
+# every frame and presses nothing. A common offset moves the wrist's table
+# and lid alike, so the two prior-height gates move by it. The rectifying
+# plane, the press point's xy and the heights reported stay as measured:
+# the 14:33 close-up found the button 4 mm from the measured aim, and 18 mm
+# from that aim re-slid to the scene camera's height.
+TABLE_OFFSET_MAX_M = 0.030  # a wrist farther off than this is recalibrated at the source, not aimed through
+# ... and only while tan(incidence at the prior) x the offset stays within
+# this: how far apart the press xy slid by the measured heights and by the
+# offset ones can be. Past ~20 mm which of them is right decides whether
+# the press lands on the 22 mm-radius button.
+TABLE_OFFSET_XY_MAX_M = 0.020
+TABLE_SUBSAMPLE = 3  # the rectified grid's every third cell each way: under 1 ms
+TABLE_MIN_CELLS = 500  # of those, below half the box's height (the live frames held 6.5-7k)
+TABLE_BIN_M = 0.002  # the table: the mode of their heights in bins this wide,
+TABLE_BAND_M = 0.004  # then the median of the heights within this of its centre
+TABLE_AGREE_M = 0.004  # two of a fix's accepted offsets this close raise its z (ButtonAimer.fix)
 
 
 @dataclass(frozen=True)
@@ -115,6 +136,12 @@ class ButtonSighting:
     incidence_deg: float = 0.0  # view ray vs the lid's +z normal at the press point
     oblique: bool = False  # found by find_button_oblique
     disc_fill: float = float("nan")  # the share of the disc with depth (oblique path)
+    # the table this frame sees less the table the aim was given (m, oblique
+    # path, _table_offset): accepted — the prior-height gates moved by it —
+    # else nan; and raw, as read, accepted or not. xyz and lid_z_m do not
+    # include it.
+    table_offset_m: float = float("nan")
+    table_offset_raw_m: float = float("nan")
 
 
 def centre_depth(depth, u, v, r):
@@ -369,13 +396,16 @@ def _incidence_deg(p, cam):
     return math.degrees(math.acos(max(-1.0, min(1.0, ray[2] / float(np.linalg.norm(ray))))))
 
 
-def _oblique_circle(lifted, cu, cv, r, s, c0, g, h0, cam, rb):
+def _oblique_circle(lifted, cu, cv, r, s, c0, g, h0, cam, rb, h_gate=None):
     """((P, h_disc, h_ring, f), None) for the rectified circle (cu, cv, r),
     or (None, why). lifted: (n, n, 3) base points of the cells' depth; f
     scales the rectified circle to metric at the height it lies at. Only the
     cells within OBLIQUE_WINDOW * r of the circle are read: every sample a
     gate counts lies within 2.5 rb of the centre and a knob's height of it,
-    and such a sample's ray crosses h0 no farther out than that."""
+    and such a sample's ray crosses h0 no farther out than that. h_gate:
+    where this frame should see the lid (h0 moved by the table offset,
+    default h0); the two prior-height gates alone read it."""
+    h_gate = h0 if h_gate is None else float(h_gate)
     half = int(math.ceil(OBLIQUE_WINDOW * r))
     i0, j0 = max(0, int(cv) - half), max(0, int(cu) - half)
     win = lifted[i0 : int(cv) + half + 1, j0 : int(cu) + half + 1]
@@ -388,8 +418,8 @@ def _oblique_circle(lifted, cu, cv, r, s, c0, g, h0, cam, rb):
     if zd.size < max(20, DISC_MIN_FILL * cell.sum()):
         return None, "too little depth on the disc (%d of %d cells)" % (zd.size, cell.sum())
     h_circle = float(np.median(zd))
-    if not -LID_PRIOR_TOL_M - TOP_RESIDUAL_MAX_M <= h_circle - h0 <= LID_PRIOR_TOL_M + KNOB_MAX_UP_M:
-        return None, "disc %.0f mm from the lid's prior height" % (1000 * (h_circle - h0))
+    if not -LID_PRIOR_TOL_M - TOP_RESIDUAL_MAX_M <= h_circle - h_gate <= LID_PRIOR_TOL_M + KNOB_MAX_UP_M:
+        return None, "disc %.0f mm from the lid's prior height" % (1000 * (h_circle - h_gate))
     p_rect = np.array([g[0] + (cu - c0) / s, g[1] + (cv - c0) / s, h0])
 
     def centre(h):
@@ -477,8 +507,8 @@ def _oblique_circle(lifted, cu, cv, r, s, c0, g, h0, cam, rb):
         return None, "ring around it is not one lid (%.0f%% of its rays meet it) — a corner?" % (
             100.0 * on_lid / (on_lid + past)
         )
-    if abs(h_ring - h0) > LID_PRIOR_TOL_M:
-        return None, "lid ring %.0f mm from its prior height" % (1000 * (h_ring - h0))
+    if abs(h_ring - h_gate) > LID_PRIOR_TOL_M:
+        return None, "lid ring %.0f mm from its prior height" % (1000 * (h_ring - h_gate))
     up = h_disc - h_ring
     if up < -TOP_RESIDUAL_MAX_M or up > KNOB_MAX_UP_M:
         return None, "disc %.0f mm from the lid around it" % (1000 * up)
@@ -486,14 +516,49 @@ def _oblique_circle(lifted, cu, cv, r, s, c0, g, h0, cam, rb):
     return (np.r_[p[:2], h_disc], h_disc, h_ring, (cam[2] - h_circle) / (cam[2] - h0), fill), None
 
 
-def _prior_miss_m(cu, cv, s, c0, g, h0, cam, prior_xy):
+def _table_offset(lifted, h0, table_z, inc_deg):
+    """(accepted, raw): how far the table this frame sees stands from
+    `table_z`, the one the aim was given (m). The table is the mode, in
+    TABLE_BIN_M bins, of the lifted heights below half the box's height
+    (every TABLE_SUBSAMPLE-th cell each way), then the median of those
+    within TABLE_BAND_M of its centre. Both nan with fewer than
+    TABLE_MIN_CELLS there; accepted is nan unless the offset is within
+    TABLE_OFFSET_MAX_M and tan(inc_deg) x the offset (the incidence at the
+    prior) within TABLE_OFFSET_XY_MAX_M."""
+    nan = float("nan")
+    if table_z is None or not np.isfinite(table_z) or not float(h0) > float(table_z):
+        return nan, nan
+    z = lifted[::TABLE_SUBSAMPLE, ::TABLE_SUBSAMPLE, 2]
+    z = z[np.isfinite(z)]
+    z = z[z < float(h0) - 0.5 * (float(h0) - float(table_z))]
+    if z.size < TABLE_MIN_CELLS:
+        return nan, nan
+    lo = float(z.min())
+    mode = lo + (int(np.argmax(np.bincount(((z - lo) / TABLE_BIN_M).astype(int)))) + 0.5) * TABLE_BIN_M
+    raw = float(np.median(z[np.abs(z - mode) <= TABLE_BAND_M])) - float(table_z)
+    if abs(raw) > TABLE_OFFSET_MAX_M or math.tan(math.radians(inc_deg)) * abs(raw) > TABLE_OFFSET_XY_MAX_M:
+        return nan, raw
+    return raw, raw
+
+
+def _table_words(off, off_raw):
+    """What a refusal says of the table its frame saw (_table_offset)."""
+    if not np.isfinite(off_raw):
+        return ""
+    return "; the table in view %+.0f mm from the one given, %s" % (
+        1000 * off_raw, "taken out" if np.isfinite(off) else "not taken out")
+
+
+def _prior_miss_m(cu, cv, s, c0, g, h0, cam, prior_xy, h_gate=None):
     """How near the rectified circle (cu, cv) can come to prior_xy at any
     height the gates allow it: the circle on h0 slid along the rays over
-    that band of heights is a segment in xy."""
+    that band of heights, around h_gate as theirs is (default h0), is a
+    segment in xy."""
+    h_gate = h0 if h_gate is None else float(h_gate)
     p_rect = np.array([g[0] + (cu - c0) / s, g[1] + (cv - c0) / s, h0])
     ends = [
         (cam + (p_rect - cam) * (cam[2] - h) / (cam[2] - h0))[:2]
-        for h in (h0 + LID_PRIOR_TOL_M + KNOB_MAX_UP_M, h0 - LID_PRIOR_TOL_M - TOP_RESIDUAL_MAX_M)
+        for h in (h_gate + LID_PRIOR_TOL_M + KNOB_MAX_UP_M, h_gate - LID_PRIOR_TOL_M - TOP_RESIDUAL_MAX_M)
     ]
     seg = ends[1] - ends[0]
     w = np.asarray(prior_xy, float) - ends[0]
@@ -509,8 +574,10 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
     optical axis meets the plane). There a horizontal circle is a circle.
     Each cell's depth is lifted along its own raw pixel's ray, so every gate
     reads base z and the lid ring's height is measured, not assumed: it
-    must lie within LID_PRIOR_TOL_M of h0. The circle found on h0 is then
-    moved along the camera's rays to the disc's measured height h:
+    must lie within LID_PRIOR_TOL_M of h0 — of h0 moved by the table
+    offset, when this frame reads its own table that far from table_z
+    (_table_offset). The circle found on h0 is then moved along the
+    camera's rays to the disc's measured height h:
     P = C + (P' - C) (Cz - h) / (Cz - h0)."""
     import cv2
 
@@ -571,6 +638,10 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
     lifted = np.full((n * n, 3), np.nan, np.float32)
     lifted[np.flatnonzero(valid)[ok]] = np.c_[xn * d[ok], yn * d[ok], d[ok]] @ rot.T + cam
     lifted = lifted.reshape(n, n, 3)
+    # the lid where this frame should see it: h0 moved by the offset of the
+    # table it sees from table_z, where that is taken out (TABLE_OFFSET_*)
+    table_off, table_raw = _table_offset(lifted, h0, table_z, inc)
+    h_gate = h0 + (table_off if np.isfinite(table_off) else 0.0)
 
     r0 = OBLIQUE_BUTTON_PX
     r_lo, r_hi = int(OBLIQUE_RADIUS_WINDOW[0] * r0), int(math.ceil(OBLIQUE_RADIUS_WINDOW[1] * r0))
@@ -590,7 +661,8 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
         # metric check after the correction is the one that holds.
         off = [math.hypot(u - c0, v - c0) / s for u, v, _ in cands]
         near = sorted(
-            (i for i in range(len(cands)) if _prior_miss_m(*cands[i][:2], s, c0, g, h0, cam, prior_xy) <= PRIOR_MAX_M),
+            (i for i in range(len(cands))
+             if _prior_miss_m(*cands[i][:2], s, c0, g, h0, cam, prior_xy, h_gate) <= PRIOR_MAX_M),
             key=lambda i: off[i],
         )
         if not near:
@@ -599,7 +671,7 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
     cands = cands[:OBLIQUE_MAX_CIRCLES]
     whys = []
     for cu, cv, r in cands:
-        hit, why = _oblique_circle(lifted, cu, cv, r, s, c0, g, h0, cam, rb)
+        hit, why = _oblique_circle(lifted, cu, cv, r, s, c0, g, h0, cam, rb, h_gate)
         if hit is None:
             whys.append(why)
             continue
@@ -618,8 +690,10 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
             xyz=(float(p[0]), float(p[1]), h_disc), uv=(float(uv_p[0]), float(uv_p[1])),
             r_px=float(kk[0, 0] * diameter / 2.0 / rng), range_m=rng, diameter_m=float(diameter),
             above_lid_m=h_disc - h_ring, lid_z_m=h_ring, incidence_deg=inc, oblique=True, disc_fill=min(1.0, fill),
+            table_offset_m=table_off, table_offset_raw_m=table_raw,
         ), None
-    return None, "%d circle(s) on the rectified lid plane, none the button: %s" % (len(cands), "; ".join(whys[:3]))
+    return None, "%d circle(s) on the rectified lid plane, none the button: %s%s" % (
+        len(cands), "; ".join(whys[:3]), _table_words(table_off, table_raw))
 
 
 def agreeing_median(points, tol=AGREE_M, n=MIN_HITS):
@@ -719,7 +793,8 @@ class StillDepth:
 class ButtonAimer:
     """Frames from a D405Grabber, still ones only, until MIN_HITS agree.
     lid_z and prior_xy go to find_button (see there). A tilted view's frame
-    is judged on the depth of the still frames before it too (StillDepth)."""
+    is judged on the depth of the still frames before it too (StillDepth),
+    and its fix's z raised by the wrist's table offset (fix)."""
 
     def __init__(self, grab, model, table_z, lid_z=None, prior_xy=None):
         self.grab = grab
@@ -732,6 +807,7 @@ class ButtonAimer:
         self.hits = 0
         self.points = []
         self.above_lid = []
+        self.table_offsets = []  # each hit's (accepted, raw) table offset, nan where none (ButtonSighting)
         self._last_stamp = None
         self._last_depth_stamp = None  # the depth that last voted (depth_paired)
         self._last_cam = None
@@ -796,6 +872,7 @@ class ButtonAimer:
         self.last_sighting = s
         self.points.append(s.xyz)
         self.above_lid.append(s.above_lid_m)
+        self.table_offsets.append((s.table_offset_m, s.table_offset_raw_m))
         dt = pair_dt_ms(f)
         if dt is not None:
             self.pair_dt_ms.append(dt)
@@ -807,8 +884,42 @@ class ButtonAimer:
         vals = [v for v in self.above_lid[-MIN_HITS:] if np.isfinite(v)]
         return float(np.median(vals)) if vals else None
 
-    def fix(self):
-        return agreeing_median(self.points)
+    def table_offset_m(self, raw=False):
+        """How far the wrist reads its own table from the one it was given
+        (m), over the hits the fix was made from: the median of their
+        accepted offsets when at least two agree within TABLE_AGREE_M (the
+        most that do), else nan — a hit whose offset was not accepted counts
+        for nothing. raw: the median of their raw offsets, accepted or not,
+        for the aim's note: drift shows there before it fails a run."""
+        pairs = self.table_offsets[-MIN_HITS:]
+        if raw:
+            vals = [v for _a, v in pairs if np.isfinite(v)]
+            return float(np.median(vals)) if vals else float("nan")
+        vals = sorted(a for a, _v in pairs if np.isfinite(a))
+        best = []
+        for i, lo in enumerate(vals):
+            near = [v for v in vals[i:] if v - lo <= TABLE_AGREE_M]
+            if len(near) > len(best):
+                best = near
+        return float(np.median(best)) if len(best) >= 2 else float("nan")
+
+    def fix(self, measured=False):
+        """The press point: the median of the last MIN_HITS hits when they
+        agree (agreeing_median), else None. Its xy is as measured; its z is
+        RAISED by the wrist's table offset where that is known and below the
+        given table (table_offset_m): the wrist that reads its table 20 mm
+        low reads the lid 20 mm low too. It is never lowered: the compliant
+        press goes by the higher of this and the scene camera's lid
+        (reach_press), and a lowered aim would no longer bound the press
+        from below should the scene camera's table and lid ever read low.
+        measured: the z as the hits measured it."""
+        xyz = agreeing_median(self.points)
+        if xyz is None or measured:
+            return xyz
+        off = self.table_offset_m()
+        if np.isfinite(off) and off < 0.0:
+            return (xyz[0], xyz[1], xyz[2] - off)
+        return xyz
 
     def status(self):
         return "%d/%d still frames found the button circle%s" % (

@@ -3242,6 +3242,54 @@ def test_the_staging_aim_builds_its_aimer_the_straight_down_way_when_no_reach_ou
     assert made[-1] == {"lid_z": 0.2, "prior_xy": (0.8, 0.0)}
 
 
+@pytest.mark.parametrize("off,off_raw,z,words,off_mm,raw_mm", [
+    (-0.0216, -0.0216, 0.3101, "the wrist reads its table -22 mm from the scene's, the button's top raised 22 mm",
+     -21.6, -21.6),
+    (float("nan"), -0.0452, 0.2885, "the wrist reads its table -45 mm from the scene's (not taken out)", None, -45.2),
+])
+def test_the_aim_says_and_keeps_the_wrists_table_offset(monkeypatch, capsys, off, off_raw, z, words, off_mm, raw_mm):
+    """Flatbot 2026-10-27 15:19: the wrist read its table 21.6 mm below the
+    scene camera's, and its aim 0.2885 where the touch met the lid at 0.3122.
+    The AIM line says what the wrist read, the press point's z is raised by
+    an offset taken out, and the note keeps the z measured and the offset
+    as read even when it was not taken out: drift shows before it fails."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from rammp_box_opening.perception import button_aim, depth_source
+    from rammp_box_opening.tasks import press_demo
+
+    frames = [0]
+
+    def snapshot():  # a new still frame each read
+        frames[0] += 1
+        st = SimpleNamespace(sec=frames[0], nanosec=0)
+        return SimpleNamespace(color=np.zeros((4, 4, 3), np.uint8), color_stamp=st, depth=np.ones((4, 4), np.float32),
+                               depth_stamp=st, k=np.eye(3), dist=None)
+
+    rot, cam = np.diag([1.0, -1.0, -1.0]), np.array([0.536, -0.144, 0.574])
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g, offset_s=None, stamp=None: (rot, cam))
+    seen = button_aim.ButtonSighting(
+        xyz=(0.661, -0.1969, 0.2885), uv=(277.0, 163.2), r_px=31.6, range_m=0.36, diameter_m=0.0501, above_lid_m=0.001,
+        lid_z_m=0.2895, incidence_deg=25.4, oblique=True, disc_fill=0.72, table_offset_m=off, table_offset_raw_m=off_raw)
+    monkeypatch.setattr(button_aim, "find_button", lambda *a, **kw: (seen, None))
+    monkeypatch.setattr(press_demo, "_spin_detect", lambda node: None)
+    notes = []
+    runner = SimpleNamespace(note=lambda leg, **kw: notes.append((leg, kw)))
+    grab = SimpleNamespace(snapshot=snapshot, color=None, depth=None, k=None, color_stamp=None, stamp_offset_s=0.0)
+    w = SimpleNamespace(grab=grab, model=SimpleNamespace(dims=(0.105, 0.105, 0.121), button_diameter_m=0.044),
+                        table_z=0.2143)
+    got, _status = press_demo.aim_button_at_staging(None, w, 0.0, timeout_s=5.0, runner=runner, tag="reach-aim",
+                                                    lid_z=0.3111, prior_xy=(0.6754, -0.1812))
+    assert got is not None and got[0] == pytest.approx((0.661, -0.1969, z), abs=1e-4)
+    assert w.last_aim == pytest.approx(got[0])  # the press point the press goes on (aim_source)
+    assert words in capsys.readouterr().out
+    ((leg, kw),) = notes
+    assert leg == "reach-aim" and kw["press_xyz"] == [0.661, -0.1969, z] and kw["measured_z"] == 0.2885
+    assert (kw["table_offset_mm"], kw["table_offset_raw_mm"]) == (off_mm, raw_mm)
+
+
 def test_staging_reach_is_judged_by_the_arms_own_kinematics(ctx, monkeypatch):
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.tasks import press_demo
