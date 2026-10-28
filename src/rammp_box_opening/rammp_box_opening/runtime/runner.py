@@ -78,6 +78,8 @@ class LegResult:
     end_err_rad: float = None
     end_err_mm: float = None
     end_err_deg: float = None
+    # a gripper leg's knuckle when it finished (rad, 0.0 open .. 0.8 closed)
+    gripper_pos: float = None
     # what tripped the guard (guards.TorqueGuard.trip_report): the joint, its
     # deviation from the baseline in force, and the run-up — so a false trip
     # can be read off the log instead of re-flown
@@ -690,11 +692,19 @@ class Runner:
         self._pending = (leg, handle, time.monotonic())
         return True
 
-    def finish(self):
-        """Collect any pending gripper command (mission end / exit)."""
+    def join_pending(self):
+        """Collect a pending gripper command now, mid-run (None when nothing
+        is pending): where what comes next needs the fingers where it sent
+        them and run() would not join it first — it joins before a gripper
+        leg, a guarded motion or a join_before_motion leg's motion only, and
+        a compliant way in is none of them."""
         if self._pending is None:
             return None
         return self._join_pending()
+
+    def finish(self):
+        """Collect any pending gripper command (mission end / exit)."""
+        return self.join_pending()
 
     def _join_pending(self):
         leg, handle, t0 = self._pending
@@ -1097,7 +1107,7 @@ class Runner:
         )
         if ok and leg.verify is not None:
             ok, detail = leg.verify(VerifyCtx(outcome=outcome, gripper_pos=pos))
-        return LegResult(leg.name, outcome, ok, detail, t_wall=time.monotonic() - t0)
+        return LegResult(leg.name, outcome, ok, detail, t_wall=time.monotonic() - t0, gripper_pos=float(pos))
 
     def _run_gripper(self, leg):
         t0 = time.monotonic()
@@ -1106,7 +1116,7 @@ class Runner:
         detail = "gripper at %.3f%s" % (pos, " (stalled)" if stalled else "")
         if ok and leg.verify is not None:
             ok, detail = leg.verify(VerifyCtx(outcome=outcome, gripper_pos=pos))
-        return LegResult(leg.name, outcome, ok, detail, t_wall=time.monotonic() - t0)
+        return LegResult(leg.name, outcome, ok, detail, t_wall=time.monotonic() - t0, gripper_pos=float(pos))
 
     def _append(self, row):
         """One row onto this run's jsonl (created on the first row)."""
