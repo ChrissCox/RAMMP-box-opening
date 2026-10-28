@@ -978,12 +978,16 @@ def _on_flatbot(ctx, monkeypatch):
 
 
 def test_on_flatbot_1623s_scene_button_is_refused_before_the_look(ctx, monkeypatch):
-    """16:23 2026-10-27, replayed: the plan without the proof takes the
-    tilted stroke at 30 deg, as the run did — 20.2 s from the look to home
-    with nothing pressed, no straight-down hand at the slide's end. At
+    """16:23 2026-10-27, replayed with the leans its turn tried then
+    (TURN_SHORT_DEG, the guarded press's): the plan without the proof takes
+    the tilted stroke at 30 deg, as the run did — 20.2 s from the look to
+    home with nothing pressed, no straight-down hand at the slide's end. At
     every tilt the look pose and the slide solve, and neither the walk in
     nor the turn after the slide turns the hand down: refused, and 30 mm
     nearer the arm or to either side as well."""
+    from rammp_box_opening.tasks import depth_press as dp
+
+    monkeypatch.setattr(dp, "COMPLIANT_TURN_SHORT_DEG", dp.TURN_SHORT_DEG)
     _chain, cfg, home = _on_flatbot(ctx, monkeypatch)
     plan, _why = reach_press.plan_reach(ctx, cfg, SCENE_1623, home)
     assert plan is not None and plan.tilt_deg == 30  # what 16:23 flew
@@ -995,6 +999,45 @@ def test_on_flatbot_1623s_scene_button_is_refused_before_the_look(ctx, monkeypat
     assert [lk.tilt_deg for lk in looks] == list(reach_press.REACH_TILTS_DEG)
     near, why = reach_press.shifted_way_down(ctx, cfg, looks[0], SCENE_1623)
     assert near is None and all("30 mm %s: the way down (walk in: " % n in why for n in reach_press.SHIFTED), why
+
+
+# 15:19's aimed button (the touch met it at 0.312; the clear's replay, test_depth_press)
+AIMED_1519 = (0.6617, -0.1972, 0.3111)
+
+
+def _at(r_az, z=0.3125):
+    """A button `r_az` (r m, az deg) from the arm, the lid at 16:23's height."""
+    r, az = r_az
+    return (r * math.cos(math.radians(az)), r * math.sin(math.radians(az)), z)
+
+
+def test_on_flatbot_1623s_scene_button_is_proven_turning_short_after_the_slide(ctx, monkeypatch):
+    """The compliant press's turn after the slide may stop up to 15 deg
+    short of straight down (depth_press.COMPLIANT_TURN_SHORT_DEG): 16:23's
+    scene button is proven at the first tilt, the slide in and a turn 10
+    deg short, 1.77 rad of joint arc — no walk in reaches it — then the
+    stroke from there. 15:19's aimed button, which the guarded leans
+    already reached, is as it was: one walk in, exactly down."""
+    from rammp_box_opening.tasks import depth_press as dp
+
+    chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    plan, why = reach_press.plan_reach(ctx, cfg, SCENE_1623, home, depth=True)
+    assert why is None and plan.tilt_deg == 30 and plan.stroke_pts is None
+    assert not plan.down.walked and max(dp.TURN_SHORT_DEG) < plan.down.short_deg <= 15.0
+    assert plan.down.short_deg == 10.0  # as modelled before this was flown
+    assert plan.down.pts[0] == pytest.approx(plan.slide_pts[-1])  # in place, where the slide ends
+    arc = dp.joint_arc(plan.down.pts)
+    assert arc <= dp.TURN_MAX_ARC_RAD and arc == pytest.approx(1.77, abs=0.02)
+    R, _t = chain.fk(plan.down.pts[-1])
+    assert math.degrees(reach_press.hand_lean(np.asarray(R, float))) == pytest.approx(plan.down.short_deg, abs=0.05)
+    assert plan.stroke.q0 == pytest.approx([float(v) for v in plan.down.pts[-1]])
+    assert [name for name, _pts, _speed in plan.stroke.legs] == ["depth:approach", "depth:press"]
+    assert 400.0 <= plan.stroke.k <= 600.0 and plan.stroke.end_z < SCENE_1623[2] - cfg.button_travel_m
+    plan, why = reach_press.plan_reach(ctx, cfg, AIMED_1519, home, depth=True)
+    assert why is None and plan.tilt_deg == 30 and plan.down.walked and plan.down.short_deg == 0.0
+    # a box the guarded leans reached only 30 mm off (r 0.766 m, az -15 deg) is reached as it stands
+    plan, why = reach_press.plan_reach(ctx, cfg, _at((0.766, -15.0)), home, depth=True)
+    assert why is None and plan.tilt_deg == 30 and not plan.down.walked and plan.down.short_deg == 8.0
 
 
 def test_on_flatbot_1519s_scene_button_walks_in_exactly_down_at_30_deg(ctx, monkeypatch):
@@ -1010,24 +1053,29 @@ def test_on_flatbot_1519s_scene_button_walks_in_exactly_down_at_30_deg(ctx, monk
     assert plan.stroke.end_z < SCENE_1519[2] - cfg.button_travel_m
 
 
-@pytest.mark.parametrize("scene, aimed, near", [
-    ((0.700, -22.0), (0.692, -23.6), "to its left"),
-    ((0.766, -15.0), (0.757, -16.6), "nearer the arm"),
+@pytest.mark.parametrize("scene, aimed, near, leans", [
+    ((0.700, -22.0), (0.692, -23.6), "to its left", "guarded"),
+    ((0.766, -15.0), (0.757, -16.6), "nearer the arm", "guarded"),
+    ((0.700, -22.0), (0.692, -23.6), "nearer the arm", "compliant"),
 ])
-def test_on_flatbot_a_scene_button_out_of_reach_by_a_little_still_flies_the_look(ctx, monkeypatch, scene, aimed, near):
-    """Two boxes found offline (r m, az deg; the lid at 16:23's 0.3125): no
-    tilt presses the scene camera's button, but one PROOF_SHIFT_M off it
-    the press reaches — and the aim's, 12-23 mm off as on 10-27, it does."""
+def test_on_flatbot_a_scene_button_out_of_reach_by_a_little_still_flies_the_look(ctx, monkeypatch, scene, aimed, near,
+                                                                                 leans):
+    """Two boxes found offline (r m, az deg; the lid at 16:23's 0.3125)
+    with the turn after the slide leaning no further than the guarded
+    press's TURN_SHORT_DEG: no tilt presses the scene camera's button, but
+    one PROOF_SHIFT_M off it the press reaches — and the aim's, 12-23 mm
+    off as on 10-27, it does. With the compliant press's own leans the
+    first is still such a box, reached 30 mm nearer the arm; the second is
+    reached as it stands (test_on_flatbot_1623s_scene_button_is_proven_turning_short_after_the_slide)."""
+    from rammp_box_opening.tasks import depth_press as dp
 
-    def at(r_az):
-        r, az = r_az
-        return (r * math.cos(math.radians(az)), r * math.sin(math.radians(az)), 0.3125)
-
+    if leans == "guarded":
+        monkeypatch.setattr(dp, "COMPLIANT_TURN_SHORT_DEG", dp.TURN_SHORT_DEG)
     _chain, cfg, home = _on_flatbot(ctx, monkeypatch)
     looks = []
-    plan, _why = reach_press.plan_reach(ctx, cfg, at(scene), home, depth=True, looks=looks)
+    plan, _why = reach_press.plan_reach(ctx, cfg, _at(scene), home, depth=True, looks=looks)
     assert plan is None and looks
-    assert reach_press.shifted_way_down(ctx, cfg, looks[0], at(scene)) == (near, None)
-    way, why, kind = reach_press.solve_way_in(ctx, cfg, at(aimed), looks[0].tilt_deg, looks[0].look_leg.goal_joints)
+    assert reach_press.shifted_way_down(ctx, cfg, looks[0], _at(scene)) == (near, None)
+    way, why, kind = reach_press.solve_way_in(ctx, cfg, _at(aimed), looks[0].tilt_deg, looks[0].look_leg.goal_joints)
     assert way is not None, (why, kind)
     assert way.move and way.down.walked and way.slide is None and way.stroke.legs
