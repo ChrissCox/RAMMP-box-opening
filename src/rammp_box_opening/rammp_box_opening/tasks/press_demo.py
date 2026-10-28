@@ -461,7 +461,7 @@ def _table_offset_words(off, off_raw):
 
 
 def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=None, tag="aim", out=None,
-                          lid_z=None, prior_xy=None):
+                          lid_z=None, prior_xy=None, min_hits=None):
     """The press aim from staging: the button's circle alone (owner's
     design 2026-09-17 — no OWL and no box-footprint gate here; the scene
     camera already said which thing is the box), the press point its
@@ -471,20 +471,23 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
     aimed frame is saved and the aim logged (`runner`) every time.
 
     lid_z / prior_xy: the lid height to expect and where the button should
-    be — what the reach-out press's oblique look aims with (button_aim).
+    be — what the reach-out press's oblique look aims with (button_aim);
+    min_hits: the agreeing hits a tilted view's fix takes (unset, MIN_HITS).
     `out` gets button_up_mm and measured_xyz, the press point as the wrist
     measured it: what the wrist's own later readings are judged against."""
     from rammp_box_opening.perception.button_aim import ButtonAimer
 
     # only what is set: unset, the call is the straight-down aim's own
-    kw = {k: v for k, v in (("lid_z", lid_z), ("prior_xy", prior_xy)) if v is not None}
+    kw = {k: v for k, v in (("lid_z", lid_z), ("prior_xy", prior_xy), ("min_hits", min_hits)) if v is not None}
     aimer = ButtonAimer(watcher.grab, watcher.model, watcher.table_z, **kw)
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout_s:
         _spin_detect(node)
+        n0 = getattr(aimer, "frames", None)
         if aimer.tick():
             xyz = aimer.fix()  # its z raised by the wrist's table offset, where that is agreed
             measured = aimer.fix(measured=True)
+            agreeing = aimer.fix_hits()  # which hits the fix was made from
             s = aimer.last_sighting
             up_m = aimer.button_above_lid_m()
             up_mm = None if up_m is None else 1000.0 * up_m
@@ -492,14 +495,16 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
             if out is not None:
                 out["button_up_mm"] = up_mm  # the caller decides (refuse_open_box)
                 out["measured_xyz"] = tuple(float(v) for v in measured)
+            # the agreeing hits apart from all of them: 15:19 2026-10-27 printed
+            # "4/19 frames agree" where 3 of its 4 hits did
             print(
                 "[press_demo] AIM: button circle at pixel (%.0f, %.0f) r %.0f px, %.0f mm across, %s above its own "
-                "lid%s%s; pressing its centre; %d/%d frames agree (%.1f s)" % (
+                "lid%s%s; pressing its centre; %d of %d hits agree (%d frames, %.1f s)" % (
                     s.uv[0], s.uv[1], s.r_px, 1000 * s.diameter_m,
                     "height unknown" if up_mm is None else "%+.1f mm" % up_mm,
                     "" if not s.oblique else ", depth on %.0f%% of it" % (100 * s.disc_fill),
                     _table_offset_words(off, off_raw),
-                    aimer.hits, aimer.frames, time.monotonic() - t0)
+                    len(agreeing), aimer.hits, aimer.frames, time.monotonic() - t0)
             )
             folder = save_aim_frame(watcher.grab, s, tag)
             # the press point, when the press goes on it (aim_source), and its frame
@@ -518,12 +523,23 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
                     table_offset_mm=round(1000 * off, 1) if math.isfinite(off) else None,
                     table_offset_raw_mm=round(1000 * off_raw, 1) if math.isfinite(off_raw) else None,
                     hits=aimer.hits, frames=aimer.frames, aim_s=round(time.monotonic() - t0, 2),
+                    # the hits the fix was made from (indices), and each hit's time since
+                    # the aimer was built and its knob reading: when the fix could have
+                    # come, and whether the knob was read alike
+                    agreeing=list(agreeing), hit_s=[round(float(v), 2) for v in aimer.hit_s],
+                    above_lid_mm=[round(1000 * float(v), 1) if math.isfinite(v) else None for v in aimer.above_lid],
                     # the wrist's depth-vs-colour stamp offsets: what PAIR_TOL_S rests on
                     pair_dt_ms=[round(v, 1) for v in aimer.pair_dt_ms] or None,
                     capture=None if folder is None else str(folder),
                 )
             return (xyz, yaw), aimer.status()
-        time.sleep(0.02)
+        # A tick that took a frame goes straight on to the next: judging a
+        # tilted one costs 45-75 ms (StillDepth and the oblique find), and
+        # with a sleep after every tick the reach-out aims of 2026-10-27 took
+        # 10.1-14.0 of the wrist OAK's 15 frames a second. Only a tick that
+        # took no new frame (none landed, or its depth not yet) waits a beat.
+        if getattr(aimer, "frames", None) == n0:
+            time.sleep(0.02)
     watcher.last_reject = aimer.last_why  # for the frame dump's caption
     return None, aimer.status()
 

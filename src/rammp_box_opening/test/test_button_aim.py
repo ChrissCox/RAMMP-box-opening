@@ -73,6 +73,57 @@ def test_hits_must_agree_before_they_aim():
     assert m is not None and m[0] == pytest.approx(0.501) and m[1] == pytest.approx(0.0)
 
 
+def test_a_fix_is_three_in_a_row_or_a_tilted_views_newest_agreeing_pair():
+    """agreeing_fix: n=3 is agreeing_median's rule, the last three. n=2 is
+    the newest pair of the last AIM_WINDOW hits that agree, on the knob too
+    (a hit without a knob reading agrees), else three of them that agree;
+    a hit older than the window agrees with nothing."""
+    from rammp_box_opening.perception.button_aim import AIM_WINDOW, agreeing_fix
+
+    a, b = (0.5, -0.16, 0.29), (0.5, -0.15, 0.29)  # 10 mm apart
+    nan = float("nan")
+    assert agreeing_fix([b, a, a, a], None, 3) == (agreeing_median([b, a, a, a]), [1, 2, 3])
+    assert agreeing_fix([a, a, b, a], [0.0] * 4, 3) is None  # three in a row, as ever
+    assert agreeing_fix([a], [0.0], 2) is None and agreeing_fix([a, b], [0.0, 0.0], 2) is None
+    assert agreeing_fix([a, a, a], [0.0, 0.0, 0.0], 2) == (a, [1, 2])  # the newest pair
+    assert agreeing_fix([a, a], [nan, 0.004], 2) == (a, [0, 1])
+    assert AIM_WINDOW == 4
+    assert agreeing_fix([a, b, (0.6, 0.0, 0.29), (0.7, 0.0, 0.29), a], [0.0] * 5, 2) is None
+
+
+def test_two_of_four_fixes_wherever_three_in_a_row_would_and_never_later():
+    """The tilted aim's rule (agreeing_fix, n=2) on random streams of hits,
+    three in ten up to 2 cm off, half the knob readings a shut box's and
+    half anywhere from -2 to +12 mm: wherever the last three agree it has
+    fixed, at that hit or sooner — two hits can only shorten an aim — its
+    first fix holds the newest hit (the aim returns on it), and a pair it
+    fixes on reads the knob alike."""
+    import random
+
+    from rammp_box_opening.perception.button_aim import KNOB_NOISE_M, agreeing_fix
+
+    rng = random.Random(7)
+    sooner = 0
+    for _ in range(1000):
+        pts, up, first = [], [], None
+        for k in range(8):
+            if rng.random() < 0.3:
+                pts.append((0.5 + rng.uniform(-0.02, 0.02), -0.16 + rng.uniform(-0.02, 0.02), 0.29))
+            else:
+                pts.append((0.5 + rng.gauss(0.0, 0.0015), -0.16 + rng.gauss(0.0, 0.0015), 0.29))
+            up.append(rng.gauss(0.002, 0.0015) if rng.random() < 0.5 else rng.uniform(-0.002, 0.012))
+            got = agreeing_fix(pts, up, 2)
+            if first is None and got is not None:
+                first, idx = k, got[1]
+                assert k in idx
+                assert len(idx) == 3 or abs(up[idx[0]] - up[idx[1]]) <= KNOB_NOISE_M
+            if agreeing_median(pts) is not None:
+                assert first is not None and first <= k
+                sooner += first < k
+                break
+    assert sooner > 100
+
+
 MISSED = Path(__file__).parent / "data" / "wrist_aim_pressed_right_20260921.npz"
 
 
@@ -1106,6 +1157,31 @@ def test_the_aimer_hands_its_priors_to_every_aim(pink, monkeypatch):
     assert aimer.last_sighting.oblique
 
 
+def test_a_tilted_aim_on_two_hits_fixes_on_its_second_frame(pink, monkeypatch):
+    """The reach-out's aimer (min_hits=2, tasks/reach_press) on the 39 deg
+    view: no fix after the first still frame, a fix after the second, on
+    those two hits — where the last-three rule takes a third."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import button_aim, depth_source
+
+    color, depth, cam, rot, b = reach_out_frame(pink, 39, lid_drop=0.021)
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g, offset_s=None, stamp=None: (rot, cam))
+    g = SimpleNamespace(color=color, depth=depth, k=OAK_K, dist=None, color_stamp=None)
+    aimer = button_aim.ButtonAimer(g, pink, b[2] - BOX_H, lid_z=b[2] + 0.01, prior_xy=(b[0] + 0.06, b[1] - 0.05),
+                                   min_hits=2)
+    got = []
+    for i in range(1, 3):
+        g.color_stamp = SimpleNamespace(sec=i, nanosec=0)
+        got.append(aimer.tick())
+    assert got == [False, True], aimer.status()
+    assert aimer.last_sighting.oblique and aimer.fix_hits() == [0, 1]
+    fx = aimer.fix()
+    assert np.hypot(fx[0] - b[0], fx[1] - b[1]) < 0.002 and fx[2] == pytest.approx(b[2], abs=0.003)
+    assert abs(aimer.button_above_lid_m()) < 0.003
+    assert aimer.status().startswith("2 of 2 hits agree in 2 frames")
+
+
 def _full_frame_d2(h, w, u, v, r_max):
     """The aim's masks as they were before _window_d2: the whole frame."""
     yy, xx = np.mgrid[0:h, 0:w]
@@ -1414,6 +1490,95 @@ def test_the_aimer_raises_its_fix_by_an_agreed_table_offset_and_never_lowers_it(
     assert aimer.fix(measured=True) == pytest.approx((0.5, -0.16, 0.290), abs=1e-9)
     assert aimer.table_offset_m() == pytest.approx(agreed, abs=1e-9, nan_ok=True)
     assert aimer.table_offset_m(raw=True) == pytest.approx(raw, abs=1e-9, nan_ok=True)
+
+
+def _scripted_hits(monkeypatch, script):
+    """find_button returning the oblique sightings `script` lists, in turn:
+    (xyz, above_lid_m, (accepted, raw) table offset)."""
+    from rammp_box_opening.perception import button_aim
+    from rammp_box_opening.perception.button_aim import ButtonSighting
+
+    def scripted(*a, **kw):
+        xyz, up, (off, raw) = script.pop(0)
+        return ButtonSighting(xyz=xyz, uv=(320.0, 200.0), r_px=30.0, range_m=0.30, diameter_m=0.044, above_lid_m=up,
+                              oblique=True, table_offset_m=off, table_offset_raw_m=raw), None
+
+    monkeypatch.setattr(button_aim, "find_button", scripted)
+
+
+def test_a_tilted_aim_fixes_on_two_agreeing_hits_of_its_last_four(aimer_env, monkeypatch):
+    """Flatbot 2026-10-27 15:19: the reach-out aim's first hit did not agree,
+    and the last-three rule waited for three more. On two hits (min_hits=2)
+    a tilted view's hits [A, A + 10 mm, A + 1 mm] fix on the first and the
+    third, at their mean, and the knob, the table offset and the status are
+    those two hits' — not the last two's or the last three's."""
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    script = [
+        ((0.500, -0.160, 0.290), 0.0010, (-0.020, -0.020)),
+        ((0.500, -0.150, 0.290), 0.0090, (-0.030, -0.030)),  # 10 mm off
+        ((0.501, -0.160, 0.292), 0.0020, (-0.022, -0.022)),
+    ]
+    _scripted_hits(monkeypatch, script)
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z, min_hits=2)
+    assert _paired_frames(aimer, g, 3) == [False, False, True] and not script
+    assert aimer.fix_hits() == [0, 2]
+    assert aimer.fix(measured=True) == pytest.approx((0.5005, -0.160, 0.291), abs=1e-9)
+    # the offset hits 1 and 3 agree on raises it; the last two (-30, -22 mm) agree on none
+    assert aimer.table_offset_m() == pytest.approx(-0.021, abs=1e-9)
+    assert aimer.fix() == pytest.approx((0.5005, -0.160, 0.312), abs=1e-9)
+    assert aimer.table_offset_m(raw=True) == pytest.approx(-0.021, abs=1e-9)  # the last three's: -22 mm
+    # the knob: 1.5 mm, where the last two read 5.5 mm and the last three 2.0
+    assert aimer.button_above_lid_m() == pytest.approx(0.0015, abs=1e-9)
+    assert aimer.status().startswith("2 of 3 hits agree in 3 frames")
+    assert len(aimer.hit_s) == 3 and aimer.hit_s == sorted(aimer.hit_s) and aimer.hit_s[0] >= 0.0
+
+
+def test_two_hits_that_read_the_knob_apart_wait_for_a_third(aimer_env, monkeypatch):
+    """Whether the box is open (press_demo.refuse_open_box at 6 mm) must not
+    rest on one outlying knob reading: two hits whose knobs read more than
+    KNOB_NOISE_M apart are no fix, and a third that pairs with neither makes
+    one of all three — their median, the knob's too."""
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    nan2 = (float("nan"), float("nan"))
+    script = [
+        ((0.500, -0.160, 0.290), 0.0005, nan2),
+        ((0.501, -0.160, 0.291), 0.0070, nan2),  # 6.5 mm apart: "open" on its own
+        ((0.500, -0.159, 0.292), 0.0035, nan2),  # 3.0 and 3.5 mm from those: a pair with neither
+    ]
+    _scripted_hits(monkeypatch, script)
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z, min_hits=2)
+    assert _paired_frames(aimer, g, 2) == [False, False]
+    assert aimer.fix() is None and aimer.status().startswith("0 of 2 hits agree in 2 frames")
+    g.color_stamp = g.depth_stamp = _st(3 * 0.08)
+    assert aimer.tick() and not script
+    assert aimer.fix_hits() == [0, 1, 2]
+    assert aimer.fix() == pytest.approx((0.500, -0.160, 0.291), abs=1e-9)
+    assert aimer.button_above_lid_m() == pytest.approx(0.0035, abs=1e-9)
+
+
+def test_a_straight_down_aim_still_needs_three_hits_in_a_row(aimer_env, monkeypatch):
+    """min_hits=2 is a tilted view's: straight-down sightings (no oblique
+    flag) still fix on the last three agreeing, as every staging aim has."""
+    from types import SimpleNamespace
+
+    from rammp_box_opening.perception import button_aim
+
+    g, model, poses, calls, found = aimer_env
+    a, b = (0.5, -0.16, 0.40), (0.5, -0.15, 0.40)
+    script = [a, a, b, a, a, a]
+
+    def scripted(*args, **kw):
+        return SimpleNamespace(xyz=script.pop(0), above_lid_m=0.0, table_offset_m=float("nan"),
+                               table_offset_raw_m=float("nan")), None
+
+    monkeypatch.setattr(button_aim, "find_button", scripted)
+    aimer = button_aim.ButtonAimer(g, model, FLAT_TABLE_Z, min_hits=2)
+    assert _paired_frames(aimer, g, 6) == [False] * 5 + [True] and not script
+    assert aimer.fix_hits() == [3, 4, 5] and aimer.fix() == pytest.approx(a)
 
 
 # lid_in_view: a camera straight down (its x along base +y, y along +x, as
