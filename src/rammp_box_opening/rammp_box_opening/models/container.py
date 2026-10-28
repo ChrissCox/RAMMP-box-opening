@@ -129,12 +129,44 @@ class PressDemoCfg:
     vlm_target: str  # what to ask Claude to box — plain English
     vlm_timeout_s: float
     vlm_pad_px: int
+    # the scene camera's box from sheppy's always-on scene segmenter
+    # (perception/segmenter_source): the classes it boxes this container as,
+    # () for none — the scene OWL alone then finds it
+    segmenter_classes: tuple = ()
+    segmenter_box: str = "holder"  # "holder": its box is the holder the lid stands on; "as_is": the container
+
+
+SCENE_DETECT_KEYS = ("segmenter_classes", "segmenter_box")
+
+
+def scene_detect_cfg(raw):
+    """(segmenter_classes, segmenter_box) from a container config's
+    scene_detect block, validated; ((), "holder") without one."""
+    sd = raw.get("scene_detect")
+    if sd is None:
+        sd = {}
+    if not isinstance(sd, dict):
+        raise ValueError("scene_detect must be a mapping (%s)" % ", ".join(SCENE_DETECT_KEYS))
+    unknown = sorted(set(sd) - set(SCENE_DETECT_KEYS))
+    if unknown:
+        raise ValueError("scene_detect: unknown key(s) %s (known: %s)" % (", ".join(map(str, unknown)), ", ".join(SCENE_DETECT_KEYS)))
+    classes = sd.get("segmenter_classes")
+    if classes is None:
+        classes = []
+    if not isinstance(classes, list) or not all(isinstance(c, str) and c.strip() for c in classes):
+        raise ValueError("scene_detect.segmenter_classes must be a list of the scene segmenter's class names "
+                         "(e.g. [food container]); an empty list or none means the scene OWL alone")
+    box = sd.get("segmenter_box", "holder")
+    if box not in ("holder", "as_is"):
+        raise ValueError("scene_detect.segmenter_box must be 'holder' or 'as_is'")
+    return tuple(c.strip() for c in classes), box
 
 
 def load_press_demo(path):
     with open(path) as f:
         raw = yaml.safe_load(f)
     pd = raw["press_demo"]
+    segmenter_classes, segmenter_box = scene_detect_cfg(raw)
     cfg = PressDemoCfg(
         travel_m=float(pd["travel_m"]),
         contact_nm=float(raw["press"].get("contact_nm", 3.0)),
@@ -184,6 +216,8 @@ def load_press_demo(path):
         vlm_target=str(raw.get("vlm", {}).get("target", "the food-storage container")),
         vlm_timeout_s=float(raw.get("vlm", {}).get("timeout_s", 20.0)),
         vlm_pad_px=int(raw.get("vlm", {}).get("pad_px", 20)),
+        segmenter_classes=segmenter_classes,
+        segmenter_box=segmenter_box,
     )
     if not raw["open_box"]["grip_band"][0] < raw["open_box"]["grip_band"][1] < 0.8:
         raise ValueError(

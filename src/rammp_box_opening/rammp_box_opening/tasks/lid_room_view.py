@@ -12,12 +12,13 @@ then add to Foxglove's 3D panel:
     /rammp_box_opening/lid_room/points    the scene camera's points, field h = height above its table
     /rammp_box_opening/lid_room/status    one line: where the lid goes, or why nowhere
 
-The box is where the scene OWL finds it (the mission's own SceneLocator)
-while press_demo.launch.py's owl_detector runs. Without it, click the box,
+The box is where the mission's own SceneLocator finds it: from sheppy's
+scene_segmenter, or the scene OWL while press_demo.launch.py's
+owl_detector runs. Without either, click the box,
 or any spot to ask "what if the box stood here", with the 3D panel's
 publish-point tool (/clicked_point; in the 2D top-down view, so the click
 lands where it looks), or pass --box X Y. A click stays the box until the
-next one, and outranks the OWL.
+next one, and outranks the cameras' detectors.
 
 Only the scene camera: the mission adds the wrist's look from staging,
 which needs the arm to fly there. What this shows is what the mission would
@@ -39,7 +40,8 @@ import numpy as np
 from rammp_box_opening.perception import clear_table as ct
 
 PERIOD_S = 3.0  # a map and a spot search a period: ~1 s of one core, niced
-OWL_RETRY_S = 30.0  # an absent owl_detector is asked again this often
+OWL_RETRY_S = 30.0  # absent detectors (no segmenter, no owl_detector) are asked again this often
+DETECTOR_NAMES = {"segmenter": "scene segmenter", "owl": "scene OWL"}  # SceneFix.source, as the status names it
 STATUS_TOPIC = "/rammp_box_opening/lid_room/status"
 MARKER_TOPIC = "/rammp_box_opening/lid_room/markers"
 POINTS_TOPIC = "/rammp_box_opening/lid_room/points"
@@ -60,7 +62,7 @@ PLANNER_RGBA = (0.30, 0.55, 1.00, 0.25)
 @dataclass
 class RoomView:
     fix: object  # the SceneFix the map was made from
-    source: str  # where the box came from: "scene OWL", "clicked", "--box"
+    source: str  # where the box came from: "scene segmenter", "scene OWL", "clicked", "--box"
     tmap: object = None
     drops: list = None
     spots: list = None
@@ -357,15 +359,18 @@ def main():
                 if pts is not None:
                     fix, why = fix_around(pts, manual["xy"], model)
             elif not args.no_owl and t0 >= owl_next:
-                source = "scene OWL"
                 fix = locator.locate(SCENE_LOCATE_S)
                 if fix is None:
-                    why = locator.last_why or "the scene OWL found no box"
-                    if locator.owl.latest is None:
-                        why = "no owl_detector is answering (press_demo.launch.py starts it)"
+                    why = locator.last_why or "the scene camera found no box"
+                    if locator.owl.latest is None and locator.last_seg_state != "live":
+                        why = ("neither sheppy's scene_segmenter nor an owl_detector is answering "
+                               "(press_demo.launch.py starts the OWL)")
                         owl_next = time.monotonic() + OWL_RETRY_S
+                else:
+                    source = DETECTOR_NAMES.get(getattr(fix, "source", "owl"), "scene camera")
             else:
-                why = "--no-owl, and no box clicked" if args.no_owl else "no owl_detector is answering"
+                why = ("--no-owl, and no box clicked" if args.no_owl
+                       else "neither sheppy's scene_segmenter nor an owl_detector is answering")
             stamp = node.get_clock().now().to_msg()
             if fix is None:
                 line = "no map — %s" % why
