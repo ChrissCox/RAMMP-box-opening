@@ -772,11 +772,15 @@ def _turns_down(chain, model, q, contact_tool, shorts=dp.TURN_SHORT_DEG):
 
 def _depth_flow(ctx, monkeypatch, tmp_path, press, compliant=False, walk_in=False, turn=_turns_down, **kw):
     """test_reach_press._flow with --depth-press: `press` stands in for
-    press_down_from_here (called with the reach's ctx). The fake chain's fk
-    stands at z 0.45 over the aimed button at 0.40. A `compliant` run's
-    press is proven before the arm moves (rp.way_down): the fake chain's
-    walks refuse — unless `walk_in`, then they fly — and the turn after the
-    slide is `turn`'s (dp.turn_down_path)."""
+    press_down_from_here (called with the reach's ctx) and, in a compliant
+    run, for the hold at the end of its one-execution way in
+    (dp.compliant_hold: `press` is the hold's verdict); the stroke before
+    it is compliant_stroke's on the fake chain. The fake chain's fk stands
+    at z 0.45 over the aimed button at 0.40 (`chain`, a kw for _flow, may
+    be another). A `compliant` run's press is proven before the arm moves
+    (rp.way_down): the fake chain's walks refuse — unless `walk_in`, then
+    they fly — and the turn after the slide is `turn`'s
+    (dp.turn_down_path)."""
     from test_reach_press import _Chain, _flow
 
     if compliant:
@@ -792,7 +796,13 @@ def _depth_flow(ctx, monkeypatch, tmp_path, press, compliant=False, walk_in=Fals
                    client_compliant=getattr(ctx_.client, "compliant", False))
         return press(ctx_)
 
+    def hold(ctx_, cfg, runner, stroke, top_z, seen):
+        got.update(top_z=top_z, stroke=stroke, client_compliant=getattr(ctx_.client, "compliant", False))
+        return press(ctx_)
+
     monkeypatch.setattr(dp, "press_down_from_here", fake)
+    if compliant:
+        monkeypatch.setattr(dp, "compliant_hold", hold)
     real = rp.run_reach_press
 
     def with_flag(node, ctx_, cfg, runner, watcher, args, scene_fix, locator):
@@ -1403,16 +1413,18 @@ def test_the_press_models_the_spring_its_legs_fly():
 
 def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx, monkeypatch, tmp_path):
     """The reach-out of a compliant run: no at-rest read, no weight check at
-    the look, no stopping guard on the re-aim, the slide in or the way up,
-    and the press told the higher top — the scene camera's, as at 15:19
-    when the wrist's aim stood 24 mm low and the touch met the scene's.
-    With no guard to stop them in time, those three lines fly at
-    FREE_LINE_SPEED, not the CONTACT_SPEED 16:23 crawled 10.5 s of them at,
-    and each is labelled with the full world: the runner refuses an
-    unguarded leg faster than CONTACT_SPEED in any other (spec §6), and the
-    arm would hold at the look pose with nothing pressed. The clear before
-    home goes up and back toward the arm (rp.clear_targets): with the hand
-    straight down, CLEAR_EXTRA_M over HOME_CLEAR_M and CLEAR_BACK_M back."""
+    the look, no stopping guard on the re-aim, the slide in, the turn, the
+    stroke or the way up, and the press stroked and judged at the higher
+    top — the scene camera's, as at 15:19 when the wrist's aim stood 24 mm
+    low and the touch met the scene's. With no guard to stop them in time,
+    the free-air lines fly at FREE_LINE_SPEED, not the CONTACT_SPEED 16:23
+    crawled 10.5 s of them at, and each is labelled with the full world:
+    the runner refuses an unguarded leg faster than CONTACT_SPEED in any
+    other (spec §6), and the arm would hold at the look pose with nothing
+    pressed. The clear before home goes up and back toward the arm
+    (rp.clear_targets): with the hand straight down, CLEAR_EXTRA_M over
+    HOME_CLEAR_M and CLEAR_BACK_M back. Straight down already within
+    TOUCH_SLOW_M of the button, the stroke has no fast stretch."""
     import json
 
     import test_reach_press as trp
@@ -1424,9 +1436,11 @@ def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx,
     low = (trp.BUTTON[0], trp.BUTTON[1], trp.BUTTON[2] - 0.024)
     code, rec, chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, first=(low, 0.4))
     assert code == 0 and rec.reads == 0
-    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
-    assert all(rec.legs[n].guard is None for n in ("reach:re-aim", "reach:slide-in", "depth:clear"))
-    for n in ("reach:re-aim", "reach:slide-in", "depth:clear"):
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:turn", "depth:press",
+                          "depth:clear", "home"]
+    assert all(rec.legs[n].guard is None for n in ("reach:re-aim", "reach:slide-in", "depth:turn", "depth:press",
+                                                   "depth:clear"))
+    for n in ("reach:re-aim", "reach:slide-in", "depth:turn", "depth:clear"):
         assert rec.legs[n].speed == FREE_LINE_SPEED and rec.legs[n].world.startswith("full"), (
             n, rec.legs[n].speed, rec.legs[n].world)
     up = [xyz for xyz, _q in chain.lines][-1]  # from the fake fk's (0.5, -0.4, 0.45)
@@ -1437,7 +1451,10 @@ def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx,
     assert not [r for r in rows if r.get("outcome") == "refused"]
     clear, = [r for r in rows if r.get("leg") == "depth_clear"]
     assert clear["flown"] and clear["back_mm"] == pytest.approx(1000 * rp.CLEAR_BACK_M) and clear["lean_deg"] == 0.0
-    assert got["compliant"] and got["client_compliant"] and got["top_z"] == pytest.approx(trp.BUTTON[2])
+    assert got["client_compliant"] and got["top_z"] == pytest.approx(trp.BUTTON[2])
+    # the stroke solved for that top: the fake chain's pads infinitely stiff, the least overshoot past its bottom
+    cfg = load_press_demo(PINK)
+    assert got["stroke"].end_z == pytest.approx(trp.BUTTON[2] - cfg.button_travel_m - dp.COMPLIANT_OVERSHOOT_M[0])
     assert not ctx.client.compliant  # the client is as it was once the run is over
 
 
@@ -1452,8 +1469,9 @@ def test_a_compliant_walk_in_flies_at_the_free_line_speed_too(ctx, monkeypatch, 
     monkeypatch.setattr(trp._Chain, "walk", lambda self, q0, xyz, quat, **k: ([list(q0), [v + 0.01 for v in q0]], None),
                         raising=False)
     code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True)
-    assert code == 0 and got["compliant"] and rec.reads == 0
-    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
+    assert code == 0 and got["client_compliant"] and rec.reads == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:approach",
+                          "depth:press", "depth:clear", "home"]
     leg = rec.legs["reach:slide-in"]
     assert rp._rot(leg.target[2])[2, 2] == pytest.approx(-1.0)  # the walk's: the hand turned straight down
     assert leg.guard is None and leg.speed == FREE_LINE_SPEED and leg.world.startswith("full"), (leg.speed, leg.world)
@@ -1479,12 +1497,13 @@ def test_a_compliant_press_is_proven_for_the_scene_button_and_again_for_the_aime
     """Before the look, from the rest pose, for the scene camera's button;
     after the aim, before the re-aim, for the aimed one: the walk in from
     the look pose, else the slide and the turn, then the stroke. The run
-    records say which, and the flight is as before."""
+    records say which, and the aimed one's flies as it was proven."""
     import json
 
     code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, walk_in=walk_in)
-    assert code == 0 and got["compliant"]
-    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
+    assert code == 0 and got["top_z"] == pytest.approx(0.40)
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in",
+                          *([] if walk_in else ["depth:turn"]), "depth:approach", "depth:press", "depth:clear", "home"]
     rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
     plan, = [r for r in rows if r["leg"] == "reach_plan"]
     assert plan["proof"] == "scene" and plan["down"] == {"walked": walk_in, "short_deg": 0.0}
@@ -1493,6 +1512,10 @@ def test_a_compliant_press_is_proven_for_the_scene_button_and_again_for_the_aime
     # the fake chain's pads are infinitely stiff: the stroke ends the least overshoot below the button's bottom
     cfg = load_press_demo(PINK)
     assert way["end_z"] == pytest.approx(0.40 - cfg.button_travel_m - dp.COMPLIANT_OVERSHOOT_M[0], abs=1e-4)
+    # ... and the stroke that flew and was held is that proof's: not solved again
+    assert got["stroke"].end_z == pytest.approx(way["end_z"], abs=1e-4) and got["stroke"].k == way["k"]
+    assert list(rec.legs["depth:press"].traj.points[-1].positions) == pytest.approx(
+        [float(v) for v in got["stroke"].legs[-1][1][-1]])
     order = [r["leg"] for r in rows]
     assert order.index("reach_plan") < order.index("reach:look") < order.index("reach_way_in") < order.index(
         "reach:re-aim")
@@ -1527,6 +1550,206 @@ def test_a_compliant_run_whose_aimed_button_no_way_down_reaches_goes_home_from_t
             "short: IK did not converge 73% of the way)) — nothing was pressed — returning home") in out
     rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
     assert not [r for r in rows if r["leg"] in ("reach_way_in", "home_refused")]
+
+
+# ---- a compliant reach-out's way in: one execution from the aimed look pose ----------------
+
+def _sinking_chain():
+    """test_reach_press._Chain whose straight lines end where they were
+    asked to go: the compliant stroke ends below where it began, and the
+    rise back up to its start has a line to fly (the plain chain's fk
+    stands still: nothing to rise). Each line's end is its own joints, so
+    a line solved before the flight never stands in for one flown."""
+    from test_reach_press import _Chain
+
+    class Sinking(_Chain):
+        def __init__(self):
+            super().__init__()
+            self.at = {}
+
+        def straight_line(self, q0, xyz, quat):
+            pts, why = super().straight_line(q0, xyz, quat)
+            if pts is not None:
+                pts[-1][-1] += 1e-6 * (len(self.at) + 1)
+                self.at[tuple(float(v) for v in pts[-1])] = [float(v) for v in xyz]
+            return pts, why
+
+        def fk(self, q):
+            R, t = super().fk(q)
+            return R, np.asarray(self.at.get(tuple(float(v) for v in q), t), float)
+
+    return Sinking()
+
+
+def _way_in_ends(ctx, monkeypatch, outcome, info):
+    """The fake client with the first goal sent under COMPLIANT_GAINS — the
+    way in's one execution — scripted to end `outcome` with `info`."""
+    real = ctx.client.execute
+    state = {"first": True}
+
+    def execute(traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        if gains == dp.COMPLIANT_GAINS and state["first"]:
+            state["first"] = False
+            ctx.client.exec_script.insert(0, (outcome, dict(info)))
+        return real(traj, speed, guard=guard, while_running=while_running, stop_when=stop_when, gains=gains)
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+
+
+@pytest.mark.parametrize("walk_in", [False, True])
+def test_a_compliant_reach_out_flies_its_way_in_as_one_execution(ctx, monkeypatch, tmp_path, walk_in):
+    """In a compliant run nothing is read between the re-aim, the slide in,
+    the turn and the stroke, yet each flew as a goal of its own that ended
+    at rest. From the aimed look pose they are ONE runner.run, merged into
+    one execution under COMPLIANT_GAINS, each starting at the last waypoint
+    of the one before as solve_way_in chained them. Then the hold, the rise
+    back up to the stroke's start, the clear and home, each a goal of its
+    own. A walk in turns the hand down on its way: no turn."""
+    import json
+
+    import test_reach_press as trp
+
+    from rammp_box_opening.constants import FREE_LINE_SPEED
+    from rammp_box_opening.runtime.legs import merge_groups
+
+    cfg = load_press_demo(PINK)
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, walk_in=walk_in,
+                                             chain=_sinking_chain())
+    assert code == 0 and rec.reads == 0
+    way_in = ["reach:re-aim", "reach:slide-in", *([] if walk_in else ["depth:turn"]), "depth:approach", "depth:press"]
+    assert rec.events == ["reach:look", "aim:reach-aim", *way_in, "depth:rise", "depth:clear", "home"]
+    legs = [rec.legs[n] for n in way_in]
+    assert len(merge_groups(legs)) == 1
+    assert (way_in, [dp.COMPLIANT_GAINS]) in rec.runs  # one runner.run, one execution, under STIFF
+    for a, b in zip(legs, legs[1:]):
+        assert list(b.traj.points[0].positions) == list(a.traj.points[-1].positions), (a.name, b.name)
+    for lg in legs:
+        assert lg.guard is None and lg.gains == dp.COMPLIANT_GAINS and lg.plan_free and lg.world.startswith("full"), (
+            lg.name, lg.guard, lg.gains, lg.world)
+    speeds = {n: FREE_LINE_SPEED for n in way_in[:-2]}
+    speeds.update({"depth:approach": cfg.press_speed, "depth:press": dp.TOUCH_SPEED})
+    assert {lg.name: lg.speed for lg in legs} == speeds
+    # then the rise back up to where the stroke began, the clear and home: goals of their own
+    assert [names for names, _g in rec.runs[-3:]] == [["depth:rise"], ["depth:clear"], ["home"]]
+    rise = rec.legs["depth:rise"]
+    assert rise.gains == dp.COMPLIANT_GAINS and rise.speed == FREE_LINE_SPEED and rise.guard is None
+    assert list(rise.traj.points[0].positions) == list(legs[-1].traj.points[-1].positions)
+    assert rise.target[1] == pytest.approx(list(got["stroke"].t0))
+    # the hold judged the stroke that flew, at the button's top
+    assert got["top_z"] == pytest.approx(trp.BUTTON[2]) and got["client_compliant"]
+    assert [float(v) for v in got["stroke"].legs[-1][1][-1]] == list(legs[-1].traj.points[-1].positions)
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    flight, = [r for r in rows if r["leg"] == "reach_way_in_flight"]
+    assert flight["legs"] == way_in and flight["outcome"] == "arrived" and flight["duration_s"] > 0.0
+    fracs = flight["seg_start_fracs"]
+    assert len(fracs) == len(way_in) and fracs[0] == 0.0 and fracs == sorted(fracs) and fracs[-1] <= 1.0
+    assert flight["stops"] == len([v for v in flight["junction_speeds"] if v < 0.04])
+    # every member's row carries the one execution's result
+    member = [r for r in rows if r["leg"] in way_in and r["kind"] == "motion"]
+    assert [r["leg"] for r in member] == way_in and len({r["t_wall"] for r in member}) == 1
+    slid, = [r for r in rows if r["leg"] == "reach_slid_in"]
+    assert slid["turned_down"] is walk_in
+    assert ctx.contact_pad > 0.0  # the stroke met the box by design: home pads it for a shove
+
+
+def test_a_way_in_that_did_not_start_goes_home_from_the_look_pose(ctx, monkeypatch, tmp_path, capsys):
+    """The driver turned the one execution down: nothing moved, the arm
+    stands at the look pose in free air. Home from there, around the box
+    as it was never touched — no clear, no back-off, nothing pressed."""
+    import json
+
+    _way_in_ends(ctx, monkeypatch, "failed", {"message": "goal rejected by the driver", "progress": 0.0})
+    code, rec, _chain, home, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True)
+    assert code == 1 and got == {}  # no hold
+    assert rec.events[-1] == "home" and "depth:clear" not in rec.events and "depth:rise" not in rec.events
+    assert rec.events[:2] == ["reach:look", "aim:reach-aim"] and rec.events.count("home") == 1
+    assert home["pad"] == 0.0  # nothing touched: no shove pad around the box
+    out = capsys.readouterr().out
+    assert ("STOP: the way in did not start (goal rejected by the driver) — nothing was pressed — returning home"
+            in out)
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    flight, = [r for r in rows if r["leg"] == "reach_way_in_flight"]
+    assert flight["outcome"] == "failed"
+
+
+def test_a_way_in_that_stopped_part_way_holds_the_arm_and_says_in_which_leg(ctx, monkeypatch, tmp_path, capsys):
+    """The execution stopped 60% of the way: the arm stands somewhere on the
+    way in, maybe over the box — it holds there, no home, no hold. The STOP
+    names the leg in flight by where each began (seg_start_fracs)."""
+    import json
+
+    from rammp_box_opening.tasks.reach_press import _phase_at
+
+    _way_in_ends(ctx, monkeypatch, "failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.6})
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True)
+    assert code == 1 and got == {} and "home" not in rec.events
+    assert rec.events[-1] == "depth:press"  # the way in was the last thing handed to the runner
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    flight, = [r for r in rows if r["leg"] == "reach_way_in_flight"]
+    phase = _phase_at(flight["legs"], flight["seg_start_fracs"], 0.6)
+    assert phase != flight["legs"][0]  # 0.6 of the way is past the re-aim
+    assert ("STOP: the way in stopped during %s (PATH_TOLERANCE_VIOLATED) — the arm holds" % phase
+            in capsys.readouterr().out)
+    # the last leg begun by then: at its own start fraction, a leg is in flight
+    names, starts = ["a", "b", "c"], [0.0, 0.3, 0.7]
+    assert [_phase_at(names, starts, p) for p in (0.0, 0.29, 0.3, 0.69, 0.7, 1.0)] == ["a", "a", "b", "b", "c", "c"]
+
+
+def test_a_way_in_the_runner_refuses_goes_home_from_the_look_pose(ctx, monkeypatch, tmp_path, capsys):
+    """The runner's own gates refuse the one execution before anything is
+    sent (its trajectory sanity gate on the turn, say): nothing moved, as
+    when the driver turns the goal down, so home from the look pose with no
+    shove pad — and no flight row, the runner having re-timed nothing for
+    it (its last_retime is still the look's)."""
+    import json
+
+    from rammp_box_opening.runtime.runner import Runner
+
+    real = Runner._refusal
+
+    def refusal(self, leg):
+        if leg.name == "depth:turn":
+            return "trajectory sanity gate: arm_joint_6 inside its limit margin"
+        return real(self, leg)
+
+    monkeypatch.setattr(Runner, "_refusal", refusal)
+    code, rec, _chain, home, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True)
+    assert code == 1 and got == {} and home["pad"] == 0.0
+    way_in = next(run for run in rec.runs if run[0][0] == "reach:re-aim")
+    assert "depth:turn" in way_in[0] and way_in[1] == []  # handed over as one run, nothing sent
+    assert rec.events[-1] == "home" and "depth:clear" not in rec.events and "depth:rise" not in rec.events
+    assert ("STOP: the way in did not start (trajectory sanity gate: arm_joint_6 inside its limit margin) — nothing "
+            "was pressed — returning home") in capsys.readouterr().out
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    assert not [r for r in rows if r["leg"] == "reach_way_in_flight"]
+    refused, = [r for r in rows if r.get("outcome") == "refused"]
+    assert refused["leg"] == "depth:turn"
+
+
+def test_why_a_way_in_is_not_one_execution(ctx, monkeypatch):
+    """The way in flies as one execution only where its legs make one merge
+    group and the first starts where the arm stands (_not_one_execution);
+    anything else is said, and the run flies it leg by leg."""
+    from test_reach_press import _Chain
+
+    from rammp_box_opening.constants import FREE_LINE_SPEED
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks.reach_press import _not_one_execution
+
+    monkeypatch.setattr(approach, "_chain", lambda: _Chain())
+    q = [[0.01 * k] * 7 for k in range(4)]
+    legs = [dp.compliant_line(ctx, name, q[i:i + 2], TURNED_DOWN, FREE_LINE_SPEED, ("full", "full.yaml"))
+            for i, name in enumerate(("reach:re-aim", "reach:slide-in", "depth:press"))]
+    ctx.client.live = list(q[0])
+    assert _not_one_execution(ctx, legs) is None
+    # under the client's run default (None) rather than the spec the others name: a goal of its own
+    legs[2].gains = None
+    assert _not_one_execution(ctx, legs) == "depth:press does not continue reach:slide-in as one goal"
+    legs[2].gains = dp.COMPLIANT_GAINS
+    # the arm 2 mrad from the first leg's start: the driver would jump there
+    ctx.client.live = [0.002] + list(q[0][1:])
+    assert _not_one_execution(ctx, legs) == "the arm stands 0.002 rad from where reach:re-aim starts"
+    assert _not_one_execution(ctx, []) == "no line to fly"
 
 
 def test_the_compliant_stroke_solved_ahead_is_the_one_the_press_flies(ctx, monkeypatch, tmp_path):
@@ -1689,16 +1912,18 @@ def test_the_walk_in_tries_only_the_guarded_leans_in_a_compliant_run_too(ctx, mo
     turns = []
 
     def turn(chain, model, q, contact_tool, shorts=dp.TURN_SHORT_DEG):
-        turns.append(tuple(shorts))
+        turns.append((tuple(shorts), tuple(contact_tool)))
         return _turns_down(chain, model, q, contact_tool, shorts)
 
-    # the fake chain's walks all refuse: the scene button's proof, the aimed
-    # one's, then the flight's walk in — each a walk, then the turn after the slide
+    # the fake chain's walks all refuse: the scene button's proof and the
+    # aimed one's — each a walk, then the turn after the slide about the
+    # fingertip — and the flight flies the aimed one's, solving none again
     code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True, turn=turn)
-    assert code == 0 and got["compliant"] and got["contact"] == rp.CONTACT_TOOL
-    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
-    assert tried == [(dp.TURN_SHORT_DEG, None)] * 3
-    assert turns == [dp.COMPLIANT_TURN_SHORT_DEG] * 2
+    assert code == 0 and got["client_compliant"]
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:turn",
+                          "depth:approach", "depth:press", "depth:clear", "home"]
+    assert tried == [(dp.TURN_SHORT_DEG, None)] * 2
+    assert turns == [(dp.COMPLIANT_TURN_SHORT_DEG, rp.CONTACT_TOOL)] * 2
     # walk_in_down itself, from the look pose: the guarded leans and no others
     leans = _leans_tried(monkeypatch)
     arm = _Arm()
