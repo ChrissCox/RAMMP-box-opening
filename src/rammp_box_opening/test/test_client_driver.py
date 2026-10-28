@@ -723,6 +723,25 @@ def test_a_position_leg_sends_no_gains():
     assert d.goals[0].control_mode == client_mod.POSITION and d.goals[0].gains.profile == 0
 
 
+def test_the_gains_named_here_are_the_drivers_own_profiles():
+    """constants.GAINS_* are robot-body constants copied from the driver:
+    they must be the profile numbers its interface defines, or a run would
+    fly a tuning other than the one its banner and press model name. A goal
+    that names none is PROFILE_SESSION_DEFAULT, which the driver resolves
+    to MEDIUM."""
+    from rammp_arm_interfaces.msg import ImpedanceGains
+
+    from rammp_box_opening import constants
+
+    assert (constants.GAINS_SOFT, constants.GAINS_MEDIUM, constants.GAINS_STIFF) == (
+        ImpedanceGains.PROFILE_SOFT, ImpedanceGains.PROFILE_MEDIUM, ImpedanceGains.PROFILE_STIFF)
+    assert ExecuteJointTrajectory.Goal().gains.profile == ImpedanceGains.PROFILE_SESSION_DEFAULT
+    assert set(constants.IMPEDANCE_KQ) == set(constants.IMPEDANCE_NAMES) == {1, 2, 3}
+    assert all(len(kq) == len(LIVE) for kq in constants.IMPEDANCE_KQ.values())
+    assert constants.COMPLIANT_RUN_GAINS in constants.IMPEDANCE_KQ
+    assert client_mod.GAINS_STIFF is constants.GAINS_STIFF  # client.GAINS_* still name them
+
+
 def test_a_compliant_guard_watches_and_never_stops_the_leg(monkeypatch):
     """Owner 2026-10-27: nothing it reads stops the arm. A trip is noted,
     the leg flies to its end."""

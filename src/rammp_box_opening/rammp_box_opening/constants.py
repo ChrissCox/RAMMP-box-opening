@@ -156,6 +156,7 @@ IMPEDANCE_NAMES = {GAINS_SOFT: "SOFT", GAINS_MEDIUM: "MEDIUM", GAINS_STIFF: "STI
 # at MEDIUM: "impedance mode needs to be firmer". STIFF and not CUSTOM: STIFF
 # is the driver's own complete set (zeta 0.7, leash 0.25 rad, torque limits at
 # the ceiling), the press model stays as it is (depth_press.COMPLIANT_KQ), and
-# nothing above STIFF has flown on this arm. Stepping up is a decision for an
-# attended run.
+# nothing above STIFF has flown on this arm. STIFF itself had not flown on
+# flatbot either (16:23 stopped before the press): the first attended run is
+# its test, and stepping up past it is a decision for an attended run.
 COMPLIANT_RUN_GAINS = GAINS_STIFF

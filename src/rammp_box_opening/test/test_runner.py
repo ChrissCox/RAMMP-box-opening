@@ -1181,20 +1181,21 @@ def test_the_recoil_does_not_extend_along_a_stroke_this_push_did_not_continue(tm
 
 
 class _ArrivesOff(FakeClient):
-    """A compliant client whose arm ends `off` short of the trajectory's end
-    on one joint (or reads `to` there): an impedance goal ends on time, its
-    spring still converging. It reports the gains it would send."""
+    """A client whose arm ends `off` short of the trajectory's end on one
+    joint (or reads `to` there): an impedance goal ends on time, its spring
+    still converging. Compliant, it reports the gains it would send, as
+    PlannerClient.execute does; in position it sends none."""
 
-    def __init__(self, joint=1, off=0.01, to=None):
+    def __init__(self, joint=1, off=0.01, to=None, compliant=True):
         super().__init__()
-        self.compliant = True
+        self.compliant = compliant
         self._joint, self._off, self._to = joint, off, to
 
     def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
         outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
         if outcome == "arrived":
             self.live[self._joint] = self._to if self._to is not None else self.live[self._joint] - self._off
-        info["gains"] = 3 if gains is None else gains
+        info["gains"] = (3 if gains is None else gains) if self.compliant else None
         return outcome, info
 
 
@@ -1290,8 +1291,31 @@ def test_an_arrival_across_the_wrap_is_the_short_way_round(tmp_path, monkeypatch
     assert res[0].end_err_mm == pytest.approx(0.0, abs=1e-9)
 
 
-def test_a_position_arrival_logs_its_mode_and_no_gains(tmp_path):
+def test_a_position_arrival_logs_its_mode_and_no_gains(tmp_path, monkeypatch):
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
     c = FakeClient()  # no compliant flag: a position run, its arm on the end
     runner(c, tmp_path).run([leg("a")], execute=True)
     row = _rows(tmp_path)["a"]
     assert row["mode"] == "position" and row["gains"] is None and row["end_err_rad"] == 0.0
+    assert row["end_err_mm"] == pytest.approx(0.0, abs=1e-9) and row["end_err_deg"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_recoil_logs_how_it_flew_and_where_it_ended_like_any_leg(tmp_path, monkeypatch):
+    """The recoil is a row of its own in the run log: it says how it flew
+    and how far from its end it arrived, as every motion does. The touch it
+    backs off is no arrival, so it logs no end error."""
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    c = _ArrivesOff(joint=1, off=0.01, compliant=False)  # a guarded run: position
+    c.exec_script = [("touch", {"message": "contact", "progress": 0.8, "torque_peak": 7.1})]
+    res = runner(c, tmp_path).run([_press_leg(chain=0)], execute=True)
+    assert [r.leg_name for r in res] == ["press:down", "recoil"] and all(r.ok for r in res)
+    rows = _rows(tmp_path)
+    recoil, press = rows["recoil"], rows["press:down"]
+    assert recoil["mode"] == "position" and recoil["gains"] is None
+    assert recoil["end_err_rad"] == pytest.approx(0.01, abs=1e-9)
+    assert recoil["end_err_mm"] == pytest.approx(5.0, rel=1e-3)
+    assert press["mode"] == "position" and press["end_err_rad"] is None and press["end_err_mm"] is None

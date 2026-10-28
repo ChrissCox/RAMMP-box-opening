@@ -73,7 +73,8 @@ class LegResult:
     # the arm's own kinematics. A goal ends when its time does, so in
     # impedance it is what the spring has not yet caught up. Measured, never
     # judged: 2026-10-27 16:23 flew at MEDIUM and TF put the tool 32 mm and
-    # 5.3 deg off its commanded look pose, where position runs were 0.0 mm off
+    # 5.3 deg off its commanded look pose, where that day's three position
+    # runs (14:33, 15:19, 15:34) agree with one another to 0.1 mm
     end_err_rad: float = None
     end_err_mm: float = None
     end_err_deg: float = None
@@ -750,6 +751,7 @@ class Runner:
             info.get("message", ""),
             progress=info.get("progress"),
             t_wall=time.monotonic() - t0,
+            **self._how_it_flew(outcome, info, traj),
         )
         planned = False
         if ok and next_group is not None:
@@ -988,11 +990,7 @@ class Runner:
             stop_when=lead.stop_when,
             **({} if gains is None else {"gains": gains}),
         )
-        # where the arm is the moment the driver called it arrived, against
-        # the end of what flew: the cached sample, no wait and no settle — a
-        # wait would hide what the spring had not caught up. Logged, never a
-        # gate (a compliant run stops for nothing it reads)
-        end_err = _arrival_error(self.client.joints(), traj) if outcome == "arrived" else (None, None, None)
+        flew = self._how_it_flew(outcome, info, traj)
         if guard is not None:
             info.setdefault("torque_peak", guard.peak)
         if info.get("while_running_error"):
@@ -1024,15 +1022,27 @@ class Runner:
             progress=info.get("progress"),
             t_wall=time.monotonic() - t0,
             contact_xyz=contact,
-            mode="impedance" if getattr(self.client, "compliant", False) else "position",
-            gains=info.get("gains"),
-            end_err_rad=end_err[0],
-            end_err_mm=end_err[1],
-            end_err_deg=end_err[2],
             trip=guard.trip_report() if guard is not None else None,
             lookahead=info.get("while_running"),
             flown_traj=traj,
+            **flew,
         )
+
+    def _how_it_flew(self, outcome, info, traj):
+        """LegResult's mode, gains and end_err_* for one execution of `traj`,
+        a motion's or the recoil's. On an arrival: where the arm is the
+        moment the driver called it arrived, against the end of what flew —
+        the cached sample, no wait and no settle, since a wait would hide
+        what the spring had not caught up. Logged, never a gate (a compliant
+        run stops for nothing it reads)."""
+        rad, mm, deg = _arrival_error(self.client.joints(), traj) if outcome == "arrived" else (None, None, None)
+        return {
+            "mode": "impedance" if getattr(self.client, "compliant", False) else "position",
+            "gains": info.get("gains"),
+            "end_err_rad": rad,
+            "end_err_mm": mm,
+            "end_err_deg": deg,
+        }
 
     @staticmethod
     def _leg_ok(leg, outcome):
