@@ -1,3 +1,4 @@
+import math
 import time
 
 import pytest
@@ -22,6 +23,126 @@ def test_merged_group_is_one_execution(tmp_path):
     res = runner(c, tmp_path).run(legs, execute=True)
     assert all(r.ok for r in res)
     assert len(c.executed) == 1  # merged: one goal
+
+
+def test_legs_that_do_not_meet_fly_as_two_executions(tmp_path):
+    """b starts 0.1 rad from where a ends. One trajectory would fly that gap
+    as a jump between two of its samples (legs.MERGE_GAP_RAD). Two goals
+    instead, and the second, no longer starting where the arm is, is planned
+    again from there."""
+    c = FakeClient()
+    legs = [leg("a", Q0, Q1, chain=0), leg("b", Q2, [0.3] * 7, chain=0)]
+    res = runner(c, tmp_path).run(legs, execute=True)
+    assert all(r.ok for r in res)
+    assert len(c.executed) == 2
+    assert c.exec_starts[1] == Q1  # from where a left the arm, not from b's own start
+
+
+def test_legs_under_different_gains_fly_as_two_executions(tmp_path):
+    """A goal carries one ImpedanceGains spec. A merged group used to fly
+    under the first gains any member named, so a leg under the run default
+    (None) flew its neighbour's. Now each spec flies as its own goal, and a
+    group under one spec sends it once."""
+    from rammp_box_opening.constants import GAINS_STIFF
+
+    c = FakeClient()
+    a, b = leg("a", Q0, Q1, chain=0), leg("b", Q1, Q2, chain=0)
+    b.gains = GAINS_STIFF
+    res = runner(c, tmp_path).run([a, b], execute=True)
+    assert all(r.ok for r in res)
+    assert len(c.executed) == 2
+    assert c.gains_sent == [None, GAINS_STIFF]
+    c = FakeClient()
+    a, b = leg("a", Q0, Q1, chain=0), leg("b", Q1, Q2, chain=0)
+    a.gains = b.gains = GAINS_STIFF
+    runner(c, tmp_path).run([a, b], execute=True)
+    assert len(c.executed) == 1 and c.gains_sent == [GAINS_STIFF]
+
+
+class _BranchClient(FakeClient):
+    """Plans a joint goal the way PlannerClient hands it to the planner: the
+    start on HOME's branch (planner_branch), the goal the short way round
+    from there (nearest_branch). Keeps every path it flew."""
+
+    def plan_to_joints(self, q7, start_joints):
+        from rammp_box_opening.runtime.branches import nearest_branch, planner_branch
+
+        self.joint_starts.append(list(start_joints))
+        start = planner_branch(start_joints)
+        return self._plan(nearest_branch(q7, start), start)
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        self.flown = getattr(self, "flown", []) + [[list(p.positions) for p in traj_.points]]
+        return super().execute(traj_, speed, guard=guard, while_running=while_running, stop_when=stop_when,
+                               gains=gains)
+
+
+def _turned(path, j):
+    """How far joint `j` turns along a flown path, the numbers as written."""
+    return sum(abs(b[j] - a[j]) for a, b in zip(path, path[1:]))
+
+
+# HOME's joint_3 is -3.137. The client hands the planner joint_3 0.30 as
+# -5.983 and 0.45 as -5.833, but 0.20 as it is: the other way round, -6.083,
+# is past the planner's -6.0. From a start under 0.283 a goal at 0.45 is
+# written +0.45, a whole turn from the -5.833 the next leg starts at
+_OVER = [-1.0, -0.15, 0.20, -1.05, -0.3, -1.0, 1.8]
+_ON = [-1.0, -0.2, 0.20, -1.1, -0.3, -1.0, 1.8]
+_ON_PAST = [-1.0, -0.2, 0.30, -1.1, -0.3, -1.0, 1.8]
+_UP = [-1.0, -0.2, 0.45, -1.1, -0.3, -1.0, 1.8]
+
+
+def test_a_lazy_group_planned_a_whole_turn_apart_flies_as_two_goals(tmp_path):
+    """A lazy group merges before its legs have trajectories, so the merge
+    cannot see where they meet. Planned at flight from live (joint_3 0.20,
+    handed as it is), the retreat ends at +0.45, and the home planned from
+    there starts at -5.833: one angle to the arm, a whole turn as written.
+    Flown as one goal, joint_3 turned 9.23 rad (offline replay 2026-10-28).
+    Two goals, and neither turns it half a turn."""
+    from rammp_box_opening.constants import HOME
+
+    c = _BranchClient()
+    c.live = list(_OVER)
+    g = GuardSpec(touch_nm=4.0, trip="setdown")
+    c.exec_script = [("touch", {"message": "contact", "progress": 0.9, "torque_peak": 4.0})]
+    down = leg("place:lid:down", _OVER, _ON, guard=g, world="interaction_place", chain=0)
+    retreat = leg("retreat", _ON, _UP, chain=1, world="interaction_place")
+    home = leg("home", _UP, HOME, chain=1)
+    for x in (retreat, home):
+        x.traj = x.goal_joints = None  # lazy: planned from live after the touch
+    res = runner(c, tmp_path).run([down, retreat, home], execute=True)
+    assert [r.leg_name for r in res] == ["place:lid:down", "retreat", "home"]
+    assert all(r.ok for r in res)
+    assert c.exec_starts[2][2] == pytest.approx(_UP[2] - 2.0 * math.pi)
+    assert max(_turned(p, 2) for p in c.flown) < math.pi
+
+
+def test_a_group_replanned_under_the_recoil_a_whole_turn_apart_flies_as_two_goals(tmp_path):
+    """The retreat and the home were planned from the press's end, joint_3
+    0.30, handed to the planner as -5.983: they met and merged. The recoil
+    plans them again from its own end, 0.20, handed as it is: the retreat
+    now ends at +0.45, and the home planned from there starts at -5.833.
+    The runner checks a junction again before it flies it, not only when
+    the legs are first planned."""
+    from rammp_box_opening.constants import HOME
+    from rammp_box_opening.runtime.branches import planner_branch
+    from rammp_box_opening.runtime.legs import merge_groups
+
+    c = _BranchClient()
+    c.live = list(_OVER)
+    press = leg("press:down", _OVER, _ON_PAST, guard=GuardSpec(touch_nm=7.0, trip="press"),
+                world="interaction_button", chain=0)
+    up = planner_branch(_UP)
+    retreat = leg("retreat", planner_branch(_ON_PAST), up, chain=1, world="interaction_button")
+    home = leg("home", up, HOME, chain=1)
+    assert [len(g) for g in merge_groups([press, retreat, home])] == [1, 2]  # as planned, they meet
+    c.exec_script = [("touch", {"message": "contact", "progress": 0.8, "torque_peak": 7.1})]
+    res = runner(c, tmp_path).run([press, retreat, home], execute=True)
+    assert [r.leg_name for r in res] == ["press:down", "recoil", "retreat", "home"]
+    assert all(r.ok for r in res)
+    assert len(c.joint_starts) == 2  # both planned once, under the recoil
+    assert c.exec_starts[3][2] == pytest.approx(_UP[2] - 2.0 * math.pi)
+    assert max(_turned(p, 2) for p in c.flown) < math.pi
 
 
 def test_unguarded_leg_requires_full_world(tmp_path):
@@ -300,7 +421,8 @@ def test_deferred_gripper_close_overlaps_the_next_transit(tmp_path):
     # sent, THEN the transit ran; the join is lazy — it outlives the run
     # to overlap whatever planning follows, and finish() collects it
     assert c.events == ["send", "execute"]
-    assert r.finish().ok
+    done = r.finish()
+    assert done.ok and done.gripper_pos == pytest.approx(0.8)  # the knuckle the join read
     assert c.events == ["send", "execute", "join"]
 
 
@@ -1175,3 +1297,147 @@ def test_the_recoil_does_not_extend_along_a_stroke_this_push_did_not_continue(tm
     runner(c, tmp_path).run([push], execute=True)
     q = np.asarray([p.positions for p in c.trajs[-1].points])
     assert q[-1] == pytest.approx(stop, abs=1e-6)  # the push reversed, nothing more
+
+
+# -- an arrival's error: what the spring had not caught up, logged, never judged --
+
+
+class _ArrivesOff(FakeClient):
+    """A client whose arm ends `off` short of the trajectory's end on one
+    joint (or reads `to` there): an impedance goal ends on time, its spring
+    still converging. Compliant, it reports the gains it would send, as
+    PlannerClient.execute does; in position it sends none."""
+
+    def __init__(self, joint=1, off=0.01, to=None, compliant=True):
+        super().__init__()
+        self.compliant = compliant
+        self._joint, self._off, self._to = joint, off, to
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+        if outcome == "arrived":
+            self.live[self._joint] = self._to if self._to is not None else self.live[self._joint] - self._off
+        info["gains"] = (3 if gains is None else gains) if self.compliant else None
+        return outcome, info
+
+
+class _TwoLink:
+    """The arm's FK stood in for by one periodic in every joint, as the real
+    one is: the tool 0.5 m out along joints 1 and 2, turned about z by
+    joints 1 and 3 and tipped by joint 2."""
+
+    def fk(self, q):
+        import numpy as np
+
+        a, b = q[0] + q[2], q[1]
+        rz = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+        rx = np.array([[1.0, 0.0, 0.0], [0.0, np.cos(b), -np.sin(b)], [0.0, np.sin(b), np.cos(b)]])
+        t = 0.5 * np.array([np.cos(q[0]) * np.cos(b), np.sin(q[0]) * np.cos(b), np.sin(b)])
+        return rz @ rx, t
+
+
+def _rows(tmp_path):
+    import json
+
+    return {r["leg"]: r for r in map(json.loads, next(tmp_path.glob("run-*.jsonl")).read_text().splitlines())}
+
+
+def test_an_arrival_logs_how_far_the_arm_stood_from_the_end_of_what_flew(tmp_path, monkeypatch):
+    """2026-10-27 16:23, MEDIUM: TF put the tool 32 mm and 5.3 deg off its
+    commanded look pose. Every arrival now says how far off it stood, so the
+    log shows what STIFF buys. A merged group logs its one end for every
+    member, as it logs its one t_wall."""
+    import math
+
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    c = _ArrivesOff(joint=1, off=0.01)
+    res = runner(c, tmp_path).run([leg("a", Q0, Q1), leg("b", Q1, Q2)], execute=True)
+    assert len(c.executed) == 1 and res[0].ok
+    rows = _rows(tmp_path)
+    for name in ("a", "b"):
+        row = rows[name]
+        assert row["end_err_rad"] == pytest.approx(0.01, abs=1e-9), name
+        # 0.01 rad of joint 2 tips the 0.5 m tool 5 mm and turns it 0.57 deg
+        assert row["end_err_mm"] == pytest.approx(5.0, rel=1e-3)
+        assert row["end_err_deg"] == pytest.approx(math.degrees(0.01), rel=1e-6)
+        assert row["mode"] == "impedance" and row["gains"] == 3
+
+
+def test_an_arrival_with_no_chain_logs_the_joints_alone_and_the_run_carries_on(tmp_path, monkeypatch):
+    from rammp_box_opening.runtime import approach
+
+    def no_chain():
+        raise RuntimeError("no arm URDF rooted at arm_mount (is /arm/robot_description published?)")
+
+    monkeypatch.setattr(approach, "_chain", no_chain)
+    c = _ArrivesOff(joint=1, off=0.01)
+    res = runner(c, tmp_path).run([leg("a", Q0, Q1, chain=0), leg("b", Q1, Q2, chain=1)], execute=True)
+    assert [r.ok for r in res] == [True, True] and len(c.executed) == 2
+    row = _rows(tmp_path)["a"]
+    assert row["end_err_rad"] == pytest.approx(0.01, abs=1e-9)
+    assert row["end_err_mm"] is None and row["end_err_deg"] is None
+
+
+def test_a_failed_execution_logs_no_arrival_error(tmp_path, monkeypatch):
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    c = _ArrivesOff()
+    c.exec_script = [("failed", {"message": "halted: emergency stop", "progress": 0.4})]
+    res = runner(c, tmp_path).run([leg("a", Q0, Q1)], execute=True)
+    assert res[0].outcome == "failed"
+    row = _rows(tmp_path)["a"]
+    assert row["end_err_rad"] is None and row["end_err_mm"] is None and row["end_err_deg"] is None
+    assert row["mode"] == "impedance" and row["gains"] == 3  # how it flew, still
+
+
+def test_an_arrival_across_the_wrap_is_the_short_way_round(tmp_path, monkeypatch):
+    """HOME's joint_3 sits 4.6 mrad from -pi and reads either side of it: an
+    end at -3.137 with the arm reading +3.140 is 6 mrad off, not 6.28 rad."""
+    import math
+
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    start = [0.0, 0.0, -3.10, 0.0, 0.0, 0.0, 0.0]
+    end = [0.0, 0.0, -3.137, 0.0, 0.0, 0.0, 0.0]
+    c = _ArrivesOff(joint=2, to=3.140)
+    c.live = list(start)
+    res = runner(c, tmp_path).run([leg("a", start, end)], execute=True)
+    assert res[0].ok
+    err = res[0].end_err_rad
+    assert err == pytest.approx(2 * math.pi - 3.140 - 3.137, abs=1e-9) and err < 0.01
+    assert res[0].end_err_deg == pytest.approx(math.degrees(err), rel=1e-6)
+    assert res[0].end_err_mm == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_position_arrival_logs_its_mode_and_no_gains(tmp_path, monkeypatch):
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    c = FakeClient()  # no compliant flag: a position run, its arm on the end
+    runner(c, tmp_path).run([leg("a")], execute=True)
+    row = _rows(tmp_path)["a"]
+    assert row["mode"] == "position" and row["gains"] is None and row["end_err_rad"] == 0.0
+    assert row["end_err_mm"] == pytest.approx(0.0, abs=1e-9) and row["end_err_deg"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_recoil_logs_how_it_flew_and_where_it_ended_like_any_leg(tmp_path, monkeypatch):
+    """The recoil is a row of its own in the run log: it says how it flew
+    and how far from its end it arrived, as every motion does. The touch it
+    backs off is no arrival, so it logs no end error."""
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    c = _ArrivesOff(joint=1, off=0.01, compliant=False)  # a guarded run: position
+    c.exec_script = [("touch", {"message": "contact", "progress": 0.8, "torque_peak": 7.1})]
+    res = runner(c, tmp_path).run([_press_leg(chain=0)], execute=True)
+    assert [r.leg_name for r in res] == ["press:down", "recoil"] and all(r.ok for r in res)
+    rows = _rows(tmp_path)
+    recoil, press = rows["recoil"], rows["press:down"]
+    assert recoil["mode"] == "position" and recoil["gains"] is None
+    assert recoil["end_err_rad"] == pytest.approx(0.01, abs=1e-9)
+    assert recoil["end_err_mm"] == pytest.approx(5.0, rel=1e-3)
+    assert press["mode"] == "position" and press["end_err_rad"] is None and press["end_err_mm"] is None

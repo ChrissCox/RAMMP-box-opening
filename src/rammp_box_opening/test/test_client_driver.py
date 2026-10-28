@@ -171,6 +171,7 @@ def _client(driver=None, armed=True):
     c._abort = None
     c._armed = armed
     c._execute = driver if driver is not None else _Driver()
+    c._active_joints = None  # no /joint_states names yet: joint_names is the bench's
     c._q = list(LIVE)
     c._eff = [0.0] * 7
     c._eff_at = time.monotonic()
@@ -631,13 +632,17 @@ def test_settled_efforts_defaults_keep_the_settle():
     assert params["duration_s"].default == 0.15
 
 
-def _compliant_run(monkeypatch, guard, fresh=True, gains=None):
+def _compliant_run(monkeypatch, guard, fresh=True, gains=None, client_gains=None):
     """A compliant client flying one guarded leg; the result settles after a
-    dozen spins. `fresh`: each spin serves a /joint_states."""
+    dozen spins. `fresh`: each spin serves a /joint_states. `client_gains`:
+    the client's own compliant_gains (else it has none set, as _client
+    builds it, and falls back on constants.COMPLIANT_RUN_GAINS)."""
     h = _ScriptedHandle(_cresp(CancelGoal.Response.ERROR_NONE), _ended(5, -6))
     d = _ScriptedDriver(h)
     c = _client(d)
     c.compliant = True
+    if client_gains is not None:
+        c.compliant_gains = client_gains
     spins = {"n": 0}
 
     def spin(node, timeout_sec=0.0):
@@ -654,12 +659,62 @@ def _compliant_run(monkeypatch, guard, fresh=True, gains=None):
 
 
 def test_a_compliant_leg_flies_in_impedance_under_its_gains(monkeypatch):
-    outcome, _info, h, d = _compliant_run(monkeypatch, None, gains=client_mod.GAINS_STIFF)
+    """Owner 2026-10-27: "impedance mode needs to be firmer". A compliant goal
+    that names no gains flies the run's, STIFF — never the driver's session
+    default, MEDIUM, which every goal of 16:23 flew; one that names a
+    profile flies that one, and so does a client told another run default."""
+    outcome, info, h, d = _compliant_run(monkeypatch, None)
     goal, = d.goals
     assert outcome == "arrived" and goal.control_mode == client_mod.IMPEDANCE
-    assert goal.gains.profile == client_mod.GAINS_STIFF
-    outcome, _info, h, d = _compliant_run(monkeypatch, None)
-    assert d.goals[0].gains.profile == 0  # the session default
+    assert client_mod.COMPLIANT_RUN_GAINS == client_mod.GAINS_STIFF == 3
+    assert goal.gains.profile == 3 and info["gains"] == 3
+    _o, info, _h, d = _compliant_run(monkeypatch, None, gains=client_mod.GAINS_MEDIUM)
+    assert d.goals[0].gains.profile == 2 and info["gains"] == 2
+    _o, info, _h, d = _compliant_run(monkeypatch, None, client_gains=client_mod.GAINS_MEDIUM)
+    assert d.goals[0].gains.profile == 2 and info["gains"] == 2
+    _o, info, _h, d = _compliant_run(
+        monkeypatch, None, gains=client_mod.GAINS_STIFF, client_gains=client_mod.GAINS_SOFT
+    )
+    assert d.goals[0].gains.profile == 3 and info["gains"] == 3  # the leg's own wins
+
+
+def test_a_client_built_for_a_run_flies_stiff(monkeypatch):
+    """PlannerClient.__init__ (the rclpy surface stubbed): position until a
+    run sets compliant, STIFF once it does."""
+
+    class _Node:
+        def __getattr__(self, name):  # create_subscription, create_client, ...
+            return lambda *a, **k: None
+
+    for name in ("ActionClient", "Buffer", "TransformListener"):
+        monkeypatch.setattr(client_mod, name, lambda *a, **k: None)
+    c = client_mod.PlannerClient(_Node())
+    assert c.compliant is False and c.compliant_gains == client_mod.GAINS_STIFF
+
+
+class _Rejected:
+    accepted = False
+
+
+class _RejectingDriver(_Driver):
+    def send_goal_async(self, goal, feedback_callback=None):
+        self.goals.append(goal)
+        return _Future(_Rejected())
+
+
+def test_a_compliant_rejection_names_the_gains_it_sent():
+    d = _RejectingDriver()
+    c = _client(d)
+    c.compliant = True
+    outcome, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert outcome == "failed" and "its STIFF gains refused" in info["message"]
+    c.compliant_gains = client_mod.GAINS_MEDIUM
+    _o, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert "its MEDIUM gains refused" in info["message"]
+    c.compliant = False  # a position goal sends none, so none is named
+    _o, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert info["message"] == "goal rejected by the driver (a stream session open, or a mode change while moving)"
+    assert info["gains"] is None and d.goals[-1].gains.profile == 0
 
 
 def test_a_position_leg_sends_no_gains():
@@ -667,6 +722,25 @@ def test_a_position_leg_sends_no_gains():
     c = _client(d)
     c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, gains=client_mod.GAINS_STIFF)
     assert d.goals[0].control_mode == client_mod.POSITION and d.goals[0].gains.profile == 0
+
+
+def test_the_gains_named_here_are_the_drivers_own_profiles():
+    """constants.GAINS_* are robot-body constants copied from the driver:
+    they must be the profile numbers its interface defines, or a run would
+    fly a tuning other than the one its banner and press model name. A goal
+    that names none is PROFILE_SESSION_DEFAULT, which the driver resolves
+    to MEDIUM."""
+    from rammp_arm_interfaces.msg import ImpedanceGains
+
+    from rammp_box_opening import constants
+
+    assert (constants.GAINS_SOFT, constants.GAINS_MEDIUM, constants.GAINS_STIFF) == (
+        ImpedanceGains.PROFILE_SOFT, ImpedanceGains.PROFILE_MEDIUM, ImpedanceGains.PROFILE_STIFF)
+    assert ExecuteJointTrajectory.Goal().gains.profile == ImpedanceGains.PROFILE_SESSION_DEFAULT
+    assert set(constants.IMPEDANCE_KQ) == set(constants.IMPEDANCE_NAMES) == {1, 2, 3}
+    assert all(len(kq) == len(LIVE) for kq in constants.IMPEDANCE_KQ.values())
+    assert constants.COMPLIANT_RUN_GAINS in constants.IMPEDANCE_KQ
+    assert client_mod.GAINS_STIFF is constants.GAINS_STIFF  # client.GAINS_* still name them
 
 
 def test_a_compliant_guard_watches_and_never_stops_the_leg(monkeypatch):
@@ -680,3 +754,289 @@ def test_a_compliant_guard_watches_and_never_stops_the_leg(monkeypatch):
 def test_a_compliant_leg_flies_on_through_a_silent_stream(monkeypatch):
     outcome, _info, h, _d = _compliant_run(monkeypatch, _Guard(), fresh=False)
     assert outcome == "arrived" and h.cancels == 0
+
+
+# -- the hold that primes the joint impedance (prime_compliant) ----------------
+
+
+class _SilentDriver(_Driver):
+    """Takes every goal and answers none of them, until `answering`: then
+    each is accepted and arrives at once, as _Driver's. A primer that waited
+    on its goal would hang here."""
+
+    def __init__(self):
+        super().__init__()
+        self.futures = []
+        self.answering = False
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        if self.answering:
+            return super().send_goal_async(goal, feedback_callback)
+        self.goals.append(goal)
+        self.futures.append(_Pending())
+        return self.futures[-1]
+
+
+def _priming(driver, armed=True):
+    c = _client(driver, armed=armed)
+    c.compliant = True
+    return c
+
+
+def test_the_impedance_is_primed_by_a_hold_where_the_arm_stands_and_nothing_waits_on_it(monkeypatch):
+    """Flatbot 2026-10-27 16:23: the look, the run's first compliant goal,
+    took 1.857 s against its 1.60 s preview — the driver's 0.25 s switch out
+    of POSITION, then its spring fading in under the look. The primer is ONE
+    impedance goal, queued as every goal is, holding the arm where it stands
+    under the run's gains; the call spins nothing and waits for neither the
+    goal's acceptance nor its result: the planning that follows serves it."""
+    from rammp_box_opening.constants import JOINT_VMAX
+
+    d = _SilentDriver()
+    c = _priming(d)
+    c._active_joints = ["arm_joint_%d" % i for i in range(1, 8)]  # flatbot's /joint_states names
+    spins = []
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", lambda node, timeout_sec=0.0: spins.append(timeout_sec))
+    monkeypatch.setattr(client_mod, "spin_until_done", lambda *a, **k: pytest.fail("the primer waited on its goal"))
+    assert c.prime_compliant() is True
+    goal, = d.goals
+    assert spins == [] and c._primer is d.futures[0] and not d.futures[0].done()
+    assert goal.control_mode == client_mod.IMPEDANCE and goal.preemption == client_mod.QUEUE
+    assert goal.gains.profile == client_mod.GAINS_STIFF and goal.sender_id == "rammp_box_opening"
+    hold = goal.trajectory
+    assert list(hold.joint_names) == c._active_joints
+    assert [_secs(p) for p in hold.points] == pytest.approx(list(client_mod.PlannerClient.PRIME_TIMES_S))
+    assert client_mod.PlannerClient.PRIME_TIMES_S == (0.02, 0.05)
+    for p in hold.points:  # two identical points at the live joints, at rest
+        assert list(p.positions) == pytest.approx(LIVE)
+        assert list(p.velocities) == [0.0] * 7 and list(p.accelerations) == [0.0] * 7
+    assert client_mod.driver.refusal(hold, LIVE, JOINT_VMAX) is None
+    # why the first point is not at t=0: the gates every goal passes refuse it
+    assert "non-monotonic" in client_mod.driver.refusal(_traj(LIVE, LIVE, times=(0.0, 0.05)), LIVE, JOINT_VMAX)
+    # the caller's own read is the one held, under whichever gains the run flies
+    q = [v + 0.01 for v in LIVE]
+    c.compliant_gains = client_mod.GAINS_MEDIUM
+    assert c.prime_compliant(q) is True
+    for p in d.goals[-1].trajectory.points:
+        assert list(p.positions) == pytest.approx(q)
+    assert d.goals[-1].gains.profile == client_mod.GAINS_MEDIUM
+    # ... within the start gate of the live arm, as any goal's first waypoint
+    assert c.prime_compliant([LIVE[0] + 0.1] + LIVE[1:]) is False and len(d.goals) == 2
+    assert spins == []
+
+
+def test_only_an_armed_compliant_client_with_no_abort_requested_primes():
+    from rammp_box_opening.runtime.abort import AbortFlag
+
+    d = _SilentDriver()
+    assert _priming(d, armed=False).prime_compliant() is False  # no --execute
+    assert _client(d).prime_compliant() is False  # a position client: --guarded, home_arm
+    aborted = _priming(d)
+    aborted._abort = AbortFlag()
+    aborted._abort.requested = True  # Ctrl+C while the scene camera looked
+    assert aborted.prime_compliant() is False
+    assert d.goals == []
+
+
+def test_no_hold_goes_out_on_a_frozen_joint_stream_or_without_the_driver(monkeypatch):
+    """The hold is judged against the live arm, as every goal is
+    (driver.refusal): where /joint_states has gone quiet (no sample newer
+    than GUARD_STALE_S, and the spins serve none) none goes out, though it
+    would hold the caller's own read; nor where the driver's action does not
+    answer. The look then pays the switch itself, as before the primer."""
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", lambda node, timeout_sec=0.0: time.sleep(0.01))
+    d = _SilentDriver()
+    frozen = _priming(d)
+    frozen._eff_at = time.monotonic() - 1.0  # the last sample a second old
+    assert frozen.prime_compliant(list(LIVE)) is False
+    gone = _SilentDriver()
+    gone.wait_for_server = lambda timeout_sec=None: False
+    assert _priming(gone).prime_compliant() is False
+    assert d.goals == [] and gone.goals == []
+
+
+def test_an_execute_after_the_primer_returns_its_own_result():
+    """The primer's goal is never answered here; the look after it is, and
+    that answer is the look's."""
+    d = _SilentDriver()
+    c = _priming(d)
+    assert c.prime_compliant()
+    d.answering = True
+    end = [v + 0.05 for v in LIVE]
+    outcome, info = c.execute(_traj(LIVE, end), 1.0)
+    assert outcome == "arrived" and info["message"] == "arrived" and info["gains"] == client_mod.GAINS_STIFF
+    primer, look = d.goals
+    assert list(primer.trajectory.points[-1].positions) == pytest.approx(LIVE)
+    assert list(look.trajectory.points[-1].positions) == pytest.approx(end)
+    assert not d.futures[0].done()  # the primer's own answer: never come, never waited on
+
+
+# -- a compliant stop lets go: the impedance reference moved to where the arm stands ----------
+
+MID = [v + 0.02 for v in LIVE]  # where the arm stands when the Ctrl+C lands, part-way
+
+
+def _ctrl_c_mid_goal(monkeypatch, compliant=True, flag=True, fresh=True, gains=None):
+    """One leg flown by a client (compliant, else in position) under
+    `gains`, Ctrl+C landing on the third spin with the arm at MID: through
+    the abort flag (`flag`; SIGINT mid-goal only sets it), else raised from
+    the spin, as rclpy's own handler does in a CLI that keeps it. With
+    `fresh` False, /joint_states stopped a second before. The cancel is
+    taken and the goal ends CANCELED. Returns (client, driver, handle) once
+    execute has raised the KeyboardInterrupt."""
+    h = _ScriptedHandle(_cresp(CancelGoal.Response.ERROR_NONE), _ended(5, -6))
+    if flag:
+        c, _flag, handler = _abort_client(h)
+    else:
+        c, handler = _client(_ScriptedDriver(h)), None
+    c.compliant = compliant
+    spins = {"n": 0}
+
+    def spin(node, timeout_sec=0.0):  # a /joint_states message per spin, unless it stopped
+        spins["n"] += 1
+        c._eff_at = time.monotonic() if fresh or spins["n"] < 3 else min(c._eff_at, time.monotonic() - 1.0)
+        if not fresh:
+            time.sleep(0.005)
+        if spins["n"] == 3:
+            c._q = list(MID)
+            if handler is None:
+                raise KeyboardInterrupt
+            handler(2, None)
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    with pytest.raises(KeyboardInterrupt):
+        c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, gains=gains)
+    return c, c._execute, h
+
+
+@pytest.mark.parametrize("flag, gains, held_under", [
+    (True, None, client_mod.GAINS_STIFF),  # the client's run default
+    (False, client_mod.GAINS_SOFT, client_mod.GAINS_SOFT),  # the backstop's cancel, a leg under its own gains
+], ids=["abort flag", "backstop"])
+def test_a_compliant_ctrl_c_lets_the_spring_go_where_the_arm_stands(monkeypatch, flag, gains, held_under):
+    """With the stop-the-arm checks off, Ctrl+C and the e-stop are the only
+    stops, and a cancel moves nothing in the driver's joint impedance: it
+    pulls on toward the cancelled goal's last reference, its velocity and
+    acceleration feed-forward still on (kinova-gen3-driver 94736cd
+    supervisor.cpp:278-296), the arm overshooting by centimetres at speed
+    or pushing on into the box. After the cancel — the abort flag's,
+    confirmed, or the backstop's, unconfirmed — exactly one more goal goes
+    out: a hold at the joints the arm stands at, at rest, LATEST_WINS (a
+    queued one would wait behind a goal whose cancel did not land), under
+    the cancelled goal's own gains (none would be MEDIUM, twice STIFF's
+    sag)."""
+    from rammp_box_opening.constants import JOINT_VMAX
+
+    c, d, h = _ctrl_c_mid_goal(monkeypatch, flag=flag, gains=gains)
+    assert h.cancels == 1
+    leg, rel = d.goals
+    assert leg.control_mode == client_mod.IMPEDANCE and leg.preemption == client_mod.QUEUE
+    assert rel.control_mode == client_mod.IMPEDANCE == 1 and rel.preemption == client_mod.LATEST_WINS == 1
+    assert rel.gains == leg.gains and rel.gains is not leg.gains and rel.gains.profile == held_under
+    assert rel.sender_id == "rammp_box_opening" and list(rel.trajectory.joint_names) == NAMES
+    points = rel.trajectory.points
+    assert [list(p.positions) for p in points] == [MID, MID]  # where the arm stands, not where the leg went
+    for p in points:
+        assert list(p.velocities) == [0.0] * 7 and list(p.accelerations) == [0.0] * 7
+    assert [_secs(p) for p in points] == pytest.approx(list(client_mod.PlannerClient.RELEASE_TIMES_S))
+    assert _secs(points[0]) > 0.0 and client_mod.driver.refusal(rel.trajectory, MID, JOINT_VMAX) is None
+
+
+def test_no_release_goes_out_on_a_frozen_joint_stream(monkeypatch, capsys):
+    """/joint_states stopped a second before the Ctrl+C: a LATEST_WINS hold
+    at that sample would pull the arm back to where it stood then. None
+    goes out, and the console says the spring was not let go."""
+    _c, d, h = _ctrl_c_mid_goal(monkeypatch, fresh=False)
+    assert h.cancels == 1 and len(d.goals) == 1
+    assert "no fresh /joint_states: not released" in capsys.readouterr().out
+
+
+def test_a_position_ctrl_c_sends_no_release(monkeypatch):
+    """Never for a POSITION goal: there is no spring to let go, and an
+    IMPEDANCE hold would switch the driver's mode under the arm."""
+    c, d, h = _ctrl_c_mid_goal(monkeypatch, compliant=False)
+    assert h.cancels == 1 and [g.control_mode for g in d.goals] == [client_mod.POSITION]
+    assert c.release() is False and len(d.goals) == 1  # nor when asked: the last goal sent was POSITION
+
+
+def _flowing(monkeypatch, c):
+    """/joint_states flowing: every spin serves `c` a fresh message."""
+
+    def spin(node, timeout_sec=0.0):
+        c._eff_at = time.monotonic()
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+
+
+def test_one_release_per_goal_sent(monkeypatch):
+    """The Ctrl+C's release is followed by the run's own (reach_press.let_go,
+    unwinding): nothing more goes out. A goal sent after it, the primer
+    too, is one a release may follow again."""
+    c, d, _h = _ctrl_c_mid_goal(monkeypatch)
+    assert len(d.goals) == 2
+    assert c.release() is False and len(d.goals) == 2
+    d = _Driver()
+    c = _client(d)
+    c.compliant = True
+    _flowing(monkeypatch, c)
+    c.compliant_gains = client_mod.GAINS_MEDIUM
+    assert c.prime_compliant() is True
+    assert c.release() is True and c.release() is False
+    assert c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0, gains=client_mod.GAINS_STIFF)[0] == "arrived"
+    assert c.release() is True and c.release() is False
+    modes = [(g.control_mode, g.preemption, g.gains.profile) for g in d.goals]
+    assert modes == [(1, 0, 2), (1, 1, 2), (1, 0, 3), (1, 1, 3)]  # primer, its release, the leg, its release
+
+
+def test_an_unarmed_client_sends_no_release(monkeypatch):
+    """The motion latch (--execute) gates the release too: an unarmed client
+    sends nothing, whatever it sent before it was disarmed."""
+    d = _Driver()
+    c = _client(d)
+    c.compliant = True
+    _flowing(monkeypatch, c)
+    assert c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)[0] == "arrived" and len(d.goals) == 1
+    c._armed = False
+    assert c.release() is False and len(d.goals) == 1
+    c._armed = True  # the latch was all that held it
+    assert c.release() is True and len(d.goals) == 2
+
+
+def test_a_release_that_fails_never_costs_the_ctrl_c_it_rides_on(monkeypatch, capsys):
+    """A release runs while a Ctrl+C unwinds: whatever goes wrong in it, here
+    its send raising, is printed and swallowed, never raised over the
+    KeyboardInterrupt press_demo exits 130 on, and it latches nothing."""
+
+    def send(self, goal, feedback_callback=None):
+        if self.goals:  # the leg went out; its release does not
+            raise RuntimeError("the context is not valid")
+        self.goals.append(goal)
+        return _Future(self.handle)
+
+    monkeypatch.setattr(_ScriptedDriver, "send_goal_async", send)
+    c, d, h = _ctrl_c_mid_goal(monkeypatch)  # the KeyboardInterrupt all the same
+    assert h.cancels == 1 and len(d.goals) == 1 and c._released is False
+    assert "[client] not released (the context is not valid) — check the arm" in capsys.readouterr().out
+
+
+class _TakesOneDriver(_Driver):
+    """Takes the first goal and turns down every one after it."""
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        if not self.goals:
+            return super().send_goal_async(goal, feedback_callback)
+        self.goals.append(goal)
+        return _Future(_Rejected())
+
+
+def test_a_release_the_driver_did_not_take_is_tried_again(monkeypatch, capsys):
+    """A hold the driver turned down let nothing go: the next release (the
+    run's own, reach_press.let_go, after the client's) sends it again."""
+    d = _TakesOneDriver()
+    c = _client(d)
+    c.compliant = True
+    _flowing(monkeypatch, c)
+    assert c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)[0] == "arrived"
+    assert c.release() is False and c.release() is False
+    assert [g.preemption for g in d.goals] == [client_mod.QUEUE, client_mod.LATEST_WINS, client_mod.LATEST_WINS]
+    assert capsys.readouterr().out.count("not released: the driver did not take the hold") == 2

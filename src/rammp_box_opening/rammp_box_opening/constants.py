@@ -49,8 +49,10 @@ CONTACT_SPEED = 0.15
 # anything it could touch, flown only after an at-rest check (or in place,
 # pivoting about the fingertip): the reach-out's rise, slide out and back
 # off, the depth press's turn, rise and centring. Every line toward the lid,
-# or loaded, stays at CONTACT_SPEED. Run 2026-10-22 20:04 flew its turn, rise
-# and back off at 0.15: 18 s of a 45 s press.
+# or loaded, stays at CONTACT_SPEED in a guarded run; a compliant run, which
+# nothing it reads stops, flies its free-air lines here too. Run 2026-10-22
+# 20:04 flew its turn, rise and back off at 0.15: 18 s of a 45 s press; the
+# compliant 2026-10-27 16:23 its re-aim, slide in and clear: 10.5 s.
 FREE_LINE_SPEED = 0.3
 DRIFT_REPLAN_RAD = 0.04  # < START_GATE_RAD: replan before the gate would refuse
 # The driver commands a trajectory's first waypoint at once, wherever the arm
@@ -137,3 +139,26 @@ JOINT_ARC_PER_M = 4.05
 # something"): every leg in the driver's joint impedance, nothing the run
 # reads stops it. press_demo --guarded flies it guarded, as before.
 COMPLIANT_DEFAULT = True
+
+# The driver's named joint-impedance tunings (ImpedanceGains.profile;
+# kinova-gen3-driver interface/gains.cpp kSoft/kMedium/kStiff): the robot's,
+# not the scene's. A goal that names none (PROFILE_SESSION_DEFAULT, 0) flies
+# the driver's session default, MEDIUM, since nothing calls /set_gains.
+GAINS_SOFT, GAINS_MEDIUM, GAINS_STIFF = 1, 2, 3
+# Their joint stiffness Kq, N·m/rad on joints 1-4 / 5-7. Damping follows from
+# zeta (0.4 / 0.5 / 0.7), and each spring's leash is 0.45 / 0.35 / 0.25 rad.
+IMPEDANCE_KQ = {
+    GAINS_SOFT: (40.0,) * 4 + (15.0,) * 3,
+    GAINS_MEDIUM: (80.0,) * 4 + (30.0,) * 3,
+    GAINS_STIFF: (160.0,) * 4 + (60.0,) * 3,
+}
+IMPEDANCE_NAMES = {GAINS_SOFT: "SOFT", GAINS_MEDIUM: "MEDIUM", GAINS_STIFF: "STIFF"}
+# Every compliant goal that names no gains flies this (PlannerClient
+# .compliant_gains). Owner 2026-10-27, after 16:23 flew all six of its goals
+# at MEDIUM: "impedance mode needs to be firmer". STIFF and not CUSTOM: STIFF
+# is the driver's own complete set (zeta 0.7, leash 0.25 rad, torque limits at
+# the ceiling), the press model stays as it is (depth_press.COMPLIANT_KQ), and
+# nothing above STIFF has flown on this arm. STIFF itself had not flown on
+# flatbot either (16:23 stopped before the press): the first attended run is
+# its test, and stepping up past it is a decision for an attended run.
+COMPLIANT_RUN_GAINS = GAINS_STIFF

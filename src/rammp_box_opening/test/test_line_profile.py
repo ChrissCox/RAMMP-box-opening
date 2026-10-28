@@ -1,5 +1,6 @@
 """A free-air plan-free line at contact speed flies a re-timed profile: no
 faster anywhere than the dilated one it replaces, and shorter."""
+import numpy as np
 import pytest
 
 from conftest import FakeClient, runner as make_runner
@@ -58,6 +59,16 @@ def test_a_free_air_line_is_retimed_never_faster(tmp_path, scale):
     assert [p.positions for p in flown.points] == [p.positions for p in lg.traj.points]  # positions untouched
     t_old, t_new = secs(before.points[-1].time_from_start), secs(flown.points[-1].time_from_start)
     assert t_new < 0.7 * t_old, (t_old, t_new)
+    # the velocities on the wire are the speed the samples are flown at, in
+    # slow mode too: the driver's quintic fits through them (at 0.5 they
+    # said twice that speed, review 2026-10-27)
+    q = np.asarray([p.positions for p in flown.points])
+    v = np.asarray([p.velocities for p in flown.points])
+    t = np.asarray([secs(p.time_from_start) for p in flown.points])
+    speed = np.linalg.norm(q[2:] - q[:-2], axis=1) / (t[2:] - t[:-2])
+    moving = speed > 1e-3
+    ratio = np.linalg.norm(v[1:-1], axis=1)[moving] / speed[moving]
+    assert np.median(ratio) == pytest.approx(1.0, abs=0.02)
 
 
 def test_contact_strokes_keep_their_dilated_time_base(tmp_path):

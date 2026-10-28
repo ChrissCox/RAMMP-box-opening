@@ -54,11 +54,17 @@ def test_the_fingertip_lands_where_it_is_aimed_and_is_read_back_from_the_tips(mo
     assert tips[2] - tool[2] == pytest.approx(TIP_TO_TOOL_M, abs=1e-9)
 
 
+STRAIGHT_DOWN = np.diag([1.0, -1.0, -1.0])  # tool_frame's z along the world's -z
+
+
 class _Chain:
     """Straight lines that always fly, through two waypoints; no joint
-    limits (ClearMarginFree finds none near)."""
+    limits (ClearMarginFree finds none near). fk stands still, the hand at
+    R: np.eye(3) unless a test says otherwise — a lean of 180 deg, whose
+    sine is ~0, so a test that means straight down sets STRAIGHT_DOWN."""
 
     limits = [(None, None)] * 7
+    R = np.eye(3)
 
     def __init__(self, refuse=()):
         self.refuse = refuse
@@ -75,7 +81,7 @@ class _Chain:
         return None, "no turning walk modelled"  # the depth press's slide in, then its turn
 
     def fk(self, q):
-        return np.eye(3), np.array([0.5, -0.4, 0.45])
+        return np.array(self.R, float), np.array([0.5, -0.4, 0.45])
 
 
 def _tilt_of(quat):
@@ -127,6 +133,89 @@ def test_a_tilt_whose_stroke_the_arm_cannot_fly_straight_is_passed_over(ctx, mon
     monkeypatch.setattr(reach_press, "_plan_motion", lambda c, s, n, t, w, sp: (SimpleNamespace(goal_joints=[0.0] * 7), s))
     plan, why = reach_press.plan_reach(ctx, cfg, (0.66, -0.57, 0.40), [0.0] * 7)
     assert plan is not None and plan.tilt_deg == 35
+
+
+DOWN_QUAT = [1.0, 0.0, 0.0, 0.0]  # STRAIGHT_DOWN as a quaternion (x, y, z, w)
+
+
+def _way_down(asked, solves=lambda tilt, tip: False):
+    """reach_press.way_down for the fake chain: each ask kept as (tilt, the
+    xy under the slid-in fingertip — the button's —, top_z); `solves(tilt,
+    fingertip)` says where the hand turns down and strokes: the turn in
+    place where the slide ends, then the press stroke from its end, each a
+    step on from the last as _Chain's lines are, the spring 440 N/m. A
+    refusal reads as 16:23's did."""
+    from rammp_box_opening.tasks import depth_press as dp
+
+    def way_down(ctx_, cfg_, q_look, slide, start, quat, top_z):
+        tip = np.asarray(start, float) + np.asarray(quat_to_mat(*quat), float) @ np.asarray(reach_press.CONTACT_TOOL)
+        asked.append((_tilt_of(quat), [float(tip[0]), float(tip[1])], float(top_z)))
+        if solves(_tilt_of(quat), tip):
+            turn = [[float(v) for v in slide[-1]], [float(v) + 0.01 for v in slide[-1]]]
+            down = dp.WayDown(turn, list(DOWN_QUAT), 0.0, False)
+            t0 = np.array([0.5, -0.4, 0.45])  # the fake fk's
+            stroke = dp.StrokePlan([("depth:press", [turn[-1], [v + 0.01 for v in turn[-1]]], dp.TOUCH_SPEED)], 440.0,
+                                   0.03 - cfg_.button_travel_m, float(top_z) - 0.03, t0,
+                                   t0 + STRAIGHT_DOWN @ np.asarray(dp.DOWN_CONTACT_TOOL), turn[-1], list(DOWN_QUAT))
+            return down, stroke, None
+        return None, None, ("walk in: 0 deg short: a joint jump of 0.19 rad 44% of the way — near a singularity; "
+                            "turn after the slide: 0 deg short: IK did not converge 73% of the way")
+
+    return way_down
+
+
+def test_a_compliant_depth_plan_passes_over_a_tilt_whose_way_down_refuses(ctx, monkeypatch):
+    """The compliant depth press never flies the tilted stroke: from the
+    look pose the hand turns down and strokes straight down (way_down).
+    plan_reach(depth=True) asks that instead, at the scene button's top,
+    passes over a tilt where it does not solve, and keeps that tilt's look
+    leg and slide (`looks`). Without depth, the tilted stroke as before."""
+    from rammp_box_opening.runtime import approach
+
+    cfg = load_press_demo(PINK)
+    ctx.model = ContainerModel.load(PINK)
+    chain = _Chain(refuse=[lambda xyz, quat: xyz[2] < 0.41])  # every tilt's stroke down (the fake fk stands at 0.45)
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    monkeypatch.setattr(reach_press, "_plan_motion",
+                        lambda c, s, n, t, w, sp: (SimpleNamespace(goal_joints=[0.0] * 7), s))
+    asked = []
+    monkeypatch.setattr(reach_press, "way_down", _way_down(asked, solves=lambda tilt, tip: tilt > 30))
+    looks = []
+    plan, why = reach_press.plan_reach(ctx, cfg, BUTTON, [0.0] * 7, depth=True, looks=looks)
+    assert plan is not None and why is None and plan.tilt_deg == 35 and plan.stroke_pts is None
+    assert plan.down.walked is False and plan.stroke.end_z == pytest.approx(BUTTON[2] - 0.03)
+    assert [(t, z) for t, _xy, z in asked] == [(30, BUTTON[2]), (35, BUTTON[2])]
+    assert all(xy == pytest.approx(list(BUTTON[:2])) for _t, xy, _z in asked)  # the slide ends over the button
+    assert not any(xyz[2] < 0.41 for xyz, _q in chain.lines)  # no tilted stroke asked for
+    (look,) = looks
+    assert look.tilt_deg == 30 and look.down is None and look.look_leg is not None and look.slide_pts
+    plan, why = reach_press.plan_reach(ctx, cfg, BUTTON, [0.0] * 7)
+    assert plan is None and all("%d deg: the stroke (" % t in why for t in reach_press.REACH_TILTS_DEG)
+
+
+def test_where_no_tilt_turns_down_and_strokes_the_depth_plan_names_every_tilt_and_keeps_their_looks(ctx, monkeypatch):
+    """A tilt whose look pose does not plan has no look to keep."""
+    from rammp_box_opening.runtime import approach
+
+    cfg = load_press_demo(PINK)
+    ctx.model = ContainerModel.load(PINK)
+    monkeypatch.setattr(approach, "_chain", lambda: _Chain())
+
+    def look_plans_from_35(ctx_, state, name, target, world, speed):
+        if _tilt_of(target[2]) < 35:
+            raise RuntimeError("planning failed for reach:look: MotionGenStatus.IK_FAIL")
+        return SimpleNamespace(goal_joints=[0.0] * 7), state
+
+    monkeypatch.setattr(reach_press, "_plan_motion", look_plans_from_35)
+    monkeypatch.setattr(reach_press, "way_down", _way_down([]))
+    looks = []
+    plan, why = reach_press.plan_reach(ctx, cfg, BUTTON, [0.0] * 7, depth=True, looks=looks)
+    assert plan is None and "30 deg: the look pose (MotionGenStatus.IK_FAIL)" in why
+    for tilt in (35, 40, 45):
+        assert ("%d deg: the way down (walk in: 0 deg short: a joint jump of 0.19 rad 44%% of the way — near a "
+                "singularity; turn after the slide: 0 deg short: IK did not converge 73%% of the way)" % tilt) in why
+    assert [lk.tilt_deg for lk in looks] == [35, 40, 45]
+    assert all(lk.down is None and lk.stroke is None and lk.look_leg is not None and lk.slide_pts for lk in looks)
 
 
 class _Gravity:
@@ -302,12 +391,21 @@ class _Rec:
         self.legs = {}  # name -> the last leg of that name
         self.owl = []  # the scene OWL's ("on"/"off", events before it)
         self.reads = 0  # at-rest reads (client.settled_efforts)
+        self.runs = []  # per runner.run: (its legs' names, the gains each execution it took was sent)
 
 
 def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4), scene_after="same", settled=None,
-          touch=None, contact=BUTTON, home_refusals=0):
-    """Run run_reach_press with the arm, the cameras and the planner faked.
-    Returns (exit code, the record, the chain, home plan's cpose and pad)."""
+          touch=None, contact=BUTTON, home_refusals=0, run_args=None, chain=None, home_turns=0, closing=None):
+    """Run run_reach_press with the arm, the cameras and the planner faked
+    (`run_args`: press_demo's args, a guarded TF press by default; `chain`,
+    a _Chain). Every plan starts at the joints it is handed (PlanState), as
+    the planner's do; each home plan's joint_3 is written `home_turns`
+    whole turns off them, as a plan handed planner_branch(start) can be.
+    `closing`: press_demo's press:close, sent before the look and pending
+    on the runner; joining it reads this (ok, knuckle, stalled), and the
+    learned empty close is kept in tmp_path. Returns (exit code, the record, the chain, home plan's cpose and pad —
+    and its start, the record's length and the live joints when it was
+    planned)."""
     from conftest import leg as make_leg
 
     from rammp_box_opening.models.container import ContainerPose
@@ -318,7 +416,7 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
     cfg = load_press_demo(PINK)
     ctx.model = ContainerModel.load(PINK)
     ctx.press_cfg = cfg
-    chain = _Chain()
+    chain = chain or _Chain()
     monkeypatch.setattr(approach, "_chain", lambda: chain)
     monkeypatch.setattr(approach, "_gravity", lambda: _Gravity())
     monkeypatch.setattr(reach_press, "oblique_aim_available", lambda: True)
@@ -330,12 +428,17 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
         if name == "home" and refusals["home"] > 0:
             refusals["home"] -= 1
             raise RuntimeError("planning failed for home: MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION: the start")
+        start = list(state.joints)
+        end = [0.0] * 7 if name == "home" else [0.05] * 7
         if name == "home":
-            home["cpose"], home["pad"] = ctx_.cpose, ctx_.contact_pad
+            home.update(cpose=ctx_.cpose, pad=ctx_.contact_pad, start=list(start), at=len(rec.events),
+                        live=list(ctx_.client.joints()))
+            start[2] += 2.0 * math.pi * home_turns
+            end = list(end)
+            end[2] += 2.0 * math.pi * home_turns
         else:
             home.setdefault("look_cposes", []).append(ctx_.cpose)
-        end = [0.0] * 7 if name == "home" else [0.05] * 7
-        lg = make_leg(name, start=list(ctx_.client.joints()), end=end, speed=speed, world=world[0])
+        lg = make_leg(name, start=start, end=end, speed=speed, world=world[0])
         lg.target = target
         return lg, state
 
@@ -346,15 +449,28 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
             for lg in legs:
                 rec.events.append(lg.name)
                 rec.legs[lg.name] = lg
-            return super().run(legs, execute, lookahead)
+            sent = len(getattr(self.client, "gains_sent", []))
+            out = super().run(legs, execute, lookahead)
+            rec.runs.append(([lg.name for lg in legs], getattr(self.client, "gains_sent", [])[sent:]))
+            return out
 
     runner = R(ctx.client, log_dir=tmp_path)
+    if closing is not None:
+        from rammp_box_opening.constants import GRIPPER_CMD_CLOSED
+
+        monkeypatch.setenv("RAMMP_BOX_OPENING_STATE", str(tmp_path))  # never the robot's own gripper.json
+        ctx.client.gripper_join = lambda handle: closing
+        assert runner.start_gripper("press:close", GRIPPER_CMD_CLOSED, True)
     aims = [first, after]
 
     def aim(node, watcher, yaw, lid_z, prior_xy, runner_, tag):
+        # each aim: (press point, knob mm[, the press point as the wrist
+        # measured it, before the raise — by default the same])
         rec.events.append("aim:" + tag)
         got = aims.pop(0)
-        return (None, "no circle", None) if got is None else ((got[0], 0.0), "3/3 frames", got[1])
+        if got is None:
+            return None, "no circle", None, None
+        return (got[0], 0.0), "3/3 frames", got[1], got[2] if len(got) > 2 else got[0]
 
     monkeypatch.setattr(reach_press, "_aim", aim)
     seq = list(FREE if settled is None else settled)
@@ -380,9 +496,9 @@ def _flow(ctx, monkeypatch, tmp_path, after=(POPPED, 12.0), first=(BUTTON, 0.4),
     # the scene OWL's enables/disables, each with how many events came before it
     owl = SimpleNamespace(enable=lambda: rec.owl.append(("on", len(rec.events))),
                           disable=lambda: rec.owl.append(("off", len(rec.events))))
-    locator = SimpleNamespace(owl=owl, locate=lambda s: (rec.events.append("scene"), seen[scene_after])[1])
+    locator = SimpleNamespace(owl=owl, prime=owl.enable, locate=lambda s: (rec.events.append("scene"), seen[scene_after])[1])
     args = SimpleNamespace(execute=True, press_only=True)
-    code = reach_press.run_reach_press(None, ctx, cfg, runner, SimpleNamespace(), args, fix, locator)
+    code = reach_press.run_reach_press(None, ctx, cfg, runner, SimpleNamespace(), run_args or args, fix, locator)
     return code, rec, chain, home
 
 
@@ -469,7 +585,7 @@ def test_an_aim_that_raises_after_the_early_enable_disables_the_scene_owl(ctx, m
     ctx.model = ContainerModel.load(PINK)
     calls = []
     owl = SimpleNamespace(enable=lambda: calls.append("on"), disable=lambda: calls.append("off"))
-    locator = SimpleNamespace(owl=owl, locate=lambda s: calls.append("scene"))
+    locator = SimpleNamespace(owl=owl, prime=owl.enable, locate=lambda s: calls.append("scene"))
 
     def aim(node, watcher, yaw, lid_z, prior_xy, runner_, tag):
         assert tag == "reach-after"
@@ -480,6 +596,32 @@ def test_an_aim_that_raises_after_the_early_enable_disables_the_scene_owl(ctx, m
     with pytest.raises(KeyboardInterrupt):
         reach_press._after_check(None, ctx, SimpleNamespace(), SimpleNamespace(), fix, locator, BUTTON, None, 0.0)
     assert calls == ["on", "off"]
+
+
+def test_both_reach_out_aims_take_their_own_budget_and_two_agreeing_hits(monkeypatch):
+    """The look's aim and the guarded run's after-press one both go through
+    _aim: REACH_AIM_S, not the straight-down STAGING_FIX_S whose 2.5 s left
+    16:23 2026-10-27 0.72 s to spare, and a fix on REACH_AIM_HITS agreeing
+    hits. The _flow harness replaces _aim outright, so this calls it."""
+    from rammp_box_opening.tasks import press_demo
+
+    asked = []
+
+    def aim(node, watcher, yaw, **kw):
+        asked.append(kw)
+        kw["out"].update(button_up_mm=0.9, measured_xyz=(0.7213, -0.297, 0.2914))
+        return ((0.7213, -0.297, 0.3095), yaw), "2 of 2 hits agree in 9 frames"
+
+    monkeypatch.setattr(press_demo, "aim_button_at_staging", aim)
+    for tag in ("reach-aim", "reach-after"):
+        got, status, up, measured = reach_press._aim(None, None, 0.6, 0.3125, (0.7248, -0.286), None, tag)
+        assert got == ((0.7213, -0.297, 0.3095), 0.6) and up == 0.9 and measured == (0.7213, -0.297, 0.2914)
+    assert [(k["tag"], k["timeout_s"], k["min_hits"]) for k in asked] == [
+        ("reach-aim", reach_press.REACH_AIM_S, reach_press.REACH_AIM_HITS),
+        ("reach-after", reach_press.REACH_AIM_S, reach_press.REACH_AIM_HITS),
+    ]
+    assert all(k["lid_z"] == 0.3125 and k["prior_xy"] == (0.7248, -0.286) for k in asked)
+    assert reach_press.REACH_AIM_S > press_demo.STAGING_FIX_S and reach_press.REACH_AIM_HITS == 2
 
 
 def _reach_world_button(ctx):
@@ -506,12 +648,19 @@ def test_when_no_straight_line_reaches_the_aimed_look_pose_the_planner_plans_it(
     assert from_container(home["look_cposes"][-1], ctx.model.button_offset) == pytest.approx(list(BUTTON))
 
 
-def test_a_home_refused_from_inside_the_boxs_padded_volume_backs_off_toward_the_arm_first(ctx, monkeypatch, tmp_path):
+def test_a_home_refused_from_inside_the_boxs_padded_volume_backs_off_toward_the_arm_first(ctx, monkeypatch, tmp_path,
+                                                                                          capsys):
     """2026-10-22: the scene camera's box 85 mm off; the aim moved the box
-    under the arm and every plan from the look pose was INVALID_START."""
+    under the arm and every plan from the look pose was INVALID_START. The
+    back-off says what the planner refused: INVALID_START_STATE_JOINT_LIMITS
+    takes it too, and that start is not inside the box's padded volume."""
     code, rec, chain, _h = _flow(ctx, monkeypatch, tmp_path, home_refusals=1,
                                  settled=[AT_REST, ([3.0, 0.0, 0.0, 0.0], Q)])  # a gravity mismatch: home from the look pose
     assert code == 1 and rec.events == ["reach:look", "reach:back-off", "home"]
+    said = capsys.readouterr().out
+    assert ("the planner refused home from here (MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION: the start) — "
+            "backing 15 cm straight off toward the arm first") in said
+    assert "inside the box's padded volume" not in said
     back = rec.legs["reach:back-off"]
     assert back.plan_free and back.guard.trip == "obstruction" and back.guard.gravity is not None
     from rammp_box_opening.constants import FREE_LINE_SPEED
@@ -608,6 +757,27 @@ def test_a_lid_that_came_up_or_went_down_is_a_moved_box(ctx, monkeypatch, tmp_pa
     assert code == 1
 
 
+@pytest.mark.parametrize("first_raise,after_raise", [(0.021, 0.0), (0.0, 0.021), (0.021, 0.019)])
+def test_the_lid_after_the_press_is_judged_by_what_the_wrist_measured(ctx, monkeypatch, tmp_path, first_raise,
+                                                                       after_raise):
+    """Flatbot 2026-10-27: the wrist reads its table and lid ~20 mm low, and
+    the aim's press point is raised by that table offset where its hits
+    agree on one (button_aim.ButtonAimer.fix) — the touch is judged against
+    it. Whether the box lifted is the wrist against itself: an aim raised
+    before the press and one not raised after it (its offset past the xy
+    bound) read no lift, nor two raised by offsets 2 mm apart."""
+    import json
+
+    first = (BUTTON, 0.4, (BUTTON[0], BUTTON[1], BUTTON[2] - first_raise))
+    measured_after = (POPPED[0], POPPED[1], POPPED[2] - first_raise)  # the same box, the knob up
+    after = ((POPPED[0], POPPED[1], measured_after[2] + after_raise), 12.0, measured_after)
+    code, rec, _c, _h = _flow(ctx, monkeypatch, tmp_path, first=first, after=after)
+    assert code == 0 and rec.events[-3:] == ["aim:reach-after", "scene", "home"]
+    rows = {r["leg"]: r for r in map(json.loads, open(next(tmp_path.glob("run-*.jsonl"))))}
+    assert rows["touch"]["verdict"] == "press" and rows["touch"]["offset_mm"] == pytest.approx(0.0, abs=0.1)
+    assert rows["reach_after"]["lid_dz_mm"] == pytest.approx(0.4, abs=0.05)  # the first aim's knob 0.4 mm up
+
+
 def test_a_touch_that_finds_no_surface_backs_out_before_going_home(ctx, monkeypatch, tmp_path):
     code, rec, _c, _h = _flow(ctx, monkeypatch, tmp_path, touch=("arrived", {"message": "ok", "progress": 1.0}))
     assert code == 1 and "press:push" not in rec.events
@@ -640,7 +810,10 @@ def test_a_gravity_model_that_does_not_fit_the_arm_stops_before_any_guarded_line
     assert code == 1 and rec.events == ["reach:look", "home"]
 
 
-def test_without_the_oblique_aim_nothing_moves(ctx, monkeypatch, tmp_path):
+@pytest.mark.parametrize("soft", [False, True])
+def test_without_the_oblique_aim_nothing_moves(ctx, monkeypatch, tmp_path, soft):
+    """Nor, in a compliant run, is the joint impedance primed: this refusal
+    comes first, and its "nothing moved" stays true."""
     from rammp_box_opening.models.container import ContainerPose
     from rammp_box_opening.perception import button_aim
     from rammp_box_opening.runtime.runner import Runner
@@ -654,12 +827,15 @@ def test_without_the_oblique_aim_nothing_moves(ctx, monkeypatch, tmp_path):
     cfg = load_press_demo(PINK)
     ctx.model = ContainerModel.load(PINK)
     fix = SimpleNamespace(pose=ContainerPose(xyz=(BUTTON[0], BUTTON[1], BUTTON[2] - 0.121), yaw=0.0), top_xyz=BUTTON)
-    code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None,
-                                       SimpleNamespace(execute=True, press_only=True), fix, None)
-    assert code == 1 and not ctx.client.executed
+    args = SimpleNamespace(execute=True, press_only=True, compliant=soft, depth_press=soft)
+    code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None, args, fix, None)
+    assert code == 1 and not ctx.client.executed and ctx.client.primes == []
 
 
-def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("soft", [False, True])
+def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys, soft):
+    """Guarded, or compliant with its press proven: the preview flies
+    nothing, and primes no joint impedance either."""
     from rammp_box_opening.models.container import ContainerPose
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.runner import Runner
@@ -673,11 +849,38 @@ def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys)
         goal_joints=[0.0] * 7, name=n, traj=None, speed=sp, world="full", kind=None, guard=None, warp=None,
         plan_s=0.0, plan_server_s=None, waypoint=None, target=t, verify=None), s))
     monkeypatch.setattr(Runner, "preview", lambda self, legs: "preview")
+    if soft:
+        monkeypatch.setattr(reach_press, "way_down", _way_down([], solves=lambda tilt, tip: True))
     fix = SimpleNamespace(pose=ContainerPose(xyz=(BUTTON[0], BUTTON[1], BUTTON[2] - 0.121), yaw=0.0), top_xyz=BUTTON)
-    code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None,
-                                       SimpleNamespace(execute=False, press_only=True), fix, None)
-    assert code == 0 and not ctx.client.executed
-    assert "gravity alone moves joint_4 0.00 Nm along the slide" in capsys.readouterr().out
+    args = SimpleNamespace(execute=False, press_only=True, compliant=soft, depth_press=soft)
+    code = reach_press.run_reach_press(None, ctx, cfg, Runner(ctx.client, log_dir=tmp_path), None, args, fix, None)
+    assert code == 0 and not ctx.client.executed and ctx.client.primes == []
+    out = capsys.readouterr().out
+    assert "gravity alone moves joint_4 0.00 Nm along the slide" in out
+    assert ("COMPLIANT: every move" in out) is soft and "enters its joint impedance" not in out
+
+
+def test_a_compliant_run_says_which_gains_every_move_flies(ctx, monkeypatch, capsys):
+    """Owner 2026-10-27: "impedance mode needs to be firmer". The banner
+    names the tuning in force — the client's compliant_gains — and the
+    client is back in position once the run is over; a guarded run has no
+    banner."""
+    from rammp_box_opening.constants import GAINS_MEDIUM
+
+    during = []
+    monkeypatch.setattr(reach_press, "_reach_press", lambda *a: during.append(ctx.client.compliant) or 0)
+    args = SimpleNamespace(compliant=True, depth_press=True, execute=True)
+    assert reach_press.run_reach_press(None, ctx, None, None, None, args, None, None) == 0
+    out = capsys.readouterr().out
+    assert ("COMPLIANT: every move in the arm's joint impedance, STIFF (Kq 160/60 N·m/rad on joints 1-4/5-7), "
+            "and nothing the run reads stops it") in out
+    ctx.client.compliant_gains = GAINS_MEDIUM
+    reach_press.run_reach_press(None, ctx, None, None, None, args, None, None)
+    assert "impedance, MEDIUM (Kq 80/30 N·m/rad on joints 1-4/5-7), and" in capsys.readouterr().out
+    assert during == [True, True] and not ctx.client.compliant
+    reach_press.run_reach_press(None, ctx, None, None, None, SimpleNamespace(compliant=False, depth_press=True),
+                                None, None)
+    assert "COMPLIANT" not in capsys.readouterr().out and during[-1] is False
 
 
 def test_a_stop_says_what_stopped_the_leg_not_always_something_met():
@@ -688,3 +891,390 @@ def test_a_stop_says_what_stopped_the_leg_not_always_something_met():
     lost = LegResult("reach:re-aim", "failed", False, "effort stream lost during guarded leg — cancelled")
     assert reach_press._stopped_by([lost]) == "stopped (effort stream lost during guarded leg — cancelled)"
     assert reach_press._stopped_by([LegResult("reach:re-aim", "touch", False, "torque guard trip")]) == "met something"
+
+
+# ---- the compliant depth press, proven before the arm moves toward the box ------------------
+
+def _depth_press_flow(ctx, monkeypatch, tmp_path, way_down, compliant=True, **kw):
+    """_flow with --depth-press — compliant, as press_demo runs by default
+    since 2026-10-27, unless `compliant` is False (--guarded) — the way down
+    `way_down`'s, the press itself faked: the guarded press, and a compliant
+    one's hold at the end of its one-execution way in, which judges it at
+    the aimed button the box was put at (ctx.cpose). Returns _flow's, and
+    what the press was handed ({} when it was not called)."""
+    from rammp_box_opening.models.container import from_container
+    from rammp_box_opening.tasks import depth_press as dp
+
+    got = {}
+
+    def press(node, ctx_, cfg, runner, watcher, contact_tool, here=None, turned=None, knob_up_mm=None, aimed=None,
+              compliant=False, top_z=None):
+        got.update(aimed=aimed, top_z=top_z, compliant=compliant)
+        return dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=14.0)
+
+    def hold(ctx_, cfg_, runner_, stroke, top_z, seen):
+        got.update(aimed=from_container(ctx_.cpose, ctx_.model.button_offset), top_z=top_z, compliant=True)
+        return dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=14.0)
+
+    monkeypatch.setattr(dp, "press_down_from_here", press)
+    monkeypatch.setattr(dp, "compliant_hold", hold)
+    monkeypatch.setattr(reach_press, "way_down", way_down)
+    kw.setdefault("touch", ("arrived", {"message": "ok", "progress": 1.0}))  # no TF stroke: the 4th motion is the clear
+    args = SimpleNamespace(execute=True, press_only=True, depth_press=True, compliant=compliant)
+    return (*_flow(ctx, monkeypatch, tmp_path, run_args=args, **kw), got)
+
+
+def test_a_scene_button_no_tilt_presses_even_30_mm_off_stops_before_anything_moves(ctx, monkeypatch, tmp_path, capsys):
+    """16:23 2026-10-27 flew the look, the re-aim and a 7.4 s slide in
+    before it asked for the turn down, which no IK reaches there. Now the
+    proof refuses at the rest pose: every tilt is named, then the button
+    PROOF_SHIFT_M nearer the arm and to either side, at the smallest
+    tilt's look, and nothing is sent to the arm but the hold where it
+    stands that primes its joint impedance (client.prime_compliant)."""
+    asked = []
+    code, rec, _chain, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked))
+    assert code == 1 and rec.events == [] and ctx.client.executed == [] and got == {}
+    # the joint impedance was primed while the proof was planned: a hold
+    # where the arm stands, which the run leaves it in
+    assert ctx.client.primes == [[0.0] * 7]
+    out = capsys.readouterr().out
+    assert ("STOP: no reach-out press for the scene camera's box — no tilt turns the hand down and strokes there, "
+            "nor with the button 30 mm nearer the arm or to either side (30 deg: the way down (walk in: ") in out
+    assert out.rstrip().endswith("; nothing moved")
+    for tilt in reach_press.REACH_TILTS_DEG:
+        assert "%d deg: the way down (walk in: " % tilt in out
+    for name in reach_press.SHIFTED:
+        assert "30 mm %s: the way down (walk in: " % name in out
+    assert [t for t, _xy, _z in asked] == list(reach_press.REACH_TILTS_DEG) + [30] * 3
+    u = np.asarray(BUTTON[:2]) / np.hypot(*BUTTON[:2])
+    across = np.array([-u[1], u[0]])  # to its left, seen from the arm
+    for (_t, xy, z), want in zip(asked[4:], (BUTTON[:2] - 0.03 * u, BUTTON[:2] + 0.03 * across,
+                                             BUTTON[:2] - 0.03 * across)):
+        assert xy == pytest.approx(list(want), abs=1e-9) and z == BUTTON[2]
+
+
+def test_a_scene_button_the_press_reaches_30_mm_off_flies_the_look_and_the_aimed_button_decides(
+        ctx, monkeypatch, tmp_path, capsys):
+    """As on flatbot's URDF for a scene button at r 0.766 m, az -15 deg
+    (test_on_flatbot_a_scene_button_out_of_reach_by_a_little_still_flies_the_look):
+    no tilt presses it, 30 mm nearer the arm the press reaches — and the
+    aim, 9 mm nearer and 21 mm aside, too. The look flies, and the aimed
+    button's own way down, solved after the aim, takes the press in — the
+    re-aim, the slide in, the turn and the stroke as one execution."""
+    import json
+
+    from rammp_box_opening.tasks import depth_press as dp
+
+    u = np.asarray(BUTTON[:2]) / np.hypot(*BUTTON[:2])
+    aimed = (BUTTON[0] - 0.02 * u[0], BUTTON[1] - 0.02 * u[1], BUTTON[2])
+    off_scene = lambda tilt, tip: np.hypot(tip[0] - BUTTON[0], tip[1] - BUTTON[1]) > 0.015  # noqa: E731
+    asked = []
+    code, rec, _chain, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked, off_scene),
+                                                   first=(aimed, 0.4))
+    assert code == 0
+    way_in = ["reach:re-aim", "reach:slide-in", "depth:turn", "depth:press"]
+    assert rec.events == ["reach:look", "aim:reach-aim", *way_in, "depth:clear", "home"]
+    assert (way_in, [dp.COMPLIANT_GAINS]) in rec.runs
+    assert got["aimed"] == pytest.approx(aimed) and got["top_z"] == pytest.approx(BUTTON[2]) and got["compliant"]
+    out = capsys.readouterr().out
+    assert ("the press does not reach the scene camera's button itself (30 deg: the way down (walk in: ") in out
+    assert "but at 30 deg it does with the button 30 mm nearer the arm — inside what the aim corrects" in out
+    # the scene button at each tilt, the first shifted one, then the aimed button after the aim
+    assert [t for t, _xy, _z in asked] == list(reach_press.REACH_TILTS_DEG) + [30, 30]
+    assert asked[-1][1] == pytest.approx(list(aimed[:2]), abs=1e-9)
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    plan, = [r for r in rows if r["leg"] == "reach_plan"]
+    assert plan["proof"] == "shifted" and plan["down"] is None and plan["tilt_deg"] == 30
+    way, = [r for r in rows if r["leg"] == "reach_way_in"]
+    assert (way["tilt_deg"], way["walked"], way["short_deg"], way["k"]) == (30, False, 0.0, 440.0)
+    assert way["end_z"] == pytest.approx(BUTTON[2] - 0.03)
+
+
+def test_where_no_straight_line_reaches_the_aimed_look_pose_the_planned_one_brings_its_own_proof(
+        ctx, monkeypatch, tmp_path):
+    """The planner plans the move to the aimed button's look pose where no
+    straight line flies there, as before; plan_reach proves the way down
+    from that leg's end, which is where the arm then stands — no second
+    solve, no re-aim after it: from there the slide in, the turn and the
+    stroke fly as one execution."""
+    import json
+
+    from rammp_box_opening.tasks import depth_press as dp
+
+    asked = []
+    chain = _Chain(refuse=[lambda xyz, quat: xyz[2] > 0.52])  # the move to the look pose (0.54), not the slide (0.47)
+    code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked, lambda tilt, tip: True),
+                                               chain=chain)
+    assert code == 0 and got["aimed"] == pytest.approx(BUTTON)
+    way_in = ["reach:slide-in", "depth:turn", "depth:press"]
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:look", *way_in, "depth:clear", "home"]
+    assert (way_in, [dp.COMPLIANT_GAINS]) in rec.runs
+    assert [t for t, _xy, _z in asked] == [30, 30]  # the scene button's, then the planned look's for the aimed one
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    way, = [r for r in rows if r["leg"] == "reach_way_in"]
+    assert way["tilt_deg"] == 30 and way["walked"] is False
+
+
+def test_a_planned_look_the_arm_stands_off_flies_its_way_in_leg_by_leg(ctx, monkeypatch, tmp_path, capsys):
+    """After the planner's look leg the way in starts at that leg's planned
+    end. An arrival a few mrad off it (impedance) is not jumped from: the
+    way in flies leg by leg, each line solved again from where the arm
+    stands, as before the one execution — the slide in from the live
+    joints, then the press, which turns and strokes from there."""
+    chain = _Chain(refuse=[lambda xyz, quat: xyz[2] > 0.52])  # the move to the look pose (0.54), not the slide (0.47)
+    real = ctx.client.execute
+
+    def execute(traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        out = real(traj, speed, guard=guard, while_running=while_running, stop_when=stop_when, gains=gains)
+        if len(ctx.client.executed) == 2:  # the planned look for the aimed button: 5 mrad short on joint_2
+            ctx.client.live[1] -= 0.005
+        return out
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+    code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down([], lambda tilt, tip: True),
+                                               chain=chain)
+    assert code == 0 and got["compliant"] and got["aimed"] == pytest.approx(BUTTON)  # the press, handed the aim
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:look", "reach:slide-in", "depth:clear", "home"]
+    assert "the way in does not fly as one execution (the arm stands 0.005 rad from where reach:slide-in starts)" in (
+        capsys.readouterr().out)
+    slide = rec.legs["reach:slide-in"]
+    assert list(slide.traj.points[0].positions) == pytest.approx([0.05, 0.045] + [0.05] * 5)  # from the live joints
+    assert (["reach:slide-in"], [None]) in rec.runs and slide.gains is None  # a goal of its own, as before
+
+
+def test_where_neither_a_line_nor_a_planned_look_brings_the_aimed_button_a_way_down_the_arm_goes_home_from_the_look(
+        ctx, monkeypatch, tmp_path, capsys):
+    """No straight line reaches the aimed button's look pose, and at no
+    tilt the planner offers does the hand turn down and stroke there: the
+    arm goes home from the look pose, in free air. No planned look leg for
+    the aimed button flies, no slide in, nothing pressed; the console says
+    why at every tilt."""
+    import json
+
+    asked = []
+    scene_only = lambda tilt, tip: len(asked) == 1  # noqa: E731 - plan_reach's, for the scene camera's button
+    chain = _Chain(refuse=[lambda xyz, quat: xyz[2] > 0.52])  # the move to the look pose (0.54), not the slide (0.47)
+    code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked, scene_only), chain=chain)
+    assert code == 1 and got == {}
+    assert rec.events == ["reach:look", "aim:reach-aim", "home"]
+    assert [t for t, _xy, _z in asked] == [30] + list(reach_press.REACH_TILTS_DEG)  # the scene's, then each planned
+    out = capsys.readouterr().out
+    assert ("STOP: no press reaches the aimed button (as straight lines: the move to its look pose (IK did not "
+            "converge); planned: 30 deg: the way down (walk in: ") in out
+    assert all("%d deg: the way down (walk in: " % t in out for t in reach_press.REACH_TILTS_DEG)
+    assert "— nothing was pressed — returning home" in out
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    assert not [r for r in rows if r["leg"] in ("reach_way_in", "home_refused")]
+
+
+@pytest.mark.parametrize("closing", [(True, 0.79, False), (False, 0.636, False)])
+def test_a_compliant_run_reads_the_fingers_close_before_its_way_in(ctx, monkeypatch, tmp_path, capsys, closing):
+    """press_demo sends press:close before the look, and the runner joins
+    it before a gripper leg or a guarded motion only. A compliant way in
+    has neither, so its close was collected after home, unread. Now it is
+    read once the aim has the button, before anything moves toward the
+    box: the press:close row comes before the way in's. A close that never
+    moved, its knuckle reading an empty close (0.636, after a driver
+    restart, 2026-09-25, which press_demo did not take for shut), found the
+    fingers shut: the press goes on, and 0.636 is kept as the empty close."""
+    import json
+
+    from rammp_box_opening.runtime import fingers
+    from rammp_box_opening.tasks import depth_press as dp
+
+    ok, knuckle, _stalled = closing
+    code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down([], lambda tilt, tip: True),
+                                               closing=closing)
+    assert code == 0 and got["compliant"] and ctx.client.gripper_sent == [0.8]
+    assert any("depth:press" in names and gains == [dp.COMPLIANT_GAINS] for names, gains in rec.runs)
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    legs = [r["leg"] for r in rows]
+    assert legs.count("press:close") == 1 and legs.index("press:close") < legs.index("reach_way_in")
+    close, = [r for r in rows if r["leg"] == "press:close"]
+    assert close["ok"] is ok and close["gripper_pos"] == pytest.approx(knuckle)
+    unmoved = [r for r in rows if r["leg"] == "closed_unmoved"]
+    assert fingers.learned_closed() == pytest.approx(fingers.NOMINAL_CLOSED if ok else knuckle)
+    assert (unmoved == []) if ok else (unmoved[0]["knuckle"] == knuckle and unmoved[0]["learned"] is True)
+    shut = ("press:close failed (gripper at 0.636 (overlapped)), but the knuckle reads an empty close: the fingers "
+            "are shut (kept as this gripper's empty close)")
+    assert (shut in capsys.readouterr().out) is (not ok)
+
+
+@pytest.mark.parametrize("soft", [True, False])
+@pytest.mark.parametrize("closing, read", [((False, 0.0, False), "failed (gripper at 0.000 (overlapped))"),
+                                           ((True, 0.41, True), "arrived (gripper at 0.410 (stalled) (overlapped))")])
+def test_fingers_not_shut_send_the_arm_home_from_the_look_pose_with_nothing_pressed(
+        ctx, monkeypatch, tmp_path, capsys, soft, closing, read):
+    """An open aperture strikes the lid and can still read "pressed";
+    fingers closed on something (0.41, the knob's reading) press with it.
+    Either is read after the aim, in free air at the look pose: the arm goes
+    home from there, nothing moved toward the box, nothing learned. A
+    guarded run's re-aim used to join a failed close and leave the arm
+    holding at the look, and took a stalled one for closed."""
+    from rammp_box_opening.runtime import fingers
+
+    asked = []
+    code, rec, _c, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked, lambda tilt, tip: True),
+                                               compliant=soft, closing=closing)
+    assert code == 1 and got == {} and rec.events == ["reach:look", "aim:reach-aim", "home"]
+    if soft:
+        assert len(asked) == 1  # the scene button's proof, before the look; none for the aimed one
+    assert ("STOP: press:close %s — the fingers are not shut; nothing was pressed — returning home" % read) in (
+        capsys.readouterr().out)
+    assert fingers.learned_closed() == pytest.approx(fingers.NOMINAL_CLOSED)
+
+
+@pytest.mark.parametrize("depth", [False, True])
+def test_a_guarded_reach_out_asks_for_no_way_down(ctx, monkeypatch, tmp_path, depth):
+    """--guarded, with or without the depth press, is planned as before:
+    no way down is asked for, and the plan's note says it was not proven."""
+    import json
+
+    asked = []
+    if depth:
+        code, rec, _chain, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down(asked), compliant=False)
+        assert got["aimed"] == pytest.approx(BUTTON) and not got["compliant"]
+    else:
+        monkeypatch.setattr(reach_press, "way_down", _way_down(asked))
+        code, rec, _chain, _h = _flow(ctx, monkeypatch, tmp_path)
+        assert "press:down" in rec.events
+    assert code == 0 and asked == [] and rec.events[:4] == ["reach:look", "aim:reach-aim", "reach:re-aim",
+                                                            "reach:slide-in"]
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    plan, = [r for r in rows if r["leg"] == "reach_plan"]
+    assert plan["proof"] is None and plan["down"] is None
+    assert not [r for r in rows if r["leg"] == "reach_way_in"]
+
+
+# Flatbot's URDF, the scene camera's buttons of 2026-10-27 (run records' scene_fix top_xyz)
+SCENE_1623 = (0.7248, -0.2860, 0.3125)
+SCENE_1519 = (0.6754, -0.1812, 0.3111)
+
+
+def _on_flatbot(ctx, monkeypatch):
+    """Flatbot's own kinematics and the pink canister, each look leg
+    'planned' to the joints client._plan_pose_near hands the planner. Pure
+    kinematics: no planner, no arm."""
+    from rammp_box_opening.constants import HOME
+    from rammp_box_opening.primitives.look import look_joints
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.branches import planner_branch
+    from rammp_box_opening.runtime.kinematics import ArmChain
+
+    chain = ArmChain(path="src/rammp_box_opening/test/data/arm_flatbot_20261021.urdf", root="arm_mount")
+    monkeypatch.setattr(approach, "_chain", lambda: chain)
+    ctx.model = ContainerModel.load(PINK)
+
+    def plan(ctx_, state, name, target, world, speed):
+        _kind, look, quat = target
+        q = chain.nearest_solution(planner_branch(HOME), look, quat, seeds=(look_joints(HOME),))
+        if q is None:
+            raise RuntimeError("planning failed for %s: MotionGenStatus.IK_FAIL" % name)
+        return SimpleNamespace(goal_joints=[float(v) for v in q]), state
+
+    monkeypatch.setattr(reach_press, "_plan_motion", plan)
+    return chain, load_press_demo(PINK), list(HOME)
+
+
+def test_on_flatbot_1623s_scene_button_is_refused_before_the_look(ctx, monkeypatch):
+    """16:23 2026-10-27, replayed with the leans its turn tried then
+    (TURN_SHORT_DEG, the guarded press's): the plan without the proof takes
+    the tilted stroke at 30 deg, as the run did — 20.2 s from the look to
+    home with nothing pressed, no straight-down hand at the slide's end. At
+    every tilt the look pose and the slide solve, and neither the walk in
+    nor the turn after the slide turns the hand down: refused, and 30 mm
+    nearer the arm or to either side as well."""
+    from rammp_box_opening.tasks import depth_press as dp
+
+    monkeypatch.setattr(dp, "COMPLIANT_TURN_SHORT_DEG", dp.TURN_SHORT_DEG)
+    _chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    plan, _why = reach_press.plan_reach(ctx, cfg, SCENE_1623, home)
+    assert plan is not None and plan.tilt_deg == 30  # what 16:23 flew
+    looks = []
+    plan, why = reach_press.plan_reach(ctx, cfg, SCENE_1623, home, depth=True, looks=looks)
+    assert plan is None
+    assert why.count("the way down (walk in: ") == len(reach_press.REACH_TILTS_DEG), why
+    assert all("%d deg: the way down (walk in: " % t in why for t in reach_press.REACH_TILTS_DEG)
+    assert [lk.tilt_deg for lk in looks] == list(reach_press.REACH_TILTS_DEG)
+    near, why = reach_press.shifted_way_down(ctx, cfg, looks[0], SCENE_1623)
+    assert near is None and all("30 mm %s: the way down (walk in: " % n in why for n in reach_press.SHIFTED), why
+
+
+# 15:19's aimed button (the touch met it at 0.312; the clear's replay, test_depth_press)
+AIMED_1519 = (0.6617, -0.1972, 0.3111)
+
+
+def _at(r_az, z=0.3125):
+    """A button `r_az` (r m, az deg) from the arm, the lid at 16:23's height."""
+    r, az = r_az
+    return (r * math.cos(math.radians(az)), r * math.sin(math.radians(az)), z)
+
+
+def test_on_flatbot_1623s_scene_button_is_proven_turning_short_after_the_slide(ctx, monkeypatch):
+    """The compliant press's turn after the slide may stop up to 15 deg
+    short of straight down (depth_press.COMPLIANT_TURN_SHORT_DEG): 16:23's
+    scene button is proven at the first tilt, the slide in and a turn 10
+    deg short, 1.77 rad of joint arc — no walk in reaches it — then the
+    stroke from there. 15:19's aimed button, which the guarded leans
+    already reached, is as it was: one walk in, exactly down."""
+    from rammp_box_opening.tasks import depth_press as dp
+
+    chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    plan, why = reach_press.plan_reach(ctx, cfg, SCENE_1623, home, depth=True)
+    assert why is None and plan.tilt_deg == 30 and plan.stroke_pts is None
+    assert not plan.down.walked and max(dp.TURN_SHORT_DEG) < plan.down.short_deg <= 15.0
+    assert plan.down.short_deg == 10.0  # as modelled before this was flown
+    assert plan.down.pts[0] == pytest.approx(plan.slide_pts[-1])  # in place, where the slide ends
+    arc = dp.joint_arc(plan.down.pts)
+    assert arc <= dp.TURN_MAX_ARC_RAD and arc == pytest.approx(1.77, abs=0.02)
+    R, _t = chain.fk(plan.down.pts[-1])
+    assert math.degrees(reach_press.hand_lean(np.asarray(R, float))) == pytest.approx(plan.down.short_deg, abs=0.05)
+    assert plan.stroke.q0 == pytest.approx([float(v) for v in plan.down.pts[-1]])
+    assert [name for name, _pts, _speed in plan.stroke.legs] == ["depth:approach", "depth:press"]
+    assert 400.0 <= plan.stroke.k <= 600.0 and plan.stroke.end_z < SCENE_1623[2] - cfg.button_travel_m
+    plan, why = reach_press.plan_reach(ctx, cfg, AIMED_1519, home, depth=True)
+    assert why is None and plan.tilt_deg == 30 and plan.down.walked and plan.down.short_deg == 0.0
+    # a box the guarded leans reached only 30 mm off (r 0.766 m, az -15 deg) is reached as it stands
+    plan, why = reach_press.plan_reach(ctx, cfg, _at((0.766, -15.0)), home, depth=True)
+    assert why is None and plan.tilt_deg == 30 and not plan.down.walked and plan.down.short_deg == 8.0
+
+
+def test_on_flatbot_1519s_scene_button_walks_in_exactly_down_at_30_deg(ctx, monkeypatch):
+    """15:19 2026-10-27, the button pressed with ~13.5 N: proven at the
+    first tilt, one walk in from the look pose to the hand exactly down,
+    the stroke from its end past the button's bottom."""
+    _chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    plan, why = reach_press.plan_reach(ctx, cfg, SCENE_1519, home, depth=True)
+    assert why is None and plan.tilt_deg == 30 and plan.stroke_pts is None
+    assert plan.down.walked and plan.down.short_deg == 0.0
+    assert plan.stroke.q0 == pytest.approx([float(v) for v in plan.down.pts[-1]])
+    assert [name for name, _pts, _speed in plan.stroke.legs] == ["depth:approach", "depth:press"]
+    assert plan.stroke.end_z < SCENE_1519[2] - cfg.button_travel_m
+
+
+@pytest.mark.parametrize("scene, aimed, near, leans", [
+    ((0.700, -22.0), (0.692, -23.6), "to its left", "guarded"),
+    ((0.766, -15.0), (0.757, -16.6), "nearer the arm", "guarded"),
+    ((0.700, -22.0), (0.692, -23.6), "nearer the arm", "compliant"),
+])
+def test_on_flatbot_a_scene_button_out_of_reach_by_a_little_still_flies_the_look(ctx, monkeypatch, scene, aimed, near,
+                                                                                 leans):
+    """Two boxes found offline (r m, az deg; the lid at 16:23's 0.3125)
+    with the turn after the slide leaning no further than the guarded
+    press's TURN_SHORT_DEG: no tilt presses the scene camera's button, but
+    one PROOF_SHIFT_M off it the press reaches — and the aim's, 12-23 mm
+    off as on 10-27, it does. With the compliant press's own leans the
+    first is still such a box, reached 30 mm nearer the arm; the second is
+    reached as it stands (test_on_flatbot_1623s_scene_button_is_proven_turning_short_after_the_slide)."""
+    from rammp_box_opening.tasks import depth_press as dp
+
+    if leans == "guarded":
+        monkeypatch.setattr(dp, "COMPLIANT_TURN_SHORT_DEG", dp.TURN_SHORT_DEG)
+    _chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    looks = []
+    plan, _why = reach_press.plan_reach(ctx, cfg, _at(scene), home, depth=True, looks=looks)
+    assert plan is None and looks
+    assert reach_press.shifted_way_down(ctx, cfg, looks[0], _at(scene)) == (near, None)
+    way, why, kind = reach_press.solve_way_in(ctx, cfg, _at(aimed), looks[0].tilt_deg, looks[0].look_leg.goal_joints)
+    assert way is not None, (why, kind)
+    assert way.move and way.down.walked and way.slide is None and way.stroke.legs
