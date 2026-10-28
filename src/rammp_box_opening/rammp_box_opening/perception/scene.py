@@ -43,6 +43,9 @@ class SceneGrabber:
         self.colors = []  # newest last, up to `keep`
         self.depths = []
         self.color_stamp = None
+        # the colour frames' own frame_id: what the scene segmenter's messages,
+        # which copy their camera frame's header, must name too
+        self.color_frame_id = None
         self.k = self.dist = None  # colour intrinsics
         self.kd = None  # depth intrinsics
         self.depth_frame = None
@@ -110,6 +113,7 @@ class SceneGrabber:
         a = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
         self._push(self.colors, a[:, :, ::-1].copy() if msg.encoding == "rgb8" else a.copy())
         self.color_stamp = msg.header.stamp
+        self.color_frame_id = msg.header.frame_id
 
     def _depth_cb(self, msg):
         if msg.encoding != "16UC1":

@@ -3185,6 +3185,24 @@ def test_detect_only_reports_the_scene_cameras_fixes_with_nothing_moving(monkeyp
     assert "NO BOX — scene camera streams missing: depth" in out
 
 
+def test_the_scene_line_names_the_detector_and_the_sightings_behind_the_fix(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from rammp_box_opening.tasks import press_demo
+
+    seg = SimpleNamespace(score=0.881, source="segmenter", n_sightings=2, sources=("segmenter", "segmenter"))
+    assert press_demo.scene_source_label(seg) == "SEG 0.88, 2 sightings (segmenter+segmenter)"
+    mixed = SimpleNamespace(score=0.31, source="owl", n_sightings=2, sources=("segmenter", "owl"))
+    assert press_demo.scene_source_label(mixed) == "OWL 0.31, 2 sightings (segmenter+owl)"
+    assert press_demo.scene_source_label(SimpleNamespace(score=0.44)) == "OWL 0.44, 1 sighting (owl)"  # an older fix
+    f = tmp_path / "residuals.jsonl"
+    fix = _SceneFix((0.6, -0.26, 0.19), 0.0, (0.6, -0.26, 0.31))
+    fix.source = "segmenter"
+    press_demo.record_residual(fix, (0.61, -0.26, 0.31), 0.0, path=f)
+    assert json.loads(f.read_text())["source"] == "segmenter"
+
+
 def test_the_lid_is_set_down_on_the_table_the_camera_measured():
     """Flatbot: no surveyed bench, so no fixed set-down zone either — the
     lid goes beside the box on the table measured this run, whole."""
