@@ -604,7 +604,7 @@ VOTE_N, VOTE_TOL_M = 2, 0.020
 # the streams were ready — and at once when the segmenter is down or a message
 # is ambiguous. The OWL needs ~1.3 s an inference and two boxes to commit.
 OWL_AFTER_S = 1.0
-SEG_DOWN = ("unavailable", "silent", "wrong_camera", "wrong_size", "stale")  # SegmenterRung.state
+SEG_DOWN = ("unavailable", "absent", "silent", "wrong_camera", "wrong_size", "stale")  # SegmenterRung.state
 SRC_LABEL = {"segmenter": "segmenter", "owl": "OWL"}  # how each source is named in the gate's reasons
 
 
@@ -624,14 +624,22 @@ class Sighting:
     det_box: tuple  # the detector's own box (the holder under a band)
 
 
-def commit_fix(sightings, segmenter_live, n=VOTE_N, tol=VOTE_TOL_M):
+def commit_fix(sightings, segmenter_live, n=VOTE_N, tol=VOTE_TOL_M, owl_settles=False):
     """(top, None) when the newest `n` sightings agree pairwise within `tol`
     — their median (d405.stable_fix) — else (None, why), why one of "too
-    few", "disagree" and "cut OWL box unconfirmed": while the segmenter is
-    live, the OWL's box of a cut lid (a partial lift) counts only with a
-    segmenter sighting beside it. At detbench 163450 the OWL's circle on the
-    cut lid slid 46 mm in 39 % of its commits; down, the segmenter cannot
-    confirm anything, and the OWL's cut boxes commit as they always did."""
+    few", "disagree", "cut OWL box unconfirmed" and "two places unsettled":
+    while the segmenter is live, the OWL's box of a cut lid (a partial lift)
+    counts only with a segmenter sighting beside it. At detbench 163450 the
+    OWL's circle on the cut lid slid 46 mm in 39 % of its commits; down, the
+    segmenter cannot confirm anything, and the OWL's cut boxes commit as
+    they always did.
+
+    `owl_settles`: a segmenter message of this look passed in two places
+    (SceneBoxFix.rivals). Two later segmenter sightings that agree on one of
+    them do not say which is the container — a frame where the canister's
+    band failed and a phantom bowl's passed, twice, would agree on the
+    phantom — so the pair must hold an OWL sighting: the OWL boxes the lid
+    itself."""
     if len(sightings) < n:
         return None, "too few"
     top = stable_fix([(s.top, i) for i, s in enumerate(sightings)], tol, n)
@@ -642,6 +650,8 @@ def commit_fix(sightings, segmenter_live, n=VOTE_N, tol=VOTE_TOL_M):
         s.source == "segmenter" for s in pair
     ):
         return None, "cut OWL box unconfirmed"
+    if owl_settles and not any(s.source == "owl" for s in pair):
+        return None, "two places unsettled"
     return top, None
 
 
@@ -787,6 +797,9 @@ class SceneLocator:
             n_seg = n_seg_boxes = 0  # segmenter frames gated in this call, and the boxes of its classes in them
             tried = {"segmenter": [], "owl": []}  # why each refused candidate was refused, per source
             ambiguous = {"segmenter": [], "owl": []}  # (top, rivals) of each message that passed in two places
+            # a segmenter message passed in two places: from then on in this
+            # look, only a pair with an OWL sighting in it commits (commit_fix)
+            owl_settles = False
             sightings = []
             unconfirmed = False  # an OWL pair on a cut lid was held back for want of a segmenter sighting
             off_frame = None  # (score, edges, R_base_color, src) of the best candidate cut by the frame's edge
@@ -895,6 +908,7 @@ class SceneLocator:
                         # two places pass as this container: no sighting, and
                         # the OWL, which boxes the lid itself, settles which
                         ambiguous[source].append((got.top, got.rivals))
+                        owl_settles = owl_settles or source == "segmenter"
                         owl_now()
                         continue
                     key = box_key(got.box)
@@ -904,7 +918,7 @@ class SceneLocator:
                         source, float(c[0]), tuple(float(v) for v in got.top), got.pose, int(got.n), tuple(got.partial),
                         float(got.table_z), got.lift, key, key if det is None else box_key(det),
                     ))
-                    top, why = commit_fix(sightings, state == "live")
+                    top, why = commit_fix(sightings, state == "live", owl_settles=owl_settles)
                     unconfirmed = unconfirmed or why == "cut OWL box unconfirmed"
                     if top is not None:
                         found = (top, sightings[-VOTE_N:], pts_base, uv, got, T_base_color)

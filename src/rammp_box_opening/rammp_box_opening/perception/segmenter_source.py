@@ -33,6 +33,11 @@ from rammp_box_opening.perception.scene_source import frame_edges
 
 SEGMENTER_TOPIC = "/perception/object_detections"
 SEG_SILENT_S = 1.0  # no message for this long (since subscribing, or since the last) = silent
+# ... but no publisher on the graph at all is "absent" at once: a profile that
+# does not select the segmenter must not cost the first look its first second
+# before the scene OWL is even asked (the OWL needs ~0.7 s for its first box).
+# The graph is asked at most this often, and only while no message has come.
+SEG_GRAPH_S = 0.5
 SEG_FRESH_S = 1.0  # newest segmenter frame this much older than the grabber's newest colour frame = stale
 SEG_TOP_K = 3  # = owl_source.TOP_K
 # the lid band, in holder-box widths/heights: this fraction of its width each
@@ -190,11 +195,14 @@ class SegmenterRung:
     messages at all."""
 
     def __init__(self, node, classes, import_types=None):
+        self.node = node
         self.classes = tuple(classes)
         self.latest = None  # SegFrame, replaced whole by the callback (one attribute store)
         self.count = 0
         self.available = False
         self.why = None
+        self.cb_error = None  # the last message the callback could not read, as repr: it keeps the frame before
+        self._graph = (None, None)  # (when, publisher count) of the last graph query (publishers)
         self.t_subscribed = time.monotonic()
         try:
             ObjectDetections, DetectedObject = (import_types or _import_types)()
@@ -215,18 +223,43 @@ class SegmenterRung:
         self.available = True
 
     def _cb(self, msg):
-        # on the perception thread: one atomic attribute store, the label image dropped
-        self.latest = frame_of(msg, self.classes, time.monotonic())
+        # on the perception thread: one atomic attribute store, the label image
+        # dropped. Never raises: an exception here would end the executor's
+        # spin, and with it every camera and OWL rung the mission's perception
+        # thread serves. A message it cannot read keeps the frame before, which
+        # goes silent in SEG_SILENT_S and hands the look to the OWL.
+        try:
+            frame = frame_of(msg, self.classes, time.monotonic())
+        except Exception as e:  # noqa: BLE001 -- someone else's node publishes this
+            self.cb_error = repr(e)
+            return
+        self.latest = frame
         self.count += 1
 
+    def publishers(self, now_s):
+        """How many publishers the graph has on SEGMENTER_TOPIC (asked at
+        most every SEG_GRAPH_S), or None when the node cannot say."""
+        t, n = self._graph
+        if t is not None and now_s - t < SEG_GRAPH_S:
+            return n
+        try:
+            n = int(self.node.count_publishers(SEGMENTER_TOPIC))
+        except Exception:  # noqa: BLE001 -- a stub node, or a graph query that failed: no answer, the timer decides
+            n = None
+        self._graph = (now_s, n)
+        return n
+
     def state(self, now_s, color_frame_id=None, color_wh=None, color_stamp_ns=None, frame=_LATEST):
-        """"unavailable" | "waiting" | "silent" | "wrong_camera" | "wrong_size"
-        | "stale" | "live" for the newest frame (or `frame`), against the scene
-        camera's own newest colour frame (its frame_id, (w, h), stamp)."""
+        """"unavailable" | "absent" | "waiting" | "silent" | "wrong_camera" |
+        "wrong_size" | "stale" | "live" for the newest frame (or `frame`),
+        against the scene camera's own newest colour frame (its frame_id,
+        (w, h), stamp)."""
         if not self.available:
             return "unavailable"
         m = self.latest if frame is _LATEST else frame
         if m is None:
+            if self.publishers(now_s) == 0:
+                return "absent"  # nothing on the graph publishes it: no word is coming
             return "waiting" if now_s - self.t_subscribed <= SEG_SILENT_S else "silent"
         if now_s - m.recv_s > SEG_SILENT_S:
             return "silent"
@@ -243,9 +276,12 @@ class SegmenterRung:
         m = self.latest if frame is _LATEST else frame
         if state == "unavailable":
             return self.why
-        if state == "silent":
-            return ("SILENT: no %s in %.1f s; select scene_segmenter: rfdetr in the sheppy profile"
-                    % (SEGMENTER_TOPIC, SEG_SILENT_S))
+        if state in ("absent", "silent"):
+            said = ("ABSENT: nothing publishes %s" % SEGMENTER_TOPIC if state == "absent"
+                    else "SILENT: no %s in %.1f s" % (SEGMENTER_TOPIC, SEG_SILENT_S))
+            if self.cb_error:
+                said += " (a message it sent could not be read: %s)" % self.cb_error
+            return said + "; select scene_segmenter: rfdetr in the sheppy profile"
         if state == "waiting":
             return "no message yet, in its first %.1f s" % SEG_SILENT_S
         if m is None:

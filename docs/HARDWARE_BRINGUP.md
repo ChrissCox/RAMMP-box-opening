@@ -290,18 +290,24 @@ run for grip and place.
   lines in `sheppy logs box_opening` → the node stopped receiving frames
   (2026-09-16/17: two executors spinning one node, fixed in the grabbers;
   a recurrence means something else) → `sheppy restart box_opening`.
-  Alive but "no box" → the box scores under the scene floor (`min_score`
-  0.12 in the launch); `ros2 topic echo` the bbox topic, 5th field.
+  Alive but "no box" → the box scores under the scene floor (the container
+  config's `vlm.owl_min_score_scene`: ankou_pink 0.05, the OXO 0.12);
+  `ros2 topic echo` the bbox topic, 5th field.
 - For a container whose config names `scene_detect.segmenter_classes`
   (ankou_pink: `[food container]`), the box comes from sheppy's always-on
   scene_segmenter first: "SCENE: ... (SEG 0.88, 2 sightings
   (segmenter+segmenter); ...)" in about 0.4 s, with the scene OWL off. The
   OWL is the fallback (segmenter down, a frame showing two places, or no fix
   in 1 s): "OWL 0.31, 2 sightings (owl+owl)" in about 2.6 s. A failure names
-  both: "scene segmenter: ...; scene OWL: ...". "scene segmenter: SILENT: no
-  /perception/object_detections in 1.0 s" → the box-opening profile does not
-  select `scene_segmenter: rfdetr`; `ros2 topic hz /perception/object_detections`
-  should show ~5 Hz. "it watches '', not the scene camera (...); the mock?" →
+  both: "scene segmenter: ...; scene OWL: ...". "scene segmenter: ABSENT:
+  nothing publishes /perception/object_detections" → the sheppy profile does
+  not select `scene_segmenter: rfdetr` (the OWL is asked at once); "SILENT: no
+  /perception/object_detections in 1.0 s" → it is selected but sends nothing
+  (`sheppy logs scene_segmenter`); `ros2 topic hz /perception/object_detections`
+  should show ~5 Hz. "two places pass as this container, [x, y] and [x, y],
+  and the OWL did not settle which" → the segmenter boxed a second bowl whose
+  band also passes; once that is seen, only a pair with an OWL sighting
+  commits. "it watches '', not the scene camera (...); the mock?" →
   the segmenter runs as sheppy's mock. "does not import" → this install does
   not chain `~/ros2_ws/install` (rammp_perception_interfaces).
 - "lid spot [x, y] refused by the planner — setting the lid down at [x, y]

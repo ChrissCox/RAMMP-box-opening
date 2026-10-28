@@ -146,6 +146,55 @@ def test_the_segmenter_is_live_only_from_the_scene_camera_at_its_size_and_fresh(
     assert rung.state(5.3, *cam, frame=None) == "silent"
 
 
+class _GraphNode(_Node):
+    """A node whose graph has `n[0]` publishers on a topic, counting the queries."""
+
+    def __init__(self, n):
+        super().__init__()
+        self.n, self.asked = n, 0
+
+    def count_publishers(self, topic):
+        assert topic == sg.SEGMENTER_TOPIC
+        self.asked += 1
+        return self.n[0]
+
+
+def test_a_segmenter_nothing_publishes_is_absent_at_once_not_after_a_silent_second():
+    """A profile that does not select the segmenter: no message will ever
+    come, and waiting out SEG_SILENT_S before the scene OWL is asked cost the
+    first look its first second. One that has a publisher still gets its
+    first second; a node that cannot say keeps the timer."""
+    n = [0]
+    node = _GraphNode(n)
+    rung = sg.SegmenterRung(node, FOOD, import_types=lambda: (object, type("D", (), {"size": None})))
+    rung.t_subscribed = 0.0
+    cam = ("scene_camera_color_optical_frame", WH, int(10.2e9))
+    assert rung.state(0.0, *cam) == "absent"
+    d = rung.describe("absent")
+    assert d.startswith("ABSENT: nothing publishes /perception/object_detections") and "scene_segmenter: rfdetr" in d
+    n[0] = 1  # it comes up: the graph is asked again only after SEG_GRAPH_S
+    assert rung.state(0.2, *cam) == "absent" and node.asked == 1
+    assert rung.state(0.0 + sg.SEG_GRAPH_S, *cam) == "waiting" and node.asked == 2
+    assert rung.state(1.1, *cam) == "silent"  # published, but nothing came in its first second
+    rung.latest = _frame(recv_s=1.2)
+    asked = node.asked
+    assert rung.state(1.3, *cam) == "live" and node.asked == asked  # a message: the graph is not asked
+    rung, _node = _rung()  # a node with no graph to ask: the timer alone
+    assert rung.state(0.5, *cam) == "waiting" and rung.state(1.1, *cam) == "silent"
+
+
+def test_a_message_the_rung_cannot_read_never_reaches_the_perception_executor():
+    """An exception in the callback would end the executor's spin, and with
+    it every camera and OWL rung the mission's perception thread serves."""
+    rung, node = _rung()
+    _type, _topic, cb = node.subs[0]
+    cb(_msg([_obj()]))
+    good = rung.latest
+    cb(SimpleNamespace(header=SimpleNamespace(stamp=None, frame_id="x"), objects=None, label_image=None))
+    assert rung.latest is good and rung.count == 1 and "TypeError" in rung.cb_error
+    assert "could not be read: TypeError" in rung.describe("silent")
+
+
 def test_a_segmenter_this_install_cannot_read_is_unavailable_and_says_why():
     def missing():
         raise ImportError("No module named 'rammp_perception_interfaces'")

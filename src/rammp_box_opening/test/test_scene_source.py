@@ -838,6 +838,17 @@ def test_the_owls_box_of_a_cut_lid_needs_the_segmenter_while_it_is_live():
     assert commit_fix([_sighting("owl", a), _sighting("owl", b)], True)[1] is None  # whole boxes need no one
 
 
+def test_once_the_segmenter_saw_two_places_only_a_pair_with_the_owl_in_it_commits():
+    from rammp_box_opening.perception.scene_source import commit_fix
+
+    a, b = (0.661, -0.265, 0.310), (0.664, -0.262, 0.309)  # 4 mm apart
+    segs = [_sighting("segmenter", a), _sighting("segmenter", b)]
+    assert commit_fix(segs, True, owl_settles=True) == (None, "two places unsettled")
+    assert commit_fix(segs, True)[1] is None  # no ambiguity in the look: the segmenter's pair is enough
+    assert commit_fix([_sighting("segmenter", a), _sighting("owl", b)], True, owl_settles=True)[1] is None
+    assert commit_fix([_sighting("owl", a), _sighting("owl", b)], True, owl_settles=True)[1] is None
+
+
 # --- locate(), driven by stubs on a test clock --------------------------------
 
 CAM_T0 = 1000.0  # the camera's clock at the test's t = 0
@@ -895,7 +906,7 @@ class _World:
     """The test's clock, and what the scene camera, the segmenter and the OWL
     publish on it."""
 
-    def __init__(self, seg_msgs=(), owl_script=(), owl_alive=True, seg_since=0.0, frame_id=SCENE_FRAME):
+    def __init__(self, seg_msgs=(), owl_script=(), owl_alive=True, seg_since=0.0, frame_id=SCENE_FRAME, publishers=None):
         from rammp_box_opening.perception.segmenter_source import SegmenterRung
 
         self.t = 0.0
@@ -908,6 +919,11 @@ class _World:
         class Node:
             def create_subscription(self, *a):
                 return None
+
+            def count_publishers(self, topic):  # what the graph says; None: a node that cannot say
+                if publishers is None:
+                    raise AttributeError("count_publishers")
+                return publishers
 
         self.rung = SegmenterRung(Node(), ("food container",), import_types=lambda: (object, Detected))
         self.rung.t_subscribed = -float(seg_since)  # subscribed this long before t = 0
@@ -1008,6 +1024,42 @@ def test_the_segmenters_frames_fix_the_box_with_the_owl_never_enabled(monkeypatc
     assert loc.last_boxes["segmenter"] == [["food container", 0.88, *_holder(1.0)]]
 
 
+def test_the_look_end_to_end_through_the_real_gate_on_the_frame_the_owl_missed():
+    """locate() on the 10-27 16:24 frame with nothing stubbed between the
+    segmenter's message and the SceneFix: its holder box in each 5 Hz
+    message, the real band, gate, vote, pose and table extent. Two fresh
+    frames commit; the OWL is never asked."""
+    from pathlib import Path
+
+    from rammp_box_opening.perception import scene_source as ss
+    from rammp_box_opening.perception.scene import color_cloud
+
+    z = np.load(Path(__file__).parent / "data" / F_162417)
+    depth = z["depth_mm"].astype(float) / 1000.0
+    _pts, _uv, _tz, _kw, objs, _gt, ref = _upright(F_162417)
+    world = _World(seg_msgs=_every(0.1, 3.0, objs))
+    world.grab.depth_median = lambda: depth
+    world.grab.cloud_in_color_frame = lambda depth=None, stride=1: color_cloud(
+        depth, z["kd"], z["k"], z["dist"], z["T_color_depth"], stride=stride)
+    loc = ss.SceneLocator.__new__(ss.SceneLocator)
+    loc.spins, loc.model, loc.table_z, loc.base_frame, loc.tag_px = False, ContainerModel.load(PINK), None, "arm_mount", None
+    loc.last_why, loc.last_timing, loc.last_boxes, loc.last_seg_state, loc.moved_note = None, {}, {}, None, None
+    loc.seg_box, loc.grab, loc.owl, loc.seg = "holder", world.grab, world.owl, world.rung
+    loc._clock, loc._sleep = world.clock, world.sleep
+    loc.ready = lambda: True
+    loc.base_to_color = lambda: z["T_base_color"]
+    fix = loc.locate(5.0)
+    assert fix is not None, loc.last_why
+    assert fix.source == "segmenter" and fix.sources == ("segmenter", "segmenter") and world.owl.ons == []
+    assert np.linalg.norm(np.subtract(fix.top_xyz, ref)) < 0.015  # the gate alone: 8.2 mm
+    assert fix.score == pytest.approx(0.881, abs=0.001) and fix.n_points == 299
+    # the pose stands on the table the side lift measured around it, under the pair's median top
+    assert fix.pose.xyz[:2] == pytest.approx(fix.top_xyz[:2]) and fix.pose.xyz[2] == pytest.approx(fix.table_z_scene)
+    assert abs(fix.top_xyz[2] - fix.pose.xyz[2] - loc.model.dims[2]) < ss.LID_BAND_M
+    assert fix.table_extent is not None and len(fix.table_points) > 0  # no survey: the table it stands on, measured
+    assert loc.last_timing["fix_s"] == pytest.approx(0.5, abs=0.05)  # the 0.1 s frame predates the look
+
+
 def test_a_silent_segmenter_hands_the_look_to_the_owl_at_once(monkeypatch):
     world = _World(seg_since=5.0, owl_script=[[(0.3, OWL_BOX)], [(0.31, OWL_BOX)]])
     loc, _gated = _locator(monkeypatch, world, {OWL_BOX: OWL_TOP})
@@ -1059,6 +1111,52 @@ def test_two_places_in_one_segmenter_frame_are_no_sighting_and_call_the_owl(monk
     fix = loc.locate(15.0)
     assert world.owl.ons[0] == pytest.approx(0.3, abs=0.05)  # at the first ambiguous frame, not a second later
     assert fix is not None and fix.sources == ("owl", "owl")
+
+
+def test_after_two_places_the_segmenter_alone_never_picks_one(monkeypatch):
+    """One frame passes the canister and a second bowl 30 cm away. In the
+    frames after it the canister's band is refused and the bowl's passes:
+    two agreeing segmenter sightings of the bowl are no evidence it is the
+    container, and the OWL, boxing the canister's lid, never agrees."""
+    other = (100.0, 216.0, 190.0, 260.0)
+    far = (SEG_TOP[0], SEG_TOP[1] + 0.3, SEG_TOP[2])
+    both = [(0.3, [("food container", 0.88, _holder()), ("food container", 0.6, other)])]
+    outcomes = {_band(_holder()): SEG_TOP, _band(other): far, OWL_BOX: OWL_TOP}
+    world = _World(seg_msgs=both + _every(0.5, 10.0, [("food container", 0.6, other)]),
+                   owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+    loc, _gated = _locator(monkeypatch, world, outcomes)
+    assert loc.locate(4.0) is None  # before: the bowl, committed at 0.7 s
+    assert world.owl.ons[0] == pytest.approx(0.3, abs=0.05)
+    assert loc.last_why.startswith("scene segmenter: two places pass as this container, [0.661, -0.265] and "
+                                   "[0.661, 0.035], and the OWL did not settle which")
+    # the frames after it pass the canister alone: the OWL's first box settles it
+    world = _World(seg_msgs=both + _every(0.5, 10.0, [("food container", 0.88, _holder())]),
+                   owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+    loc, _gated = _locator(monkeypatch, world, outcomes)
+    fix = loc.locate(15.0)
+    assert fix is not None and fix.sources == ("segmenter", "owl")
+    assert fix.top_xyz == pytest.approx(tuple(0.5 * (s + o) for s, o in zip(SEG_TOP, OWL_TOP)))
+    assert loc.last_timing["fix_s"] == pytest.approx(1.0, abs=0.06)  # the OWL's box on its enable edge
+
+
+def test_a_segmenter_nothing_publishes_hands_the_first_look_to_the_owl_at_prime(monkeypatch):
+    """The box-opening profile without `scene_segmenter: rfdetr`: prime(),
+    at the locator's construction, finds nothing on the graph and wakes the
+    OWL there, as before the segmenter, so its first box is on the topic by
+    the time the look starts. Waiting out the rung's first second instead
+    (a node that cannot ask the graph) starts the OWL only in the look."""
+    timings = {}
+    for publishers in (0, None):
+        world = _World(publishers=publishers, owl_script=[[(0.3, OWL_BOX)], [(0.3, OWL_BOX)]])
+        loc, _gated = _locator(monkeypatch, world, {OWL_BOX: OWL_TOP})
+        loc.prime()  # at construction: just subscribed
+        world.sleep(0.8)  # the readiness checks, the arm to its rest pose
+        fix = loc.locate(15.0)
+        assert fix is not None and fix.sources == ("owl", "owl"), loc.last_why
+        timings[publishers] = loc.last_timing["fix_s"]
+        assert loc.last_seg_state == ("absent" if publishers == 0 else "silent")
+    assert timings[0] == pytest.approx(1.2, abs=0.06)  # the second box: 1.3 s after the first, at 0.7 s
+    assert timings[None] == pytest.approx(2.2, abs=0.06)  # the OWL woken 0.2 s into the look, then two boxes
 
 
 def test_without_a_segmenter_for_the_container_the_owl_looks_as_it_always_did(monkeypatch):
