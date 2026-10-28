@@ -590,9 +590,26 @@ def let_go(ctx):
     reference it was stopped at — below the button, or the next point of a
     path cut short. Only where the arm is loaded or was stopped part-way:
     between legs in free air the reference is a leg's end, the arm at rest
-    there, and a release would only add its own sag. A client with no
-    release lets nothing go."""
+    there, and a release would only add its own sag. A way home from the
+    box that did not get home lets go: a leg of it stopped part-way, or,
+    where a plan was refused instead, that sag is all it costs. A client
+    with no release lets nothing go."""
     getattr(ctx.client, "release", lambda: None)()
+
+
+def let_go_part_way(ctx, res):
+    """let_go after a compliant runner.run (`res`, its results) that failed
+    part-way: the runner flew its last execution and the driver reported
+    progress on it, so the springs pull on toward its next point, its
+    feed-forward on. One that did not start — the runner's gates, the
+    client's own or the driver refused it, no progress — left the arm at
+    rest at a leg's end: nothing to let go of, as _fly_way_in's way in that
+    did not start. Nor in a guarded run, whose POSITION goals hold where
+    they stopped. Called after the run returns, never with a goal in
+    flight."""
+    last = res[-1] if res else None  # the runner returns at the first leg that fails
+    if compliant(ctx) and last is not None and not last.ok and last.flown_traj is not None and bool(last.progress):
+        let_go(ctx)
 
 
 def gains_text(profile):
@@ -773,7 +790,7 @@ def _home_legs(ctx, cfg, start=None):
                        "(last: %s) — jog the arm clear by hand" % (CLEAR_MARGIN_MAX_STEP_RAD, last))
 
 
-def _back_off(ctx, runner, ref=None, why=None):
+def _back_off(ctx, runner, ref=None, why=None, lets_go=True):
     """Straight back toward the arm by REACH_PULLBACK_M, level, at the
     hand's own attitude — guarded, like the slide out: out of the
     padded cuboid of a box that is not where the arm's pose was planned
@@ -781,7 +798,9 @@ def _back_off(ctx, runner, ref=None, why=None):
     free-air reading the caller already holds, else one read here. `why`:
     the planner's refusal of home from here, printed as it said it — not
     always the box's padded volume (INVALID_START_STATE_JOINT_LIMITS takes
-    the back-off too). False when it cannot be flown or met something."""
+    the back-off too). False when it cannot be flown or met something; a
+    compliant one stopped part-way lets go there (let_go_part_way) unless
+    `lets_go` is False (_go_home's)."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
 
@@ -806,10 +825,12 @@ def _back_off(ctx, runner, ref=None, why=None):
     # from free air only (_go_home's callers), level and away from the box
     res = runner.run([line_leg(ctx, "reach:back-off", pts, quat, FREE_LINE_SPEED, free_guard(ctx, ref),
                                _full_world(ctx))], execute=True)
+    if lets_go:
+        let_go_part_way(ctx, res)
     return all(r.ok for r in res)
 
 
-def _go_home(ctx, cfg, runner, why, ref=None):
+def _go_home(ctx, cfg, runner, why, ref=None, lets_go=True):
     """Home from free air (the look pose, or where the run started), planned
     in the full world around the box where it now is. A start the planner
     refuses INVALID_START — inside the box's padded cuboid (the box not
@@ -817,14 +838,17 @@ def _go_home(ctx, cfg, runner, why, ref=None):
     2026-10-22), or INVALID_START_STATE_JOINT_LIMITS, which the same test
     takes — backs straight off toward the arm first (guarded against `ref`
     when given), the refusal printed. Every refusal is in the run log.
-    False — the arm holds — when the plan is refused or a move fails."""
+    False — the arm holds — when the plan is refused or a move fails. A
+    compliant run's back-off or home that stopped part-way lets go there
+    (let_go_part_way), unless `lets_go` is False: _home_from_over_box's
+    callers let go of a home that did not get there themselves."""
     if why:
         print("[press_demo] %s — returning home" % why)
     try:
         legs = _home_legs(ctx, cfg)
     except RuntimeError as e:
         runner.note("home_refused", why=str(e)[:300])
-        if "INVALID_START" not in str(e) or not _back_off(ctx, runner, ref, why=str(e)):
+        if "INVALID_START" not in str(e) or not _back_off(ctx, runner, ref, why=str(e), lets_go=lets_go):
             print("[press_demo] home plan refused (%s) — the arm holds; home it with sheppy's home_arm" % _short(e))
             return False
         try:
@@ -834,6 +858,8 @@ def _go_home(ctx, cfg, runner, why, ref=None):
             print("[press_demo] home plan refused (%s) — the arm holds; home it with sheppy's home_arm" % _short(e2))
             return False
     res = runner.run(legs, execute=True)
+    if lets_go:
+        let_go_part_way(ctx, res)
     return all(r.ok for r in res)
 
 
@@ -1025,7 +1051,8 @@ def _clear_over_box(ctx, runner, ref):
 def _home_from_over_box(ctx, cfg, runner, result):
     """Home after a free depth press (DepthPress.free): clear of the box's
     padded volume first, then planned once, the back-off left as the
-    fallback. False — the arm holds — when it did not get there."""
+    fallback. False — the arm holds, and a compliant run's caller lets go
+    (let_go) — when it did not get there."""
     ref = result.ref or (None if compliant(ctx) else _settled(ctx, "over the box"))
     if ref is not None or compliant(ctx):
         clear = _clear_over_box(ctx, runner, ref)
@@ -1033,7 +1060,7 @@ def _home_from_over_box(ctx, cfg, runner, result):
             return False
     from rammp_box_opening.tasks.depth_press import home_why
 
-    return _go_home(ctx, cfg, runner, home_why(result), ref=ref)
+    return _go_home(ctx, cfg, runner, home_why(result), ref=ref, lets_go=False)
 
 
 def _unload_stopped(res):
@@ -1272,8 +1299,9 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
     goes home from the look pose; one that stopped part-way holds the arm
     there, its STOP naming the leg in flight. From the way in's start to
     where the way home ends, a stop lets go (let_go): the way in stopped
-    part-way, the way home stopped, anything raised. Returns the process
-    exit code."""
+    part-way, the way home stopped or did not get home (its fallback's
+    clear or home, _home_from_over_box), anything raised. Returns the
+    process exit code."""
     from rammp_box_opening.tasks import depth_press as dp
 
     names = [lg.name for lg in legs]
@@ -1322,7 +1350,8 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
         raise
     if not moved:
         # from the look pose, in free air: nothing came near the box — no
-        # shove to pad it for, and nothing to let go of
+        # shove to pad it for, and nothing to let go of but a home that
+        # stops part-way (_go_home's own)
         ctx.contact_pad = pad
         _go_home(ctx, cfg, runner, "STOP: the way in did not start (%s) — nothing was pressed"
                  % (last.detail or last.outcome))
@@ -1332,9 +1361,12 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
               % (_phase_at(names, retimed.get("seg_start_fracs") or [0.0], last.progress), last.detail or last.outcome))
         let_go(ctx)
         return 1
-    if not result.free:
+    if not result.free or not homed:
         # the way home stopped (_way_home): the arm holds on the button — no
-        # way up flies — or where the rise or the one execution stopped
+        # way up flies — or where the rise or the one execution stopped. Free
+        # but not home, its fallback home from over the box did not get there
+        # (_home_from_over_box): its clear or home stopped part-way, as the one
+        # execution can, or a plan was refused, the arm at rest at a leg's end
         let_go(ctx)
     runner.finish()
     return dp.finish(ctx, dataclasses.replace(result, touch_xyz=seen.get("touch_xyz")), homed)
@@ -1600,6 +1632,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         return 1
     res = runner.run([plan.look_leg], execute=True)
     if any(not r.ok for r in res):
+        let_go_part_way(ctx, res)
         return 1
     at_look = None
     if not soft:
@@ -1698,6 +1731,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             else:
                 res = runner.run([plan2.look_leg], execute=True)
                 if any(not r.ok for r in res):
+                    let_go_part_way(ctx, res)
                     return 1
                 # plan_reach proved the way down from the leg's end: that proof
                 # is the way in. Solved again from the live joints, an
@@ -1737,6 +1771,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             if any(not r.ok for r in res):
                 print("[press_demo] STOP: the move to the aimed button's look pose %s — the arm holds; "
                       "nothing was pressed" % _stopped_by(res))
+                let_go_part_way(ctx, res)
                 return 1
     else:
         plan2, why = plan_reach(ctx, cfg, button, ctx.client.joints())
@@ -1746,6 +1781,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
             return 1
         res = runner.run([plan2.look_leg], execute=True)
         if any(not r.ok for r in res):
+            let_go_part_way(ctx, res)
             return 1
     if not soft:
         at_look = _settled(ctx, "the look pose")
@@ -1776,6 +1812,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     if any(not r.ok for r in res):
         print("[press_demo] STOP: the slide in %s before the button — the arm holds; nothing was pressed"
               % _stopped_by(res))
+        let_go_part_way(ctx, res)  # toward the slide's next point, toward the box
         return 1
     at_start = None if soft else _settled(ctx, "the stroke's start" if walk is None
                                           else "over the button, pointing down")
@@ -1796,6 +1833,12 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
                                                   top_z=button[2])
         result = depth_press.after_scene_check(ctx, runner, result, scene_fix, locator)
         homed = result.free and _home_from_over_box(ctx, cfg, runner, result)
+        if soft and result.free and not homed:
+            # free but not home, its home from over the box did not get there
+            # (_home_from_over_box): its clear or home stopped part-way, as
+            # _fly_way_in's fallback can, or a plan was refused, the arm at
+            # rest at a leg's end. Not free, press_compliant let go where it stopped
+            let_go(ctx)
         runner.finish()
         return depth_press.finish(ctx, result, homed)
 

@@ -3412,6 +3412,31 @@ def test_a_compliant_stroke_that_stopped_part_way_lets_go_once_and_holds(ctx, mo
     assert events == ["depth:turn", "depth:approach", "depth:press"]
 
 
+@pytest.mark.parametrize("soft, ends, asked_after", [
+    (True, "stopped", [1]),  # the turn's goal failed 40% of the way, over the button
+    (True, "not started", []),  # ... turned down by the driver: at rest where the slide in left it
+    (False, "stopped", []),  # --guarded: a POSITION goal holds where it stopped
+], ids=["compliant, stopped", "compliant, not started", "guarded, stopped"])
+def test_a_turn_down_that_stopped_part_way_over_the_button_lets_go_once_in_a_compliant_press(
+        ctx, monkeypatch, tmp_path, soft, ends, asked_after):
+    """Where the slide in did not turn the hand down (no walk in), the press
+    turns it first (turn_down), over the button. A compliant turn stopped
+    part-way leaves the springs pulling toward its next point, its
+    feed-forward on: the arm holds, free False, nothing pressed, and it
+    lets go once, after the turn — no stroke, no hold. A turn the driver
+    turned down moved nothing, and nothing is let go; nor in a guarded
+    press."""
+    asked = _releases(ctx)
+    why = "PATH_TOLERANCE_VIOLATED" if ends == "stopped" else "goal rejected by the driver"
+    ctx.client.exec_script = [("failed", {"message": why, "progress": 0.4 if ends == "stopped" else 0.0})]
+    ctx.client.compliant = soft
+    result, events, arm, _legs, _start = _press(ctx, monkeypatch, tmp_path, [], touch_at=None, compliant=soft,
+                                                top_z=COMPLIANT_TOP if soft else None)
+    assert not result.free and result.why == "the turn met something (%s)" % why and dp.exit_code(result) == 1
+    assert asked == asked_after and events == ["depth:turn"] and ctx.contact_pad == 0.0
+    assert len(arm.reads) == (0 if soft else 1)  # a guarded press reads its reference before the turn
+
+
 @pytest.mark.parametrize("ends, code, asked_after", [
     ("the way in stopped part-way", 1, [2]),  # the look, then the way in: stopped 60% of the way
     ("the way home stopped", 1, [3]),  # ... the way in, the hold, then the way home, just begun
@@ -3436,6 +3461,85 @@ def test_a_compliant_reach_out_lets_go_where_it_stopped_loaded_or_part_way_and_n
     got, _rec, _chain, _home, _got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True,
                                                  chain=_sinking_chain())
     assert got == code and asked == asked_after
+
+
+STOPPED = ("failed", {"message": "PATH_TOLERANCE_VIOLATED", "progress": 0.4})
+REJECTED = ("failed", {"message": "goal rejected by the driver", "progress": 0.0})
+
+
+@pytest.mark.parametrize("fallback, ends, code, asked_after", [
+    ("none planned", {}, 0, []),  # the look, the way in, the rise alone, the clear, home: nothing let go
+    ("none planned", {4: STOPPED}, 1, [4]),  # ... the clear from over the box stopped 40% of the way
+    ("none planned", {5: STOPPED}, 1, [5]),  # ... home from the clear's end stopped
+    ("home off the clear", {4: REJECTED}, 0, []),  # [rise, clear], its home turned down, home from there
+    ("home off the clear", {4: REJECTED, 5: STOPPED}, 1, [5]),  # ... and that home stopped
+], ids=["none planned, home", "none planned, clear stopped", "none planned, home stopped", "later goal, home",
+        "later goal, home stopped"])
+def test_a_compliant_reach_outs_fallback_home_from_over_the_box_lets_go_where_it_stopped(
+        ctx, monkeypatch, tmp_path, fallback, ends, code, asked_after):
+    """Where no way home was planned ahead (home refused from both clears'
+    ends: the rise alone, _rise_then_home), or a later goal of it did not
+    start, the way home is home from over the box (_home_from_over_box):
+    the clear up and back, then home, goals of their own. Either stopped
+    part-way leaves the springs pulling toward its next point, its
+    feed-forward on, as the one execution's stop does: free, but not home.
+    It lets go once, after that goal, and the arm holds there. A fallback
+    that gets home lets nothing go."""
+    kw = {}
+    if fallback == "none planned":
+        kw["home_refusals"] = 2
+    else:
+        real = rp._home_legs
+
+        def off_the_clear(ctx_, cfg_, start=None):
+            legs = real(ctx_, cfg_, start=start)
+            if start is not None:  # planned ahead, from the clear's end: 10 mrad off it, a goal of its own
+                p = legs[0].traj.points[0]
+                p.positions = [float(v) + (0.01 if j == 1 else 0.0) for j, v in enumerate(p.positions)]
+            return legs
+
+        monkeypatch.setattr(rp, "_home_legs", off_the_clear)
+    asked = _releases(ctx)
+    real_execute = ctx.client.execute
+
+    def execute(traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        n = len(ctx.client.executed) + 1  # every goal sent, the look's the first
+        if n in ends:
+            ctx.client.exec_script.insert(0, (ends[n][0], dict(ends[n][1])))
+        return real_execute(traj, speed, guard=guard, while_running=while_running, stop_when=stop_when, gains=gains)
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+    got, rec, _chain, _home, _got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True,
+                                                chain=_sinking_chain(), **kw)
+    assert got == code and asked == asked_after
+    after = [names for names, _g in _after_the_hold(rec)]
+    assert after[0] == (["depth:rise"] if fallback == "none planned" else WAY_OUT)  # the fallback, not home in one
+
+
+@pytest.mark.parametrize("home, asked_after", [(None, []), (STOPPED, [3]), (REJECTED, [])],
+                         ids=["home", "home stopped", "home not started"])
+def test_a_compliant_way_in_that_did_not_start_lets_go_only_where_its_home_from_the_look_pose_stopped(
+        ctx, monkeypatch, tmp_path, home, asked_after):
+    """The driver turned the way in's goal down: the arm stands at rest at
+    the look pose, in free air, nothing pressed, and goes home from there
+    (_go_home). Home stopped part-way leaves the springs pulling toward its
+    next point, its feed-forward on: the run lets go once, after it, and
+    the arm holds there. Home, or turned down too, nothing is let go."""
+    asked = _releases(ctx)
+    ends = {2: REJECTED, 3: home}  # the look, the way in, home
+    real_execute = ctx.client.execute
+
+    def execute(traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        n = len(ctx.client.executed) + 1
+        if ends.get(n) is not None:
+            ctx.client.exec_script.insert(0, (ends[n][0], dict(ends[n][1])))
+        return real_execute(traj, speed, guard=guard, while_running=while_running, stop_when=stop_when, gains=gains)
+
+    monkeypatch.setattr(ctx.client, "execute", execute)
+    got, rec, _chain, _home, _got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True,
+                                                chain=_sinking_chain())
+    assert got == 1 and asked == asked_after
+    assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "home"] and len(ctx.client.executed) == 3
 
 
 def test_a_ctrl_c_in_a_compliant_reach_outs_hold_lets_go_once_and_still_stops_the_run(ctx, monkeypatch, tmp_path):
