@@ -1117,6 +1117,28 @@ def test_the_reach_out_slides_in_turning_down_in_one_leg(ctx, monkeypatch, tmp_p
     assert sum(xyz == pytest.approx(bottom) for xyz, _q in chain.lines) == 1
 
 
+@pytest.mark.parametrize("compliant", [False, True])
+def test_the_depth_press_checks_the_aim_as_the_wrist_measured_it(ctx, monkeypatch, tmp_path, compliant):
+    """Flatbot 2026-10-27 15:19: over the box the guarded depth press found
+    the aim 175.9 mm below the lens and the wrist's own depth under the
+    fingers 190.0 — 14 mm, inside LOOK_EXPECT_DEPTH_M. The aim's press
+    point raised by the wrist's 21.6 mm table offset (ButtonAimer.fix) would
+    read 36 mm off that same depth and be refused. So the depth press gets
+    the aim as the wrist measured it, while the box's world and the
+    compliant press's top go by the raised one."""
+    from rammp_box_opening.models.container import from_container
+
+    import test_reach_press as trp
+
+    measured = (trp.BUTTON[0], trp.BUTTON[1], trp.BUTTON[2] - 0.0216)
+    code, _rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=compliant,
+                                              first=(trp.BUTTON, 0.4, measured))
+    assert code == 0 and got["compliant"] == compliant
+    assert got["aimed"] == pytest.approx(measured) and got["top_z"] == pytest.approx(trp.BUTTON[2])
+    kw = [kw for kind, kw in ctx.worlds.pushes if kind == "interaction" and kw.get("tag") == "reach"][-1]
+    assert from_container(kw["cpose"], ctx.model.button_offset) == pytest.approx(list(trp.BUTTON))
+
+
 def test_where_no_walk_turns_down_on_the_way_it_slides_then_turns(ctx, monkeypatch, tmp_path):
     import test_reach_press as trp
 
@@ -1366,25 +1388,3 @@ def test_a_guarded_reach_out_is_as_before(ctx, monkeypatch, tmp_path):
     # at rest, at the look, at the look again, over the button, and over the box for the home
     assert code == 0 and not got["compliant"] and rec.reads == 5
     assert rec.legs["reach:slide-in"].guard is not None
-
-
-@pytest.mark.parametrize("compliant", [False, True])
-def test_the_depth_press_checks_the_aim_as_the_wrist_measured_it(ctx, monkeypatch, tmp_path, compliant):
-    """Flatbot 2026-10-27 15:19: over the box the guarded depth press found
-    the aim 175.9 mm below the lens and the wrist's own depth under the
-    fingers 190.0 — 14 mm, inside LOOK_EXPECT_DEPTH_M. The aim's press
-    point raised by the wrist's 21.6 mm table offset (ButtonAimer.fix) would
-    read 36 mm off that same depth and be refused. So the depth press gets
-    the aim as the wrist measured it, while the box's world and the
-    compliant press's top go by the raised one."""
-    from rammp_box_opening.models.container import from_container
-
-    import test_reach_press as trp
-
-    measured = (trp.BUTTON[0], trp.BUTTON[1], trp.BUTTON[2] - 0.0216)
-    code, _rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=compliant,
-                                              first=(trp.BUTTON, 0.4, measured))
-    assert code == 0 and got["compliant"] == compliant
-    assert got["aimed"] == pytest.approx(measured) and got["top_z"] == pytest.approx(trp.BUTTON[2])
-    kw = [kw for kind, kw in ctx.worlds.pushes if kind == "interaction" and kw.get("tag") == "reach"][-1]
-    assert from_container(kw["cpose"], ctx.model.button_offset) == pytest.approx(list(trp.BUTTON))
