@@ -627,6 +627,56 @@ def test_a_short_arc_is_no_circle():
     assert centre is not None and np.hypot(centre[0] - 0.5, centre[1]) < 0.003
 
 
+def test_a_cut_lids_mirror_across_its_own_silhouette_is_no_second_place():
+    """Half out of the frame, a lid shows its depth only as a strip by its
+    silhouette on the side the frame does not cut, and the circle tangent to
+    that strip from the other side holds it too: the lid's mirror across its
+    silhouette, 105 mm away (detbench P4, 2026-10-27). Two places, as the arc
+    alone says; but the box's uncut side is that silhouette, the lid touches
+    it and the mirror runs 105 mm past it."""
+    from rammp_box_opening.perception.scene_source import lid_circle, past_sides
+
+    model = ContainerModel.load(PINK)
+    r = model.lid_dims[0] / 2
+    cam = np.array([0.0, 0.0, 0.40])
+    lid = np.array([0.40, 0.0])
+    a = np.arcsin(r / np.linalg.norm(lid))
+    ray = np.array([np.cos(a), -np.sin(a)])  # the silhouette on the lid's uncut side
+    tangent = np.sqrt(lid @ lid - r * r) * ray
+    mirror = 2 * (lid @ ray) * ray - lid
+    rng = np.random.default_rng(1)
+    t_lid = np.arctan2(tangent[1] - lid[1], tangent[0] - lid[0]) - rng.uniform(-0.040, 0.030, 130) / r
+    t_mir = np.arctan2(tangent[1] - mirror[1], tangent[0] - mirror[0]) + rng.uniform(-0.040, -0.015, 50) / r
+    xy = np.r_[lid + r * np.c_[np.cos(t_lid), np.sin(t_lid)], mirror + r * np.c_[np.cos(t_mir), np.sin(t_mir)]]
+    band = np.c_[xy + rng.normal(0, 0.0015, xy.shape), np.full(len(xy), 0.38)]  # the lid's strip, the smear past it
+    across = np.array([-ray[1], ray[0]])
+    side = np.r_[-np.sign(lid @ across) * across, 0.0]  # the plane of that ray, its normal away from the lid
+    assert past_sides([lid, mirror], (side,), cam, 0.38, r) == pytest.approx([0.0, 0.105], abs=0.001)
+    centre, why = lid_circle(band, model, cam)
+    assert centre is None and "two places" in why
+    centre, why = lid_circle(band, model, cam, sides=(side,))
+    assert centre is not None, why
+    assert np.hypot(centre[0] - lid[0], centre[1] - lid[1]) < 0.005
+
+
+def test_a_boxs_uncut_side_is_a_plane_through_the_camera_read_off_the_cloud():
+    """The side of a cut box the frame does not reach is a plane through the
+    camera, found from the cloud's own pixels (no intrinsics passed in): the
+    points past it are the ones whose pixels are past the box. A box cut at
+    both its sides has no uncut side to bound its lid."""
+    from rammp_box_opening.perception.scene_source import pixel_plane, uncut_sides
+
+    pts, uv, _canister, _tall = _side_scene(np.random.default_rng(3))
+    n = pixel_plane(0, 300.0, pts, uv, SIDE_CAM, SIDE_R)
+    clear = np.abs(uv[:, 0] - 300.0) > 0.01
+    assert np.all(np.sign((pts[clear] - SIDE_CAM) @ n) == np.sign(uv[clear, 0] - 300.0))
+    (right,) = uncut_sides([0.0, 100.0, 300.0, 200.0], ("left",), pts, uv, SIDE_CAM, SIDE_R)
+    (left,) = uncut_sides([300.0, 100.0, 639.0, 200.0], ("right",), pts, uv, SIDE_CAM, SIDE_R)
+    assert right / np.linalg.norm(right) == pytest.approx(n / np.linalg.norm(n), abs=1e-9)
+    assert left / np.linalg.norm(left) == pytest.approx(-n / np.linalg.norm(n), abs=1e-9)
+    assert uncut_sides([0.0, 100.0, 639.0, 200.0], ("left", "right"), pts, uv, SIDE_CAM, SIDE_R) == ()
+
+
 def test_a_scene_camera_whose_tf_still_has_its_frames_upside_down_is_refused():
     """Nothing turns frames for the OWL any more: a camera hung upside down
     rotates them on the device (rammp-deployments #133). One whose TF still
@@ -685,6 +735,7 @@ def _upright(name):
 F_162417 = "scene_upright_flatbot_20261027_162417.npz"  # the 10-27 16:24 frame the OWL missed ("saw no box in 15 s")
 F_144302 = "scene_upright_flatbot_20261022_144302.npz"  # P1: something nearer than the canister inside its holder box
 F_133403 = "scene_upright_flatbot_20261023_133403.npz"  # P4: the holder cut by the frame's left edge
+F_172707 = "scene_upright_flatbot_20261023_172707.npz"  # P4: the lid half off the frame's left edge, its arc fit two places
 
 
 def test_the_band_above_the_segmenters_holder_box_finds_the_canister_the_owl_missed():
@@ -783,6 +834,96 @@ def test_a_holder_the_frame_cuts_is_grown_and_finished_from_its_lid_in_view():
     assert got.pose is not None, got.tried
     assert got.partial == ("left",)
     assert np.linalg.norm(np.subtract(got.top, ref)) < 0.020  # measured 13.4 mm
+
+
+def test_the_lid_half_off_the_frame_is_one_place_inside_its_boxs_uncut_side(monkeypatch):
+    """Flatbot 2026-10-23 17:27 (detbench P4): the canister stands half off
+    the scene frame's left edge, and the gate refused every sample of it:
+    its lid's arc fit two places. The second is the lid's mirror across its
+    own right silhouette, 103 mm off, and it holds more of the arc than the
+    lid: only the rival rule kept it from being the fix. It runs past the
+    grown holder box's right side, which the lid stays inside: one place,
+    11 mm from the reference."""
+    from rammp_box_opening.perception import scene_source as ss
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, _gt, ref = _upright(F_172707)
+    (c,) = segmenter_candidates(objs, ("food container",), (640, 400))
+    assert c.kind == "grown" and c.box[0] < 1.0
+    got = ss.scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert got.pose is not None, got.tried
+    assert got.partial == ("left",) and got.rivals == ()
+    assert np.linalg.norm(np.subtract(got.top, ref)) < 0.015  # measured 11.2 mm
+    assert got.top == pytest.approx((0.3966, -0.1725, 0.2829), abs=0.0005)
+    # the bound alone picks the lid: no rival rule, the same fix
+    monkeypatch.setattr(ss, "PARTIAL_RIVAL_FRAC", 2.0)
+    alone = ss.scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", **kw)
+    assert alone.top == got.top
+    # without the bound, the mirror: two places, or with no rival rule a fix 103 mm off
+    monkeypatch.setattr(ss, "PARTIAL_BOX_SLACK_M", float("inf"))
+    mirror = ss.scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", **kw)
+    assert mirror.pose is not None and np.hypot(mirror.top[0] - ref[0], mirror.top[1] - ref[1]) > 0.08
+    monkeypatch.setattr(ss, "PARTIAL_RIVAL_FRAC", 0.85)
+    two = ss.scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", **kw)
+    assert two.pose is None and "two places" in two.tried[-1]
+
+
+def test_a_cut_box_looser_or_tighter_than_its_lid_fixes_the_lid_or_nothing():
+    """The uncut side the bound reads is the detector's: it may sit a little
+    inside the lid's silhouette or well outside it (a holder's, or a loose
+    box). Moved 40 px either way, the half-off canister is still fixed where
+    it was; moved further, it is refused, never fixed somewhere else."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, _gt, ref = _upright(F_172707)
+    (c,) = segmenter_candidates(objs, ("food container",), (640, 400))
+    x0, y0, x1, y1 = c.box
+    for dx in (-60, -40, -20, 0, 20, 40, 60, 100):
+        got = scene_fix_from_boxes([c._replace(box=(x0, y0, x1 + dx, y1))], pts, uv, tz, model, src="segmenter", **kw)
+        if abs(dx) <= 40:
+            assert got.pose is not None, (dx, got.tried)
+        if got.pose is not None:
+            assert np.linalg.norm(np.subtract(got.top, ref)) < 0.015, dx  # measured 10.6-11.3 mm
+
+
+def test_a_cut_lid_inside_its_boxs_uncut_side_is_fixed_where_it_was(monkeypatch):
+    """The bound only takes out circles that run past the box: where the
+    best one stands inside it, the fix is the arc's own to the bit (detbench:
+    no fix moved within its box, the 28 of 3,552 samples that moved changed
+    winning box, the detector's first now passing)."""
+    from rammp_box_opening.perception import scene_source as ss
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, _gt, _ref = _upright(F_133403)
+    cands = segmenter_candidates(objs, ("food container",), (640, 400))
+    got = ss.scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    monkeypatch.setattr(ss, "PARTIAL_BOX_SLACK_M", float("inf"))
+    plain = ss.scene_fix_from_boxes(cands, pts, uv, tz, model, src="segmenter", rivals=True, **kw)
+    assert got.pose is not None and got.partial == ("left",)
+    assert got.top == plain.top and got.n == plain.n
+
+
+def test_a_cut_box_that_holds_only_the_holder_under_the_lid_is_refused():
+    """A cut box around the holder alone (RF-DETR's holder box as it is, an
+    OWL "a pink lid" that boxed the brim) lifts its top at the brim, under
+    the lid's but inside the lid band, and the lid's circle fitted to the
+    brim put the box 43-47 mm off on detbench P4 once the lid's mirror was no
+    second place. The lid stands over that band: the box holds what is under
+    the lid, and is refused. Grown over the lid, the same holder is the fix."""
+    from rammp_box_opening.perception.scene_source import scene_fix_from_boxes
+    from rammp_box_opening.perception.segmenter_source import segmenter_candidates
+
+    model = ContainerModel.load(PINK)
+    pts, uv, tz, kw, objs, _gt, ref = _upright(F_133403)
+    as_is = scene_fix_from_boxes([(objs[0][1], list(objs[0][2]))], pts, uv, tz, model, **kw)
+    assert as_is.pose is None and "under the lid" in as_is.tried[-1], as_is.tried
+    (c,) = segmenter_candidates(objs, ("food container",), (640, 400))
+    grown = scene_fix_from_boxes([c], pts, uv, tz, model, src="segmenter", **kw)
+    assert grown.pose is not None and np.linalg.norm(np.subtract(grown.top, ref)) < 0.020  # measured 13.4 mm
 
 
 def test_the_gates_reasons_name_the_detector_they_came_from():
