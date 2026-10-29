@@ -51,7 +51,9 @@ the knob up or not, the box where it was, the fingers on the knob or on
 air, where the lid goes, the lid still in them at the table. Contact is bounded by the spring,
 not stopped by a guard: the grip's pads ride on the lid where it stands
 higher than estimated, and the set-down presses the lid SETDOWN_OVER_M past
-where the scene camera's table says it lands.
+where the scene camera's table says it lands. Where it looks at rest — the
+knob, the spot — and before the fingers close on the knob, it waits for the
+arm to stand still (runner.wait_still): between motions, never a stop.
 """
 
 import math
@@ -176,9 +178,9 @@ def drop_reachable(ctx, drop, q_start, seeds=()):
 
 # ---- where the lid goes, chosen with the lid lifted -----------------------
 
-# The spot look: frames after the arm stood still this long, the first new
-# one within SPOT_FRAME_S (depth_press.look's settle)
-SPOT_SETTLE_S = dp.LOOK_SETTLE_S
+# The spot look: the first new frame shot once the arm stands still
+# (runner.wait_still, which took over depth_press.look's blind 0.3 s
+# settle), within SPOT_FRAME_S
 SPOT_FRAME_S = 1.0
 # What of the wrist's frame is not the table: nearer the lens than this —
 # the fingers and the lid in them, 116-190 mm off (the OAK's stereo drops
@@ -209,19 +211,17 @@ def _table_z(watcher, scene_fix, cpose):
     return float(cpose.xyz[2])
 
 
-def spot_look(node, watcher):
+def spot_look(node, watcher, runner):
     """The wrist camera's points in the base frame (press_demo.wrist_points)
-    from its first frame shot SPOT_SETTLE_S after the arm stood still, or
-    None: no camera, no node, no new frame within SPOT_FRAME_S, or no pose
-    for it."""
+    from its first frame shot once the arm stands still (runner.wait_still,
+    noted 'still' before the spot look), or None: no camera, no node, no
+    new frame within SPOT_FRAME_S, or no pose for it."""
     from rammp_box_opening.tasks.press_demo import _spin_detect, wrist_points
 
     g = getattr(watcher, "grab", None)
     if node is None or g is None:
         return None
-    t_end = time.monotonic() + SPOT_SETTLE_S
-    while time.monotonic() < t_end:
-        _spin_detect(node)
+    runner.wait_still("spot-look")
     after = node.get_clock().now().nanoseconds
     t_end = time.monotonic() + SPOT_FRAME_S
     while time.monotonic() < t_end:
@@ -941,8 +941,10 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how):
     if lift is None:
         return _back_out(ctx, cfg, runner, way, "the lid has no way off the box (%s) — not gripping it" % why,
                          opened=False)
+    # closed once the arm stands still: the hand where it came down to, not
+    # where it is settling past (Leg.send_when_still)
     close = _gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:close", GRIPPER_CMD_CLOSED, world,
-                         verify=band_verify(cfg.grip_band))
+                         verify=band_verify(cfg.grip_band), send_when_still=True)
     print("[press_demo] CLOSE, then ONE MOTION: %s — %.0f mm straight up, then %.0f mm back toward the arm" % (
         ", ".join(lg.name for lg in lift.legs), 1000 * lift_off_m(ctx.model), 1000 * lift.back_m))
     res = runner.run([close, *lift.legs], execute=True)
@@ -984,9 +986,9 @@ def choose_and_carry(ctx, cfg, runner, eyes):
 
     node, watcher, scene_fix, scene_q = eyes
     world = _full_world(ctx)
-    q = [float(v) for v in ctx.client.joints()]
     table_z = _table_z(watcher, scene_fix, ctx.cpose)
-    wrist = spot_look(node, watcher)
+    wrist = spot_look(node, watcher, runner)
+    q = [float(v) for v in ctx.client.joints()]  # where the arm stood still for the frame
     tmap = spot_map(ctx, wrist, q, scene_fix, scene_q, table_z,
                     getattr(getattr(watcher, "grab", None), "wrist_lens_in_hand_m", None))
     rest = list(pd.rest_joints(cfg))

@@ -624,6 +624,43 @@ def test_both_reach_out_aims_take_their_own_budget_and_two_agreeing_hits(monkeyp
     assert reach_press.REACH_AIM_S > press_demo.STAGING_FIX_S and reach_press.REACH_AIM_HITS == 2
 
 
+def test_every_reach_out_aim_waits_for_a_still_arm_and_the_record_says_how_long(monkeypatch, tmp_path):
+    """2026-10-28 16:23: the look's aim took its first two hits 0.32 and
+    0.41 s in, the arm creeping back from past the look, 7.2 and 5.5 mm off
+    the pair that agreed after; the aim's own still test (4 mm and 0.02 rad
+    between frames) passed them. Each aim — the look's, the one after the
+    press, knob_look's recheck alike — now starts once the arm stands
+    still (runner.wait_still), noted 'still' before its tag."""
+    import json
+
+    from conftest import FakeClient
+
+    from rammp_box_opening.runtime.runner import Runner
+    from rammp_box_opening.tasks import press_demo
+
+    order = []
+
+    class _Settles(FakeClient):
+        def wait_still(self):
+            order.append("still")
+            return 0.42, False
+
+    def aim(node, watcher, yaw, **kw):
+        order.append(kw["tag"])
+        kw["out"].update(button_up_mm=0.9, measured_xyz=(0.7213, -0.297, 0.2914))
+        return ((0.7213, -0.297, 0.3095), yaw), "2 of 2 hits agree in 9 frames"
+
+    monkeypatch.setattr(press_demo, "aim_button_at_staging", aim)
+    runner = Runner(_Settles(), log_dir=tmp_path)
+    for tag in ("reach-aim", "reach-after"):
+        got, _status, _up, _measured = reach_press._aim(None, None, 0.6, 0.3125, (0.7248, -0.286), runner, tag)
+        assert got == ((0.7213, -0.297, 0.3095), 0.6)
+    assert order == ["still", "reach-aim", "still", "reach-after"]
+    rows = [json.loads(line) for line in next(tmp_path.glob("run-*.jsonl")).read_text().splitlines()]
+    assert [(r["leg"], r["before"], r["settle_s"], r["timed_out"]) for r in rows] == [
+        ("still", "reach-aim", 0.42, False), ("still", "reach-after", 0.42, False)]
+
+
 def _reach_world_button(ctx):
     from rammp_box_opening.models.container import from_container
 

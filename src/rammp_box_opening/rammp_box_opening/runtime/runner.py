@@ -675,6 +675,8 @@ class Runner:
             if lead.kind is Kind.GRIPPER:
                 if id(lead) in self._sent_early:
                     continue  # dispatched under the previous motion; pending
+                if lead.send_when_still:
+                    self.wait_still(lead.name)  # what the fingers close on stops moving first
                 if lead.defer_join and lead.verify is None:
                     handle = self.client.gripper_send(lead.gripper_cmd)
                     if handle is not None:
@@ -788,6 +790,7 @@ class Runner:
                         and cand.defer_join
                         and cand.verify is None
                         and cand.send_with_previous_motion
+                        and not cand.send_when_still
                         and self._pending is None
                         and all(g.guard is None for g in group)
                     ):
@@ -899,6 +902,22 @@ class Runner:
     def finish(self):
         """Collect any pending gripper command (mission end / exit)."""
         return self.join_pending()
+
+    def wait_still(self, before):
+        """Wait, the arm at rest, until it stands still (client.wait_still),
+        before `before`, which wants it so: a camera read at rest — the aim,
+        the spot look — or a gripper leg sent once the arm is still
+        (Leg.send_when_still, the grip's close). Noted 'still': how long it
+        took (settle_s) and whether it timed out, the run carrying on all
+        the same. Never moves or stops anything: a wait between motions,
+        never during one. A client that keeps no stream to wait on waits
+        for nothing. Returns (settle_s, timed_out), or None."""
+        wait = getattr(self.client, "wait_still", None)
+        if wait is None:
+            return None
+        settle_s, timed_out = wait()
+        self.note("still", before=before, settle_s=round(float(settle_s), 3), timed_out=bool(timed_out))
+        return settle_s, timed_out
 
     def _join_pending(self):
         leg, handle, t0 = self._pending

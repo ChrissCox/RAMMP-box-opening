@@ -229,6 +229,7 @@ def _gripper_leg(
     defer_join=False,
     join_before_motion=False,
     send_with_previous_motion=False,
+    send_when_still=False,
 ):
     world_name, world_path = world
     return Leg(
@@ -247,6 +248,7 @@ def _gripper_leg(
         defer_join=defer_join,
         join_before_motion=join_before_motion,
         send_with_previous_motion=send_with_previous_motion,
+        send_when_still=send_when_still,
     )
 
 
