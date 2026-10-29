@@ -184,8 +184,10 @@ REACH_LOOK_RISE_M = 0.065
 # look after the press put the button 6-11 mm farther out than the aim the
 # press and the grip went by (12:02, 12:03, 12:04; 10:27's 0 mm), and 12:03's
 # grip closed on air 11 mm short of it. The look pose and the proof before it
-# go by the scene camera's button, as before.
-AIM_FORWARD_M = 0.02
+# go by the scene camera's button, as before. 2 cm was too much (owner
+# 2026-10-29, after flying it: "2 cm was too much, change it to 1"): 1 cm, as
+# the after-looks' 6-11 mm said.
+AIM_FORWARD_M = 0.01
 # The closed 2F-85's lowest point at these tilts, in tool_frame, with the
 # reach attitude's roll (fingers side by side across the line to the box):
 # one fingertip's end, 11 mm past tool_frame like TCP_OFFSET_M straight down.
