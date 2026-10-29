@@ -668,14 +668,15 @@ def _sent(gains):
 
 
 # constants.GAINS_RIGID as the driver must receive it, the numbers copied here
-RIGID_SENT = (4, [400.0] * 4 + [200.0] * 3, 1.0, [39.0] * 4 + [9.0] * 3)
+RIGID_SENT = (4, [400.0] * 7, 1.0, [39.0] * 4 + [9.0] * 3)
 
 
 def test_a_compliant_leg_flies_in_impedance_under_its_gains(monkeypatch):
     """Owner 2026-10-27: "impedance mode needs to be firmer"; 2026-10-28,
-    after 13:43's press under STIFF: "extreamly rigid". A compliant goal that
-    names no gains flies the run's, RIGID — PROFILE_CUSTOM with its own Kq
-    400/200 N·m/rad, zeta 1.0 and torque limits 39/9 N·m — never the
+    after 13:43's press under STIFF: "extreamly rigid"; 2026-10-29: "double
+    the spring coefficient". A compliant goal that names no gains flies the
+    run's, RIGID — PROFILE_CUSTOM with its own Kq 400 N·m/rad on every joint
+    (the driver's ceiling), zeta 1.0 and torque limits 39/9 N·m — never the
     driver's session default, MEDIUM, which every goal of 16:23 flew; one
     that names a profile flies that one, as its number, and so does a
     client told another run default."""
@@ -762,7 +763,7 @@ def test_the_gains_named_here_are_the_drivers_own_profiles():
     assert ExecuteJointTrajectory.Goal().gains.profile == ImpedanceGains.PROFILE_SESSION_DEFAULT
     rigid = constants.GAINS_RIGID
     assert set(constants.IMPEDANCE_KQ) == set(constants.IMPEDANCE_NAMES) == {1, 2, 3, rigid}
-    assert constants.IMPEDANCE_KQ[rigid] == rigid.kq == (400.0,) * 4 + (200.0,) * 3
+    assert constants.IMPEDANCE_KQ[rigid] == rigid.kq == (400.0,) * 7
     assert constants.IMPEDANCE_NAMES[rigid] == rigid.name == "RIGID"
     assert all(len(kq) == len(LIVE) for kq in constants.IMPEDANCE_KQ.values())
     assert constants.COMPLIANT_RUN_GAINS in constants.IMPEDANCE_KQ
@@ -781,7 +782,7 @@ def test_fill_gains_writes_a_custom_spec_as_profile_custom_and_a_profile_as_its_
     msg = ImpedanceGains()
     client_mod.fill_gains(msg, client_mod.GAINS_RIGID)
     assert msg.profile == ImpedanceGains.PROFILE_CUSTOM == 4
-    assert list(msg.custom.kq) == [400.0] * 4 + [200.0] * 3 and msg.custom.zeta == 1.0
+    assert list(msg.custom.kq) == [400.0] * 7 and msg.custom.zeta == 1.0
     assert list(msg.custom.torque_limit) == [39.0] * 4 + [9.0] * 3
     for profile in (client_mod.GAINS_SOFT, client_mod.GAINS_MEDIUM, client_mod.GAINS_STIFF):
         msg = ImpedanceGains()
@@ -1116,3 +1117,314 @@ def test_a_release_the_driver_did_not_take_is_tried_again(monkeypatch, capsys):
     assert c.release() is False and c.release() is False
     assert [g.preemption for g in d.goals] == [client_mod.QUEUE, client_mod.LATEST_WINS, client_mod.LATEST_WINS]
     assert capsys.readouterr().out.count("not released: the driver did not take the hold") == 2
+
+
+# -- the flight log: what the arm said, kept at the price of an append ------------
+
+
+def _joint_states(k, velocity=True):
+    """/joint_states message `k` as the flatbot driver sends it: the arm's
+    seven joints and the gripper's knuckle, stamped on its clock at 49 Hz."""
+    from sensor_msgs.msg import JointState
+
+    m = JointState()
+    t = 1793216726.0 + k / 49.0
+    m.header.stamp.sec = int(t)
+    m.header.stamp.nanosec = int(round((t - int(t)) * 1e9))
+    m.name = ["arm_joint_%d" % i for i in range(1, 8)] + ["arm_robotiq_85_left_knuckle_joint"]
+    m.position = [0.001 * k + 0.1 * i for i in range(7)] + [0.8]
+    m.velocity = [0.01 * k] * 7 + [float("nan")] if velocity else []
+    m.effort = [1.0] * 7 + [float("nan")]
+    return m
+
+
+def _listening_client(monkeypatch):
+    """PlannerClient.__init__ with the rclpy surface stubbed, as
+    test_a_client_built_for_a_run_flies_rigid builds it."""
+
+    class _Node:
+        def __getattr__(self, name):  # create_subscription, create_client, ...
+            return lambda *a, **k: None
+
+    for name in ("ActionClient", "Buffer", "TransformListener"):
+        monkeypatch.setattr(client_mod, name, lambda *a, **k: None)
+    return client_mod.PlannerClient(_Node())
+
+
+def test_the_joint_states_history_keeps_the_newest_in_order_and_hands_out_a_copy(monkeypatch):
+    """What the arm does after an arrival is read from what the client heard
+    (runner._note_settle): the newest JOINT_HISTORY_N messages — 3 s and
+    more of a ~98 Hz stream, a state_publish_divisor of 1 — each with its
+    stamp, the arm's joints, velocities and efforts in order, the knuckle
+    left out."""
+    c = _listening_client(monkeypatch)
+    n = client_mod.PlannerClient.JOINT_HISTORY_N
+    assert n >= 3 * 100
+    for k in range(n + 50):
+        c._js_cb(_joint_states(k))
+    kept = c.joint_history()
+    assert len(kept) == n
+    stamps = [s.stamp for s in kept]
+    assert stamps == sorted(stamps) and stamps[0] == pytest.approx(1793216726.0 + 50 / 49.0, abs=1e-6)  # 50 dropped
+    assert all(a.t <= b.t for a, b in zip(kept, kept[1:]))
+    k = n + 49
+    assert kept[-1].q == pytest.approx([0.001 * k + 0.1 * i for i in range(7)]) and kept[-1].q == c.joints()
+    assert kept[-1].qd == pytest.approx([0.01 * k] * 7) and kept[-1].effort == [1.0] * 7
+    # a copy: what is heard after it changes nothing in it
+    c._js_cb(_joint_states(n + 50))
+    assert kept[-1].stamp == stamps[-1] and c.joint_history()[-1].stamp > stamps[-1]
+    # since: only what was heard at or after it; a message without velocities keeps none
+    time.sleep(0.002)
+    mid = time.monotonic()
+    c._js_cb(_joint_states(n + 51, velocity=False))
+    (late,) = c.joint_history(since=mid)
+    assert late.qd is None and late.stamp == pytest.approx(1793216726.0 + (n + 51) / 49.0, abs=1e-6)
+
+
+class _ReportingDriver(_Driver):
+    """Replays `n` feedbacks, each with its fraction and the joints it
+    measured, as the driver's sampler does every tick."""
+
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        self.goals.append(goal)
+        for k in range(self.n):
+            fb = ExecuteJointTrajectory.Feedback(fraction_complete=k / self.n,
+                                                 actual=JointTrajectoryPoint(positions=[k * 1e-3] * 7))
+            feedback_callback(SimpleNamespace(feedback=fb))
+        return _Future(_GoalHandle(0, ""))
+
+
+def test_every_tenth_feedback_is_kept_with_its_fraction_and_when_it_was_heard():
+    """The driver's 1 kHz feedback was heard and deserialized for its
+    fraction alone: every 10th now keeps the joints it measured too, for the
+    run record's side file — and every one still moves the progress."""
+    driver = _ReportingDriver(95)
+    c = _client(driver)
+    t0 = time.monotonic()
+    end = [v + 0.05 for v in LIVE]
+    outcome, info = c.execute(_traj(LIVE, end), 1.0)
+    assert outcome == "arrived"
+    kept = list(info["feedback_q"])
+    assert [round(f * 95) for _t, f, _q in kept] == list(range(0, 95, 10))  # the 1st, the 11th, ... the 91st
+    for (_t, _f, q), k in zip(kept, range(0, 95, 10)):
+        assert q == pytest.approx([k * 1e-3] * 7)
+    assert t0 <= info["sent_at"] <= kept[0][0] <= kept[-1][0] <= time.monotonic()
+    assert list(info["sent_traj"].points[-1].positions) == pytest.approx(end)
+    assert info["progress"] == pytest.approx(94 / 95)
+
+
+def test_the_feedback_kept_is_bounded_to_the_newest(monkeypatch):
+    monkeypatch.setattr(client_mod.PlannerClient, "FEEDBACK_KEEP", 5)
+    _outcome, info = _client(_ReportingDriver(200)).execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert [round(f * 200) for _t, f, _q in info["feedback_q"]] == [150, 160, 170, 180, 190]
+
+
+def test_a_refused_trajectory_reports_nothing_sent():
+    away = [LIVE[0] + 0.1] + LIVE[1:]
+    outcome, info = _client().execute(_traj(away, away), 1.0)
+    assert outcome == "failed" and "sent_at" not in info and "feedback_q" not in info
+
+
+def test_every_goal_that_goes_to_the_driver_is_timed():
+    """An arrival's settle window ends where the next goal begins
+    (runner._note_settle): every execution's send and a release's are
+    kept, oldest first."""
+    from collections import deque
+
+    c = _client(_Driver())
+    c._sent_at = deque(maxlen=client_mod.PlannerClient.GOALS_KEPT)
+    c.compliant = True
+    t0 = time.monotonic()
+    _outcome, info = c.execute(_traj(LIVE, [v + 0.05 for v in LIVE]), 1.0)
+    assert c.release()
+    sent = c.goals_sent()
+    assert len(sent) == 2 and t0 <= sent[0] <= info["sent_at"] <= sent[1] <= time.monotonic()
+
+
+def test_a_ctrl_c_leaves_what_went_out_where_the_runner_keeps_it_from(monkeypatch):
+    """A Ctrl+C raises through execute once the cancel and the release are
+    out, with nothing returned: what the call kept is last_execution, from
+    which the runner keeps the stopped motion's side file
+    (runner._keep_aborted). A call stopped before anything went out leaves
+    its own there, nothing sent — never the call before's."""
+    t0 = time.monotonic()
+    c, d, _h = _ctrl_c_mid_goal(monkeypatch)
+    info = c.last_execution
+    assert t0 <= info["sent_at"] <= time.monotonic() and len(d.goals) == 2  # the leg, its release
+    assert list(info["sent_traj"].points[-1].positions) == pytest.approx([v + 0.05 for v in LIVE])
+    assert list(info["feedback_q"]) == []  # this driver sends no feedback
+    with pytest.raises(KeyboardInterrupt):  # the abort flag still up: the next leg never starts
+        c.execute(_traj(MID, [v + 0.05 for v in LIVE]), 1.0)
+    assert c.last_execution is not info and "sent_at" not in c.last_execution
+
+
+# -- a still arm before a camera read at rest, or a grip's close ---------------
+
+# 15:45's second look (2026-10-28, /joint_states at 49 Hz): the fastest |qd|
+# of any joint at each reading from its arrival on (rad/s) — under 0.02 once
+# where joint_2 turns back (+0.07 s), joint_2 creeping back from 45 mrad past
+# its end at up to 0.13, then joint_6 — still from +0.72 s for good
+LOOK_1545 = [0.070, 0.038, 0.024, 0.018, 0.050, 0.065, 0.087, 0.093, 0.105, 0.116, 0.119, 0.129, 0.125, 0.124,
+             0.123, 0.122, 0.121, 0.104, 0.101, 0.088, 0.086, 0.080, 0.075, 0.071, 0.066, 0.060, 0.065, 0.054,
+             0.052, 0.043, 0.045, 0.033, 0.032, 0.030, 0.027, 0.017, 0.015, 0.012, 0.008, 0.003, 0.002, 0.000,
+             0.000, 0.000]
+
+
+def _reading(k, speed, q2, velocity=True):
+    """/joint_states message `k` of a 49 Hz stream, stamped on the
+    driver's clock: joint_2 at `q2`, moving at `speed` (rad/s), the other
+    joints at rest; without `velocity`, positions only."""
+    from sensor_msgs.msg import JointState
+
+    m = JointState()
+    t = 1793216799.6768 + k / 49.0
+    m.header.stamp.sec = int(t)
+    m.header.stamp.nanosec = int(round((t - int(t)) * 1e9))
+    m.name = ["arm_joint_%d" % i for i in range(1, 8)] + ["arm_robotiq_85_left_knuckle_joint"]
+    m.position = [0.1, q2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    m.velocity = [0.0, -speed] + [0.0] * 5 + [float("nan")] if velocity else []
+    m.effort = [1.0] * 7 + [float("nan")]
+    return m
+
+
+def _still_stream(monkeypatch, speeds, velocity=True):
+    """A listening client on a scripted clock: each spin moves it one period
+    of a 49 Hz stream and hears the next of `speeds` — joint_2 moving at it
+    (_reading), None a spin that hears nothing — and past them the arm at
+    rest. Returns (the client, the clock: its time and readings so far)."""
+    c = _listening_client(monkeypatch)
+    clock = {"t": 500.0, "k": 0, "q2": 0.3}
+    monkeypatch.setattr(client_mod, "time", SimpleNamespace(monotonic=lambda: clock["t"]))
+
+    def spin(node, timeout_sec=0.0):
+        clock["t"] += 1.0 / 49.0
+        k = clock["k"]
+        clock["k"] += 1
+        speed = speeds[k] if k < len(speeds) else 0.0
+        if speed is not None:
+            clock["q2"] -= speed / 49.0
+            c._js_cb(_reading(k, speed, clock["q2"], velocity))
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", spin)
+    return c, clock
+
+
+def test_the_creep_after_the_look_is_not_still_and_the_arm_at_rest_after_it_is(monkeypatch):
+    """15:45's second look, its own readings: the camera's still test passed
+    frames while joint_2 crept back. Every joint under STILL_QD_RAD_S for
+    STILL_HOLD_S is still — not the one reading under it where joint_2
+    turns back, but the fifth in a row from +0.72 s, the 40th reading (the
+    bag's +0.80 s: the creep over, joint_6 between two swings, the tool
+    1.2 mm from where it stood when the way in left). Nothing goes to the
+    driver: the wait only spins the node."""
+    c, clock = _still_stream(monkeypatch, LOOK_1545)
+    waited, timed_out = c.wait_still()
+    assert not timed_out
+    assert clock["k"] == 40 and waited == pytest.approx(40 / 49.0)
+    assert c.goals_sent() == []
+    # the same readings without velocities: their positions over their stamps
+    c, clock = _still_stream(monkeypatch, LOOK_1545, velocity=False)
+    assert c.wait_still() == (pytest.approx(40 / 49.0), False) and clock["k"] == 40
+
+
+def test_a_joint_turning_back_through_zero_is_not_still(monkeypatch):
+    """The way homes of 15:45 turned back through zero at +0.70-0.73 s, two
+    readings under STILL_QD_RAD_S, and swung on 17 mm. Still is five
+    readings in a row at 49 Hz (STILL_HOLD_S): four are not."""
+    turn = [0.15, 0.06, 0.002, 0.009, 0.04, 0.10] + [0.0] * 5
+    c, clock = _still_stream(monkeypatch, turn)
+    assert not c.wait_still()[1] and clock["k"] == 11  # the fifth at rest, not the turn
+    four = [0.10] + [0.01] * 4 + [0.10] + [0.0] * 5
+    c, clock = _still_stream(monkeypatch, four)
+    assert not c.wait_still()[1] and clock["k"] == 11
+
+
+def test_a_wait_right_after_another_finds_the_arm_still_at_once_never_on_what_was_heard_before_a_goal(monkeypatch):
+    """knob_look's recheck aims right after its aim, nothing flown between:
+    the readings heard since say the arm stands still, and one fresh
+    reading is enough. Nothing heard before the call, as after a long
+    plan, takes five; so does what was heard before the last goal went
+    out, which says nothing of the arm since, and a stream silent longer
+    than STILL_GAP_S (the aim drops messages between frames) — shorter,
+    the readings either side of it are one still stretch."""
+    gap = int(client_mod.PlannerClient.STILL_GAP_S * 49) + 1
+    c, clock = _still_stream(monkeypatch, [0.0] * 11 + [None] * 5 + [0.0] + [None] * gap + [0.0] * 20)
+    assert c.wait_still() == (pytest.approx(5 / 49.0), False)  # nothing heard before it: five readings
+    assert c.wait_still() == (pytest.approx(1 / 49.0), False) and clock["k"] == 6  # right after: one
+    clock["t"] += 0.001
+    c._mark_sent()  # a goal went out after the last reading was heard (the arm at rest all the same)
+    assert c.wait_still() == (pytest.approx(5 / 49.0), False) and clock["k"] == 11
+    assert c.wait_still() == (pytest.approx(6 / 49.0), False)  # silent 0.10 s: still since before it
+    assert c.wait_still() == (pytest.approx((gap + 5) / 49.0), False)  # silent 0.27 s: five more
+
+
+def test_the_wait_runs_out_carries_on_and_says_so_in_one_line(monkeypatch, capsys):
+    """Nothing waits longer than STILL_TIMEOUT_S: the run carries on, one
+    line saying which joint was still moving and how fast — or that no
+    reading said."""
+    c, _clock = _still_stream(monkeypatch, [0.05] * 200)
+    waited, timed_out = c.wait_still()
+    assert timed_out and waited == pytest.approx(client_mod.PlannerClient.STILL_TIMEOUT_S, abs=1.0 / 49.0)
+    assert capsys.readouterr().out.splitlines() == [
+        "[client] the arm is not still after 1.2 s (arm_joint_2 at 0.050 rad/s at the last reading) — carrying on"]
+    c, _clock = _still_stream(monkeypatch, [None] * 200)  # the stream silent
+    assert c.wait_still()[1]
+    assert capsys.readouterr().out.splitlines() == [
+        "[client] the arm is not still after 1.2 s (no /joint_states reading says how fast it moves) — carrying on"]
+
+
+def test_a_ctrl_c_while_the_arm_settles_ends_the_run_as_a_ctrl_c(monkeypatch):
+    """No goal is in flight while the wait spins, so a Ctrl+C raises at once
+    (abort.sigint_handler), and raised inside a subscription's take it
+    surfaces as RuntimeError (press_demo._spin_detect): the wait hands it
+    on as the KeyboardInterrupt it is — main's exit 130, not a traceback.
+    A RuntimeError with no Ctrl+C behind it goes on as it is."""
+    from rammp_box_opening.runtime.abort import AbortFlag, sigint_handler
+
+    c, _clock = _still_stream(monkeypatch, [0.05] * 200)
+    c._abort = AbortFlag()
+    handler = sigint_handler(c._abort)
+
+    def ctrl_c_in_a_take(node, timeout_sec=0.0):
+        try:
+            handler(2, None)
+        except KeyboardInterrupt as e:
+            raise RuntimeError("the take failed") from e
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", ctrl_c_in_a_take)
+    with pytest.raises(KeyboardInterrupt):
+        c.wait_still()
+    c._abort = AbortFlag()  # nobody pressed Ctrl+C
+
+    def broken(node, timeout_sec=0.0):
+        raise RuntimeError("the context is gone")
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", broken)
+    with pytest.raises(RuntimeError, match="the context is gone"):
+        c.wait_still()
+
+
+def test_still_is_the_newest_readings_each_joint_under_the_limit_none_further_apart_than_the_gap():
+    """still_for: from the first of the trailing run of readings under the
+    limit, by their stamps (a message sent unstamped: when it was heard),
+    to the newest; 0.0 when the newest moves; a reading further from the
+    one before it than the gap begins the run again; the count stops at
+    `enough`."""
+    S = client_mod.JointSample
+    rest, q = [0.0] * 7, [0.0] * 7
+    gap = client_mod.PlannerClient.STILL_GAP_S
+    run = [S(0.0, 10.0 + 0.02 * k, q, rest, None) for k in range(6)]
+    assert client_mod.still_for(run, 0.02, gap) == pytest.approx(0.10)
+    assert client_mod.still_for(run, 0.02, gap, enough=0.03) == pytest.approx(0.04)  # the first past 0.03
+    moved = run[:3] + [S(0.0, 10.06, q, [0.0, 0.0, 0.0, 0.0, 0.0, 0.021, 0.0], None)] + run[4:]
+    assert client_mod.still_for(moved, 0.02, gap) == pytest.approx(0.02)  # since the reading that moved
+    assert client_mod.still_for(moved[:4], 0.02, gap) == 0.0
+    late = run + [S(0.0, 10.10 + gap + 0.01, q, rest, None)]
+    assert client_mod.still_for(late, 0.02, gap) == 0.0  # alone after the gap
+    unstamped = [S(3.0 + 0.02 * k, 0.0, q, rest, None) for k in range(5)]
+    assert client_mod.still_for(unstamped, 0.02, gap) == pytest.approx(0.08)
+    assert client_mod.still_for([], 0.02, gap) == 0.0

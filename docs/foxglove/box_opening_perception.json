@@ -1,0 +1,339 @@
+{
+  "configById": {
+    "3D!boxopening": {
+      "cameraState": {
+        "perspective": true,
+        "distance": 1.6,
+        "phi": 58,
+        "thetaOffset": 210,
+        "targetOffset": [
+          0.5,
+          -0.2,
+          0.2
+        ],
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.01,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "followTf": "arm_mount",
+      "scene": {
+        "backgroundColor": "#18181b",
+        "transforms": {
+          "showLabel": false,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/box_opening/viz/markers": {
+          "visible": true
+        },
+        "/scene_camera/color/image_raw/compressed": {
+          "visible": true,
+          "cameraInfoTopic": "/scene_camera/color/camera_info",
+          "distance": 0.6,
+          "planarProjectionFactor": 0,
+          "color": "#ffffff"
+        },
+        "/scene_camera/color/camera_info": {
+          "visible": true
+        },
+        "/wrist_camera/color/camera_info": {
+          "visible": true
+        }
+      },
+      "layers": {
+        "5f0d2c1e-7a3b-4e7c-9a51-0b0c7d1e2f01": {
+          "visible": true,
+          "frameLocked": true,
+          "label": "Grid",
+          "instanceId": "5f0d2c1e-7a3b-4e7c-9a51-0b0c7d1e2f01",
+          "layerId": "foxglove.Grid",
+          "size": 2,
+          "divisions": 20,
+          "lineWidth": 1,
+          "color": "#248eff",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        },
+        "5f0d2c1e-7a3b-4e7c-9a51-0b0c7d1e2f02": {
+          "visible": true,
+          "frameLocked": true,
+          "label": "The arm (/arm/robot_description)",
+          "instanceId": "5f0d2c1e-7a3b-4e7c-9a51-0b0c7d1e2f02",
+          "layerId": "foxglove.Urdf",
+          "sourceType": "topic",
+          "url": "",
+          "filePath": "",
+          "parameter": "",
+          "topic": "/arm/robot_description",
+          "framePrefix": "",
+          "displayMode": "auto",
+          "fallbackColor": "#ffffff",
+          "order": 2
+        }
+      },
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "imageMode": {},
+      "foxglovePanelTitle": "box opening in 3D: TF, the arm, the scene camera, the fix, the aim, the stroke"
+    },
+    "Image!bosceneannotated": {
+      "cameraState": {
+        "distance": 20,
+        "perspective": true,
+        "phi": 60,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "thetaOffset": 45,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "imageMode": {
+        "imageTopic": "/box_opening/viz/scene/annotated/compressed"
+      },
+      "foxglovePanelTitle": "box opening: the scene look (every box judged, the fix)"
+    },
+    "Image!bowristannotated": {
+      "cameraState": {
+        "distance": 20,
+        "perspective": true,
+        "phi": 60,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "thetaOffset": 45,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "imageMode": {
+        "imageTopic": "/box_opening/viz/wrist/annotated/compressed"
+      },
+      "foxglovePanelTitle": "wrist camera: box opening's aim (the frame it judged, button, lid, hits)"
+    },
+    "Image!scenecolor": {
+      "cameraState": {
+        "distance": 20,
+        "perspective": true,
+        "phi": 60,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "thetaOffset": 45,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "imageMode": {
+        "imageTopic": "/scene_camera/color/image_raw/compressed"
+      },
+      "foxglovePanelTitle": "scene camera colour"
+    },
+    "Image!rfdetroverlay": {
+      "cameraState": {
+        "distance": 20,
+        "perspective": true,
+        "phi": 60,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "thetaOffset": 45,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "imageMode": {
+        "imageTopic": "/perception/scene_segmenter/overlay/compressed"
+      },
+      "foxglovePanelTitle": "RF-DETR scene segmenter overlay"
+    },
+    "RawMessages!bostatus": {
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "topicPath": "/box_opening/viz/status.data",
+      "fontSize": 16,
+      "foxglovePanelTitle": "box opening: the phase and the last decision"
+    },
+    "RosOut!rosout": {
+      "searchTerms": [],
+      "minLogLevel": 1,
+      "topicToRender": "/rosout",
+      "foxglovePanelTitle": "/rosout"
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "first": {
+      "first": "3D!boxopening",
+      "second": {
+        "first": "RawMessages!bostatus",
+        "second": "RosOut!rosout",
+        "direction": "row",
+        "splitPercentage": 55
+      },
+      "direction": "column",
+      "splitPercentage": 74
+    },
+    "second": {
+      "first": {
+        "first": "Image!bosceneannotated",
+        "second": "Image!bowristannotated",
+        "direction": "row"
+      },
+      "second": {
+        "first": "Image!scenecolor",
+        "second": "Image!rfdetroverlay",
+        "direction": "row"
+      },
+      "direction": "column",
+      "splitPercentage": 58
+    },
+    "direction": "row",
+    "splitPercentage": 42
+  }
+}

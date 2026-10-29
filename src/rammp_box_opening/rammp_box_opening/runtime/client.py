@@ -11,13 +11,18 @@ The spec §6 hardening stands: the guard is ARMED by execution feedback
 progress > 0 (never at goal-accept) and efforts come from the /joint_states
 stream. What the driver does not check before it moves — the start state,
 velocity limits, timing — is checked here (runtime/driver.py), and nothing
-moves at all unless this client was armed by --execute.
+moves at all unless this client was armed by --execute. What the planner
+calls a success is checked too (runtime/planner.py): a plan is handed on
+only when it ends where it was asked (PlannerClient.PLAN_END_*), and never
+as it came when the planner says it goes the long way round.
 """
 
 import copy
+import math
 import sys
+import threading
 import time
-from collections import namedtuple
+from collections import deque, namedtuple
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -59,7 +64,7 @@ from rammp_box_opening.constants import (  # noqa: F401 - GAINS_* are re-exporte
     JOINTS,
     NODE_NAMESPACE,
 )
-from rammp_box_opening.runtime import driver
+from rammp_box_opening.runtime import driver, planner
 from rammp_box_opening.runtime.approach import plan_with_vertical_approach
 from rammp_box_opening.runtime.branches import joint_time, nearest_branch, planner_branch
 from rammp_box_opening.runtime.stamps import set_stamp
@@ -77,6 +82,56 @@ LATEST_WINS = 1  # replaces the goal running, and any queued behind it, at once 
 
 # a gripper command in flight: knuckle-radian target, the knuckle at send, when
 GripperHandle = namedtuple("GripperHandle", "target start t0")
+# one /joint_states message as PlannerClient.joint_history keeps it: when it
+# was heard (time.monotonic()), its header stamp (s, the driver's clock: when
+# it was measured), and the arm's joints in order — positions, velocities and
+# efforts, None where the message carried none
+JointSample = namedtuple("JointSample", "t stamp q qd effort")
+
+
+def _measured_at(s):
+    """When the JointSample `s` was measured: its stamp, else (a message
+    sent unstamped) when it was heard."""
+    return s.stamp if s.stamp else s.t
+
+
+def _speeds(samples, i):
+    """Each joint's speed (rad/s) at samples[i]: its velocities, else its
+    positions differenced, wrap-aware, over when it and the reading before
+    it were measured; None where neither says."""
+    s = samples[i]
+    if s.qd is not None:
+        return [abs(float(v)) for v in s.qd]
+    if i == 0:
+        return None
+    dt = _measured_at(s) - _measured_at(samples[i - 1])
+    if not dt > 0.0:
+        return None
+    from rammp_box_opening.geometry import ang_diff
+
+    return [abs(ang_diff(a, b)) / dt for a, b in zip(s.q, samples[i - 1].q)]
+
+
+def still_for(samples, qd_max, gap_s, enough=None):
+    """How long the newest of `samples` (JointSample, oldest first) have read
+    the arm still, by when they were measured: from the first of the
+    trailing run in which every reading has each joint under `qd_max`
+    (_speeds) and was measured at most `gap_s` after the reading before it,
+    to the newest. 0.0 when the newest is not still; the count stops once
+    it reaches `enough`."""
+    newest = first = None
+    for i in range(len(samples) - 1, -1, -1):
+        v = _speeds(samples, i)
+        if v is None or not all(x < qd_max for x in v):
+            break
+        t = _measured_at(samples[i])
+        if first is not None and not 0.0 <= first - t <= gap_s:
+            break
+        newest = t if newest is None else newest
+        first = t
+        if enough is not None and newest - first >= enough:
+            break
+    return 0.0 if newest is None else newest - first
 
 
 def fill_gains(msg, spec):
@@ -106,6 +161,30 @@ def spin_until_done(node, future, timeout_s, abort=None):
     return future.result()
 
 
+def pose_goal_joints(xyz, quat_xyzw, start_joints):
+    """The joints a pose goal from `start_joints` is planned to
+    (PlannerClient._plan_pose_near): of the arm's own IK solutions for
+    tool_frame at (xyz, quat_xyzw), the one quickest to fly to from the
+    start (kinematics.ArmChain.nearest_solution), walked from there or else
+    from the look above HOME — or None, where it finds none or the
+    kinematics fail, and the pose goes to the planner as a pose. The
+    reach-out asks first, to prove its press from these joints before the
+    planner is asked for the look (tasks/reach_press.plan_reach); asked
+    again with the same numbers the chain answers from its last answer
+    (nearest_solution), so the plan request that follows is the one it
+    always was."""
+    if not start_joints:
+        return None
+    try:
+        from rammp_box_opening.constants import HOME
+        from rammp_box_opening.primitives.look import look_joints
+        from rammp_box_opening.runtime.approach import _chain
+
+        return _chain().nearest_solution(planner_branch(start_joints), xyz, quat_xyzw, seeds=(look_joints(HOME),))
+    except Exception:  # a kinematics problem must never cost the plan
+        return None
+
+
 class PlannerClient:
     # a pending gripper setpoint is re-sent this often: the topic is
     # best-effort and latest-wins, so one lost message must not strand a
@@ -126,6 +205,19 @@ class PlannerClient:
         self._q = None
         self._eff = None
         self._eff_at = 0.0  # monotonic stamp of the last joint_states message
+        # the newest JOINT_HISTORY_N /joint_states messages, oldest first
+        # (joint_history), appended under the lock by whichever thread
+        # spins this node
+        self._history = deque(maxlen=self.JOINT_HISTORY_N)
+        self._history_lock = threading.Lock()
+        # when each goal went to the driver (time.monotonic()), newest last:
+        # what the arm does after an arrival stops being that arrival's
+        # settle when the next goal goes out (goals_sent)
+        self._sent_at = deque(maxlen=self.GOALS_KEPT)
+        # the last execute call's info, filled as it runs: a Ctrl+C's
+        # unwinding hands none back, and the runner keeps the stopped
+        # motion's side file from this (runner._keep_aborted)
+        self.last_execution = None
         # Set on first /joint_states message: 'joint_1..7' on bench,
         # 'arm_joint_1..7' on flatbot (nightly driver renders arm_mount URDF).
         self._active_joints = None
@@ -180,6 +272,17 @@ class PlannerClient:
         return self._active_joints if self._active_joints is not None else list(JOINTS)
 
     # -- state streams -----------------------------------------------------
+    # What the arm does after the driver calls a goal arrived is read from
+    # here (runner._note_settle). /joint_states runs 49 Hz on flatbot (the
+    # driver's state_publish_divisor 2; 1 would be ~98 Hz), so 600 messages
+    # are 6-12 s: an arrival's settle window (runner.SETTLE_WINDOW_S, 1.5 s)
+    # is noted when the next goal goes out, the aim or the planning between.
+    # Its stamp, not when it was heard, says when the arm was where it says:
+    # the aim spins this node once a frame and the subscription keeps 5
+    # (SensorDataQoS), so between frames messages wait, and some are dropped
+    JOINT_HISTORY_N = 600
+    GOALS_KEPT = 8
+
     def _js_cb(self, msg):
         if self._active_joints is None:
             if "arm_joint_1" in msg.name:
@@ -200,11 +303,19 @@ class PlannerClient:
                 if len(msg.effort) == len(msg.name)
                 else None
             )
+            qd = (
+                [float(msg.velocity[idx[n]]) for n in self._active_joints]
+                if len(msg.velocity) == len(msg.name)
+                else None
+            )
         except (KeyError, IndexError):
             return
         self._q = q
         self._eff = eff
         self._eff_at = time.monotonic()
+        stamp = msg.header.stamp
+        with self._history_lock:
+            self._history.append(JointSample(self._eff_at, stamp.sec + 1e-9 * stamp.nanosec, q, qd, eff))
         for name in msg.name:
             if any(h in name for h in _GRIPPER_JOINT_HINTS):
                 self._gripper_pos = float(msg.position[idx[name]])
@@ -224,6 +335,30 @@ class PlannerClient:
                     "shell export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp?"
                 )
         return list(self._q)
+
+    def joint_history(self, since=None):
+        """The /joint_states messages kept (JointSample, the newest
+        JOINT_HISTORY_N), oldest first: a copy, only those heard at or after
+        `since` (time.monotonic()) when it is given. Spins nothing, waits
+        for nothing: what this node has heard is what there is."""
+        lock = getattr(self, "_history_lock", None)
+        if lock is None:
+            return []
+        with lock:
+            kept = list(self._history)
+        return kept if since is None else [s for s in kept if s.t >= since]
+
+    def goals_sent(self):
+        """When each of the last GOALS_KEPT goals went to the driver
+        (time.monotonic()), oldest first: every execution, the hold that
+        primes the joint impedance and the release."""
+        return list(getattr(self, "_sent_at", ()))
+
+    def _mark_sent(self):
+        """A goal is about to go to the driver: when (goals_sent)."""
+        sent = getattr(self, "_sent_at", None)
+        if sent is not None:
+            sent.append(time.monotonic())
 
     # A guarded leg polls wrist_efforts() and trips on deviation from a
     # baseline. If the /joint_states subscription STALLS, self._eff keeps
@@ -284,6 +419,86 @@ class PlannerClient:
         q = [q0[j] + sum(ang_diff(row[j], q0[j]) for row in qs) / n for j in range(len(q0))]
         return [sum(c) / n for c in zip(*effs)], q
 
+    # A camera read at rest, and a grip's close, wait here for the arm to
+    # stand still (wait_still; the runner notes it, runner.wait_still).
+    # "Arrived" is the driver's trajectory clock running out, and the
+    # camera's own still test (perception/depth_source STILL_TRANS_M 4 mm,
+    # STILL_ROT_RAD 0.02 between processed frames 75-90 ms apart) passes an
+    # arm creeping 22-25 mm/s: on 2026-10-28 15:45 both looks arrived with
+    # joint_2 45-47 mrad past their end and crept back at up to 0.12-0.13
+    # rad/s, and at 16:23 the look's aim took its first two hits 0.32 and
+    # 0.41 s in, the knob -7.2 and -5.5 mm above its lid where the two that
+    # agreed after them read +1.1 and +0.7. On 15:45's /joint_states
+    # (49 Hz) the arm at rest read at most 0.0032 rad/s on any joint in
+    # RIGID at zeta 0.7 (50 s at HOME; at 1.0 unmeasured: the first run's
+    # 'still' notes show it) and 0.0010 in POSITION (200 s), and the looks'
+    # creep read over STILL_QD_RAD_S to +0.70 s. A settling joint turns
+    # back through zero, one or two readings under it (the look's turn at
+    # +0.07 s, the way homes' at +0.70-0.73), where STILL_HOLD_S takes five
+    # in a row at 49 Hz: the looks passed at +0.81 s, the POSITION home at
+    # +0.08 (+0.10 by positions). The looks' pass is the creep over, not
+    # the arm at its last rest: joint_6 stopped between two swings, the
+    # tool 1.2-1.5 mm from where it stood when the way in left (+1.4-1.6 s),
+    # drifting back at up to 5 mm/s (joint_6 at up to 0.012-0.017 rad/s),
+    # within 1 mm of it for good from +1.03-1.07 s — far inside the
+    # camera's still test, and each frame's pose is TF's at its stamp.
+    # Readings further apart than STILL_GAP_S make no one still stretch
+    # (the aim spins this node once a frame, and between frames messages
+    # are dropped): the arm swings at 0.7-1.1 Hz, its turns 0.45 s and more
+    # apart. The way homes, 86-88 mm short when they ended, passed only at
+    # +1.49-1.50 s: past STILL_TIMEOUT_S, and the wait carries on (no
+    # camera reads there).
+    STILL_QD_RAD_S = 0.02
+    STILL_HOLD_S = 0.08
+    STILL_GAP_S = 0.25
+    STILL_TIMEOUT_S = 1.2
+
+    def wait_still(self):
+        """Wait, the arm at rest after a motion, until it stands still: every
+        joint under STILL_QD_RAD_S in each /joint_states reading over
+        STILL_HOLD_S (still_for), of those heard since the last goal went to
+        the driver (goals_sent), the newest heard during this call — so a
+        call right after another, nothing sent between, finds it still at
+        once. Returns (s waited, timed out): after STILL_TIMEOUT_S it
+        carries on, saying so in one line. Sends nothing and stops nothing:
+        it spins this node while the arm settles (or the stream is
+        silent), no more.
+
+        No goal is in flight here, so a Ctrl+C raises at once
+        (abort.sigint_handler); raised inside a subscription's take it
+        surfaces as RuntimeError (press_demo._spin_detect), and goes on as
+        the KeyboardInterrupt it is: the run ends as a Ctrl+C (exit 130),
+        not a traceback."""
+        t0 = time.monotonic()
+        sent = self.goals_sent()
+        since = sent[-1] if sent else None
+        last = None
+        while True:
+            try:
+                rclpy.spin_once(self.node, timeout_sec=0.02)
+            except RuntimeError as e:
+                if self._abort is not None and self._abort.requested:
+                    raise KeyboardInterrupt from e
+                raise
+            waited = time.monotonic() - t0
+            if self._eff_at != last:  # a new reading to judge
+                last = self._eff_at
+                kept = self.joint_history(since=since)
+                if (kept and kept[-1].t > t0
+                        and still_for(kept, self.STILL_QD_RAD_S, self.STILL_GAP_S, self.STILL_HOLD_S)
+                        >= self.STILL_HOLD_S):
+                    return waited, False
+            if waited >= self.STILL_TIMEOUT_S:
+                kept = self.joint_history(since=since)
+                v = _speeds(kept, len(kept) - 1) if kept and kept[-1].t > t0 else None
+                if v is None:
+                    said = "no /joint_states reading says how fast it moves"
+                else:
+                    j = max(range(len(v)), key=lambda k: v[k])
+                    said = "%s at %.3f rad/s at the last reading" % (self.joint_names[j], v[j])
+                print("[client] the arm is not still after %.1f s (%s) — carrying on" % (waited, said))
+                return waited, True
+
     def efforts_present(self):
         self.joints()  # ensure at least one message arrived
         return self._eff is not None
@@ -338,9 +553,9 @@ class PlannerClient:
     def planner_reachable(self, timeout_s=5.0):
         """True when both planner actions AND its set_world service respond.
 
-        set_world is the first thing every plan calls, and it is advertised
-        only once cuRobo has finished loading, so an action that answers
-        before it does is not a planner that can plan yet."""
+        set_world is advertised only once cuRobo has finished loading, so
+        an action that answers before it does is not a planner that can plan
+        yet (box opening never calls it: worlds.py)."""
         return (
             self._plan_pose.wait_for_server(timeout_sec=timeout_s)
             and self._plan_joints.wait_for_server(timeout_sec=2.0)
@@ -373,9 +588,77 @@ class PlannerClient:
         return sorted({n for n, _ns in self.node.get_node_names_and_namespaces() if n in self.OTHER_ARM_CLIENTS})
 
     # -- planning ----------------------------------------------------------
+    # The planner plans one goal at a time and turns any other away at once,
+    # unplanned: "planner busy — one plan at a time" (planner_node.py
+    # _finish_plan, which leaves no line of it in its own log). Teleop's
+    # home, the microwave engine and the driver's GoTo actions plan on the
+    # same node, 0.14-0.34 s a plan on 2026-10-28 (p10-p90 of 72): a goal
+    # that lands in one of theirs is asked again, BUSY_RETRIES times
+    # BUSY_WAIT_S apart, before it fails as it always did.
+    BUSY_RETRIES = 2
+    BUSY_WAIT_S = 0.2
+
+    # A plan's END is checked against what was asked before anything uses
+    # it: the arm flies what comes back, and the leg after it starts there
+    # (core._plan_motion's goal_joints). A joint plan ends ON its goal — the
+    # native solve to ~5e-7 rad (rammp-curobo CLAUDE.md, 2026-08-11; its
+    # smoke test bounds it at 1e-3). Where that solve fails, PlanToJoints
+    # falls back to planning to the goal's FK pose (3 of 72 plans on
+    # 2026-10-28, 13:32-13:34: TRAJOPT_FAIL on joint goals from a client
+    # the planner report never identified): the same tool to cuRobo's
+    # 5 mm / 5.7 deg, through whatever joints its IK finds, another elbow
+    # or wrist among them, said only in goal_mismatch_rad, which nothing
+    # here read. cuRobo v0.7.8's finetune can also hand back the previous
+    # solve's plan as a success (rammp-curobo #37: 3-7 of 200 in its
+    # probe), which the start gate catches only when the two starts differ.
+    # 0.01 rad is ten times that smoke test's bound and at most 10.2 mm at
+    # the tool (one joint off, 2000 postures on flatbot's URDF, offline
+    # 2026-10-28).
+    PLAN_END_RAD = 0.01
+    # A pose plan meets cuRobo's own success test: the tool within
+    # position_threshold 0.005 m and rotation_threshold 0.05 of its pose
+    # (motion_gen.py's defaults, which the rammp config leaves alone) — the
+    # error quaternion's vector part, sin(turn/2) < 0.05, 5.73 deg, as the
+    # planner's own planner.py and PlanToPose.action read it. The arm's FK
+    # here agrees with the planner's to 0.01 mm, so a plan that met the
+    # test for THIS pose is inside these, and one outside them met it for
+    # some other.
+    PLAN_END_M = 0.006
+    PLAN_END_DEG = 6.0
+
+    # Every plan this client refused (_refuse), oldest first, a tuple that
+    # each refusal adds one to. The run record keeps the ones made while a
+    # leg was planned (core._plan_motion, Runner._replan_group): a refused
+    # joint plan the pose plan then stood in for leaves no other trace.
+    refusals = ()
+
+    def _refuse(self, res, why):
+        """planner.refuse(res, why): the failed plan a caller gets in place
+        of `res`, its message kept in `refusals`."""
+        out = planner.refuse(res, why)
+        self.refusals += (out.message,)
+        return out
+
     def _call(self, client, goal, timeout_s=120.0):
+        """The planner's result for `goal` (None: not taken, or no answer in
+        `timeout_s`), asked again while the planner answers that it is busy
+        with another plan (BUSY_RETRIES): then its last answer, a failed
+        plan as before. A Ctrl+C ends the wait at once."""
         if not client.wait_for_server(timeout_sec=5.0):
             sys.exit("planner not reachable — is sheppy's `planner` node up?")
+        res = self._ask(client, goal, timeout_s)
+        for n in range(1, self.BUSY_RETRIES + 1):
+            if not planner.busy(res):
+                break
+            print("[client] planner busy (another goal is planning) — asking again in %.1f s (%d/%d)"
+                  % (self.BUSY_WAIT_S, n, self.BUSY_RETRIES))
+            if not self._spin_for(self.BUSY_WAIT_S):
+                break  # aborted: the busy answer stands, a failed plan
+            res = self._ask(client, goal, timeout_s)
+        return res
+
+    def _ask(self, client, goal, timeout_s):
+        """One round trip of `goal` to the planner action `client`."""
         send = spin_until_done(
             self.node, client.send_goal_async(goal), 10.0, abort=self._abort
         )
@@ -385,6 +668,19 @@ class PlannerClient:
             self.node, send.get_result_async(), timeout_s, abort=self._abort
         )
         return None if wrapped is None else wrapped.result
+
+    def _spin_for(self, seconds):
+        """Serve this node for `seconds` — a plan hosted inside an execution
+        (execute's while_running) keeps its feedback flowing — or False at
+        once when an abort is requested."""
+        t_end = time.monotonic() + float(seconds)
+        while True:
+            if self._abort is not None and self._abort.requested:
+                return False
+            left = t_end - time.monotonic()
+            if left <= 0.0:
+                return True
+            rclpy.spin_once(self.node, timeout_sec=min(left, 0.05))
 
     def plan_to_pose(self, xyz, quat_xyzw, start_joints, approach_offset_m=0.0):
         """>0 approach_offset_m: arrive from a waypoint that far straight above
@@ -404,20 +700,11 @@ class PlannerClient:
         4.7 s approach to a box on the left, bench 2026-09-25). The planner
         still plans and collision-checks the path; when no solution is found
         or its plan fails, the pose goes to it as before."""
-        if start_joints:
-            try:
-                from rammp_box_opening.constants import HOME
-                from rammp_box_opening.primitives.look import look_joints
-                from rammp_box_opening.runtime.approach import _chain
-
-                start = planner_branch(start_joints)
-                q_goal = _chain().nearest_solution(start, xyz, quat_xyzw, seeds=(look_joints(HOME),))
-            except Exception:  # a kinematics problem must never cost the plan
-                q_goal = None
-            if q_goal is not None:
-                res = self.plan_to_joints(q_goal, start_joints)
-                if res is not None and res.success:
-                    return res
+        q_goal = pose_goal_joints(xyz, quat_xyzw, start_joints)
+        if q_goal is not None:
+            res = self.plan_to_joints(q_goal, start_joints)
+            if res is not None and res.success:
+                return res
         return self._no_long_way(self._plan_pose_once(xyz, quat_xyzw, start_joints), start_joints)
 
     # A plan is re-planned when an equivalent end is at least this much quicker
@@ -431,24 +718,40 @@ class PlannerClient:
         way round, or the wrist folded the far way (kinematics.equivalents).
         Then it is re-planned to that end (plan_to_joints); the original stands
         if that plan fails. The arm does not turn a joint round when it does
-        not need to (owner, 2026-09-25)."""
+        not need to (owner, 2026-09-25).
+
+        Except a plan the planner itself says goes the long way round
+        (planner.LONG_WAY_ROUND): its own replan onto the start's branch
+        failed, and it handed the winding plan back as a success (15:56:05
+        2026-10-28, 4.38 s). That one is never flown as it is: it is
+        re-planned to the quickest end whatever that saves, and refused when
+        no end is found, there is no chain to find one by, or that plan
+        fails too."""
         if res is None or not res.success or not start_joints or res.trajectory is None or not res.trajectory.points:
             return res
+        wound = planner.long_way(res)
         try:
             from rammp_box_opening.runtime.approach import _chain
 
             start = planner_branch(start_joints)
             end = [float(v) for v in res.trajectory.points[-1].positions]
             alts = _chain().equivalents(start, end)
-        except Exception:  # a kinematics problem must never cost the plan
-            return res
+        except Exception as e:  # noqa: BLE001 - a kinematics problem never costs a plan the planner did not flag
+            return self._refuse(res, "the plan goes the long way round, and there are no kinematics to find the "
+                                "short way by (%s) — not flown" % e) if wound else res
         if not alts:
-            return res
+            return self._refuse(res, "the plan goes the long way round, and no other way to its end was found — "
+                                "not flown") if wound else res
         best = min(alts, key=lambda q: joint_time(start, q))
-        if joint_time(start, best) > joint_time(start, end) - self.QUICKER_BY_S:
+        if not wound and joint_time(start, best) > joint_time(start, end) - self.QUICKER_BY_S:
             return res
         better = self.plan_to_joints(best, start_joints)
-        return better if better is not None and better.success else res
+        if better is not None and better.success:
+            return better
+        if wound:
+            return self._refuse(res, "the plan goes the long way round, and its re-plan the short way failed (%s) — "
+                                "not flown" % getattr(better, "message", "no answer"))
+        return res
 
     def _plan_pose_once(self, xyz, quat_xyzw, start_joints):
         g = PlanToPose.Goal()
@@ -464,18 +767,72 @@ class PlannerClient:
         # on HOME's side of the wrap: the planner plans between the numbers
         # it is given, and a start written the other way round is a full turn
         g.start_joints = planner_branch(start_joints) if start_joints else []
-        return self._call(self._plan_pose, g)
+        return self._checked_pose(self._call(self._plan_pose, g), xyz, quat_xyzw)
+
+    def _checked_pose(self, res, xyz, quat_xyzw):
+        """`res`, the planner's plan to the tool pose (xyz, quat_xyzw), when
+        it ends there: within PLAN_END_M and PLAN_END_DEG by the arm's own
+        FK, which every plan that met cuRobo's success test for this pose
+        does. One that ends further off is another goal's plan, and refused,
+        as is one with no finite end to measure. With no chain to measure
+        by, it goes on as it always did (a kinematics problem never costs
+        the plan); how far off it ends is in the run record
+        (planner.plan_record)."""
+        if res is None or not getattr(res, "success", False):
+            return res
+        if planner.plan_end(getattr(res, "trajectory", None)) is None:
+            return self._refuse(res, "the plan has no finite end to check against its pose — not flown")
+        err = planner.pose_end_error(res.trajectory, xyz, quat_xyzw)
+        if err is None:
+            return res
+        off, turn = err
+        if off > self.PLAN_END_M or math.degrees(turn) > self.PLAN_END_DEG:
+            return self._refuse(res, "the plan ends %.2f mm and %.2f deg from its pose, past cuRobo's own success "
+                                "test (5 mm, 5.7 deg) — another goal's plan; not flown"
+                                % (1000.0 * off, math.degrees(turn)))
+        return res
 
     def plan_to_joints(self, q7, start_joints):
         """A joint goal, each continuous joint taken the short way round from
         the start (branches.nearest_branch): the same arm configuration,
         never a winding. The planner does this for itself since 1.0.0
-        (_nearest_branch); done here too, it does not depend on that."""
+        (_nearest_branch); done here too, it does not depend on that.
+
+        The plan comes back only if it ends at `q7` (_checked_joints)."""
         start = planner_branch(start_joints) if start_joints else None
         goal = nearest_branch(q7, start) if start is not None else [float(v) for v in q7]
         g = PlanToJoints.Goal(target_joints=goal)
         g.start_joints = start or []  # on HOME's side of the wrap (plan_to_pose)
-        return self._call(self._plan_joints, g)
+        return self._checked_joints(self._call(self._plan_joints, g), q7)
+
+    def _checked_joints(self, res, q7):
+        """`res`, the planner's plan to the joints `q7`, when it ends there:
+        every joint within PLAN_END_RAD, each continuous joint the short way
+        round — the goal went out on the start's branch, a whole turn from
+        `q7` where that is the short way. A plan that ends elsewhere (the
+        FK-pose fallback's other arm, a previous goal's plan) is refused, as
+        is one with no finite end to measure, and one the planner says goes
+        the long way round: the goal it was sent already was the short way,
+        so the long way is all its fallback found. The planner's
+        goal_mismatch_rad is reported with it, not judged: the same gap
+        measured without the wrap (rammp-curobo's planner.py,
+        np.abs(final - q_goal).max()), it reads 6.28 for a joint a turn
+        from its goal."""
+        if res is None or not getattr(res, "success", False):
+            return res
+        rad, j = planner.joint_end_error(getattr(res, "trajectory", None), q7)
+        if rad is None:
+            return self._refuse(res, "the plan has no finite end to check against its joint goal — not flown")
+        if rad > self.PLAN_END_RAD:
+            mismatch = planner.finite(getattr(res, "goal_mismatch_rad", None))
+            return self._refuse(res, "the plan ends %.4f rad from its joint goal (joint %d%s) — the planner's "
+                                "FK-pose fallback, another arm at the same tool pose, or another goal's plan; "
+                                "not flown" % (rad, j + 1, "" if mismatch is None else
+                                               "; goal_mismatch_rad %.4f" % mismatch))
+        if planner.long_way(res):
+            return self._refuse(res, "the plan goes the long way round, where its goal went out the short way — "
+                                "not flown")
+        return res
 
     # -- execution ---------------------------------------------------------
     def _cancel_confirm(self, send, result_future):
@@ -577,10 +934,12 @@ class PlannerClient:
 
     def _note_sent(self, goal):
         """Keep what release() needs of `goal`, about to be sent: its
-        control_mode and a copy of its gains. Nothing has let it go yet."""
+        control_mode and a copy of its gains. Nothing has let it go yet.
+        And when it went (goals_sent)."""
         self._last_mode = int(goal.control_mode)
         self._last_gains = copy.deepcopy(goal.gains)
         self._released = False
+        self._mark_sent()
 
     # release()'s hold: as prime_compliant's, two points at the arm's joints,
     # the first past t=0 (check_like_executor refuses a first point at 0)
@@ -645,6 +1004,7 @@ class PlannerClient:
             goal.gains = self._last_gains
             goal.preemption = LATEST_WINS
             goal.sender_id = "rammp_box_opening"
+            self._mark_sent()
             # no abort: after a Ctrl+C the flag is already set
             send = spin_until_done(self.node, self._execute.send_goal_async(goal), 2.0)
         except Exception as e:  # noqa: BLE001 - a release must never cost the unwinding it rides on
@@ -657,6 +1017,18 @@ class PlannerClient:
         self._released = True
         print("[client] released: the joint spring now holds where the arm stands")
         return True
+
+    # The driver sends a feedback every sampler tick, 1 kHz by code, its
+    # `actual` the measured joints (kinova-gen3-driver 94736cd
+    # supervisor.cpp), and what this node hears of it is deserialized here
+    # anyway: every FEEDBACK_EVERY-th heard is kept (~100 a second, if all
+    # are; how many are has never been measured — the side file's times
+    # say) with its fraction (the driver's own trajectory clock) and when it
+    # was heard — the newest FEEDBACK_KEEP, a minute of motion (the longest
+    # of 2026-10-28 flew 9.2 s, 15:46:37's way in) — for the run record's
+    # side file (runner._keep_flight)
+    FEEDBACK_EVERY = 10
+    FEEDBACK_KEEP = 6000
 
     def execute(self, traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
         """Run one trajectory on the driver; outcome 'arrived' | 'touch' | 'failed'.
@@ -694,8 +1066,17 @@ class PlannerClient:
         this motion instead of after it (the planner is its own container).
         Its blocking plans spin this same node, so feedback keeps flowing;
         its result lands in info["while_running"], an exception in
-        info["while_running_error"] — never past the cancel path."""
+        info["while_running_error"] — never past the cancel path.
+
+        Once the goal goes out, info["sent_at"] is when (time.monotonic()),
+        info["sent_traj"] the trajectory sent (dilated where `speed` asked)
+        and info["feedback_q"] what flew: every FEEDBACK_EVERY-th feedback
+        as (when it was heard, its fraction, the measured joints). The same
+        info is self.last_execution from the call's start: a Ctrl+C raises
+        through here, once the cancel and the release are out, with
+        nothing returned."""
         info = {"message": "", "progress": 0.0, "torque_peak": None, "gains": None}
+        self.last_execution = info
         if self._abort is not None and self._abort.requested:
             raise KeyboardInterrupt  # aborted before this leg ever started
         if not self._armed:
@@ -732,9 +1113,15 @@ class PlannerClient:
         goal.preemption = QUEUE  # never displace a goal that is still settling
         goal.sender_id = "rammp_box_opening"
         self._note_sent(goal)
+        # what flew, at the price of a count and an append a feedback
+        kept, every, heard = deque(maxlen=self.FEEDBACK_KEEP), self.FEEDBACK_EVERY, 0
 
         def _fb(msg):
+            nonlocal heard
             info["progress"] = float(msg.feedback.fraction_complete)
+            if heard % every == 0:
+                kept.append((time.monotonic(), info["progress"], list(msg.feedback.actual.positions)))
+            heard += 1
             if guard is not None:
                 guard.on_progress(info["progress"])
 
@@ -744,6 +1131,7 @@ class PlannerClient:
             self._abort.goal_in_flight = True
         unwinding = False
         try:
+            info.update(sent_at=time.monotonic(), sent_traj=flown, feedback_q=kept)
             send = spin_until_done(
                 self.node,
                 self._execute.send_goal_async(goal, feedback_callback=_fb),
@@ -883,23 +1271,13 @@ class PlannerClient:
 
     # -- services / gripper ------------------------------------------------
     def set_world(self, path_or_name):
-        """Push a world; a no-op when the planner already holds it. This is
-        the ONE record of what the planner holds (plan-time pushes and
-        replans both route here; two trackers drifted, review 2026-09-02).
-        Worlds are content-hashed paths, so equal path == equal world. The
-        planner runs in a container: the path must exist inside it too."""
-        key = str(path_or_name)
-        if key == self.world_held:
-            return True, "held"
-        if not self._set_world.wait_for_service(timeout_sec=5.0):
-            return False, "set_world service unavailable"
-        req = SetWorld.Request(world=key)
-        resp = spin_until_done(self.node, self._set_world.call_async(req), 10.0)
-        if resp is None or not resp.success:
-            self.world_held = None
-            return False, "set_world timed out" if resp is None else resp.message
-        self.world_held = key
-        return True, resp.message
+        """Box opening sends the planner no world (worlds.py): it plans in
+        the one its deployment started it with, world_empty.yaml on flatbot,
+        and refuses an empty scene sent at runtime anyway. Kept as the one
+        place every plan and replan asks, so nothing sneaks a SetWorld in;
+        `path_or_name` (worlds.PLANNER_WORLD) is what it records as held."""
+        self.world_held = str(path_or_name)
+        return True, "box opening sends no world: the planner plans in the one it was started with"
 
     def gripper_cmd(self, position):
         """Command the gripper and wait (knuckle rad: 0.0 open .. 0.8 closed);

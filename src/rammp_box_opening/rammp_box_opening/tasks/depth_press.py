@@ -697,8 +697,8 @@ def turn_down(ctx, runner, contact_tool, ref, q=None, shorts=TURN_SHORT_DEG):
     joints), about its fingertip (`contact_tool`, in tool_frame), guarded:
     `shorts` (turn_down_path's) tried in order. Returns (quat, moved, None)
     — moved False when it already points down — or (None, False, why). A
-    compliant turn stopped part-way, over the button, lets go there
-    (rp.let_go_part_way)."""
+    compliant turn (unguarded, faster: rp.free_guard, rp.free_line_speed)
+    stopped part-way, over the button, lets go there (rp.let_go_part_way)."""
     from rammp_box_opening.runtime import approach
 
     q = ctx.client.joints() if q is None else q
@@ -710,7 +710,7 @@ def turn_down(ctx, runner, contact_tool, ref, q=None, shorts=TURN_SHORT_DEG):
     if short:
         print("[press_demo] TURN: %.0f deg short of straight down (no hand nearer straight down flies here)" % short)
     # in place, the fingertip the pivot: free air, nothing nearer the lid
-    res = runner.run([rp.line_leg(ctx, "depth:turn", pts, quat, FREE_LINE_SPEED, rp.free_guard(ctx, ref),
+    res = runner.run([rp.line_leg(ctx, "depth:turn", pts, quat, rp.free_line_speed(ctx), rp.free_guard(ctx, ref),
                                   _full_world(ctx))], execute=True)
     if any(not r.ok for r in res):
         rp.let_go_part_way(ctx, res)
@@ -1168,7 +1168,7 @@ def compliant_rise(ctx, runner, stroke, held):
     """From the hold back up to where the stroke began: 'depth:rise' from
     where the arm stands back up the stroke (rise_back_up), else a straight
     line to its start (stroke.t0), the lean held — reach_press._rise_legs,
-    as the one-execution way home rises — at FREE_LINE_SPEED
+    as the one-execution way home rises — at rp.free_line_speed
     (compliant_line, labelled with the full world). A bent stroke's end is
     no IK solution: in free air the hand stands there 3-6 deg off the
     attitude the stroke held, and a straight line's first 2 mm step takes
@@ -1256,6 +1256,7 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     moved nothing, and nothing is let go: after the stroke's, the arm
     stands over the button in free air, free to go home."""
     from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks.press_demo import viz_hook
 
     if top_z is None:
         return DepthPress(free=True, why="a compliant press needs the button's height (the aim or the scene camera)")
@@ -1271,6 +1272,7 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     world = _full_world(ctx)
     legs = [compliant_line(ctx, name, pts, quat, speed, world) for name, pts, speed in stroke.legs]
     print("[press_demo] %s" % press_text(stroke, cfg))
+    viz_hook("press", stroke, top_z, cfg)  # the stroke, drawn off this thread (perception/viz)
     try:
         res = runner.run(legs, execute=True)
         if len(res) == 1 and not res[0].ok and (res[0].outcome == "refused" or not res[0].progress):

@@ -174,6 +174,19 @@ def test_the_scene_fix_is_the_first_owl_box_whose_top_is_this_container():
     assert len(got.tried) == 1  # the table box, refused and said why
     none = scene_fix_from_boxes(boxes[:1], pts, uv, table_z, model)
     assert none.pose is None and none.tried
+    # every reason beside the box it refused, the candidate's own object (perception/viz draws it at that box):
+    # one refused at the frame's edge, one by the top-face lift, then the side lift's refusals
+    edge = [0.0, 200.0, 40.0, 240.0]
+    got = scene_fix_from_boxes([(0.70, edge), *boxes], pts, uv, table_z, model, image_wh=(640, 480))
+    assert got.pose is not None and got.box is boxes[1][1]
+    assert len(got.tried) == len(got.tried_boxes) == 2
+    assert got.tried[0].startswith("it runs off the frame at its left edge") and got.tried_boxes[0] is edge
+    assert "(OWL 0.60)" in got.tried[1] and got.tried_boxes[1] is boxes[0][1]
+    side = scene_fix_from_boxes([(0.70, edge), boxes[0]], pts, uv, table_z, model, cam_xyz=(0.3, -0.2, 1.0),
+                                image_wh=(640, 480))
+    assert side.pose is None and len(side.tried) == len(side.tried_boxes) >= 3
+    assert side.tried_boxes[0] is edge and all(b is boxes[0][1] for b in side.tried_boxes[1:])
+    assert any(t.startswith("from the side") for t in side.tried[1:]), side.tried
 
 
 def _table_low_wall_high(rng, n=3000, h=1000):

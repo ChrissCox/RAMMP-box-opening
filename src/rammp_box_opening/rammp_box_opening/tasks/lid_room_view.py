@@ -68,7 +68,7 @@ class RoomView:
     spots: list = None
     judged: list = None
     why: str = None
-    boxes: list = None  # what the planner's worlds get from the same map (press_demo.adopt_seen)
+    boxes: list = None  # the standing cuboids clear_table.obstacle_boxes makes of the same map (no planner gets them)
 
 
 def fix_around(pts_base, box_xy, model):
@@ -135,6 +135,41 @@ def _room_rgba(room_m):
     return (1.0 - t, 1.0, 0.0, 0.9)
 
 
+class MarkerList:
+    """A visualization_msgs/MarkerArray in `frame` at `stamp`, made one
+    marker at a time (add), each numbered in turn. Its first marker deletes
+    every marker the last one drew. perception/viz draws the mission's
+    perception with it too."""
+
+    def __init__(self, frame, stamp):
+        from std_msgs.msg import ColorRGBA
+        from visualization_msgs.msg import Marker, MarkerArray
+
+        self._Marker, self._ColorRGBA = Marker, ColorRGBA
+        self.frame, self.stamp, self.n = frame, stamp, 0
+        self.array = MarkerArray()
+        clear_all = Marker()
+        clear_all.header.frame_id = frame
+        clear_all.action = Marker.DELETEALL
+        self.array.markers.append(clear_all)
+
+    def add(self, ns, kind, rgba, scale=(1.0, 1.0, 1.0)):
+        m = self._Marker()
+        m.header.frame_id, m.header.stamp = self.frame, self.stamp
+        m.ns, m.id, m.type, m.action = ns, self.n, kind, self._Marker.ADD
+        self.n += 1
+        m.pose.orientation.w = 1.0
+        m.scale.x, m.scale.y, m.scale.z = (float(v) for v in scale)
+        m.color = self._ColorRGBA(r=float(rgba[0]), g=float(rgba[1]), b=float(rgba[2]), a=float(rgba[3]))
+        self.array.markers.append(m)
+        return m
+
+
+def yawed(m, yaw):
+    """Marker `m` turned `yaw` about the vertical."""
+    m.pose.orientation.z, m.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+
+
 def view_markers(view, model, frame, stamp):
     """The view as a visualization_msgs/MarkerArray in `frame` (the map's
     base frame): what stands (each square its own height, red where it
@@ -144,28 +179,10 @@ def view_markers(view, model, frame, stamp):
     carry. The first marker deletes the last period's."""
     from geometry_msgs.msg import Point
     from std_msgs.msg import ColorRGBA
-    from visualization_msgs.msg import Marker, MarkerArray
+    from visualization_msgs.msg import Marker
 
-    out = MarkerArray()
-    clear_all = Marker()
-    clear_all.header.frame_id = frame
-    clear_all.action = Marker.DELETEALL
-    out.markers.append(clear_all)
-    n = [0]
-
-    def marker(ns, kind, rgba, scale=(1.0, 1.0, 1.0)):
-        m = Marker()
-        m.header.frame_id, m.header.stamp = frame, stamp
-        m.ns, m.id, m.type, m.action = ns, n[0], kind, Marker.ADD
-        n[0] += 1
-        m.pose.orientation.w = 1.0
-        m.scale.x, m.scale.y, m.scale.z = (float(v) for v in scale)
-        m.color = ColorRGBA(r=float(rgba[0]), g=float(rgba[1]), b=float(rgba[2]), a=float(rgba[3]))
-        out.markers.append(m)
-        return m
-
-    def yawed(m, yaw):
-        m.pose.orientation.z, m.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+    markers = MarkerList(frame, stamp)
+    out, marker = markers.array, markers.add
 
     fix, tz = view.fix, float(view.fix.table_z_scene)
     lid_r, lid_h = 0.5 * max(float(model.lid_dims[0]), float(model.lid_dims[1])), float(model.lid_dims[2])

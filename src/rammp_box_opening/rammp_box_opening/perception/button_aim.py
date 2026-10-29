@@ -866,6 +866,7 @@ class ButtonAimer:
         self._last_stamp = None
         self._last_depth_stamp = None  # the depth that last voted (depth_paired)
         self._last_cam = None
+        self.last_frame = None  # (the snapshot it judged last, its camera pose or None): perception/viz draws it
         self.last_sighting = None
         self.pair_dt_ms = []  # each hit's depth-minus-colour stamp (ms), when known
         self.still_depth = StillDepth()
@@ -897,6 +898,7 @@ class ButtonAimer:
         self._last_depth_stamp = depth_key(f)
         self.frames += 1
         cam = camera_pose_at(g, stamp=f.color_stamp)
+        self.last_frame = (f, cam)  # references: nothing is copied
         if cam is None:
             self.last_why = "no camera pose for the frame"
             return False

@@ -88,10 +88,10 @@ HOME_FIRSTS = []  # the keywords of every home_first call, in order
 REACH_OUTS = []  # the scene fixes handed to the reach-out
 
 
-def run_main(monkeypatch, tmp_path, argv, approach, client=None):
+def run_main(monkeypatch, tmp_path, argv, approach, client=None, found=True):
     """press_demo.main() with `approach(ctx)` standing in for the reach-out:
-    its result's `failed` decides the exit code. Returns (exit code, client,
-    run-log rows)."""
+    its result's `failed` decides the exit code; `found` False, the scene
+    camera finds no box. Returns (exit code, client, run-log rows)."""
     import faulthandler
 
     import rclpy.executors
@@ -116,7 +116,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None):
         table_extent = None
 
     class _Locator:
-        last_why = None
+        last_why = None if found else "the OWL's 3 candidates refused"
         moved_note = None
         last_timing = {}
         grab = None
@@ -129,7 +129,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None):
 
         def locate(self, timeout):
             LOCATES.append(timeout)
-            return _Fix
+            return _Fix if found else None
 
         def base_to_link(self):
             return None
@@ -217,6 +217,45 @@ def test_the_first_look_for_the_box_keeps_at_it_longer_than_a_re_check(monkeypat
     assert len(REACH_OUTS) == 1  # a box within the straight-down staging reach goes to the reach-out too
 
 
+def test_a_run_whose_scene_camera_finds_no_box_says_so_in_its_record(monkeypatch, tmp_path):
+    """NO BOX is printed and the arm goes home: the record now says why the
+    reach-out never started, before the home it flies (reach_refused)."""
+    REACH_OUTS.clear()
+    code, _c, rows = run_main(monkeypatch, tmp_path, ["--execute"], _at_staging(), found=False)
+    assert code == 2 and not REACH_OUTS
+    refused = [r for r in rows if r["leg"] == "reach_refused"]
+    assert [r["why"] for r in refused] == ["NO BOX — scene camera: the OWL's 3 candidates refused"]
+    assert rows.index(refused[0]) < len(rows) - 1 and rows[-1]["kind"] == "motion"  # then the home
+
+
+class _Hears(FakeClient):
+    """A client that keeps what it heard and when it sent, as PlannerClient
+    does (nothing heard here): each execution says when it went out, so its
+    arrival's settle is due."""
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        import time
+
+        outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+        info.update(sent_at=time.monotonic(), sent_traj=traj_, feedback_q=[])
+        return outcome, info
+
+    def joint_history(self, since=None):
+        return []
+
+    def goals_sent(self):
+        return []
+
+
+def test_the_last_arrivals_settle_is_noted_as_the_run_ends(monkeypatch, tmp_path):
+    """Nothing after a run's last motion goes out to note its settle: main's
+    exit does (runner.flush), the NO BOX run's home's after its own row, cut
+    where the run ended."""
+    code, _c, rows = run_main(monkeypatch, tmp_path, ["--execute"], _at_staging(), client=_Hears(), found=False)
+    assert code == 2 and rows[-2]["kind"] == "motion"
+    assert rows[-1]["leg"] == "settle" and rows[-1]["cut"] == "run end" and rows[-1]["legs"][-1] == rows[-2]["leg"]
+
+
 def _refused(ctx):
     """The scene approach refused: the run goes home and stops (exit 1),
     right after the start these tests are about."""
@@ -291,6 +330,35 @@ def test_the_wrist_mount_observation_flies_the_look_pose_from_the_exact_rest_pos
     assert [k.get("tol") for k in HOME_FIRSTS] == [press_demo.AT_REST_RAD]
     previewed = [ln.split()[0] for ln in capsys.readouterr().out.splitlines() if ln.split()[1:2] == ["motion"]]
     assert previewed == ["look"]
+
+
+def test_the_perception_executor_shuts_down_whatever_the_viz_stop_does(monkeypatch, tmp_path):
+    """The finally stops the viz first, then the perception executor: a
+    second Ctrl+C in the viz's stop (KeyboardInterrupt regardless,
+    runtime/abort) must not skip the executor's shutdown, or the
+    interpreter tears rclpy down under a live spin. A run that unwinds from
+    a Ctrl+C asks the viz for nothing more (last=False)."""
+    from rammp_box_opening.tasks import press_demo
+
+    calls = []
+    monkeypatch.setattr(_Exec, "shutdown", lambda self: calls.append("shutdown"))
+
+    def stop(last=True):
+        calls.append(("stop", last))
+        raise KeyboardInterrupt  # viz.stop lets none out (test_viz); the finally holds without that
+
+    monkeypatch.setattr(press_demo, "stop_viz", stop)
+    with pytest.raises(KeyboardInterrupt):
+        run_main(monkeypatch, tmp_path, ["--press-only"], _at_staging())
+    assert calls == [("stop", True), "shutdown"]
+    calls.clear()
+    monkeypatch.setattr(press_demo, "stop_viz", lambda last=True: calls.append(("stop", last)))
+
+    def ctrl_c(ctx):
+        raise KeyboardInterrupt
+
+    code, _c, _rows = run_main(monkeypatch, tmp_path, ["--press-only"], ctrl_c)
+    assert code == 130 and calls == [("stop", False), "shutdown"]
 
 
 """main()'s shape around the perception thread, read from its source (no

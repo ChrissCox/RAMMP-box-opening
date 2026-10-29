@@ -15,6 +15,23 @@ def state_dir(env=None):
     return Path(env.get("RAMMP_BOX_OPENING_STATE") or Path.home() / ".ros" / "rammp_box_opening")
 
 
+VIZ_ENV = "RAMMP_BOX_OPENING_VIZ"  # 1 (or on, true, yes): a Foxglove view of the run (perception/viz)
+
+
+def viz_enabled(env=None):
+    """Whether a run draws its perception for Foxglove (perception/viz):
+    only where $RAMMP_BOX_OPENING_VIZ says 1 (or on, true, yes). Off by
+    default: it has not yet been watched on the robot (2026-10-28), and its
+    longest step no checkpoint breaks, the marker type's ~27 ms import (a
+    mission thread waking inside it waited 3-5 ms for the GIL, up to 17
+    with the Jetson loaded), lands once a run in the mission's first quiet
+    second, which may be a motion. Off, a run is what it was without it.
+    Here, not in viz: a run with it off never imports that module
+    (press_demo.start_viz)."""
+    env = os.environ if env is None else env
+    return str(env.get(VIZ_ENV, "")).strip().lower() in ("1", "on", "true", "yes")
+
+
 # Gen3 home joints in controller order (flatbot, new_adapter_plate_v3, 2026-10-21).
 # joint_3 sits AT -pi (every comparison uses ang_diff; -pi and +pi are equivalent).
 HOME = [0.067, -1.897, -3.137, -2.269, -0.211, -0.683, 1.725]
@@ -51,10 +68,57 @@ CONTACT_SPEED = 0.15
 # pivoting about the fingertip): the reach-out's rise, slide out and back
 # off, the depth press's turn, rise and centring. Every line toward the lid,
 # or loaded, stays at CONTACT_SPEED in a guarded run; a compliant run, which
-# nothing it reads stops, flies its free-air lines here too. Run 2026-10-22
-# 20:04 flew its turn, rise and back off at 0.15: 18 s of a 45 s press; the
-# compliant 2026-10-27 16:23 its re-aim, slide in and clear: 10.5 s.
+# nothing it reads stops, flies its free-air lines faster still
+# (COMPLIANT_FREE_LINE_SPEED). Run 2026-10-22 20:04 flew its turn, rise and
+# back off at 0.15: 18 s of a 45 s press; the compliant 2026-10-27 16:23 its
+# re-aim, slide in and clear: 10.5 s.
 FREE_LINE_SPEED = 0.3
+# A compliant run's free-air lines (reach_press.free_line_speed): the re-aim,
+# the slide in or the walk, the turn, the rise off the hold, the way down
+# backwards, the grip's way back up, the clears and the retreat from the lid:
+# the same plan-free lines, the same positions, at 1.8x FREE_LINE_SPEED. Only
+# there: a compliant run is re-timed under the wrist's ceiling
+# (COMPLIANT_QD_CEILING, Runner.retime_params), and without it these lines
+# would ask arm_joint_6 0.51-0.60 rad/s at 0.55, past the ~0.54 it makes.
+# 2026-10-28 16:23 walked between the tilted look and the hand turned down
+# 60 mm over the button four times (the way in, the way back, the grip's way
+# in, its back out): the walks were 15.9 s of the run's 29.4 s from the scene
+# fix to home, at 0.3. Offline, under the ceiling, the compliant ease and the
+# junction ceiling (COMPLIANT_JUNCTION_SPEED), on flatbot's URDF with the
+# mission's own legs: 16:23's way in 7.26 -> 5.65 s, way back 5.11 -> 3.49,
+# grip in 5.28 -> 3.75, back out 4.91 -> 3.39, lift and clear 1.74 -> 1.44,
+# retreat and home 3.97 -> 3.70; 15:45's way in 8.40 -> 7.09, way out
+# 7.35 -> 6.28. The shoulder and elbow then run up to 0.69 rad/s
+# (0.55 x 0.9 x 1.396), the wrist at most its 0.45; 15:45's looks ran
+# arm_joint_2 at 1.50-1.62 without a fault. The lines meet each other and
+# the legs around them as they did at 0.3 (COMPLIANT_JUNCTION_SPEED); the
+# legs that meet the button, the knob or the table keep their own speeds.
+# Nothing plans or collision-checks these lines at any speed (rammp-curobo
+# #23, #43): they fly where the proof put them, faster.
+COMPLIANT_FREE_LINE_SPEED = 0.55
+# A compliant run's junctions (RetimeParams.junction_cruise,
+# Runner.retime_params): the sample two chained legs share, and the one on
+# either side of it, cruise no faster than this, whatever the legs' speeds.
+# A junction otherwise takes the lower of its two legs' fractions, and the
+# re-timer's corner bounds budget its turn over both adjacent intervals
+# while the driver's quintic turns it inside the shorter one. At
+# COMPLIANT_FREE_LINE_SPEED without it (offline 2026-10-28, flatbot's URDF,
+# the full run's executions at 30 boxes 0.50-0.80 m out) 79 of 393 junctions
+# flowed faster than at 0.3, up to 1.83x: the slide in into the turn at
+# (0.68, -0.35) 0.50 -> 0.92 rad/s, the quintic asking arm_joint_6 for 65
+# rad/s^2 where 0.3 asked 19; the rise into the walk back at (0.56, -0.25)
+# 0.53 -> 0.72, arm_joint_1 101 where 55; at 16:23's box the three 142 deg
+# turns (the rise or the grip's way up into the walk back, the grip's walk
+# into its approach; joints 1, 4 and 6 reversing) 0.52-0.53 -> 0.57, 59-62
+# where 16:23 flew them at 47-51 without a fault. At FREE_LINE_SPEED's 0.3 the
+# lines meet as they did: no junction at the 30 boxes faster, 16:23's within
+# 2 %, the quintic's peak, where over 10 rad/s^2, within 6 % (16:23's
+# 48.6-50.8); 16:23's and 15:45's ways in and back, grip in and back out give
+# back 0.04-0.17 s each of the 1.35-1.74 s they gain at 0.55 without it. The
+# one junction of two legs faster than 0.3 that is not a free-air line's, the
+# carry into the set-down (TRANSIT_SPEED into setdown_speed 0.35, never
+# flown), meets at it too: up to 0.55 -> 0.51 rad/s, 0-0.08 s longer.
+COMPLIANT_JUNCTION_SPEED = FREE_LINE_SPEED
 DRIFT_REPLAN_RAD = 0.04  # < START_GATE_RAD: replan before the gate would refuse
 # The driver commands a trajectory's first waypoint at once, wherever the arm
 # is; runtime/driver.py refuses a goal whose start is farther than this from
@@ -84,6 +148,43 @@ REST_TOL_RAD = 0.05  # "already there": the start gate's tolerance
 # URDF's): the re-timer caps every joint below these and runtime/driver.py
 # refuses a goal above them — two independent gates on the same numbers.
 JOINT_VMAX = [1.396, 1.396, 1.396, 1.396, 1.222, 1.222, 1.222]
+
+# A compliant run re-times every motion to what the arm follows in the driver's
+# joint impedance (runtime/runner.py Runner.retime_params): the robot's, not
+# the scene's. Measured under RIGID at zeta 0.7 on the 2026-10-28 15:45
+# /joint_states bag (49 Hz, two runs), against a reference rebuilt with
+# retime_group.
+# The wrist's speed ceiling, rad/s, ABSOLUTE (RetimeParams.qd_ceiling): it
+# caps what a leg's cruise fraction leaves and no fraction scales it, so a 0.3
+# line whose wrist runs under it is not slowed. On both 15:45 way homes
+# arm_joint_6 held a median 0.536 / 0.541 rad/s for 1.75 s, its command at the
+# 9 N·m clamp and its link torque at its rest value, against the 0.9 x 1.222 =
+# 1.10 the re-timer allows: it stood 0.25 rad short when the goal ended (the
+# tool 86-88 mm off), overshot 56 mrad and was within 2 mm only 1.15 s later.
+# 15:41:58's POSITION home drove it to 0.738 and arrived 0.7 mm off.
+# arm_joint_5 was seen at 0.51. 0.45 keeps the re-timer's 0.9 margin under
+# the ~0.5 those two make. arm_joint_7, the hand's own turn with the least
+# behind it, was capped like them until a flight log measured it: on
+# 2026-10-29 12:02's carry it turned the hand 2.64 rad at its 0.45 ceiling
+# (6.0 of the carry's 7.8 s), 22 mrad median behind its reference while it
+# cruised, 96 at most, spurting to 0.70 rad/s — so it gets 0.9 (owner
+# 2026-10-29: "we also need to speed up the lid placement"). Joints 1-4 have
+# none of their own (0.9 x JOINT_VMAX).
+COMPLIANT_QD_CEILING = (float("inf"),) * 4 + (0.45, 0.45, 0.9)
+# Out of rest, rad/s^2 along the path (RetimeParams.accel 6). The 15:45 look's
+# reference asked arm_joint_2 for ~4.2 rad/s^2; it made ~3, fell 101-123 mrad
+# behind, caught up at 1.50-1.62 rad/s — over the 1.257 cruise and the URDF's
+# 1.396 — and stood 45-47 mrad PAST its end when the goal ended (the tool 14 mm
+# off), creeping back for 0.55 s. At 3 the look asks it 2.2-2.4: inside what
+# it made.
+COMPLIANT_ACCEL = 3.0
+# Into rest (RetimeParams.decel 3), still half the ease out, so the arrival
+# stays the long half. Every fast stop of those runs ended with the arm past its
+# end: the look 45-47 mrad, the way home 56 mrad after its short arrival. How
+# much the two cut that is unmeasured (no model of the arm gets the look's sign
+# right): the first logged run tells. Offline the three cost the look 0.4-0.5 s
+# (16:23: 1.36 -> 1.82 s), a 0.3 line 0.0-0.2 s, 15:45's way out 1.0 s.
+COMPLIANT_DECEL = 1.5
 
 # Reflex recoil after a press trip: how much of the descent's own path to
 # reverse, and at what cruise fraction. Measured with the real planner and
@@ -179,16 +280,22 @@ class CustomGains(namedtuple("CustomGains", "name kq zeta torque_limit")):
 # 1050-1160 N/m straight down (STIFF: 420-460), so 1.5 N·m of friction or
 # model error on each of joints 1-4 and 0.5 on 5-7 puts them 3-4 mm off
 # (STIFF: 8-11). 400 on the wrist too buys only 0.3-0.5 mm more, on the
-# joints with the least inertia, where nothing above 60 has flown. The torque
+# joints with the least inertia, where nothing above 60 had flown. The torque
 # limits are STIFF's.
+# Owner 2026-10-29, after that day's full runs: "we need to double the spring
+# coefficient when in impedance mode because it's still too loose". The wrist
+# doubles, 200 -> 400 (flown at 200 since 10-28 14:21). Joints 1-4 stay at
+# 400: it is the driver's ceiling for a custom spec (kinova-gen3-driver
+# interface/gains.h kKqMax), and a goal asking more is refused, not clamped.
+# The wrist's 9 N·m torque limit, its ceiling too, is now reached 22 mrad
+# off its reference instead of 45.
 # zeta 1.0, above STIFF's 0.7 (owner 2026-10-28: "the impedance mode may be
 # too loose still, it's very bouncy, maybe we can adjust or offset the
-# bounciness through our motions"): the damping is the one gain left to raise.
-# Kq is at the driver's ceiling on joints 1-4, the wrist's 200 already pulls
-# its 9 N·m limit from 31-58 mrad off, so more wrist Kq pulls no harder, and
-# STIFF was worse (13:43: the look 29.6 mm off when its trajectory ran out,
-# the way home 179.7 mm). The driver damps the velocity ERROR, D_i (qd_i -
-# qd_ref_i), D_i = 2 zeta sqrt(Kq_i M_ii(q)) on the URDF's inertia
+# bounciness through our motions"; 2026-10-29: "commit 76"): the damping is
+# the one gain left to raise, every Kq at the driver's ceiling, and STIFF was
+# worse (13:43: the look 29.6 mm off when its trajectory ran out, the way home
+# 179.7 mm). The driver damps the velocity ERROR, D_i (qd_i - qd_ref_i),
+# D_i = 2 zeta sqrt(Kq_i M_ii(q)) on the URDF's inertia
 # (kinova-gen3-driver joint_impedance_mode.cpp), but the joints move as if
 # 6-11 kg·m² heavier (fitted on 15:45's bag; joint 2 made ~3 rad/s² of the
 # look's 4.2), so the damping ratio D buys them is a fraction of zeta: ~0.2 on
@@ -203,20 +310,17 @@ class CustomGains(namedtuple("CustomGains", "name kq zeta torque_limit")):
 # on, the damper pushes them down too, c_z v_z at the pads (c_z = 1 / (J_z
 # D^-1 J_z^T), v_z the reference's speed down there): on flatbot's URDF 4.3 N
 # where 16:23's stroke runs straight down at 25 mm/s and 7.2 N on its bend at
-# 41, 1.7 and 6.0 N on 15:45's at 19 and 68 (0.7: 3.0, 5.0, 1.2, 4.2). With
-# the lid rigid, that puts the force 3-4 N above the hold's for the stroke's
-# last 0.10-0.13 s (0.7: 1.5-2.3 N, which 15:45's bag does not show). The
-# set-down's place:touch (reach_lid_off) meets the table the same way, faster:
-# at the spots beside 15:45's and 16:23's boxes the hand reaches, its
-# reference still runs at 48-63 mm/s 6 mm before its end, the damper pushing
-# 6.5-11.9 N as the lid touches (0.7: 4.6-8.4) and the force at most 5 N above
-# its spring's for the line's last ~0.1 s (0.7: 2.7); none where the scene's
-# table stands 6 mm or more above the real one.
+# 41, 1.7 and 6.0 N on 15:45's at 19 and 68 (0.7: 3.0, 5.0, 1.2, 4.2), with
+# the wrist at 200. With the lid rigid, that puts the force 3-4 N above the
+# hold's for the stroke's last 0.10-0.13 s (0.7: 1.5-2.3 N). The set-down's
+# place:touch (reach_lid_off) meets the table the same way: the damper pushes
+# 6.5-11.9 N as the lid touches at the old touch speed (0.7: 4.6-8.4), more at
+# today's PLACE_TOUCH_SPEED, for the line's last ~0.1 s.
 # depth_press's model is Kq's alone: k, the bend and the overshoot are planned
 # on it, and press_n reads the arm at rest, where the damper pushes nothing.
 # 1.3 only if the flown look and home still overshoot (the driver takes
 # 0.05-2.0).
-GAINS_RIGID = CustomGains("RIGID", (400.0,) * 4 + (200.0,) * 3, 1.0, (39.0,) * 4 + (9.0,) * 3)
+GAINS_RIGID = CustomGains("RIGID", (400.0,) * 7, 1.0, (39.0,) * 4 + (9.0,) * 3)
 IMPEDANCE_KQ[GAINS_RIGID] = GAINS_RIGID.kq
 IMPEDANCE_NAMES[GAINS_RIGID] = GAINS_RIGID.name
 # Every compliant goal that names no gains flies this (PlannerClient
