@@ -1237,6 +1237,21 @@ def _plan_by_ik(chain, home):
     return plan_ik
 
 
+def test_the_lid_is_pressed_onto_the_table_no_harder_than_its_push_and_never_past_two_millimetres(monkeypatch):
+    """Owner 2026-10-29: the lid is set down "too hard aka the arm is moving
+    too far down towards the table and pressing against it abnormally
+    hard". 6 mm past the table at the hand's 1150-2290 N/m was 11-30 N on
+    it. The touch ends SETDOWN_PUSH_N (5 N) on the spring straight down at
+    the fingertips past where the lid meets the table, at most
+    SETDOWN_OVER_M (2 mm): a stiff hand goes less deep, a soft one no
+    deeper than 2 mm."""
+    assert rlo.SETDOWN_PUSH_N == pytest.approx(5.0) and rlo.SETDOWN_OVER_M == pytest.approx(0.002)
+    for k, over in ((5000.0, 0.001), (2500.0, 0.002), (1150.0, 0.002), (float("inf"), 0.0)):
+        monkeypatch.setattr(dp, "fingertip_stiffness_z", lambda chain, q, k=k: k)
+        got, k_z = rlo.setdown_over(None, None)
+        assert got == pytest.approx(over) and k_z == k
+
+
 @pytest.mark.parametrize("shortest_walk", [False, True], ids=["today's posture", "the quickest walks' posture"])
 @pytest.mark.parametrize("box", FLATBOT_BOXES, ids=["%.3f,%.2f" % b for b in FLATBOT_BOXES])
 def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ctx, monkeypatch, tmp_path, box,
@@ -1312,6 +1327,11 @@ def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ct
     assert tier == "beside the box"
     carry, why = rlo.plan_carry(ctx, cfg, q_look, drop)
     assert carry is not None, why
+    # the touch ends past where the lid meets the table no deeper than SETDOWN_PUSH_N on the hand's spring there
+    _quat, contact, _hover = rlo.setdown_poses(ctx, drop)
+    _R, t_touch = chain.fk(carry.legs[2].goal_joints)
+    assert t_touch[2] == pytest.approx(contact[2] - carry.over_m, abs=5e-4)
+    assert 0.0 < carry.over_m <= rlo.SETDOWN_OVER_M and carry.k_z * carry.over_m <= rlo.SETDOWN_PUSH_N + 1e-9
     home_legs, why = rlo.plan_home_after(ctx, cfg, carry)
     assert home_legs is not None, why
     names = [lg.name for lg in carry.legs + home_legs]

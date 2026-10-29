@@ -65,8 +65,9 @@ table at their own. It decides only what it must:
 the knob up or not, the box where it was, the fingers on the knob or on
 air, where the lid goes, the lid still in them at the table. Contact is bounded by the spring,
 not stopped by a guard: the grip's pads ride on the lid where it stands
-higher than estimated, and the set-down presses the lid SETDOWN_OVER_M past
-where the scene camera's table says it lands. Where it looks at rest — the
+higher than estimated, and the set-down presses the lid at most
+SETDOWN_OVER_M past where the scene camera's table says it lands, no deeper
+than SETDOWN_PUSH_N on the hand's spring (setdown_over). Where it looks at rest — the
 knob, the spot — and before the fingers close on the knob, it waits for the
 arm to stand still (runner.wait_still): between motions, never a stop.
 """
@@ -174,15 +175,26 @@ GRIP_TRIES = 2
 LIFT_OFF_CLEAR_M = 0.015
 # The set-down: at setdown_speed or faster (PLACE_TOUCH_SPEED below) to this
 # far above where the lid meets the table, then at PLACE_TOUCH_SPEED to
-# SETDOWN_OVER_M below it — the spring
-# pressing the lid onto the table there (~6 N at the ~1000 N/m RIGID gives
-# straight down), never a guard. The table is the scene camera's, which
-# stood 7-18 mm above the touched one on 2026-10-28: a lid let go up to that
-# much above the table drops onto it. Small, too, so the arm's reference
-# after the release stays within the runner's drift gate (0.04 rad ~ 10
-# mm) of where the retreat starts, if the hand has not yet sunk back to it.
+# setdown_over below it — the spring pressing the lid onto the table there,
+# never a guard. The table is the scene camera's, which stood 7-18 mm above
+# the touched one on 2026-10-28: a lid let go up to that much above the
+# table drops onto it. Small, too, so the arm's reference after the release
+# stays within the runner's drift gate (0.04 rad ~ 10 mm) of where the
+# retreat starts, if the hand has not yet sunk back to it.
 SETDOWN_SLOW_M = 0.04
-SETDOWN_OVER_M = 0.006
+# How far past where the lid meets the table the touch ends: no deeper than
+# SETDOWN_PUSH_N on the hand's spring there (depth_press.fingertip_stiffness_z
+# under the run's gains), and never more than SETDOWN_OVER_M. It was a fixed
+# 6 mm, "~6 N at the ~1000 N/m RIGID gives". On 2026-10-29 the hand stood
+# 7-14 mm short of its set-down end when the motion's clock ran out, at
+# 1150-2290 N/m straight down (the wrist's springs doubled from 13:00, #88):
+# 11-30 N on the lid, 18-30 N after 13:00, and it sank 5-10 mm more before
+# the fingers let go (the knob the fingers hold gives into the lid). The
+# owner: the lid is set down "too hard ... pressing against it abnormally
+# hard". With 2 mm the lid let go up to that far above the table drops onto
+# it, which a lid does no harm.
+SETDOWN_PUSH_N = 5.0
+SETDOWN_OVER_M = 0.002
 # Owner 2026-10-29: "we also need to speed up the lid placement". The way down
 # to SETDOWN_SLOW_M over the table is free air, so it flies at the free-air
 # lines' speed (reach_press.free_line_speed: 0.55 in a compliant run; it was
@@ -192,6 +204,15 @@ SETDOWN_OVER_M = 0.006
 # down "too hard" (2026-10-29 14:45): the faster touch met the table at twice
 # the speed, the damper (zeta 1.0) pushing on while the reference ran on.
 PLACE_TOUCH_SPEED = dp.TOUCH_SPEED
+
+
+def setdown_over(chain, q):
+    """How far past where the lid meets the table the set-down's touch ends,
+    the hand at joints `q` (near there): SETDOWN_PUSH_N on the spring straight
+    down at the fingertips (depth_press.fingertip_stiffness_z, the run's
+    gains), at most SETDOWN_OVER_M. Returns (metres, the spring in N/m)."""
+    k = float(dp.fingertip_stiffness_z(chain, q))
+    return min(SETDOWN_OVER_M, SETDOWN_PUSH_N / k) if k > 0 else SETDOWN_OVER_M, k
 
 
 def lift_off_m(model):
@@ -868,6 +889,8 @@ class Carry:
     retreat: list
     quat: list
     drop: object
+    over_m: float = None  # how far past where the lid meets the table the touch ends (setdown_over)
+    k_z: float = None  # the hand's spring straight down there, N/m
 
 
 def plan_carry(ctx, cfg, q_from, drop):
@@ -893,8 +916,12 @@ def plan_carry(ctx, cfg, q_from, drop):
     carry.gains = dp.COMPLIANT_GAINS
     lines = []
     q = carry.goal_joints
-    for name, z in (("place:down", contact[2] + SETDOWN_SLOW_M), ("place:touch", contact[2] - SETDOWN_OVER_M),
-                    ("place:retreat", hover[2])):
+    over, k_z = SETDOWN_OVER_M, None
+    for name in ("place:down", "place:touch", "place:retreat"):
+        if name == "place:touch":  # sized on the spring where the way down ends, 4 cm over the table
+            over, k_z = setdown_over(chain, q)
+        z = {"place:down": contact[2] + SETDOWN_SLOW_M, "place:touch": contact[2] - over,
+             "place:retreat": hover[2]}[name]
         pts, why = chain.straight_line(q, [hover[0], hover[1], z], quat)
         if pts is not None:
             why = dp.line_refusal(chain, pts)
@@ -905,7 +932,7 @@ def plan_carry(ctx, cfg, q_from, drop):
     down_speed = max(float(cfg.setdown_speed), rp.free_line_speed(ctx))
     legs = [carry, dp.compliant_line(ctx, "place:down", lines[0], quat, down_speed, world),
             dp.compliant_line(ctx, "place:touch", lines[1], quat, PLACE_TOUCH_SPEED, world)]
-    return Carry(legs, lines[2], quat, drop), None
+    return Carry(legs, lines[2], quat, drop, over_m=over, k_z=k_z), None
 
 
 def plan_home_after(ctx, cfg, carry):
@@ -1466,8 +1493,10 @@ def choose_and_carry(ctx, cfg, runner, eyes, ahead=None):
                                                                  drop.xyz[1] - ctx.cpose.xyz[1]),
         says, "; the planner refused %s" % "; ".join(refused) if refused else ""))
     pd.viz_hook("spot", tmap, drop, tier, says, table_z)  # the map and the spot, drawn off this thread (perception/viz)
-    print("[press_demo] ONE MOTION: %s — to [%.2f, %.2f] and down onto the table" % (
-        ", ".join(lg.name for lg in carry.legs), drop.xyz[0], drop.xyz[1]))
+    print("[press_demo] ONE MOTION: %s — to [%.2f, %.2f] and down onto the table, %.1f mm past where the lid "
+          "meets it (%.1f N on the hand's %.0f N/m)" % (
+              ", ".join(lg.name for lg in carry.legs), drop.xyz[0], drop.xyz[1], 1000 * (carry.over_m or 0.0),
+              (carry.k_z or 0.0) * (carry.over_m or 0.0), carry.k_z or 0.0))
     res = runner.run(carry.legs, execute=True, lookahead=lambda _end: plan_home_after(ctx, cfg, carry))
     ahead = runner.lookahead_result
     last = res[-1]
