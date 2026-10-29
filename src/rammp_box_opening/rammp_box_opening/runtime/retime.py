@@ -21,7 +21,10 @@ The profile, along the path's joint-space arc length:
   - per-joint velocity never exceeds vmax_margin x the joint limit, so the
     gates runtime/driver.py applies before every goal (URDF velocity
     limits, per-interval continuity at 3 x vmax x dt) hold by
-    construction — and refuse the goal if not.
+    construction — and refuse the goal if not;
+  - nor, where one is set (qd_ceiling), an ABSOLUTE per-joint ceiling the
+    cruise fraction does not scale: what a compliant arm's wrist follows
+    (runtime/runner.py Runner.retime_params).
 
 Guarded strokes are NOT re-timed here: their fast-then-slow warp and the
 guard's rebaseline/arm fractions are tuned to contact and stay in warp.py.
@@ -77,6 +80,15 @@ class RetimeParams:
     # its reference wobble and run backwards, for 20-255 ms of a run at 0.5
     # and over a third of it at 0.3 and below (review 2026-10-27)
     time_scale: float = 1.0
+    # an ABSOLUTE per-joint speed ceiling, rad/s (None: none), no margin
+    # applied: it bounds what a leg's cruise fraction of vmax leaves and is
+    # never scaled by it, so a slow leg it does not bind keeps its speed.
+    # Written as a smaller vmax instead (0.5, which the 0.9 margin makes
+    # 0.45 at full speed) it is 0.3 x 0.9 x 0.5 = 0.135 rad/s on a 0.3 line
+    # (16:23's way in 7.25 -> 12.4 s, offline 2026-10-28). A compliant run
+    # sets it (constants.COMPLIANT_QD_CEILING): in the driver's joint
+    # impedance the wrist follows no faster than ~0.54 rad/s
+    qd_ceiling: tuple = None
 
 
 def _dedup(positions, min_ds):
@@ -168,6 +180,16 @@ def velocity_caps(positions, vmax, margin):
     return cap, ds
 
 
+def joint_caps(positions, vmax, params):
+    """velocity_caps at params.vmax_margin, lowered where params.qd_ceiling
+    binds (rad/s, no margin): the per-sample path-speed bound under which
+    every interval keeps every joint below both. Returns (cap, ds)."""
+    cap, ds = velocity_caps(positions, vmax, params.vmax_margin)
+    if params.qd_ceiling is not None:
+        cap = np.minimum(cap, velocity_caps(positions, params.qd_ceiling, 1.0)[0])
+    return cap, ds
+
+
 def corner_caps(positions, ds, params):
     """Per-sample speed cap from the direction change at that sample, and
     which samples are genuine stops (reversal apexes).
@@ -245,6 +267,10 @@ def speed_profile(positions, cruise, vmax, params, v_start=0.0, v_end=0.0):
     cap, ds = velocity_caps(positions, vmax, params.vmax_margin)
     ccap, _stop = corner_caps(positions, ds, params)
     target = np.minimum(np.minimum(np.asarray(cruise) * cap, ccap), cap)
+    # the ceiling after the cruise fraction, never scaled by it; from here
+    # on `cap` is the bound both set (the rounding's fill, the ends)
+    cap, _ = joint_caps(positions, vmax, params)
+    target = np.minimum(target, cap)
     n = len(positions)
     if params.smooth_pts > 0 and n > 2 * params.smooth_pts + 2:
         # round the tops of the TARGET (its lower envelope with a moving
@@ -359,7 +385,7 @@ def retime_group(trajs, speeds, vmax, params=RetimeParams()):
         return trajs[0], {"duration_s": 0.0, "junction_speeds": [], "stops": 0, "n_points": len(positions)}
     cruise = cruise_per_sample(seg, speeds)
     v, ds = speed_profile(positions, cruise, vmax, params)
-    cap, _ = velocity_caps(positions, vmax, params.vmax_margin)
+    cap, _ = joint_caps(positions, vmax, params)
     t = times_from_profile(v, ds, params, cap)
     junctions = [k for k in range(1, len(seg)) if seg[k] != seg[k - 1]]
     jspeeds = [float(v[k - 1]) for k in junctions]

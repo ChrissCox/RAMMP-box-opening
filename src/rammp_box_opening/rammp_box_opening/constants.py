@@ -85,6 +85,39 @@ REST_TOL_RAD = 0.05  # "already there": the start gate's tolerance
 # refuses a goal above them — two independent gates on the same numbers.
 JOINT_VMAX = [1.396, 1.396, 1.396, 1.396, 1.222, 1.222, 1.222]
 
+# A compliant run re-times every motion to what the arm follows in the driver's
+# joint impedance (runtime/runner.py Runner.retime_params): the robot's, not
+# the scene's. Measured under RIGID at zeta 0.7 on the 2026-10-28 15:45
+# /joint_states bag (49 Hz, two runs), against a reference rebuilt with
+# retime_group.
+# The wrist's speed ceiling, rad/s, ABSOLUTE (RetimeParams.qd_ceiling): it
+# caps what a leg's cruise fraction leaves and no fraction scales it, so a 0.3
+# line whose wrist runs under it is not slowed. On both 15:45 way homes
+# arm_joint_6 held a median 0.536 / 0.541 rad/s for 1.75 s, its command at the
+# 9 N·m clamp and its link torque at its rest value, against the 0.9 x 1.222 =
+# 1.10 the re-timer allows: it stood 0.25 rad short when the goal ended (the
+# tool 86-88 mm off), overshot 56 mrad and was within 2 mm only 1.15 s later.
+# 15:41:58's POSITION home drove it to 0.738 and arrived 0.7 mm off.
+# arm_joint_5 was seen at 0.51; arm_joint_7 never above 0.32, so its own
+# ceiling is unmeasured: it is capped like its siblings until a flight log shows
+# it can go faster. 0.45 keeps the re-timer's 0.9 margin under the ~0.5 the
+# wrist makes. Joints 1-4 have none of their own (0.9 x JOINT_VMAX).
+COMPLIANT_QD_CEILING = (float("inf"),) * 4 + (0.45,) * 3
+# Out of rest, rad/s^2 along the path (RetimeParams.accel 6). The 15:45 look's
+# reference asked arm_joint_2 for ~4.2 rad/s^2; it made ~3, fell 101-123 mrad
+# behind, caught up at 1.50-1.62 rad/s — over the 1.257 cruise and the URDF's
+# 1.396 — and stood 45-47 mrad PAST its end when the goal ended (the tool 14 mm
+# off), creeping back for 0.55 s. At 3 the look asks it 2.2-2.4: inside what
+# it made.
+COMPLIANT_ACCEL = 3.0
+# Into rest (RetimeParams.decel 3), still half the ease out, so the arrival
+# stays the long half. Every fast stop of those runs ended with the arm past its
+# end: the look 45-47 mrad, the way home 56 mrad after its short arrival. How
+# much the two cut that is unmeasured (no model of the arm gets the look's sign
+# right): the first logged run tells. Offline the three cost the look 0.4-0.5 s
+# (16:23: 1.36 -> 1.82 s), a 0.3 line 0.0-0.2 s, 15:45's way out 1.0 s.
+COMPLIANT_DECEL = 1.5
+
 # Reflex recoil after a press trip: how much of the descent's own path to
 # reverse, and at what cruise fraction. Measured with the real planner and
 # FK at two bench placements (2026-09-03): 0.085 rad of joint arc lifts

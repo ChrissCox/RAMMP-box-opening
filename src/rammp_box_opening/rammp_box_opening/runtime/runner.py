@@ -19,6 +19,9 @@ import numpy as np
 from rammp_box_opening.geometry import ang_diff
 
 from rammp_box_opening.constants import (
+    COMPLIANT_ACCEL,
+    COMPLIANT_DECEL,
+    COMPLIANT_QD_CEILING,
     JOINT_VMAX,
     START_GATE_RAD,
     RECOIL_ARC_RAD,
@@ -443,7 +446,11 @@ def line_profile(leg, params, time_scale=1.0):
     positions are re-timed with the accelerations scaled by speed (not
     speed**2) and the cruise lowered until no sample's path speed exceeds
     the dilated profile's peak: never faster than it flies today, only less
-    time spent getting up to speed and back down."""
+    time spent getting up to speed and back down. Under a speed ceiling (a
+    compliant run's, Runner.retime_params) the profile flies even where it
+    takes the longer: the dilated line eases at 6 x speed**2 and knows no
+    ceiling — at 0.55 a 0.6 rad joint_6 line would run that joint at 0.61
+    rad/s, and above 0.5 its ease is harsher than the compliant one."""
     from rammp_box_opening.runtime.driver import dilate
 
     s = float(leg.speed)
@@ -455,6 +462,8 @@ def line_profile(leg, params, time_scale=1.0):
         traj, _info = retime_group([leg.traj], [cruise], JOINT_VMAX, p)
         peak = _path_speed_peak(traj)
         if peak <= v_max * (1.0 + 1e-6):
+            if p.qd_ceiling is not None:
+                return traj
             return traj if secs(traj.points[-1].time_from_start) < secs(ref.points[-1].time_from_start) else None
         cruise *= 0.98 * v_max / peak
     return None
@@ -476,7 +485,8 @@ class Runner:
         self._pending = None  # (leg, handle, t0)
         self._sent_early = set()  # ids of gripper legs dispatched under a motion
         # the human-motion profile for unguarded groups (retime.py); the
-        # mission may replace it with the container's motion: block
+        # mission may replace it with the container's motion: block. Every
+        # re-timing reads it through retime_params (a compliant run's own)
         self.retime = RetimeParams()
         self.last_retime = None  # report of the most recent re-timed group
         # whole-run slow mode (--speed-scale): dilates every motion, guarded
@@ -488,6 +498,25 @@ class Runner:
         # goes out (_keep_flight, _note_settle)
         self._flights = 0
         self._settling = None
+
+    def retime_params(self):
+        """What this runner re-times a motion with: every group it profiles
+        (a guarded tail rides its approach's), a free-air line's profile and
+        the recoil, in flight and in the preview alike, so what the preview
+        shows is what flies; slow mode is the caller's (time_scale). A
+        compliant client's (client.compliant) eases out of rest at
+        COMPLIANT_ACCEL and into it at COMPLIANT_DECEL, and no interval runs
+        a joint past COMPLIANT_QD_CEILING: what the arm follows in the
+        driver's joint impedance (constants). The flag is read at every
+        call, never kept: press_demo builds the runner before
+        run_reach_press sets it. Positions are never touched. A stroke
+        flown on its own under a contact guard keeps its dilated or warped
+        timing, tuned to the contact (no compliant leg carries a guard). A
+        guarded run, which flies in position, keeps self.retime as it is,
+        as every other position run does."""
+        if not getattr(self.client, "compliant", False):
+            return self.retime
+        return replace(self.retime, accel=COMPLIANT_ACCEL, decel=COMPLIANT_DECEL, qd_ceiling=COMPLIANT_QD_CEILING)
 
     # -- preview -----------------------------------------------------------
     def preview(self, legs):
@@ -517,7 +546,7 @@ class Runner:
                         [g.traj for g in group],
                         [g.speed for g in group],
                         JOINT_VMAX,
-                        replace(self.retime, time_scale=self.time_scale),
+                        replace(self.retime_params(), time_scale=self.time_scale),
                     )
                     per = info["duration_s"] / len(group)
                     for g in group:
@@ -527,7 +556,7 @@ class Runner:
         for leg in legs:
             flies = "-"
             line = (
-                line_profile(leg, self.retime, self.time_scale)
+                line_profile(leg, self.retime_params(), self.time_scale)
                 if leg.kind is Kind.MOTION and leg.traj is not None and _free_air_line(leg)
                 else None
             )
@@ -972,7 +1001,7 @@ class Runner:
             [positions_to_traj(flown.joint_names, path)],
             [RECOIL_SPEED],
             JOINT_VMAX,
-            replace(self.retime, time_scale=self.time_scale),
+            replace(self.retime_params(), time_scale=self.time_scale),
         )
         reflex = Leg(
             name="recoil",
@@ -1170,7 +1199,7 @@ class Runner:
             # A guarded TAIL rides the same profile: the approach and the
             # descent it leads into are one motion with no stop between
             # them, and the descent keeps its own (slow) cruise fraction.
-            params = replace(self.retime, time_scale=self.time_scale)
+            params = replace(self.retime_params(), time_scale=self.time_scale)
             traj, self.last_retime = retime_group(
                 [g.traj for g in group], [g.speed for g in group], JOINT_VMAX, params
             )
@@ -1197,7 +1226,7 @@ class Runner:
         else:
             traj = group[0].traj
             exec_speed = lead.speed * self.time_scale
-            flown = line_profile(lead, self.retime, self.time_scale) if _free_air_line(lead) else None
+            flown = line_profile(lead, self.retime_params(), self.time_scale) if _free_air_line(lead) else None
             if flown is not None:
                 traj, exec_speed = flown, 1.0
             elif guard_spec is not None and lead.warp is None and lead.guard_from is not None:
