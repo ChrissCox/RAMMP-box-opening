@@ -1340,11 +1340,11 @@ def _wrist_peaks(traj_):
 
 
 def test_a_compliant_run_retimes_gentler_and_under_the_wrist_ceiling_in_preview_and_flight(tmp_path):
-    """15:45 2026-10-28, RIGID: out of rest the look asked joint_2 for ~4.2
-    rad/s^2 and the arm made ~3; on the way home joint_6 topped out at 0.54
-    rad/s, its command at the clamp, where the re-timer allowed 1.10. A
-    compliant client's runner re-times every unguarded motion at
-    COMPLIANT_ACCEL / COMPLIANT_DECEL under COMPLIANT_QD_CEILING, and its
+    """15:45 2026-10-28, RIGID at zeta 0.7: out of rest the look asked
+    joint_2 for ~4.2 rad/s^2 and the arm made ~3; on the way home joint_6
+    topped out at 0.54 rad/s, its command at the clamp, where the re-timer
+    allowed 1.10. A compliant client's runner re-times every unguarded
+    motion at COMPLIANT_ACCEL / COMPLIANT_DECEL under COMPLIANT_QD_CEILING, and its
     preview shows the time that flies. In the mission's order: press_demo
     builds the runner on a position client, run_reach_press sets the flag
     on it and puts it back when the run ends — the runner reads it at every
