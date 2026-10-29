@@ -119,7 +119,7 @@ def test_a_joint_plan_flies_only_when_it_ends_on_the_joints_asked_for(off, flies
         assert got is res
         return
     assert not got.success and got.trajectory is None  # nothing to fly by mistake
-    assert "%.3f rad from its joint goal (joint 4; goal_mismatch_rad %.3f)" % (off, off) in got.message
+    assert "%.4f rad from its joint goal (joint 4; goal_mismatch_rad %.4f)" % (off, off) in got.message
     assert got.message.endswith("(planner: %s)" % PLANNED)
 
 
@@ -172,8 +172,9 @@ def test_a_joint_plan_the_planner_says_goes_the_long_way_round_is_refused():
 
 def test_a_refused_plan_is_a_failed_plan_to_whoever_plans_a_leg(ctx):
     """core._plan_motion takes it as any failed plan (its callers' stops and
-    fallbacks apply): a RuntimeError naming the leg and why."""
-    from rammp_box_opening.primitives.core import PlanState, _plan_motion
+    fallbacks apply): a RuntimeError naming the leg and why — a PlanRefused,
+    which home_arm tells apart from the planner's own failures."""
+    from rammp_box_opening.primitives.core import PlanRefused, PlanState, _plan_motion
 
     def fallback(kind, g):  # the FK-pose fallback's other arm: the elbow 0.4 rad round
         end = list(g.target_joints)
@@ -182,8 +183,12 @@ def test_a_refused_plan_is_a_failed_plan_to_whoever_plans_a_leg(ctx):
 
     ctx.client = _client(fallback)
     at = PlanState(joints=list(START), chain=0)
-    with pytest.raises(RuntimeError, match=r"planning failed for home: the plan ends 0\.400 rad from its joint goal"):
+    with pytest.raises(PlanRefused, match=r"planning failed for home: the plan ends 0\.4000 rad from its joint goal"):
         _plan_motion(ctx, at, "home", ("joints", list(HOME)), ("full", "full.yaml"), 1.0)
+    ctx.client = _client(lambda kind, g: _joints_result(success=False, message=FAILED))
+    with pytest.raises(RuntimeError, match="TRAJOPT_FAIL") as failed:
+        _plan_motion(ctx, at, "home", ("joints", list(HOME)), ("full", "full.yaml"), 1.0)
+    assert not isinstance(failed.value, PlanRefused)  # the planner's own failure, as before
 
 
 def test_a_reach_whose_joint_plan_is_refused_asks_the_planner_for_the_pose(chain):
@@ -205,6 +210,60 @@ def test_a_reach_whose_joint_plan_is_refused_asks_the_planner_for_the_pose(chain
     got = c.plan_to_pose(list(t), mat_to_quat_xyzw(R), START)
     assert got.success and [k for k, _g in c.sent] == ["joints", "pose"]
     assert list(got.trajectory.points[-1].positions) == pytest.approx(q_look)
+
+
+def _other_arm(kind, g):
+    """The FK-pose fallback's answer to a joint goal: the same tool, the
+    elbow 0.4 rad round."""
+    end = list(g.target_joints)
+    end[3] += 0.4
+    return _joints_result([START, end], mismatch=0.4)
+
+
+def _homing(ctx, answers):
+    """ctx with a PlannerClient for home_arm: the arm at HOME's own joints."""
+    c = _client(answers)
+    c.joints = lambda: list(START)
+    c._active_joints = None  # joint_names: the bench's (ClearMarginFree reads them)
+    ctx.client = c
+    return c
+
+
+def test_home_arm_does_not_answer_a_refused_home_with_the_bare_world(ctx):
+    """home_arm answers a home the guarded bench world refuses with the bare
+    table world: its band makes the START invalid when the arm holds inside
+    it. A home the client refused is not that. The planner did plan in the
+    guarded world, to another arm at HOME's tool pose (its FK-pose fallback),
+    and the bare world would plan the same home blind to where the box may
+    be (review 2026-10-28): it stops, saying what is left to try, and the
+    bare world is never asked."""
+    from rammp_box_opening.primitives.core import PlanRefused
+    from rammp_box_opening.tasks import home_arm
+
+    c = _homing(ctx, _other_arm)
+    with pytest.raises(PlanRefused, match=r"the plan ends 0\.4000 rad from its joint goal") as refused:
+        home_arm.build_legs(ctx)
+    assert "not re-planned in the bare world" in str(refused.value) and "--lift-first 0.08" in str(refused.value)
+    assert [kw.get("model") is None for kind, kw in ctx.worlds.pushes if kind == "bench"] == [False]  # guarded only
+    assert len(c.sent) == 1
+
+
+def test_home_arm_with_no_table_known_stops_on_a_refused_home(ctx, capsys):
+    """Flatbot: no table, so one plan in the bare world. Refused, it raises,
+    with what is left to try; the planner's own failure raises as before."""
+    from rammp_box_opening.primitives.core import PlanRefused
+    from rammp_box_opening.tasks import home_arm
+
+    ctx.worlds.table_top_z = None
+    c = _homing(ctx, _other_arm)
+    with pytest.raises(PlanRefused, match=r"0\.4000 rad from its joint goal.*--lift-first 0\.08") as refused:
+        home_arm.build_legs(ctx)
+    assert "bare world" not in str(refused.value)  # it planned in nothing else
+    assert len(c.sent) == 1 and "[client] plan refused" in capsys.readouterr().out
+    _homing(ctx, lambda kind, g: _joints_result(success=False, message=FAILED))
+    with pytest.raises(RuntimeError, match="TRAJOPT_FAIL") as failed:
+        home_arm.build_legs(ctx)
+    assert not isinstance(failed.value, PlanRefused)
 
 
 # -- a pose plan: it ends at its pose ---------------------------------------------
@@ -233,7 +292,22 @@ def test_a_pose_plan_flies_only_when_it_ends_at_its_pose(chain, off_mm, turn_deg
         assert got is res
         return
     assert not got.success and got.trajectory is None
-    assert "the plan ends %.1f mm and %.1f deg from its pose" % (off_mm, turn_deg) in got.message
+    assert "the plan ends %.2f mm and %.2f deg from its pose" % (off_mm, turn_deg) in got.message
+
+
+def test_a_pose_plan_ending_with_the_tool_half_a_turn_round_is_refused(chain):
+    """A rotation vector loses its axis at half a turn: kinematics.rotvec
+    reads a flip of exactly pi as no turn at all. The turn is read off the
+    trace instead, so a tool flipped half a turn about its own axis is 180
+    deg from its pose, and refused."""
+    q_end = list(START)
+    q_end[1] += 0.3
+    q_end[3] += 0.2
+    R, t = chain.fk(q_end)
+    flipped = np.asarray(R, float) @ np.diag([-1.0, -1.0, 1.0])  # pi about the tool's own z
+    got = _client(lambda kind, g: _pose_result([START, q_end]))._plan_pose_once(list(t), mat_to_quat_xyzw(flipped),
+                                                                               START)
+    assert not got.success and "the plan ends 0.00 mm and 180.00 deg from its pose" in got.message
 
 
 def test_a_pose_plan_with_no_chain_to_measure_it_by_flies_as_it_always_did(monkeypatch):
@@ -249,6 +323,27 @@ def test_a_success_with_nothing_to_fly_is_refused():
     assert not _client(lambda kind, g: _joints_result([])).plan_to_joints(list(START), START).success
     pose = _client(lambda kind, g: _pose_result([]))._plan_pose_once([0.4, 0.0, 0.3], [1.0, 0.0, 0.0, 0.0], START)
     assert not pose.success
+
+
+@pytest.mark.parametrize("joint", [0, 3])
+def test_a_plan_whose_end_is_no_number_is_refused(chain, joint):
+    """NaN is never past a limit (NaN > 0.01 is False), so a NaN in the
+    plan's last point read as no gap at all and flew: it is no end to fly
+    to, and refused, a joint plan's and a pose plan's alike. A joint goal
+    with no number in it is as far from any end as a joint can be."""
+    goal = list(START)
+    goal[1] += 0.3
+    end = list(goal)
+    end[joint] = math.nan
+    got = _client(lambda kind, g: _joints_result([START, end])).plan_to_joints(goal, START)
+    assert not got.success and "the plan has no finite end to check against its joint goal" in got.message
+    R, t = chain.fk(goal)
+    got = _client(lambda kind, g: _pose_result([START, end]))._plan_pose_once(list(t), mat_to_quat_xyzw(R), START)
+    assert not got.success and "the plan has no finite end to check against its pose" in got.message
+    lost = list(goal)
+    lost[joint + 1] = math.nan
+    got = _client(lambda kind, g: _joints_result([START, goal])).plan_to_joints(lost, START)
+    assert not got.success and "the plan ends inf rad from its joint goal (joint %d" % (joint + 2) in got.message
 
 
 # -- the long way round: the planner's own word -----------------------------------
@@ -295,7 +390,7 @@ def test_a_long_way_plan_is_never_flown_as_it_is(chain, monkeypatch):
 
     monkeypatch.setattr(approach, "_chain", no_chain)
     got = c._no_long_way(wound, START)
-    assert not got.success and "no other way to its end was found" in got.message
+    assert not got.success and "no kinematics to find the short way by (no arm URDF)" in got.message
     assert c._no_long_way(plain, START) is plain
 
 
@@ -397,7 +492,7 @@ def test_a_planned_legs_row_keeps_what_the_planner_said_and_how_its_plan_ends(ct
     runner(ctx.client, tmp_path).run([leg], execute=True)
     plan = _rows(tmp_path)["home"]["plan"]
     assert plan["message"] == PLANNED and plan["solve_s"] == 0.15 and plan["goal_mismatch_rad"] == pytest.approx(4e-7)
-    assert plan["end_rad"] == 0.0 and plan["plan_s"] >= 0.0 and "replanned" not in plan
+    assert plan["end_rad"] == 0.0 and plan["plan_s"] >= 0.0 and "replanned" not in plan and "refused" not in plan
 
 
 def test_a_pose_legs_row_keeps_how_far_its_plan_ends_from_the_pose(ctx, tmp_path, chain):
@@ -411,7 +506,9 @@ def test_a_pose_legs_row_keeps_how_far_its_plan_ends_from_the_pose(ctx, tmp_path
     runner(ctx.client, tmp_path).run([leg], execute=True)
     plan = _rows(tmp_path)["reach:look"]["plan"]
     assert plan["end_mm"] == pytest.approx(2.0, abs=0.01) and plan["end_deg"] == pytest.approx(0.0, abs=1e-3)
-    assert "goal_mismatch_rad" not in plan  # a pose plan reports none
+    # the planner's own pose plan (PlanToPose) reports none; a pose leg
+    # planned to the arm's IK answer is a PlanToJoints plan, and does
+    assert "goal_mismatch_rad" not in plan
 
 
 def test_a_leg_planned_at_flight_keeps_its_own_plan_in_the_run_record(tmp_path):
@@ -423,3 +520,48 @@ def test_a_leg_planned_at_flight_keeps_its_own_plan_in_the_run_record(tmp_path):
     assert res[-1].ok
     plan = _rows(tmp_path)["retreat"]["plan"]
     assert plan["message"] == "ok" and plan["end_rad"] == 0.0 and plan["replanned"] is True
+
+
+def test_a_refused_joint_plan_the_pose_plan_stood_in_for_is_in_the_legs_plan_record(ctx, chain):
+    """The leg flies the pose plan, and its record is that plan's: the
+    refused joint plan before it would leave no trace but a console line.
+    The record names it (PlannerClient.refusals), and only for the leg it
+    was refused for."""
+    from rammp_box_opening.primitives.core import PlanState, _plan_motion
+
+    q_look = list(START)
+    q_look[1] += 0.3
+    q_look[3] += 0.2
+    R, t = chain.fk(q_look)
+
+    def answers(kind, g):
+        return _other_arm(kind, g) if kind == "joints" else _pose_result([START, q_look])
+
+    ctx.client = _client(answers)
+    at = PlanState(joints=list(START), chain=0)
+    leg, _st = _plan_motion(ctx, at, "reach:look", ("pose", list(t), mat_to_quat_xyzw(R)), ("full", "full.yaml"), 1.0)
+    plan = leg.plan
+    assert plan["message"] == PLANNED and "goal_mismatch_rad" not in plan  # the pose plan's
+    assert plan["end_mm"] == pytest.approx(0.0, abs=0.01)
+    assert len(plan["refused"]) == 1
+    assert plan["refused"][0].startswith("the plan ends 0.4000 rad from its joint goal (joint 4; goal_mismatch_rad")
+    ctx.client._call = lambda kind, g: _joints_result([START, list(g.target_joints)])
+    home, _st = _plan_motion(ctx, at, "home", ("joints", list(HOME)), ("full", "full.yaml"), 1.0)
+    assert "refused" not in home.plan and home.plan["end_rad"] == 0.0
+
+
+def test_a_re_plan_that_fails_at_flight_leaves_a_note_of_what_was_said(tmp_path):
+    """The failure's row is the group lead's, with the plan it no longer
+    flies, or none for a lazy leg: the failed re-plan, the client's refusal
+    here, is a note of its own."""
+    from rammp_box_opening.runtime.legs import Kind, Leg
+
+    c = _client(_other_arm)
+    c.joints = lambda: list(START)
+    lazy = Leg(name="home", kind=Kind.MOTION, traj=None, speed=1.0, guard=None, world="full", chain=0,
+               target=("joints", list(HOME)), goal_joints=None)
+    assert runner(c, tmp_path)._replan_group([lazy], 4) == (None, 4)
+    note = _rows(tmp_path)["replan_failed"]
+    assert note["kind"] == "note" and note["name"] == "home" and lazy.plan is None
+    assert note["plan"]["message"].startswith("the plan ends 0.4000 rad from its joint goal (joint 4")
+    assert note["plan"]["refused"] == [note["plan"]["message"]] and note["plan"]["end_rad"] is None
