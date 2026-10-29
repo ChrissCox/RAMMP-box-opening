@@ -174,6 +174,18 @@ REACH_PULLBACK_M = 0.15
 # when the scene camera put the lid 9 cm high). 6.5 cm up is ~0.30 m, and
 # the slide in, from above the old one, comes no nearer the box.
 REACH_LOOK_RISE_M = 0.065
+# The wrist's aim puts the button this much nearer the arm than it is, along
+# the box's bearing from arm_mount: every aim's point is moved out by it
+# (aim_forward), so the press and the grip come down that much farther out,
+# and an aim after the press is judged against the first on the same footing
+# (owner 2026-10-29: "the camera calibration is slightly off, we need to make
+# the arm move just 2 cm forward when pressing the box and gripping the lid so
+# it grabs the middle, not the edge"). On 2026-10-29's full runs the wrist's
+# look after the press put the button 6-11 mm farther out than the aim the
+# press and the grip went by (12:02, 12:03, 12:04; 10:27's 0 mm), and 12:03's
+# grip closed on air 11 mm short of it. The look pose and the proof before it
+# go by the scene camera's button, as before.
+AIM_FORWARD_M = 0.02
 # The closed 2F-85's lowest point at these tilts, in tool_frame, with the
 # reach attitude's roll (fingers side by side across the line to the box):
 # one fingertip's end, 11 mm past tool_frame like TCP_OFFSET_M straight down.
@@ -835,7 +847,7 @@ def let_go_part_way(ctx, res):
 
 def gains_text(profile):
     """A driver gains profile, or a custom spec (constants.CustomGains), as
-    the console names it, e.g. "RIGID (Kq 400/200 N·m/rad on joints 1-4/5-7)"."""
+    the console names it, e.g. "RIGID (Kq 400/400 N·m/rad on joints 1-4/5-7)"."""
     p = profile if isinstance(profile, CustomGains) else int(profile)
     kq = IMPEDANCE_KQ.get(p)
     name = IMPEDANCE_NAMES.get(p, "gains profile %s" % (p,))
@@ -922,7 +934,8 @@ REACH_AIM_HITS = 2
 def _aim(node, watcher, yaw, lid_z, prior_xy, runner, tag):
     """(got, status, the knob's height above its lid in mm, the press point
     as the wrist measured it) from aim_button_at_staging, within REACH_AIM_S
-    and on REACH_AIM_HITS agreeing hits. got's z is raised by the wrist's
+    and on REACH_AIM_HITS agreeing hits, got's point moved AIM_FORWARD_M
+    out from the arm (aim_forward). got's z is raised by the wrist's
     table offset (button_aim.ButtonAimer.fix): the height the arm and the
     scene camera are compared with. The measured point is the one the
     wrist's own readings are judged against — the lid after the press, the
@@ -946,7 +959,17 @@ def _aim(node, watcher, yaw, lid_z, prior_xy, runner, tag):
     got, status = aim_button_at_staging(node, watcher, yaw, timeout_s=REACH_AIM_S, runner=runner, tag=tag, out=seen,
                                         lid_z=lid_z, prior_xy=prior_xy, min_hits=REACH_AIM_HITS)
     measured = seen.get("measured_xyz", None if got is None else got[0])
+    if got is not None:
+        got = (aim_forward(got[0]), got[1])  # what the hand goes by; `measured` stays the wrist's own
     return got, status, seen.get("button_up_mm"), measured
+
+
+def aim_forward(xyz):
+    """The wrist's aim `xyz` moved AIM_FORWARD_M farther from the arm along
+    its bearing from arm_mount, its height kept: the cameras' error."""
+    x, y, z = (float(v) for v in xyz)
+    d = math.hypot(x, y)
+    return (x + AIM_FORWARD_M * x / d, y + AIM_FORWARD_M * y / d, z)
 
 
 def _lid_z(button_z, up_mm):

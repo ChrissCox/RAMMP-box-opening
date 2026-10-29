@@ -464,10 +464,10 @@ def test_the_full_runs_free_air_lines_fly_at_the_compliant_speed_and_only_under_
     assert code == (0 if lid_off else 1)
     want = {n: COMPLIANT_FREE_LINE_SPEED for n in ("reach:re-aim", "reach:slide-in", "depth:turn", "depth:rise",
                                                    "depth:turn-back", "reach:slide-out", "grip:up", "lid:clear",
-                                                   "place:retreat")}
+                                                   "place:retreat", "place:down")}  # the set-down's way down: free air
     # the stroke's own speed: here the faked way down's (test_reach_press._way_down), its press at TOUCH_SPEED
     want.update({"depth:press": dp.TOUCH_SPEED, "grip:approach": cfg.grip_speed, "grip:down": dp.TOUCH_SPEED,
-                 "lid:lift": cfg.lift_speed, "place:down": cfg.setdown_speed, "place:touch": dp.TOUCH_SPEED,
+                 "lid:lift": cfg.lift_speed, "place:touch": rlo.PLACE_TOUCH_SPEED,
                  "reach:look": TRANSIT_SPEED, "lid:carry": TRANSIT_SPEED, "home": TRANSIT_SPEED})
     assert [(n, s) for n, s in flown if s != want[n]] == []
     names = {n for n, _s in flown}
@@ -705,8 +705,7 @@ def test_a_clear_spot_the_wrist_sees_after_the_lift_is_where_the_lid_goes(ctx, m
     assert "where the cameras see room for it and the hand" in capsys.readouterr().out
     d = math.hypot(ctx.lid_drop.xyz[0] - BOX_XY[0], ctx.lid_drop.xyz[1] - BOX_XY[1])
     assert d >= 0.19  # lid_place_min_clear from the box
-    seen, = [r for r in rows if r["leg"] == "seen_obstacles"]  # the carry's world from the same map
-    assert seen["when"] == "wrist and scene camera, the lid lifted"
+    assert not [r for r in rows if r["leg"] == "seen_obstacles"]  # the map is the mission's: no planner world gets it
 
 
 def test_nothing_clear_still_sets_the_lid_down_at_the_most_room_seen(ctx, monkeypatch, tmp_path, capsys):
@@ -847,7 +846,6 @@ def test_the_lid_s_spot_is_mapped_and_its_carry_planned_from_where_the_arm_stood
     look's wait for a still arm, where its frame was shot: not before it,
     the arm still settling from the lift and the clear."""
     from rammp_box_opening.runtime.runner import Runner
-    from rammp_box_opening.tasks import press_demo as pd
 
     stood = [0.01 * (k + 1) for k in range(7)]
     seen = []
@@ -863,7 +861,6 @@ def test_the_lid_s_spot_is_mapped_and_its_carry_planned_from_where_the_arm_stood
     monkeypatch.setattr(rlo, "spot_look", look)
     monkeypatch.setattr(rlo, "spot_map", lambda ctx_, wrist, q, *rest: seen.append(("spot_map", list(q))))
     monkeypatch.setattr(rlo, "spot_candidates", candidates)
-    monkeypatch.setattr(pd, "adopt_seen", lambda *a, **k: None)
     monkeypatch.setattr(rlo, "plan_carry", lambda ctx_, cfg_, q, drop: (seen.append(("plan_carry", list(q))),
                                                                         (None, "refused"))[1])
     eyes = (None, SimpleNamespace(table_z=-0.027), None, None)
@@ -1105,3 +1102,17 @@ def test_on_flatbot_the_free_air_lines_fly_faster_under_the_wrists_ceiling_and_s
         if what == "way in":
             k = next(i for i, lg in enumerate(legs) if lg.name in ("depth:approach", "depth:press"))
             assert info["junction_speeds"][k - 1] <= before["junction_speeds"][k - 1] + 1e-9, (info, before)
+
+
+def test_the_lid_is_set_down_faster_and_the_hand_turns_it_at_the_wrists_measured_pace():
+    """Owner 2026-10-29: "we also need to speed up the lid placement". The
+    set-down's way down is free air and flies at the free-air speed (it was
+    setdown_speed, 0.35), its touch at PLACE_TOUCH_SPEED, twice the press's;
+    the hand's own turn (arm_joint_7), measured on 12:02's carry following
+    0.45 rad/s 22 mrad behind, is capped at 0.9, the other wrist joints at
+    0.45 as before."""
+    from rammp_box_opening.constants import COMPLIANT_FREE_LINE_SPEED, COMPLIANT_QD_CEILING
+
+    assert rlo.PLACE_TOUCH_SPEED == pytest.approx(2 * dp.TOUCH_SPEED)
+    assert COMPLIANT_FREE_LINE_SPEED > load_press_demo(PINK).setdown_speed
+    assert COMPLIANT_QD_CEILING[4:] == (0.45, 0.45, 0.9)

@@ -825,7 +825,7 @@ def test_both_reach_out_aims_take_their_own_budget_and_two_agreeing_hits(monkeyp
     monkeypatch.setattr(press_demo, "aim_button_at_staging", aim)
     for tag in ("reach-aim", "reach-after"):
         got, status, up, measured = reach_press._aim(None, None, 0.6, 0.3125, (0.7248, -0.286), None, tag)
-        assert got == ((0.7213, -0.297, 0.3095), 0.6) and up == 0.9 and measured == (0.7213, -0.297, 0.2914)
+        assert got == (reach_press.aim_forward((0.7213, -0.297, 0.3095)), 0.6) and up == 0.9 and measured == (0.7213, -0.297, 0.2914)
     assert [(k["tag"], k["timeout_s"], k["min_hits"]) for k in asked] == [
         ("reach-aim", reach_press.REACH_AIM_S, reach_press.REACH_AIM_HITS),
         ("reach-after", reach_press.REACH_AIM_S, reach_press.REACH_AIM_HITS),
@@ -865,7 +865,7 @@ def test_every_reach_out_aim_waits_for_a_still_arm_and_the_record_says_how_long(
     runner = Runner(_Settles(), log_dir=tmp_path)
     for tag in ("reach-aim", "reach-after"):
         got, _status, _up, _measured = reach_press._aim(None, None, 0.6, 0.3125, (0.7248, -0.286), runner, tag)
-        assert got == ((0.7213, -0.297, 0.3095), 0.6)
+        assert got == (reach_press.aim_forward((0.7213, -0.297, 0.3095)), 0.6)
     assert order == ["still", "reach-aim", "still", "reach-after"]
     rows = [json.loads(line) for line in next(tmp_path.glob("run-*.jsonl")).read_text().splitlines()]
     assert [(r["leg"], r["before"], r["settle_s"], r["timed_out"]) for r in rows] == [
@@ -1155,7 +1155,7 @@ def test_a_compliant_run_says_which_gains_every_move_flies(ctx, monkeypatch, cap
     args = SimpleNamespace(compliant=True, depth_press=True, execute=True)
     assert reach_press.run_reach_press(None, ctx, None, None, None, args, None, None) == 0
     out = capsys.readouterr().out
-    assert ("COMPLIANT: every move in the arm's joint impedance, RIGID (Kq 400/200 N·m/rad on joints 1-4/5-7), "
+    assert ("COMPLIANT: every move in the arm's joint impedance, RIGID (Kq 400/400 N·m/rad on joints 1-4/5-7), "
             "and nothing the run reads stops it") in out
     ctx.client.compliant_gains = GAINS_MEDIUM
     reach_press.run_reach_press(None, ctx, None, None, None, args, None, None)
@@ -1948,3 +1948,18 @@ def test_the_look_planned_is_the_request_the_client_always_sent_for_it(ctx, monk
     worlds.clear()
     plan, why = reach_press.plan_reach(ctx, cfg, SCENE_142812, home, depth=True, looks=[])
     assert plan is None and sent == [] and worlds == []
+
+
+def test_the_wrist_aim_is_moved_2_cm_out_from_the_arm_for_the_press_and_the_grip():
+    """Owner 2026-10-29: "the camera calibration is slightly off, we need to
+    make the arm move just 2 cm forward when pressing the box and gripping
+    the lid so it grabs the middle, not the edge". The aim's point goes
+    AIM_FORWARD_M farther out along its bearing from arm_mount, its height
+    kept; the wrist's own measured point (what its later readings are judged
+    against) is not moved."""
+    assert reach_press.AIM_FORWARD_M == pytest.approx(0.02)
+    for xyz in [(0.5475, -0.3106, 0.2941), (0.6339, -0.0094, 0.3117), (0.40, 0.30, 0.25)]:
+        moved = reach_press.aim_forward(xyz)
+        assert moved[2] == xyz[2]
+        assert math.hypot(*moved[:2]) - math.hypot(*xyz[:2]) == pytest.approx(0.02)
+        assert math.atan2(moved[1], moved[0]) == pytest.approx(math.atan2(xyz[1], xyz[0]))

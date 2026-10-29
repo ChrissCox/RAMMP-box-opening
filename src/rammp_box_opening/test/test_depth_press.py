@@ -1407,7 +1407,7 @@ def test_the_press_models_the_spring_its_legs_fly():
     from rammp_box_opening.constants import COMPLIANT_RUN_GAINS, GAINS_RIGID
 
     assert dp.COMPLIANT_GAINS is COMPLIANT_RUN_GAINS is GAINS_RIGID
-    assert dp.COMPLIANT_KQ == IMPEDANCE_KQ[GAINS_RIGID] == (400.0,) * 4 + (200.0,) * 3
+    assert dp.COMPLIANT_KQ == IMPEDANCE_KQ[GAINS_RIGID] == (400.0,) * 7
 
 
 STIFF_KQ = IMPEDANCE_KQ[GAINS_STIFF]  # Kq 160/60: the spring the 10-27 press tests were laid out on
@@ -2475,7 +2475,7 @@ def test_on_flatbot_1623s_aimed_button_is_pressed_turning_12_deg_short_after_the
     assert stroke.over == pytest.approx(dp.COMPLIANT_OVERSHOOT_M[0], abs=0.0005)
     assert stroke.k == pytest.approx(1320.0, abs=20.0) and stroke.k * stroke.over == pytest.approx(19.8, abs=0.3)
     _held, f = _held_at(chain, stroke.q_end, _pads_at(chain, _straight_end(chain, stroke.legs[-1][1], bottom)))
-    assert f == pytest.approx([0.0, 0.0, 19.9], abs=0.1)  # the button's push on the pads: straight up
+    assert f == pytest.approx([0.0, 0.0, 20.1], abs=0.1)  # the button's push on the pads: straight up (19.9 at wrist Kq 200)
 
 
 # ---- a compliant run's clear before home: up as far as the lean needs, and back -----------
@@ -2850,7 +2850,8 @@ def test_on_flatbot_a_bent_press_pushes_straight_down_where_a_straight_one_shove
         assert result.press_n == pytest.approx(f[2], abs=0.01) and notes[bent]["felt"]
         assert notes[bent]["sideways_n"] == pytest.approx(np.hypot(*f[:2]), abs=0.06)
     straight, bent = pushes[False], pushes[True]
-    assert -straight[2] == pytest.approx(19.5, abs=0.3) and np.hypot(*straight[:2]) == pytest.approx(6.2, abs=0.3)
+    # a straight press shoves the pads 9.2 N aside with the wrist at Kq 400 (6.2 at 200); the bent one, which flies, none
+    assert -straight[2] == pytest.approx(20.3, abs=0.3) and np.hypot(*straight[:2]) == pytest.approx(9.2, abs=0.3)
     assert -bent[2] == pytest.approx(17.5, abs=0.1) and np.hypot(*bent[:2]) < 0.05
     assert -bent[2] == pytest.approx(stroke.k * stroke.over, abs=0.1)  # the bend's force, scaled to its bound
     q_b = np.asarray(_straight_end(chain, stroke.legs[-1][1], bottom), float)
@@ -2971,7 +2972,7 @@ def test_on_flatbot_a_compliant_press_rises_back_up_its_bent_stroke(ctx, monkeyp
 
     scene, aimed, yaw_deg, first = {  # the straight line's first step from the free-air end, rad
         "15:19": (trp.SCENE_1519, trp.AIMED_1519, 85.9, {"STIFF": 0.114, "RIGID": 0.051}),
-        "16:23": (trp.SCENE_1623, (0.7213, -0.2970, 0.3125), 36.9, {"STIFF": 0.134, "RIGID": 0.066}),
+        "16:23": (trp.SCENE_1623, (0.7213, -0.2970, 0.3125), 36.9, {"STIFF": 0.134, "RIGID": 0.061}),
         "0.76 m out": ((0.75, -0.15, 0.31), (0.75, -0.15, 0.31), 0.0, {"STIFF": None, "RIGID": 0.067}),  # None: refused
     }[case]
     first = first[spring]

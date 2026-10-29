@@ -162,11 +162,15 @@ JOINT_VMAX = [1.396, 1.396, 1.396, 1.396, 1.222, 1.222, 1.222]
 # 1.10 the re-timer allows: it stood 0.25 rad short when the goal ended (the
 # tool 86-88 mm off), overshot 56 mrad and was within 2 mm only 1.15 s later.
 # 15:41:58's POSITION home drove it to 0.738 and arrived 0.7 mm off.
-# arm_joint_5 was seen at 0.51; arm_joint_7 never above 0.32, so its own
-# ceiling is unmeasured: it is capped like its siblings until a flight log shows
-# it can go faster. 0.45 keeps the re-timer's 0.9 margin under the ~0.5 the
-# wrist makes. Joints 1-4 have none of their own (0.9 x JOINT_VMAX).
-COMPLIANT_QD_CEILING = (float("inf"),) * 4 + (0.45,) * 3
+# arm_joint_5 was seen at 0.51. 0.45 keeps the re-timer's 0.9 margin under
+# the ~0.5 those two make. arm_joint_7, the hand's own turn with the least
+# behind it, was capped like them until a flight log measured it: on
+# 2026-10-29 12:02's carry it turned the hand 2.64 rad at its 0.45 ceiling
+# (6.0 of the carry's 7.8 s), 22 mrad median behind its reference while it
+# cruised, 96 at most, spurting to 0.70 rad/s — so it gets 0.9 (owner
+# 2026-10-29: "we also need to speed up the lid placement"). Joints 1-4 have
+# none of their own (0.9 x JOINT_VMAX).
+COMPLIANT_QD_CEILING = (float("inf"),) * 4 + (0.45, 0.45, 0.9)
 # Out of rest, rad/s^2 along the path (RetimeParams.accel 6). The 15:45 look's
 # reference asked arm_joint_2 for ~4.2 rad/s^2; it made ~3, fell 101-123 mrad
 # behind, caught up at 1.50-1.62 rad/s — over the 1.257 cruise and the URDF's
@@ -276,10 +280,17 @@ class CustomGains(namedtuple("CustomGains", "name kq zeta torque_limit")):
 # 1050-1160 N/m straight down (STIFF: 420-460), so 1.5 N·m of friction or
 # model error on each of joints 1-4 and 0.5 on 5-7 puts them 3-4 mm off
 # (STIFF: 8-11). 400 on the wrist too buys only 0.3-0.5 mm more, on the
-# joints with the least inertia, where nothing above 60 has flown. zeta and
+# joints with the least inertia, where nothing above 60 had flown. zeta and
 # the torque limits are STIFF's: the driver derives damping from zeta and each
 # joint's inertia, so the damping ratio stays STIFF's.
-GAINS_RIGID = CustomGains("RIGID", (400.0,) * 4 + (200.0,) * 3, 0.7, (39.0,) * 4 + (9.0,) * 3)
+# Owner 2026-10-29, after that day's full runs: "we need to double the spring
+# coefficient when in impedance mode because it's still too loose". The wrist
+# doubles, 200 -> 400 (flown at 200 since 10-28 14:21). Joints 1-4 stay at
+# 400: it is the driver's ceiling for a custom spec (kinova-gen3-driver
+# interface/gains.h kKqMax), and a goal asking more is refused, not clamped.
+# The wrist's 9 N·m torque limit, its ceiling too, is now reached 22 mrad
+# off its reference instead of 45.
+GAINS_RIGID = CustomGains("RIGID", (400.0,) * 7, 0.7, (39.0,) * 4 + (9.0,) * 3)
 IMPEDANCE_KQ[GAINS_RIGID] = GAINS_RIGID.kq
 IMPEDANCE_NAMES[GAINS_RIGID] = GAINS_RIGID.name
 # Every compliant goal that names no gains flies this (PlannerClient
