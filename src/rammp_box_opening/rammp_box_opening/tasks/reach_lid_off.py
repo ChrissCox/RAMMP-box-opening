@@ -439,9 +439,10 @@ def spot_candidates(ctx, tmap, table_z, q, seeds=(), reach=None):
     down from joints `q` (`reach`, drop_reachable's stand-in — _Reach, the
     verdicts kept —, else drop_reachable): (spot, tier, what it says).
     Tiers, each tried at most TIER_TRIES: 'clear' — where `tmap` shows
-    room for the lid and the hand (press_demo.clear_lid_drops, best first);
-    'most room' — nothing clear, the spots it judged, the most room first;
-    'beside the box' — the spots beside it in the set-down zone
+    room for the lid and the hand (press_demo.clear_lid_drops, best first,
+    the hand's turn to each counted from where the arm's FK has it face at
+    `q`); 'most room' — nothing clear, the spots it judged, the most room
+    first; 'beside the box' — the spots beside it in the set-down zone
     (press_demo.lid_drop_candidates, drop_zone); 'nearest' — the table
     points round the box (_nearest_points). A generator: only as many as
     are asked for are checked."""
@@ -455,11 +456,17 @@ def spot_candidates(ctx, tmap, table_z, q, seeds=(), reach=None):
 
     tiers = []
     if tmap is not None:
+        from rammp_box_opening.runtime import approach
+        from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
+
+        R, _t = approach._chain().fk([float(v) for v in q])
+        facing = clear_table.hand_yaw(mat_to_quat_xyzw(np.asarray(R, float)))  # where the hand holding the lid faces
         judged = []
-        drops, spots, why = pd.clear_lid_drops(m, ctx.cpose, tmap, table_z, judged_out=judged)
-        tiers.append(("clear", [(d, "where the cameras see room for it and the hand (%.0f mm to spare%s)" % (
-            1000 * s.room_m, "" if s.what == "nothing" else ", %s nearest anything" % s.what))
-            for d, s in zip(drops, spots)]))
+        drops, spots, why = pd.clear_lid_drops(m, ctx.cpose, tmap, table_z, judged_out=judged, hand_at=facing)
+        tiers.append(("clear", [(d, "where the cameras see room for it and the hand (%.0f mm to spare%s; the hand "
+                                    "turns %+.0f deg)" % (1000 * s.room_m, "" if s.what == "nothing" else
+                                                          ", %s nearest anything" % s.what, math.degrees(s.rotation)))
+                                for d, s in zip(drops, spots)]))
         most = sorted(judged, key=lambda s: -s.room_m)
         tiers.append(("most room", [(ContainerPose(xyz=(s.xy[0], s.xy[1], float(table_z)), yaw=s.turn),
                                      "nothing reads clear (%s): the most room seen, %s %.0f mm short" % (

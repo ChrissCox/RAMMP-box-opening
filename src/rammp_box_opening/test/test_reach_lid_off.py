@@ -1002,6 +1002,52 @@ def test_a_spot_look_with_no_points_says_why(monkeypatch):
     assert rlo.spot_look(node, SimpleNamespace(), runner) is None and notes[-1][1]["why"] == "no wrist camera"
 
 
+# 2026-10-29 12:02:48: where the arm stood with the lid lifted, at the spot
+# look (the carry's first point), the button its after-look aimed at, and
+# the scene camera's table. The carry from there turned the hand 91 deg
+# about the vertical (by FK) to a spot with 46 mm to spare, joint_7 151.
+AT_1202_SPOT_LOOK = [0.1754, -0.1941, 3.0832, -1.0629, -0.0708, -1.7567, 1.6355]
+BUTTON_1202 = (0.6422, -0.009, 0.3117)
+TABLE_1202 = 0.2163
+
+
+def test_the_hands_turn_to_each_spot_is_counted_from_where_the_arm_holds_the_lid(ctx, monkeypatch):
+    """Flatbot's own kinematics at 12:02's spot look: the hand faces, by
+    FK, within a degree of the reach-out's grip at the button
+    (reach_press.reach_quat, what clear_lid_drops takes without the arm).
+    spot_candidates counts the hand's turn to each spot from where the FK
+    has it face, and says it: on open table it comes down unturned, the
+    hand turning ~1 deg. Joint_7 turned on 1.4 rad, the hand faces 80 deg
+    otherwise, and the spot it comes down at is the quarter turn nearest
+    that — not the press attitude unturned, 80 deg away."""
+    from rammp_box_opening.geometry import ang_diff
+    from rammp_box_opening.perception import clear_table
+    from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
+
+    chain, _cfg, home = trp._on_flatbot(ctx, monkeypatch)
+    ctx.cpose = rp.cpose_for_button(BUTTON_1202, 0.0, ctx.model.button_offset)
+    box = ctx.cpose.xyz[:2]
+    tmap = clear_table.table_map([(_table(xy=box, z=TABLE_1202), TABLE_1202)], box)
+    pressing = clear_table.hand_yaw(ctx.model.press_quat(ctx.cpose.xyz))
+
+    def facing(q):
+        return clear_table.hand_yaw(mat_to_quat_xyzw(np.asarray(chain.fk(q)[0], float)))
+
+    grip = clear_table.hand_yaw(rp.reach_quat(ctx.model, BUTTON_1202[:2], 0.0))
+    assert abs(math.degrees(ang_diff(facing(AT_1202_SPOT_LOOK), grip))) < 1.0
+    drop, tier, says = next(rlo.spot_candidates(ctx, tmap, TABLE_1202, AT_1202_SPOT_LOOK, seeds=(home,)))
+    turn = math.degrees(ang_diff(pressing, facing(AT_1202_SPOT_LOOK)))
+    assert (tier, drop.yaw) == ("clear", 0.0) and abs(turn) < 2.0
+    assert "the hand turns %+.0f deg)" % turn in says
+    turned = list(AT_1202_SPOT_LOOK)
+    turned[6] += 1.4
+    assert abs(math.degrees(ang_diff(facing(turned), facing(AT_1202_SPOT_LOOK)))) == pytest.approx(80.2, abs=1.0)
+    nearest = min(clear_table.TURNS, key=lambda t: abs(ang_diff(pressing + t, facing(turned))))
+    assert abs(nearest) == pytest.approx(math.pi / 2)
+    drop, tier, says = next(rlo.spot_candidates(ctx, tmap, TABLE_1202, turned, seeds=(home,)))
+    assert tier == "clear" and drop.yaw == pytest.approx(nearest), says
+
+
 def test_the_lid_s_spot_is_mapped_and_its_carry_planned_from_where_the_arm_stood_still(ctx, monkeypatch, tmp_path):
     """The joints the wrist's frame is mapped from (spot_map) and the carry
     planned from (spot_candidates, plan_carry) are read after the spot
