@@ -60,6 +60,10 @@ compliant depth press, the default, goes on to take the lid off — the look
 at the knob from the look pose, the press once more where it is not up, the
 grip, the lift, the carry and the set-down (tasks/reach_lid_off) — unless
 --press-only.
+
+Each tilt is proven from its look pose's joints before the planner is asked
+for anything, and only the first that proves has its look planned
+(plan_reach).
 """
 
 import dataclasses
@@ -254,7 +258,7 @@ class ReachPlan:
     look_xyz: list
     start_xyz: list
     bottom_xyz: list
-    look_leg: object  # planned from the joints asked, full world
+    look_leg: object  # planned from the joints asked, full world; None for a look plan_reach kept unplanned
     slide_pts: list  # look -> start, the attitude held
     stroke_pts: list  # start -> bottom, straight down; None for a depth plan, which never flies it
     # a depth plan's (plan_reach depth=True, solve_way_in): how the hand turns
@@ -262,6 +266,10 @@ class ReachPlan:
     # stroke from there (depth_press.StrokePlan)
     down: object = None
     stroke: object = None
+    # plan_reach's: the joints its slide and the rest were proven from — the
+    # arm's own IK's for the look pose (client.pose_goal_joints), or the
+    # planned look's end where that IK found none or the plan ended elsewhere
+    look_joints: list = None
 
 
 def _short(e):
@@ -371,48 +379,141 @@ def way_down(ctx, cfg, q_look, slide_pts, start_xyz, quat, top_z):
     return way, stroke, None
 
 
+# A look pose whose wrist stands further than this past everything the arm
+# reaches (kinematics.ArmChain.past_reach_m) is refused without asking the
+# planner. Where the arm's own IK finds no look the client hands the planner
+# the pose, and cuRobo calls a pose reached within 5 mm and 5.7 deg
+# (sin(err/2) < 0.05: its MotionGen defaults; rammp-curobo 4fa044d
+# planner.py _verify_hold). 5.7 deg swings flatbot's wrist, 0.2875 m back
+# from tool_frame, 29 mm: 34 mm in all, so no look it could still call
+# reached is refused. 2026-10-28 14:29:19, a box seen at r 1.13 m: the four
+# looks' wrists stood 99, 73, 47 and 21 mm past, and the planner answered
+# IK_FAIL to each (~1.15 s); 14:29:54 (r 1.04 m): the 30 deg look's 22 mm.
+LOOK_PAST_REACH_M = 0.04
+# A planned look that ends further than this from the joints its press was
+# proven from (any joint; a continuous one the short way round) is proven
+# again from where it ends, as every look was until 2026-10-28. The
+# planner's joint plan ends on its goal (rammp-curobo's smoke test:
+# goal_mismatch_rad under 1e-3); its FK-pose fallback inside PlanToJoints
+# (3 of 10-28's 72 plans) and the client's PlanToPose end wherever their IK
+# lands.
+LOOK_END_RAD = 0.01
+
+
+def _joint_gap(q_end, q):
+    """The largest joint difference between `q_end` and `q`, a continuous
+    joint the short way round (branches.on_branch)."""
+    from rammp_box_opening.runtime.branches import on_branch
+
+    return max(abs(a - float(b)) for a, b in zip(on_branch(q_end, q), q))
+
+
+def _plan_look(ctx, q_from, look_xyz, quat):
+    """The look leg from joints `q_from`, planned as it always has been —
+    the pose goal, full world, TRANSIT_SPEED — which the client plans to its
+    own IK's joints (client.pose_goal_joints), else hands the planner as a
+    pose. Returns (leg, None) or (None, why)."""
+    try:
+        leg, _st = _plan_motion(
+            ctx, PlanState(joints=list(q_from), chain=0), "reach:look", ("pose", look_xyz, quat), _full_world(ctx),
+            TRANSIT_SPEED,
+        )
+    except RuntimeError as e:
+        return None, _short(e)
+    return leg, None
+
+
+def _proven(ctx, cfg, chain, tilt, button, geometry, q_look, depth):
+    """plan_reach's proof of `tilt` (`geometry`: reach_geometry's quat,
+    start, bottom and look for `button`) from the look pose's joints
+    `q_look`: (ReachPlan with no look leg yet, None, None) where the slide
+    and the stroke — with `depth`, the way down — fly from there; else
+    (None, why, None), or, where the slide flies and the way down does not,
+    (None, why, the ReachPlan plan_reach keeps in its `looks`)."""
+    quat, start, bottom, look = geometry
+    q_look = [float(v) for v in q_look]
+    slide, why = chain.straight_line(q_look, start, quat)
+    if slide is None:
+        return None, "the slide in (%s)" % why, None
+    if depth:
+        down, stroke, why = way_down(ctx, cfg, q_look, slide, start, quat, button[2])
+        if down is None:
+            kept = ReachPlan(tilt, quat, button, look, start, bottom, None, slide, None, look_joints=q_look)
+            return None, "the way down (%s)" % why, kept
+        if down.slide is not None:  # it turns lower down: the slide carries on to there
+            slide, start = down.slide, down.start_xyz
+        return ReachPlan(tilt, quat, button, look, start, bottom, None, slide, None, down, stroke, q_look), None, None
+    stroke, why = chain.straight_line(slide[-1], bottom, quat)
+    if stroke is None:
+        return None, "the stroke (%s)" % why, None
+    return ReachPlan(tilt, quat, button, look, start, bottom, None, slide, stroke, look_joints=q_look), None, None
+
+
 def plan_reach(ctx, cfg, button, q_from, tilts=REACH_TILTS_DEG, depth=False, looks=None):
-    """The smallest tilt whose look pose plans (full world, from `q_from`)
-    and whose slide and stroke the arm's own kinematics can fly as straight
-    lines. The way back out retraces both. `depth` (the compliant depth
-    press): no tilted stroke — that press never flies it — but the hand
-    must turn down from the look pose over the slide and stroke from there
-    (way_down); a tilt whose look pose and slide solve but whose way down
-    does not is passed over, and appended to `looks` (a list) with no
-    `down`. Returns (ReachPlan, None) or (None, why)."""
+    """The smallest tilt whose slide and stroke the arm's own kinematics
+    can fly as straight lines from its look pose, and whose look pose plans
+    (full world, from `q_from`). The way back out retraces both. `depth`
+    (the compliant depth press): no tilted stroke — that press never flies
+    it — but the hand must turn down from the look pose over the slide and
+    stroke from there (way_down); a tilt whose look pose and slide solve but
+    whose way down does not is passed over, and appended to `looks` (a
+    list) with no `down`.
+
+    Each tilt is proven from the joints the client plans its look pose to
+    (client.pose_goal_joints: the arm's own IK) before the planner is asked
+    for anything, and only the first that proves is planned, with the
+    request its look has always gone with (_plan_look). On 2026-10-28
+    14:28:13 four looks were planned, 0.15-0.17 s each, and no way down flew
+    from any of them. A look the arm's IK solved is kept in `looks`
+    unplanned (look_leg None; plan_shifted_look plans the one that flies).
+    A planned look that ends off the joints it was proven from
+    (LOOK_END_RAD) is proven again from its end. Where the arm's IK solves
+    no look the pose goes to the planner, and its plan is proven from where
+    it ends, as always — unless the look stands past everything the arm
+    reaches (LOOK_PAST_REACH_M). Returns (ReachPlan, None) or (None,
+    why)."""
     from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime.client import pose_goal_joints
 
     chain = approach._chain()
     bx, by, bz = (float(v) for v in button)
     refused = []
     for tilt in tilts:
-        quat, start, bottom, look = reach_geometry(ctx.model, button, tilt, cfg.travel_m)
+        geometry = reach_geometry(ctx.model, button, tilt, cfg.travel_m)
+        quat, _start, _bottom, look = geometry
         try:
-            leg, _st = _plan_motion(
-                ctx, PlanState(joints=list(q_from), chain=0), "reach:look", ("pose", look, quat), _full_world(ctx), TRANSIT_SPEED
-            )
-        except RuntimeError as e:
-            refused.append("%d deg: the look pose (%s)" % (tilt, _short(e)))
+            past = chain.past_reach_m(look, quat)
+        except Exception:  # noqa: BLE001 - a kinematics problem must never refuse a look: it is planned as always
+            past = None
+        if past is not None and past > LOOK_PAST_REACH_M:  # no IK solves it, the arm's own or the planner's
+            refused.append("%d deg: the look pose (its wrist %.0f mm past the arm's reach)" % (tilt, 1000 * past))
             continue
-        slide, why = chain.straight_line(leg.goal_joints, start, quat)
-        if slide is None:
-            refused.append("%d deg: the slide in (%s)" % (tilt, why))
-            continue
-        if depth:
-            down, stroke, why = way_down(ctx, cfg, leg.goal_joints, slide, start, quat, bz)
-            if down is None:
-                refused.append("%d deg: the way down (%s)" % (tilt, why))
-                if looks is not None:
-                    looks.append(ReachPlan(tilt, quat, (bx, by, bz), look, start, bottom, leg, slide, None))
+        q_look, leg = pose_goal_joints(look, quat, list(q_from)), None  # as _plan_look's PlanState hands it
+        if q_look is None:  # the pose to the planner, as the client hands it: proven from where its plan ends
+            leg, why = _plan_look(ctx, q_from, look, quat)
+            if leg is None:
+                refused.append("%d deg: the look pose (%s)" % (tilt, why))
                 continue
-            if down.slide is not None:  # it turns lower down: the slide carries on to there
-                slide, start = down.slide, down.start_xyz
-            return ReachPlan(tilt, quat, (bx, by, bz), look, start, bottom, leg, slide, None, down, stroke), None
-        stroke, why = chain.straight_line(slide[-1], bottom, quat)
-        if stroke is None:
-            refused.append("%d deg: the stroke (%s)" % (tilt, why))
+            q_look = leg.goal_joints
+        plan, why, kept = _proven(ctx, cfg, chain, tilt, (bx, by, bz), geometry, q_look, depth)
+        if plan is not None and leg is None:  # the first tilt that proves: the one look planned
+            leg, why_leg = _plan_look(ctx, q_from, look, quat)
+            if leg is None:
+                plan, why = None, "the look pose (%s)" % why_leg
+            else:
+                gap = _joint_gap(leg.goal_joints, q_look)
+                if gap > LOOK_END_RAD:
+                    print("  NOTE reach:look at %d deg: planned to end %.3f rad from the joints its press was proven "
+                          "from — proven again from there" % (tilt, gap))
+                    plan, why, kept = _proven(ctx, cfg, chain, tilt, (bx, by, bz), geometry, leg.goal_joints, depth)
+        if plan is None:
+            refused.append("%d deg: %s" % (tilt, why))
+            if kept is not None and looks is not None:
+                kept.look_leg = leg  # None where it was not planned
+                looks.append(kept)
             continue
-        return ReachPlan(tilt, quat, (bx, by, bz), look, start, bottom, leg, slide, stroke), None
+        plan.look_leg = leg
+        return plan, None
     return None, "; ".join(refused)
 
 
@@ -443,13 +544,14 @@ def shifted_way_down(ctx, cfg, look, button, m=PROOF_SHIFT_M):
     """For a scene button no tilt presses (plan_reach depth=True): whether
     the press reaches one of _shifted_buttons from `look` — the smallest
     tilt whose look pose and slide solved (plan_reach's `looks`) — the slide
-    from its look joints straight to that button's start at its tilt, then
-    way_down. Returns (SHIFTED's name, None) for the first that does, or
-    (None, why)."""
+    from its look joints (look_joints: those it was proven from, planned or
+    not) straight to that button's start at its tilt, then way_down.
+    Returns (SHIFTED's name, None) for the first that does, or (None,
+    why)."""
     from rammp_box_opening.runtime import approach
 
     chain = approach._chain()
-    q = look.look_leg.goal_joints
+    q = look.look_joints
     whys = []
     for name, b in zip(SHIFTED, _shifted_buttons(button, m)):
         quat, start, _bottom, _look = reach_geometry(ctx.model, b, look.tilt_deg, cfg.travel_m)
@@ -463,6 +565,54 @@ def shifted_way_down(ctx, cfg, look, button, m=PROOF_SHIFT_M):
             continue
         return name, None
     return None, "; ".join(whys)
+
+
+def plan_shifted_look(ctx, cfg, looks, button, q_from, m=PROOF_SHIFT_M):
+    """For a scene button no tilt presses (plan_reach depth=True): the press
+    to one of _shifted_buttons from the smallest tilt of its `looks`
+    (shifted_way_down, as it always was asked), and that look's leg,
+    planned from `q_from` only once the press reaches — plan_reach plans
+    none of them, so a box nothing presses costs the planner nothing
+    (14:28:12 2026-10-28: four looks planned, none pressed from). Where the
+    press reaches but the look does not plan, the next look is asked in its
+    place, as plan_reach passes over a look that does not plan; where the
+    press does not reach, the search ends there, unplanned. Until
+    2026-10-28 a look that did not plan was never kept, so the next one was
+    asked: a kept look that would not have planned now stops the run where
+    a larger tilt's press might have flown — knowing would cost a plan on
+    every such stop. One planned to end off the joints it was proven from
+    (LOOK_END_RAD) is proven again from where it ends. Returns (the
+    ReachPlan with its look leg planned, SHIFTED's name, None) or (None,
+    None, why)."""
+    from rammp_box_opening.runtime import approach
+
+    whys = []
+    for look in looks:
+        near, why = shifted_way_down(ctx, cfg, look, button, m)
+        if near is None:
+            return None, None, "; ".join(whys + ["at %d deg: %s" % (look.tilt_deg, why)])
+        leg = look.look_leg
+        if leg is None:
+            leg, why = _plan_look(ctx, q_from, look.look_xyz, look.quat)
+            if leg is None:
+                whys.append("at %d deg the press reaches it %.0f mm %s, but the look pose does not plan (%s)"
+                            % (look.tilt_deg, 1000 * m, near, why))
+                continue
+        gap = _joint_gap(leg.goal_joints, look.look_joints)
+        if gap > LOOK_END_RAD:
+            print("  NOTE reach:look at %d deg: planned to end %.3f rad from the joints its press was proven from — "
+                  "proven again from there" % (look.tilt_deg, gap))
+            q = [float(v) for v in leg.goal_joints]
+            slide, why = approach._chain().straight_line(q, look.start_xyz, look.quat)
+            if slide is None:
+                whys.append("at %d deg, planned %.3f rad off: the slide in (%s)" % (look.tilt_deg, gap, why))
+                continue
+            look = dataclasses.replace(look, slide_pts=slide, look_joints=q)
+            near, why = shifted_way_down(ctx, cfg, look, button, m)
+            if near is None:
+                return None, None, "; ".join(whys + ["at %d deg, planned %.3f rad off: %s" % (look.tilt_deg, gap, why)])
+        return dataclasses.replace(look, look_leg=leg), near, None
+    return None, None, "; ".join(whys)
 
 
 @dataclass
@@ -1340,10 +1490,11 @@ def _not_one_execution(ctx, legs):
     chains them and way_in_legs names one gains spec on every one, so it
     should not happen), or the first does not start where the arm stands
     (REUSE_RAD, as _line_from reuses a solved line). After the planner's
-    look leg the way in starts at that leg's planned end, which an
-    impedance arrival leaves a few mm off; the driver would jump to it, and
-    the runner refuses it from DRIFT_REPLAN_RAD on. Leg by leg, each is
-    solved again from where the arm stands."""
+    look leg the way in starts at the joints that leg was planned to
+    (plan_reach's look_joints; the leg ends within LOOK_END_RAD of them),
+    which an impedance arrival leaves a few mm off; the driver would jump
+    to them, and the runner refuses it from DRIFT_REPLAN_RAD on. Leg by
+    leg, each is solved again from where the arm stands."""
     if not legs:
         return "no line to fly"
     if len(merge_groups(legs)) != 1:
@@ -1640,7 +1791,7 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     press is proven by the arm's own kinematics before the arm moves
     toward the box: from the look pose the hand turns down and strokes —
     for the scene camera's button, or one PROOF_SHIFT_M off it, before the
-    look (plan_reach depth=True, shifted_way_down), and for the aimed
+    look (plan_reach depth=True, plan_shifted_look), and for the aimed
     button before the re-aim (solve_way_in). Where it does not, nothing
     moves, or the arm goes home from the look pose. Where it does, the way
     in flies as proven, as ONE execution from the aimed look pose to the
@@ -1723,15 +1874,16 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     plan, why = plan_reach(ctx, cfg, prior_button, q0, depth=proof, looks=looks)
     proven = "scene" if proof and plan is not None else None
     if plan is None and proof and looks:
-        near, why_near = shifted_way_down(ctx, cfg, looks[0], prior_button)
-        if near is None:
+        # no look was planned for it: the shifted press's is, once it flies
+        plan, near, why_near = plan_shifted_look(ctx, cfg, looks, prior_button, q0)
+        if plan is None:
             stop = ("no reach-out press for the scene camera's box — no tilt turns the hand down and strokes there, "
-                    "nor with the button %.0f mm nearer the arm or to either side (%s; at %d deg: %s)"
-                    % (1000 * PROOF_SHIFT_M, why, looks[0].tilt_deg, why_near))
+                    "nor with the button %.0f mm nearer the arm or to either side (%s; %s)"
+                    % (1000 * PROOF_SHIFT_M, why, why_near))
             print("[press_demo] STOP: %s; nothing moved" % stop)
             runner.note("reach_refused", why=stop)
             return 1
-        plan, proven = looks[0], "shifted"
+        proven = "shifted"
         print("[press_demo] REACH-OUT: the press does not reach the scene camera's button itself (%s), but at %d deg "
               "it does with the button %.0f mm %s — inside what the aim corrects — so the look flies and the aimed "
               "button decides" % (why, plan.tilt_deg, 1000 * PROOF_SHIFT_M, near))
@@ -1880,13 +2032,14 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
                 if any(not r.ok for r in res):
                     let_go_part_way(ctx, res)
                     return 1
-                # plan_reach proved the way down from the leg's end: that proof
-                # is the way in. Solved again from the live joints, an
-                # impedance arrival a few mm off the look pose would only add a
-                # re-aim, which the planned move never had. It starts at the
-                # leg's planned end, though, and an impedance arrival read the
-                # moment its goal ends stands mm off it, past REUSE_RAD: this
-                # way in then flies leg by leg (_not_one_execution)
+                # plan_reach proved the way down from the joints the leg was
+                # planned to (look_joints; the leg ends within LOOK_END_RAD of
+                # them): that proof is the way in. Solved again from the live
+                # joints, an impedance arrival a few mm off the look pose would
+                # only add a re-aim, which the planned move never had. It
+                # starts at those joints, though, and an impedance arrival read
+                # the moment its goal ends stands mm off them, past REUSE_RAD:
+                # this way in then flies leg by leg (_not_one_execution)
                 way = WayIn([], plan2, plan2.down, None if plan2.down.walked else plan2.slide_pts, plan2.stroke)
         if way is None:
             # from the look pose, in free air: nothing slid into the box's
