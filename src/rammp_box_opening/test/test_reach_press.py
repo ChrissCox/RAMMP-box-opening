@@ -954,6 +954,56 @@ def test_a_scene_button_no_tilt_presses_even_30_mm_off_stops_before_anything_mov
         assert xy == pytest.approx(list(want), abs=1e-9) and z == BUTTON[2]
 
 
+def _refusals(tmp_path):
+    import json
+
+    return [r for f in tmp_path.glob("run-*.jsonl") for r in map(json.loads, open(f)) if r["leg"] == "reach_refused"]
+
+
+def test_a_refused_proof_is_noted_in_the_record_word_for_word_as_its_stop_line(ctx, monkeypatch, tmp_path, capsys):
+    """14:28:12, 14:29:19 and 14:29:54 2026-10-28 ended here, before the arm
+    moved: the reason printed, the record ending at the scene fix. It is
+    noted now, as the STOP line says it."""
+    code, rec, _chain, _h, _got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down([]))
+    assert code == 1 and rec.events == [] and ctx.client.executed == []
+    (note,) = _refusals(tmp_path)
+    assert note["why"].startswith("no reach-out press for the scene camera's box — no tilt turns the hand down")
+    assert "[press_demo] STOP: %s; nothing moved" % note["why"] in capsys.readouterr().out
+
+
+def test_a_box_no_look_plans_for_is_noted_in_the_record(ctx, monkeypatch, tmp_path, capsys):
+    chain = _Chain(refuse=[lambda xyz, quat: True])  # no straight line anywhere: no tilt slides in
+    code, rec, _c, _h = _flow(ctx, monkeypatch, tmp_path, chain=chain)
+    assert code == 1 and rec.events == [] and ctx.client.executed == []
+    (note,) = _refusals(tmp_path)
+    assert note["why"].startswith("no reach-out press plans for the scene camera's box (30 deg: the slide in (IK did "
+                                  "not converge)")
+    assert "[press_demo] STOP: %s; nothing moved" % note["why"] in capsys.readouterr().out
+
+
+def test_a_guarded_reach_with_no_steady_reading_at_rest_is_noted_in_the_record(ctx, monkeypatch, tmp_path):
+    code, rec, _c, _h = _flow(ctx, monkeypatch, tmp_path, settled=[None])
+    assert code == 1 and rec.events == [] and ctx.client.executed == []
+    (note,) = _refusals(tmp_path)
+    assert note["why"].startswith("no steady joint efforts at the rest pose")
+
+
+def test_a_reach_out_this_install_cannot_aim_is_noted_in_the_record(ctx, monkeypatch, tmp_path):
+    from rammp_box_opening.models.container import ContainerPose
+    from rammp_box_opening.runtime.runner import Runner
+
+    monkeypatch.setattr(reach_press, "oblique_aim_available", lambda: False)
+    ctx.model = ContainerModel.load(PINK)
+    fix = SimpleNamespace(pose=ContainerPose(xyz=(BUTTON[0], BUTTON[1], BUTTON[2] - 0.121), yaw=0.0), top_xyz=BUTTON)
+    args = SimpleNamespace(execute=True, press_only=False, compliant=True, depth_press=True)
+    runner = Runner(ctx.client, log_dir=tmp_path)
+    assert reach_press.run_reach_press(None, ctx, load_press_demo(PINK), runner, None, args, fix, None) == 1
+    (note,) = _refusals(tmp_path)
+    assert note["why"] == ("no reach-out press — this install's wrist aim cannot look at the lid obliquely "
+                           "(perception/button_aim takes no lid_z/prior_xy)")
+    assert not ctx.client.executed and ctx.client.primes == []
+
+
 def test_a_scene_button_the_press_reaches_30_mm_off_flies_the_look_and_the_aimed_button_decides(
         ctx, monkeypatch, tmp_path, capsys):
     """As on flatbot's URDF for a scene button at r 0.766 m, az -15 deg

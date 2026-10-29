@@ -1393,6 +1393,33 @@ def test_a_failed_execution_logs_no_arrival_error(tmp_path, monkeypatch):
     assert row["mode"] == "impedance" and row["gains"] == 3  # how it flew, still
 
 
+def test_a_custom_specs_zeta_is_in_the_record_and_its_side_file_beside_its_name(tmp_path, monkeypatch):
+    """RIGID flew at zeta 0.7 from 14:21 to 16:23 2026-10-28: a run under
+    the same name at another zeta is told apart in the record by its zeta,
+    not its name. A driver profile's zeta is the driver's own: None."""
+    import json
+
+    from rammp_box_opening.constants import CustomGains
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    spec = CustomGains("RIGID", (400.0,) * 4 + (200.0,) * 3, 1.0, (39.0,) * 4 + (9.0,) * 3)
+
+    class Sends(_ArrivesOff):
+        def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+            outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+            info.update(gains=spec, sent_at=time.monotonic(), sent_traj=traj_)
+            return outcome, info
+
+    res = runner(Sends(), tmp_path).run([leg("a", Q0, Q1)], execute=True)
+    assert res[0].ok and (res[0].gains, res[0].gains_zeta) == ("RIGID", 1.0)
+    assert (_rows(tmp_path)["a"]["gains"], _rows(tmp_path)["a"]["gains_zeta"]) == ("RIGID", 1.0)
+    doc = json.loads((tmp_path / res[0].flight).read_text())
+    assert (doc["gains"], doc["gains_zeta"]) == ("RIGID", 1.0)
+    res = runner(_ArrivesOff(), tmp_path / "profile").run([leg("a", Q0, Q1)], execute=True)
+    assert (res[0].gains, res[0].gains_zeta) == (3, None)
+
+
 def test_an_arrival_across_the_wrap_is_the_short_way_round(tmp_path, monkeypatch):
     """HOME's joint_3 sits 4.6 mrad from -pi and reads either side of it: an
     end at -3.137 with the arm reading +3.140 is 6 mrad off, not 6.28 rad."""
@@ -1441,3 +1468,412 @@ def test_the_recoil_logs_how_it_flew_and_where_it_ended_like_any_leg(tmp_path, m
     assert recoil["end_err_rad"] == pytest.approx(0.01, abs=1e-9)
     assert recoil["end_err_mm"] == pytest.approx(5.0, rel=1e-3)
     assert press["mode"] == "position" and press["end_err_rad"] is None and press["end_err_mm"] is None
+
+
+# -- the flight log: each joint's signed arrival, the settle after it, what flew --
+
+
+def test_an_arrival_signs_each_joints_error_by_its_travel_into_the_end(tmp_path, monkeypatch):
+    """15:45 2026-10-28: the look arrived with joint_2 45 mrad PAST its end,
+    the home with joint_6 253 mrad SHORT, and end_err_rad read both as one
+    unsigned number. Each joint now has its own: + past the end along the
+    way it travelled into it, - short of it, whichever way that is; and the
+    worst is named."""
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    cases = [
+        (Q0, Q1, 0.11, +10.0),  # up to 0.1, the arm on at 0.11: past
+        (Q0, Q1, 0.09, -10.0),  # ... at 0.09: short
+        (Q1, Q0, -0.01, +10.0),  # down to 0.0, the arm on at -0.01: past
+        (Q1, Q0, 0.01, -10.0),  # ... at 0.01: short
+    ]
+    for i, (a, b, to, want) in enumerate(cases):
+        d = tmp_path / str(i)
+        c = _ArrivesOff(joint=1, to=to)
+        c.live = list(a)
+        res = runner(c, d).run([leg("a", a, b)], execute=True)
+        assert res[0].end_err_mrad[1] == pytest.approx(want, abs=1e-9), (a, b, to)
+        assert res[0].end_err_mrad[:1] + res[0].end_err_mrad[2:] == [0.0] * 6
+        assert res[0].end_err_joint == "joint_2"
+        row = _rows(d)["a"]
+        assert row["end_err_mrad"] == res[0].end_err_mrad and row["end_err_joint"] == "joint_2"
+        assert row["end_err_rad"] == pytest.approx(0.01, abs=1e-9)  # the unsigned worst, as before
+
+
+def test_a_joint_is_signed_by_where_it_last_travelled_not_by_its_noise():
+    """A joint that finished moving early holds to float noise (cuRobo's
+    float32 samples); its last real travel into the end signs it. One that
+    never moves reads along its own axis. One whose travel turned back
+    before the end (a cuRobo path may) is signed by the way it came in,
+    not by where it set out from."""
+    from rammp_box_opening.runtime import runner as runner_mod
+
+    rows = [[0.0, 0.5, 0.0, 0.0], [0.1, 0.3, 0.0, 0.3], [0.2, 0.2, 0.0, 0.2], [0.2 + 3e-7, 0.2, 0.0, 0.2],
+            [0.2 - 2e-7, 0.2, 0.0, 0.2]]
+    t = traj(Q0, Q1)
+    t.points = []
+    for row in rows:
+        p = JointTrajectoryPoint()
+        p.positions = row
+        t.points.append(p)
+    assert list(runner_mod._travel_signs(t)) == [1.0, -1.0, 1.0, -1.0]
+    # joint_4 came in down from 0.3: at 0.19 it is past its 0.2, though it set out from 0.0 below it
+    mrad, worst = runner_mod._signed_end_error([0.21, 0.19, -0.004, 0.19], t)
+    assert mrad == pytest.approx([10.0, 10.0, -4.0, 10.0], abs=0.05) and worst in ("joint_1", "joint_2", "joint_4")
+    assert runner_mod._signed_end_error(None, t) == (None, None)
+
+
+class _Clock:
+    """runtime/runner's `time`, moved by hand: the settle note's window and
+    the arrival are measured on it, the driver's stamps on its time()."""
+
+    strftime = staticmethod(time.strftime)  # the record's name (bound before time() below hides the module)
+
+    def __init__(self):
+        self.mono = 100.0
+        self.wall_off = 1793216726.0 - self.mono
+
+    def monotonic(self):
+        return self.mono
+
+    def time(self):
+        return self.mono + self.wall_off
+
+    def sleep(self, s):
+        self.mono += float(s)
+
+
+# the look of 15:45 2026-10-28 in shape: the tool 14 mm off its end at the
+# arrival, joint_2 past it, creeping back — out above 2 mm once more at
+# +0.7 s — and in to 0.5 mm; (s after the arrival, mm off). The last is
+# outside the 1.5 s window
+CREEP = [(0.0, 14.0), (0.1, 12.0), (0.2, 8.0), (0.3, 6.0), (0.4, 4.0), (0.5, 3.0), (0.6, 1.5), (0.7, 2.5),
+         (0.8, 1.8), (0.9, 0.9), (1.0, 0.6), (1.2, 0.5), (1.4, 0.5), (1.6, 0.5)]
+
+
+class _Creeps(FakeClient):
+    """A compliant client whose every motion takes 1 s on `clock` and
+    arrives as CREEP says: joint_2 past the end by what puts _TwoLink's tool
+    `mm` off it, its /joint_states stamped on the driver's clock (`clock`'s
+    time()) and heard 5 ms later — and only once the clock has passed
+    them, as a real stream is. One more, measured 20 ms before the arrival
+    30 mm off, is heard just after it, as the subscription's queue hands
+    on what waited (SensorDataQoS keeps 5): by its stamp it is the motion's,
+    not the settle's. goals_sent: every execution's send, and any a test
+    adds."""
+
+    def __init__(self, clock, script=CREEP):
+        super().__init__()
+        self.compliant = True
+        self.clock, self.script = clock, script
+        self.heard, self.sent = [], []
+
+    @staticmethod
+    def past(end, mm):
+        q = list(end)
+        q[1] += 2.0 * math.asin(mm / 1000.0)  # _TwoLink's tool turns 0.5 m about joint_2: a chord
+        return q
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        from rammp_box_opening.runtime.client import JointSample
+
+        sent_at = self.clock.mono
+        self.sent.append(sent_at)
+        self.clock.mono += 1.0
+        outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+        end = list(traj_.points[-1].positions)
+        t0, w0 = self.clock.monotonic(), self.clock.time()
+        self.live = self.past(end, self.script[0][1])
+        qd = [0.0, -0.05, 0.0, 0.0, 0.0, 0.0, 0.0]
+        self.heard.append(JointSample(t0 + 0.002, w0 - 0.02, self.past(end, 30.0), [0.0, 0.3] + [0.0] * 5, None))
+        self.heard += [JointSample(t0 + s + 0.005, w0 + s, self.past(end, mm), qd, None) for s, mm in self.script[1:]]
+        info.update(gains=3, sent_at=sent_at, sent_traj=traj_, feedback_q=[(sent_at + 0.5, 0.5, list(end))])
+        return outcome, info
+
+    def joint_history(self, since=None):
+        return [s for s in self.heard if s.t <= self.clock.mono and (since is None or s.t >= since)]
+
+    def goals_sent(self):
+        return list(self.sent)
+
+
+def _creep(monkeypatch, tmp_path, script=CREEP):
+    from rammp_box_opening.runtime import approach
+    from rammp_box_opening.runtime import runner as runner_mod
+
+    clock = _Clock()
+    monkeypatch.setattr(runner_mod, "time", clock)
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    c = _Creeps(clock, script)
+    return clock, c, runner(c, tmp_path)
+
+
+def _settles(tmp_path):
+    import json
+
+    return [r for r in map(json.loads, next(tmp_path.glob("run-*.jsonl")).read_text().splitlines())
+            if r["leg"] == "settle"]
+
+
+def test_an_arrivals_settle_is_noted_when_the_next_goal_goes_out(tmp_path, monkeypatch):
+    """The look of 15:45 arrived 14 mm off and was within 2 mm only 0.55 s
+    later; the record had the 14 mm. The settle is measured from the
+    /joint_states the client kept, placed by their stamps, over the 1.5 s
+    after the arrival, and noted when the next goal goes out — nothing
+    waits for it: when the tool came within 5, 2 and 1 mm FOR GOOD (where
+    the line between the last reading outside and the next meets each),
+    how far each joint went past its end, how fast it moved, how far the
+    tool strayed and where it was left."""
+    clock, c, r = _creep(monkeypatch, tmp_path)
+    res = r.run([leg("a", Q0, Q1)], execute=True)
+    assert res[0].ok and res[0].end_err_mm == pytest.approx(14.0, abs=1e-6)
+    assert _settles(tmp_path) == []  # nothing noted at the arrival
+    clock.mono += 2.0  # the aim, the planning: past the window
+    r.run([leg("b", Q1, Q2)], execute=True)
+    (note,) = _settles(tmp_path)
+    assert note["legs"] == ["a"] and note["seq"] == 1 and note["cut"] is None and note["window_s"] == 1.5
+    assert note["arrived_t"] == pytest.approx(1793216727.0, abs=1e-3)
+    # 1.0 to 1.2 s; +1.6 s is outside, and the reading measured before the arrival is not the settle's
+    assert note["samples"] == 12 and note["last_s"] == 1.4 and note["gap_ms"] == pytest.approx(200.0)
+    assert note["within_5mm_s"] == pytest.approx(0.3 + 0.1 * (6.0 - 5.0) / (6.0 - 4.0), abs=1e-3)
+    # out above 2 mm again at +0.7 s: within it for good only after that
+    assert note["within_2mm_s"] == pytest.approx(0.7 + 0.1 * (2.5 - 2.0) / (2.5 - 1.8), abs=1e-3)
+    assert note["within_1mm_s"] == pytest.approx(0.8 + 0.1 * (1.8 - 1.0) / (1.8 - 0.9), abs=1e-3)
+    assert note["max_mm"] == 14.0 and note["end_mm"] == 0.5
+    past = note["past_mrad"]
+    assert past[1] == pytest.approx(2000.0 * math.asin(0.014), abs=0.05) and past[1] > 0  # joint_2: past its end
+    assert past[:1] + past[2:] == [0.0] * 6
+    assert note["peak_qd"] == [0.0, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+
+def test_a_settle_window_ends_where_the_next_goal_begins(tmp_path, monkeypatch):
+    """What the arm does once the next goal is out is that goal's: the
+    window is cut at the runner's next execution, about to go out, or at
+    any goal the client sent before it (the hold that primes the
+    impedance, a release), and says which. Within 1 mm is not reached
+    inside 0.65 s: None, not a guess."""
+    clock, c, r = _creep(monkeypatch, tmp_path)
+    r.run([leg("a", Q0, Q1)], execute=True)
+    clock.mono += 0.65
+    r.run([leg("b", Q1, Q2)], execute=True)
+    (note,) = _settles(tmp_path)
+    assert note["cut"] == "next execution" and note["window_s"] == pytest.approx(0.65)
+    assert note["samples"] == 6 and note["last_s"] == 0.6 and note["end_mm"] == 1.5
+    assert note["within_5mm_s"] == pytest.approx(0.35, abs=1e-3)
+    assert note["within_2mm_s"] == pytest.approx(0.5 + 0.1 * (3.0 - 2.0) / (3.0 - 1.5), abs=1e-3)
+    assert note["within_1mm_s"] is None
+    # a release 0.35 s after b's arrival cuts b's window there
+    clock.mono += 0.35
+    c.sent.append(clock.mono)
+    clock.mono += 1.0
+    r.run([leg("c", Q2, Q1)], execute=True)
+    note = _settles(tmp_path)[-1]
+    assert note["legs"] == ["b"] and note["cut"] == "next goal" and note["window_s"] == pytest.approx(0.35)
+    assert note["samples"] == 3 and note["within_5mm_s"] is None and note["end_mm"] == 6.0
+
+
+def test_the_last_arrivals_settle_is_noted_at_the_run_end_and_only_once(tmp_path, monkeypatch):
+    clock, c, r = _creep(monkeypatch, tmp_path)
+    r.run([leg("a", Q0, Q1)], execute=True)
+    clock.mono += 0.25
+    r.flush()
+    r.flush()
+    (note,) = _settles(tmp_path)
+    assert note["cut"] == "run end" and note["window_s"] == pytest.approx(0.25) and note["samples"] == 2
+    assert note["last_s"] == 0.2 and note["within_5mm_s"] is None and note["max_mm"] == 14.0 and note["end_mm"] == 8.0
+
+
+def test_a_settle_nothing_was_heard_after_claims_nothing(tmp_path, monkeypatch):
+    """Nothing spins the node after a run's last motion, the home: its note
+    at the run's end has the arrival's own reading alone, however long the
+    exit took. It says so — cut where the run ended, no reading after the
+    arrival — and claims neither where the tool went nor that it stayed
+    within anything: None, never a 0.0 read off the arrival alone."""
+    clock, c, r = _creep(monkeypatch, tmp_path, script=[(0.0, 0.8)])  # in at 0.8 mm, then nothing heard
+    r.run([leg("home", Q0, Q1)], execute=True)
+    clock.mono += 3.0  # the exit: the perception thread's join, its node destroyed
+    r.flush()
+    (note,) = _settles(tmp_path)
+    assert note["cut"] == "run end" and note["window_s"] == 1.5 and note["samples"] == 0 and note["last_s"] == 0.0
+    assert note["gap_ms"] == 1500.0 and note["peak_qd"] is None and note["max_mm"] == 0.8
+    assert note["end_mm"] is None
+    assert [note["within_%gmm_s" % mm] for mm in (5, 2, 1)] == [None, None, None]
+
+
+def test_a_settle_heard_through_its_whole_window_is_whole_at_the_run_end(tmp_path, monkeypatch):
+    """A window whose readings run on past its end was heard whole, whenever
+    its note is written: at the run's end too it is not cut."""
+    clock, c, r = _creep(monkeypatch, tmp_path)
+    r.run([leg("a", Q0, Q1)], execute=True)
+    clock.mono += 2.0  # the reading at +1.6 s is heard by now
+    r.flush()
+    (note,) = _settles(tmp_path)
+    assert note["cut"] is None and note["window_s"] == 1.5 and note["samples"] == 12 and note["end_mm"] == 0.5
+
+
+def test_no_settle_is_noted_for_an_execution_that_did_not_arrive(tmp_path, monkeypatch):
+    clock, c, r = _creep(monkeypatch, tmp_path)
+    c.exec_script = [("failed", {"message": "halted: emergency stop", "progress": 0.4})]
+    r.run([leg("a", Q0, Q1)], execute=True)
+    clock.mono += 2.0
+    r.flush()
+    assert _settles(tmp_path) == []
+
+
+class _Flies(FakeClient):
+    """A client that reports what it sent, as PlannerClient.execute does:
+    when, the trajectory, and every 10th feedback; and lists, while each
+    motion flies, the side files already written."""
+
+    FEEDBACK_EVERY = 10
+
+    def __init__(self, tmp_path):
+        super().__init__()
+        self.tmp_path, self.during, self.flown = tmp_path, [], []
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        self.during.append(sorted(p.name for p in self.tmp_path.glob("run-*.flights/*")))
+        self.flown.append(traj_)
+        outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+        now = time.monotonic()
+        info.update(sent_at=now - 1.0, sent_traj=traj_,
+                    feedback_q=[(now - 1.0 + 0.1 * k, 0.1 * k, [0.01 * k] * 7) for k in range(11)])
+        return outcome, info
+
+
+def test_each_execution_keeps_what_it_sent_and_what_flew_beside_the_record_once_it_has_flown(tmp_path):
+    """The runner dropped the trajectory each execution flew (flown_traj is
+    not log material). Now every execution sent leaves a side file next to
+    the run record, <record>.flights/<number>-<first leg>.json: each point
+    sent (t, q, qd, qdd) and the driver's feedback of what flew — written
+    once the motion is over, never while it flies — and every row of its
+    legs names it."""
+    import json
+
+    import numpy as np
+
+    c = _Flies(tmp_path)
+    r = runner(c, tmp_path)
+    r.run([leg("reach:look", Q0, Q1, chain=0)], execute=True)
+    r.run([leg("b", Q1, Q2, chain=0), leg("c", Q2, [0.3] * 7, chain=0)], execute=True)
+    assert c.during == [[], ["01-reach_look.json"]]  # nothing of a motion is written while it flies
+    record = next(tmp_path.glob("run-*.jsonl"))
+    folder = record.with_suffix(".flights")
+    assert sorted(p.name for p in folder.iterdir()) == ["01-reach_look.json", "02-b.json"]
+    doc = json.loads((folder / "02-b.json").read_text())
+    assert doc["seq"] == 2 and doc["legs"] == ["b", "c"] and doc["outcome"] == "arrived"
+    sent = c.flown[1]
+    assert doc["trajectory"]["t"] == pytest.approx([p.time_from_start.sec + 1e-9 * p.time_from_start.nanosec
+                                                    for p in sent.points], abs=1e-4)
+    for key, attr in (("q", "positions"), ("qd", "velocities"), ("qdd", "accelerations")):
+        np.testing.assert_allclose(doc["trajectory"][key], [list(getattr(p, attr)) for p in sent.points], atol=1e-4)
+    assert doc["joint_names"] == list(sent.joint_names) and doc["feedback"]["every"] == 10
+    fb = doc["feedback"]
+    assert fb["t"] == pytest.approx([0.1 * k for k in range(11)], abs=1e-4)
+    assert fb["fraction"] == pytest.approx([0.1 * k for k in range(11)])
+    np.testing.assert_allclose(fb["q"], [[0.01 * k] * 7 for k in range(11)], atol=1e-6)
+    rows = [json.loads(line) for line in record.read_text().splitlines()]
+    flights = {row["leg"]: row["flight"] for row in rows}
+    assert flights == {"reach:look": record.stem + ".flights/01-reach_look.json",
+                       "b": record.stem + ".flights/02-b.json", "c": record.stem + ".flights/02-b.json"}
+
+
+def test_an_execution_the_client_never_sent_keeps_no_flight_and_no_settle(tmp_path, monkeypatch):
+    c = _Flies(tmp_path)
+    r = runner(c, tmp_path)
+
+    def refused(traj_, speed, **kw):
+        return "failed", {"message": "refused before sending: velocity limit", "progress": 0.0}
+
+    c.execute = refused
+    res = r.run([leg("a")], execute=True)
+    assert res[0].outcome == "failed" and res[0].flight is None
+    assert not list(tmp_path.glob("run-*.flights")) and r._settling is None
+
+
+def test_the_recoil_is_an_execution_like_any_other_in_the_flight_log(tmp_path, monkeypatch):
+    """A push that ran its bound arrived: its settle is noted as the recoil
+    goes out, its window cut there, after the hold on the button. The
+    recoil keeps its side file, and its own settle is noted as the next
+    execution goes out."""
+    import json
+
+    clock, c, r = _creep(monkeypatch, tmp_path)
+    push = leg("press:push", Q0, Q1, guard=GuardSpec(touch_nm=4.0, trip="press"), world="interaction_button")
+    push.verify = lambda v: (v.outcome in ("touch", "arrived"), "pressed")  # as press_push's
+    push.hold_s = 0.35  # held on the button (the clock's sleep)
+    res = r.run([push, leg("retreat", Q1, Q2, chain=1, world="interaction_button")], execute=True)
+    assert [x.leg_name for x in res] == ["press:push", "recoil", "retreat"]
+    record = next(tmp_path.glob("run-*.jsonl"))
+    rows = [json.loads(line) for line in record.read_text().splitlines()]
+    assert [row["leg"] for row in rows] == ["press:push", "settle", "recoil", "settle", "retreat"]
+    pushed, recoiled = rows[1], rows[3]
+    assert pushed["legs"] == ["press:push"] and pushed["cut"] == "next execution"
+    assert pushed["window_s"] == pytest.approx(0.35) and pushed["samples"] == 3
+    assert rows[2]["flight"] == record.stem + ".flights/02-recoil.json"
+    assert recoiled["legs"] == ["recoil"] and recoiled["seq"] == 2 and recoiled["cut"] == "next execution"
+
+
+class _CtrlC(_Flies):
+    """_Flies, its execution number `at` stopped by a Ctrl+C: as
+    PlannerClient.execute does once the cancel and the release are out, it
+    raises KeyboardInterrupt with nothing returned, what it kept of the call
+    in last_execution — or, `sent` False, raises before anything went out,
+    last_execution still the call before's."""
+
+    def __init__(self, tmp_path, at, sent=True):
+        super().__init__(tmp_path)
+        self.at, self.sent, self.n = at, sent, 0
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        self.n += 1
+        if self.n != self.at:
+            outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+            self.last_execution = info
+            return outcome, info
+        if self.sent:
+            self.flown.append(traj_)
+            now = time.monotonic()
+            self.last_execution = {"message": "", "progress": 0.4, "torque_peak": None, "gains": None, "sent_at": now,
+                                   "sent_traj": traj_, "feedback_q": [(now + 0.1, 0.4, [0.02] * 7)]}
+        raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize("stopped", ["b", "recoil"])
+def test_an_execution_a_ctrl_c_stopped_keeps_its_flight_and_the_ctrl_c_goes_on(tmp_path, stopped):
+    """A Ctrl+C: the client cancels, lets the spring go and raises, handing
+    nothing back. The motion it stopped is the one most worth reading: its
+    side file is kept all the same, from what the client kept of the call,
+    and the KeyboardInterrupt goes on to press_demo's exit."""
+    import json
+
+    import numpy as np
+
+    c = _CtrlC(tmp_path, at=2)
+    r = runner(c, tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        if stopped == "b":
+            r.run([leg("a", Q0, Q1)], execute=True)
+            r.run([leg("b", Q1, Q2)], execute=True)
+        else:
+            c.exec_script = [("touch", {"message": "contact", "progress": 0.8, "torque_peak": 7.1})]
+            r.run([_press_leg(chain=0), leg("retreat", Q1, Q2, chain=1, world="interaction_button")], execute=True)
+    folder = next(tmp_path.glob("run-*.flights"))
+    first = "01-a.json" if stopped == "b" else "01-press_down.json"
+    assert sorted(p.name for p in folder.iterdir()) == [first, "02-%s.json" % stopped] and r._flights == 2
+    doc = json.loads((folder / ("02-%s.json" % stopped)).read_text())
+    assert doc["outcome"] == "aborted" and doc["legs"] == [stopped] and doc["feedback"]["fraction"] == [0.4]
+    np.testing.assert_allclose(doc["trajectory"]["q"], [list(p.positions) for p in c.flown[-1].points], atol=1e-6)
+
+
+def test_a_ctrl_c_before_anything_went_out_keeps_no_flight(tmp_path):
+    """The client's last_execution is then the call before's: it is never
+    kept again, under another leg's name."""
+    c = _CtrlC(tmp_path, at=2, sent=False)
+    r = runner(c, tmp_path)
+    r.run([leg("a", Q0, Q1)], execute=True)
+    with pytest.raises(KeyboardInterrupt):
+        r.run([leg("b", Q1, Q2)], execute=True)
+    folder = next(tmp_path.glob("run-*.flights"))
+    assert sorted(p.name for p in folder.iterdir()) == ["01-a.json"] and r._flights == 1
