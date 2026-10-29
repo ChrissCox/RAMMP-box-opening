@@ -915,6 +915,84 @@ def test_flagged_gripper_leg_is_not_sent_under_a_guarded_motion(tmp_path):
     r.finish()
 
 
+class _StillGripClient(_AsyncGripClient):
+    """_AsyncGripClient whose waits for a still arm are events too, each
+    answering `settle` (s waited, timed out)."""
+
+    def __init__(self, settle=(0.31, False)):
+        super().__init__()
+        self.settle = settle
+
+    def wait_still(self):
+        self.events.append("still")
+        return self.settle
+
+
+def _notes(tmp_path, kind):
+    import json
+
+    return [r for r in map(json.loads, next(tmp_path.glob("run-*.jsonl")).read_text().splitlines()) if r["leg"] == kind]
+
+
+def test_a_gripper_leg_sent_when_still_goes_out_once_the_arm_stands_still_and_the_record_says_how_long(tmp_path):
+    """reach_lid_off's grip:close, after the way down to the knob (the run
+    before), the open that rode it still pending: in the joint impedance
+    the way down "arrives" when its clock runs out, the arm still
+    settling. The open is joined, then the arm waited still
+    (Runner.wait_still, noted 'still'), then the fingers close. A gripper
+    leg not flagged goes out at once."""
+    c = _StillGripClient()
+    r = runner(c, tmp_path)
+    opened = leg("grip:open", kind=Kind.GRIPPER, cmd=0.0)
+    opened.defer_join = True
+    r.run([opened, leg("grip:down", Q0, Q1)], execute=True)
+    close = leg("grip:close", kind=Kind.GRIPPER, cmd=0.8, verify=lambda ctx: (True, "on the knob"))
+    close.send_when_still = True
+    res = r.run([close, leg("lid:lift", Q1, Q2)], execute=True)
+    assert all(x.ok for x in res) and [x.leg_name for x in res] == ["grip:open", "grip:close", "lid:lift"]
+    assert c.events == ["send", "execute", "join", "still", "send", "join", "execute"]
+    (note,) = _notes(tmp_path, "still")
+    assert (note["before"], note["settle_s"], note["timed_out"]) == ("grip:close", 0.31, False)
+    c2 = _StillGripClient()
+    runner(c2, tmp_path).run([leg("grip:down", Q0, Q1), leg("grip:close", kind=Kind.GRIPPER, cmd=0.8)],
+                             execute=True)
+    assert "still" not in c2.events
+
+
+def test_a_wait_that_runs_out_is_noted_and_the_fingers_close_all_the_same(tmp_path):
+    """A wait for a still arm never costs the run: past client.STILL_TIMEOUT_S
+    it carries on, the record saying it timed out."""
+    c = _StillGripClient(settle=(1.2, True))
+    close = leg("grip:close", kind=Kind.GRIPPER, cmd=0.8)
+    close.send_when_still = True
+    res = runner(c, tmp_path).run([leg("grip:down", Q0, Q1), close], execute=True)
+    assert all(x.ok for x in res) and c.events == ["execute", "still", "send", "join"]
+    (note,) = _notes(tmp_path, "still")
+    assert (note["settle_s"], note["timed_out"]) == (1.2, True)
+
+
+def test_a_gripper_leg_sent_when_still_is_never_sent_under_the_previous_motion(tmp_path):
+    """send_when_still wins over send_with_previous_motion: under the
+    motion, the arm is anything but still."""
+    c = _StillGripClient()
+    r = runner(c, tmp_path)
+    close = leg("grip:close", kind=Kind.GRIPPER, cmd=0.8)
+    close.defer_join = close.send_with_previous_motion = close.send_when_still = True
+    r.run([leg("grip:down", Q0, Q1), close], execute=True)
+    assert c.events == ["execute", "still", "send"]  # after the motion, deferred: joined at the end
+    r.finish()
+    assert c.events[-1] == "join"
+
+
+def test_a_client_that_keeps_no_stream_waits_for_nothing(tmp_path):
+    class _NoStream(FakeClient):
+        wait_still = None
+
+    r = runner(_NoStream(), tmp_path)
+    assert r.wait_still("reach-aim") is None
+    assert not list(tmp_path.glob("run-*.jsonl"))  # nothing noted
+
+
 def test_recoil_follows_a_push_that_ran_its_bound(tmp_path):
     """The arm is on the button whether the push met a stop or arrived at
     its bound: both recoil before the retreat."""
