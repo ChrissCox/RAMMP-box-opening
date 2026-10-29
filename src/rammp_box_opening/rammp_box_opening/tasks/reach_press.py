@@ -742,11 +742,12 @@ def oblique_aim_available():
 # button_aim.MIN_HITS are the straight-down aim's, where most frames hit).
 # Flatbot 2026-10-27: three agreeing hits took 14, 19 and 25 frames
 # (1.38-1.78 s), and at 15:19 the first hit did not agree, so three more
-# were needed. A compliant run aims the moment the look leg arrives, with no
+# were needed. A compliant run aimed the moment the look leg arrived, with no
 # at-rest read before it: 16:23's 1.78 s included the settle and left 0.72 s
 # of the 2.5, and a timeout ends the run with nothing pressed. The aim
 # returns on its fix: the longer budget is spent only where it would have
-# timed out.
+# timed out. The wait for a still arm before it (_aim) is its own, at most
+# client.STILL_TIMEOUT_S.
 REACH_AIM_S = 4.0
 # two agreeing hits among the last four (button_aim.agreeing_fix), as
 # depth_press.look's LOOK_HITS: one outlier no longer costs three hits
@@ -762,9 +763,20 @@ def _aim(node, watcher, yaw, lid_z, prior_xy, runner, tag):
     wrist's own readings are judged against — the lid after the press, the
     depth press's depth from over the box — so the wrist's own error
     cancels, as it did before the raise (flatbot 2026-10-27 15:19: the aim
-    14 mm off the wrist's depth under the fingers measured, 36 mm raised)."""
+    14 mm off the wrist's depth under the fingers measured, 36 mm raised).
+
+    The arm stands still first (runner.wait_still, noted 'still' before
+    `tag`): the aim's own still test passes frames from an arm creeping
+    after the look (16:23 2026-10-28: its first two hits read the knob
+    -7.2 and -5.5 mm above its lid, the pair that agreed +1.1 and +0.7).
+    Its first frame may be one shot just before the wait passed (on 15:45's
+    looks, in the creep's last 0.1-0.15 s, the tool under 15 mm/s). A
+    recheck right after an aim, nothing flown between, finds it still at
+    once (client.wait_still)."""
     from rammp_box_opening.tasks.press_demo import aim_button_at_staging
 
+    if runner is not None:
+        runner.wait_still(tag)
     seen = {}
     got, status = aim_button_at_staging(node, watcher, yaw, timeout_s=REACH_AIM_S, runner=runner, tag=tag, out=seen,
                                         lid_z=lid_z, prior_xy=prior_xy, min_hits=REACH_AIM_HITS)
@@ -1597,7 +1609,9 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     2026-10-28): every leg in the driver's joint impedance, under the
     client's compliant_gains (RIGID) where a leg names none, and
     nothing the run reads stops the arm — no torque guard, no at-rest read
-    or check, no look after the press (depth_press.press_compliant). Its
+    or check, no look after the press (depth_press.press_compliant); a
+    camera read at rest and the grip's close wait for the arm to stand
+    still (runner.wait_still), between motions, never stopping one. Its
     free-air lines (the re-aim, the slide in, the clear before home) fly at
     FREE_LINE_SPEED: CONTACT_SPEED is there so a guard can stop a line in
     time, and these carry none (16:23 crawled 10.5 s of them at 0.15). The
@@ -1639,8 +1653,13 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     why = unsupported(m)
     if why is None and not oblique_aim_available():
         why = "this install's wrist aim cannot look at the lid obliquely (perception/button_aim takes no lid_z/prior_xy)"
+    # Every refusal before the arm moves is noted as well as printed
+    # (reach_refused, here and below): 14:28:12, 14:29:19 and 14:29:54
+    # 2026-10-28 stopped at the proof or the look's plans, and their records
+    # end at the scene fix with no reason
     if why is not None:
         print("[press_demo] STOP: no reach-out press — %s; nothing moved" % why)
+        runner.note("reach_refused", why="no reach-out press — %s" % why)
         return 1
     yaw = scene_fix.pose.yaw
     prior = from_container(scene_fix.pose, m.button_offset)
@@ -1687,9 +1706,11 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     if plan is None and proof and looks:
         near, why_near = shifted_way_down(ctx, cfg, looks[0], prior_button)
         if near is None:
-            print("[press_demo] STOP: no reach-out press for the scene camera's box — no tilt turns the hand down and "
-                  "strokes there, nor with the button %.0f mm nearer the arm or to either side (%s; at %d deg: %s); "
-                  "nothing moved" % (1000 * PROOF_SHIFT_M, why, looks[0].tilt_deg, why_near))
+            stop = ("no reach-out press for the scene camera's box — no tilt turns the hand down and strokes there, "
+                    "nor with the button %.0f mm nearer the arm or to either side (%s; at %d deg: %s)"
+                    % (1000 * PROOF_SHIFT_M, why, looks[0].tilt_deg, why_near))
+            print("[press_demo] STOP: %s; nothing moved" % stop)
+            runner.note("reach_refused", why=stop)
             return 1
         plan, proven = looks[0], "shifted"
         print("[press_demo] REACH-OUT: the press does not reach the scene camera's button itself (%s), but at %d deg "
@@ -1697,6 +1718,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
               "button decides" % (why, plan.tilt_deg, 1000 * PROOF_SHIFT_M, near))
     if plan is None:
         print("[press_demo] STOP: no reach-out press plans for the scene camera's box (%s); nothing moved" % why)
+        runner.note("reach_refused", why="no reach-out press plans for the scene camera's box (%s)" % why)
         return 1
     runner.note("reach_plan", tilt_deg=plan.tilt_deg, look_xyz=[round(v, 4) for v in plan.look_xyz],
                 button=list(prior_button), proof=proven,
@@ -1716,6 +1738,8 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         return 0
     at_rest = None if soft else _settled(ctx, "the rest pose")
     if at_rest is None and not soft:
+        runner.note("reach_refused", why="no steady joint efforts at the rest pose — the reach-out's guards cannot be "
+                                         "referenced")
         return 1
     res = runner.run([plan.look_leg], execute=True)
     if any(not r.ok for r in res):
