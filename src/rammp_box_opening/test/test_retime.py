@@ -362,3 +362,150 @@ def test_the_group_reports_where_each_leg_begins_in_time():
     at = float(t[-1]) * fracs[1]
     reached = float(np.interp(at, t, np.linalg.norm(_q - _q[0], axis=1)))
     assert abs(reached - 0.5) < 0.02  # the junction is where leg b starts
+
+
+# -- the absolute ceiling (RetimeParams.qd_ceiling): what a compliant arm's wrist follows --
+
+WRIST_CEILING = (math.inf,) * 4 + (0.45,) * 3  # constants.COMPLIANT_QD_CEILING
+# stamps are whole nanoseconds (stamps.set_stamp): an interval at the ceiling reads
+# a few parts in 1e8 over it
+
+
+def _joint_speeds(msg):
+    """Each interval's per-joint speed, as the driver flies the samples."""
+    q, _v, t = _arrays(msg)
+    return np.abs(np.diff(q, axis=0)) / np.diff(t)[:, None]
+
+
+def test_the_ceiling_is_absolute_a_slow_line_it_does_not_bind_flies_as_before():
+    """The ceiling caps what a leg's cruise fraction leaves and no fraction
+    scales it. A 0.3 walk like 16:23's (joint_1 -1.35, joint_3 +1.20,
+    joint_6 -0.63 rad) runs its wrist well under 0.45 rad/s, so it flies
+    exactly as without the ceiling: the shoulder is not slowed. The same
+    0.45 written as a smaller vmax is 0.3 x 0.9 x 0.5 on it, and slows the
+    whole line (16:23's way in 7.25 -> 12.4 s, offline 2026-10-28)."""
+    walk = _traj(_line([0] * 7, [-1.35, 0.37, 1.2, 0.83, 0.1, -0.63, 0.2], 80))
+    free, _ = retime_group([walk], [0.3], JOINT_VMAX, RetimeParams())
+    capped, info = retime_group([walk], [0.3], JOINT_VMAX, RetimeParams(qd_ceiling=WRIST_CEILING))
+    assert _joint_speeds(capped)[:, 4:].max() <= 0.45 * (1 + 1e-6)
+    assert np.abs(_arrays(capped)[1][:, 4:]).max() <= 0.45 * (1 + 1e-6)  # the velocities on the wire too
+    for got, want in zip(_arrays(capped), _arrays(free)):
+        assert np.array_equal(got, want)
+    _, as_vmax = retime_group([walk], [0.3], JOINT_VMAX[:4] + [0.5] * 3, RetimeParams())
+    assert as_vmax["duration_s"] > 1.2 * info["duration_s"]
+
+
+def test_a_full_speed_leg_holds_its_wrist_to_the_ceiling_and_a_shoulder_move_flies_as_before():
+    """At 1.0 the re-timer let joint_6 run 0.9 x 1.222 = 1.10 rad/s; in the
+    driver's joint impedance it made 0.54 (15:45 2026-10-28, its command at
+    the 9 N·m clamp). Under the ceiling a full-speed leg holds the wrist to
+    0.45 and slows its whole path with it, positions untouched; a move of
+    joints 1-4 alone, which the ceiling does not name, flies as before."""
+    look = _traj(_line([0] * 7, [0.1, 1.2, 0.5, 0.7, 0.3, 1.0, 0.1], 60))
+    free, _ = retime_group([look], [1.0], JOINT_VMAX, RetimeParams())
+    capped, info = retime_group([look], [1.0], JOINT_VMAX, RetimeParams(qd_ceiling=WRIST_CEILING))
+    assert _joint_speeds(free)[:, 5].max() > 0.8  # what it asked without
+    assert _joint_speeds(capped)[:, 4:].max() <= 0.45 * (1 + 1e-6)
+    assert np.abs(_arrays(capped)[1][:, 4:]).max() <= 0.45 * (1 + 1e-6)
+    assert np.array_equal(_arrays(capped)[0], _arrays(free)[0])  # positions never touched
+    assert info["duration_s"] > 1.0 / 0.45  # 1 rad of joint_6 under 0.45 rad/s
+    assert check_like_executor(capped, JOINT_VMAX) == []
+    arm = _traj(_line([0] * 7, [0.3, 1.2, 0.5, 0.7, 0.0, 0.0, 0.0], 60))
+    a_free, _ = retime_group([arm], [1.0], JOINT_VMAX, RetimeParams())
+    a_capped, _ = retime_group([arm], [1.0], JOINT_VMAX, RetimeParams(qd_ceiling=WRIST_CEILING))
+    for got, want in zip(_arrays(a_capped), _arrays(a_free)):
+        assert np.array_equal(got, want)
+
+
+def test_a_rest_to_rest_interval_averages_under_the_ceiling_too():
+    """An interval between two rest samples is timed apart from the profile
+    (times_from_profile's triangle, a trapezoid where the cap binds): its
+    cap is the ceiling's too, so 1 rad of joint_6 there averages under
+    0.45 rad/s, not under the 1.10 the joint limit alone allows. Averages:
+    the driver's quintic between two rest samples peaks at 15/8 of that
+    (0.77 rad/s here; 1.58 under the joint cap alone, as before this). The
+    mission's lines and turns are sampled every 2-5 mm and the planner's
+    plans densely, and there the quintic follows each interval's speed
+    within a few per cent (1 % on a straight line)."""
+    src = _traj([[0.0] * 7, [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]])
+    out, info = retime_group([src], [1.0], JOINT_VMAX, RetimeParams(qd_ceiling=WRIST_CEILING))
+    _, _, t = _arrays(out)
+    assert 1.0 / (t[-1] - t[0]) < 0.45
+    assert info["duration_s"] > 1.0 / 0.45
+    assert check_like_executor(out, JOINT_VMAX) == []
+
+
+# -- the junction ceiling (RetimeParams.junction_cruise): a compliant run's faster lines meet as at 0.3 --
+
+
+def _near_reversal(turn_deg):
+    """16:23's rise into its walk back in miniature: a stroke sampled every
+    0.023 rad, then a walk every 0.15 rad, turning `turn_deg` in joint space
+    where they meet (joints 1, 4 and 6 reversing at 132 deg)."""
+    d1 = np.array([1.0, 0, 0, 0.6, 0, 0.5, 0])
+    d1 /= np.linalg.norm(d1)
+    e = np.array([0, 0.8, 0.3, 0, 0, 0, 0.0])
+    e -= e.dot(d1) * d1
+    e /= np.linalg.norm(e)
+    th = math.radians(turn_deg)
+    d2 = math.cos(th) * d1 + math.sin(th) * e
+    p0 = np.zeros(7)
+    p1 = p0 + d1 * 0.023 * 11
+    p2 = p1 + d2 * 0.15 * 5
+    return [_traj(_line(p0, p1, 12)), _traj(_line(p1, p2, 6))]
+
+
+def test_the_junction_ceiling_holds_the_junction_and_the_sample_either_side_and_no_other():
+    """Without one, the sample a junction shares cruises at the lower of its
+    two legs' fractions and every other at its own leg's. Under
+    junction_cruise neither that sample nor the one on either side of it —
+    the ends of the two intervals the driver's quintic turns the junction
+    in — cruises faster, whichever leg each is of; one slower keeps its
+    own, and every other sample its leg's. Nothing sets one but a compliant
+    run (Runner.retime_params)."""
+    from rammp_box_opening.runtime.retime import cruise_per_sample
+
+    seg = np.asarray([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2])
+    speeds = [0.55, 0.55, 0.175]  # a walk, a turn, the stroke's approach
+    assert list(cruise_per_sample(seg, speeds)) == [0.55] * 7 + [0.175] * 4
+    held = cruise_per_sample(seg, speeds, 0.3)
+    assert list(held) == [0.55, 0.55, 0.3, 0.3, 0.3, 0.55, 0.3, 0.175, 0.175, 0.175, 0.175]
+    assert RetimeParams().junction_cruise is None
+
+
+@pytest.mark.parametrize("turn_deg", [132.0, 60.0, 31.5])
+def test_lines_that_cruise_faster_under_the_junction_ceiling_meet_as_the_slower_lines_did(turn_deg):
+    """Offline 2026-10-28, flatbot's URDF: at COMPLIANT_FREE_LINE_SPEED a
+    junction of two free-air lines took their 0.55 and flowed through up to
+    1.83x as fast as at FREE_LINE_SPEED, and the driver's quintic, which
+    turns it inside the shorter adjacent interval, was asked up to 3.4x the
+    acceleration there (16:23's rise into its walk back 47 -> 59 rad/s^2).
+    Under a compliant run's COMPLIANT_JUNCTION_SPEED the junction meets at
+    the speed the slower lines gave it and the quintic is asked what it was,
+    while the lines between cruise faster: shorter, the same positions, no
+    stop gained or lost."""
+    from dataclasses import replace
+
+    from jtc_model import peak_accel
+
+    from rammp_box_opening.constants import (
+        COMPLIANT_ACCEL,
+        COMPLIANT_DECEL,
+        COMPLIANT_FREE_LINE_SPEED,
+        COMPLIANT_JUNCTION_SPEED,
+        FREE_LINE_SPEED,
+    )
+
+    legs = _near_reversal(turn_deg)
+    p = RetimeParams(accel=COMPLIANT_ACCEL, decel=COMPLIANT_DECEL, qd_ceiling=WRIST_CEILING)
+    slow, was = retime_group(legs, [FREE_LINE_SPEED] * 2, JOINT_VMAX, p)
+    loose, free = retime_group(legs, [COMPLIANT_FREE_LINE_SPEED] * 2, JOINT_VMAX, p)
+    held, info = retime_group(legs, [COMPLIANT_FREE_LINE_SPEED] * 2, JOINT_VMAX,
+                              replace(p, junction_cruise=COMPLIANT_JUNCTION_SPEED))
+    assert free["junction_speeds"][0] > 1.3 * was["junction_speeds"][0]  # what it did without
+    assert peak_accel(loose)[0] > 1.5 * peak_accel(slow)[0]
+    assert info["junction_speeds"] == pytest.approx(was["junction_speeds"])
+    assert peak_accel(held)[0] <= 1.02 * peak_accel(slow)[0]
+    assert info["duration_s"] < 0.85 * was["duration_s"] and info["stops"] == was["stops"] == 0
+    assert np.array_equal(_arrays(held)[0], _arrays(loose)[0])  # positions never touched
+    assert check_like_executor(held, JOINT_VMAX) == []
