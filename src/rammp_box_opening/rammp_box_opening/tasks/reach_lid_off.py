@@ -136,8 +136,9 @@ GRIP_SLOW_M = dp.TOUCH_SLOW_M  # the grip's last stretch down flies at TOUCH_SPE
 # rest of the way out is up and back toward the arm (reach_press
 # .clear_targets), as the way home's clear goes.
 LIFT_OFF_CLEAR_M = 0.015
-# The set-down: at setdown_speed to this far above where the lid meets the
-# table, then at TOUCH_SPEED to SETDOWN_OVER_M below it — the spring
+# The set-down: at setdown_speed or faster (PLACE_TOUCH_SPEED below) to this
+# far above where the lid meets the table, then at PLACE_TOUCH_SPEED to
+# SETDOWN_OVER_M below it — the spring
 # pressing the lid onto the table there (~6 N at the ~1000 N/m RIGID gives
 # straight down), never a guard. The table is the scene camera's, which
 # stood 7-18 mm above the touched one on 2026-10-28: a lid let go up to that
@@ -146,6 +147,13 @@ LIFT_OFF_CLEAR_M = 0.015
 # mm) of where the retreat starts, if the hand has not yet sunk back to it.
 SETDOWN_SLOW_M = 0.04
 SETDOWN_OVER_M = 0.006
+# Owner 2026-10-29: "we also need to speed up the lid placement". The way down
+# to SETDOWN_SLOW_M over the table is free air, so it flies at the free-air
+# lines' speed (reach_press.free_line_speed: 0.55 in a compliant run; it was
+# setdown_speed, 0.35); the last stretch onto the table at PLACE_TOUCH_SPEED,
+# twice the press's TOUCH_SPEED, the lid's 6 N on the spring the same at the
+# end. 12:02's and 12:04's way down and touch took 1.8 s of the carry.
+PLACE_TOUCH_SPEED = 0.3
 
 
 def lift_off_m(model):
@@ -730,8 +738,9 @@ def plan_carry(ctx, cfg, q_from, drop):
             return None, "%s (%s)" % (name, why)
         lines.append([[float(v) for v in p] for p in pts])
         q = lines[-1][-1]
-    legs = [carry, dp.compliant_line(ctx, "place:down", lines[0], quat, cfg.setdown_speed, world),
-            dp.compliant_line(ctx, "place:touch", lines[1], quat, dp.TOUCH_SPEED, world)]
+    down_speed = max(float(cfg.setdown_speed), rp.free_line_speed(ctx))
+    legs = [carry, dp.compliant_line(ctx, "place:down", lines[0], quat, down_speed, world),
+            dp.compliant_line(ctx, "place:touch", lines[1], quat, PLACE_TOUCH_SPEED, world)]
     return Carry(legs, lines[2], quat, drop), None
 
 

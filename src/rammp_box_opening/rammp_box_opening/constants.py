@@ -162,11 +162,15 @@ JOINT_VMAX = [1.396, 1.396, 1.396, 1.396, 1.222, 1.222, 1.222]
 # 1.10 the re-timer allows: it stood 0.25 rad short when the goal ended (the
 # tool 86-88 mm off), overshot 56 mrad and was within 2 mm only 1.15 s later.
 # 15:41:58's POSITION home drove it to 0.738 and arrived 0.7 mm off.
-# arm_joint_5 was seen at 0.51; arm_joint_7 never above 0.32, so its own
-# ceiling is unmeasured: it is capped like its siblings until a flight log shows
-# it can go faster. 0.45 keeps the re-timer's 0.9 margin under the ~0.5 the
-# wrist makes. Joints 1-4 have none of their own (0.9 x JOINT_VMAX).
-COMPLIANT_QD_CEILING = (float("inf"),) * 4 + (0.45,) * 3
+# arm_joint_5 was seen at 0.51. 0.45 keeps the re-timer's 0.9 margin under
+# the ~0.5 those two make. arm_joint_7, the hand's own turn with the least
+# behind it, was capped like them until a flight log measured it: on
+# 2026-10-29 12:02's carry it turned the hand 2.64 rad at its 0.45 ceiling
+# (6.0 of the carry's 7.8 s), 22 mrad median behind its reference while it
+# cruised, 96 at most, spurting to 0.70 rad/s — so it gets 0.9 (owner
+# 2026-10-29: "we also need to speed up the lid placement"). Joints 1-4 have
+# none of their own (0.9 x JOINT_VMAX).
+COMPLIANT_QD_CEILING = (float("inf"),) * 4 + (0.45, 0.45, 0.9)
 # Out of rest, rad/s^2 along the path (RetimeParams.accel 6). The 15:45 look's
 # reference asked arm_joint_2 for ~4.2 rad/s^2; it made ~3, fell 101-123 mrad
 # behind, caught up at 1.50-1.62 rad/s — over the 1.257 cruise and the URDF's
