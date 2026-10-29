@@ -21,6 +21,7 @@ from rammp_box_opening.geometry import ang_diff
 from rammp_box_opening.constants import (
     COMPLIANT_ACCEL,
     COMPLIANT_DECEL,
+    COMPLIANT_JUNCTION_SPEED,
     COMPLIANT_QD_CEILING,
     JOINT_VMAX,
     START_GATE_RAD,
@@ -505,18 +506,20 @@ class Runner:
         the recoil, in flight and in the preview alike, so what the preview
         shows is what flies; slow mode is the caller's (time_scale). A
         compliant client's (client.compliant) eases out of rest at
-        COMPLIANT_ACCEL and into it at COMPLIANT_DECEL, and no interval runs
-        a joint past COMPLIANT_QD_CEILING: what the arm follows in the
-        driver's joint impedance (constants). The flag is read at every
-        call, never kept: press_demo builds the runner before
-        run_reach_press sets it. Positions are never touched. A stroke
+        COMPLIANT_ACCEL and into it at COMPLIANT_DECEL, no interval runs a
+        joint past COMPLIANT_QD_CEILING, and no junction cruises faster than
+        COMPLIANT_JUNCTION_SPEED: what the arm follows in the driver's joint
+        impedance (constants). The flag is read at every call, never kept:
+        press_demo builds the runner before run_reach_press sets it.
+        Positions are never touched. A stroke
         flown on its own under a contact guard keeps its dilated or warped
         timing, tuned to the contact (no compliant leg carries a guard). A
         guarded run, which flies in position, keeps self.retime as it is,
         as every other position run does."""
         if not getattr(self.client, "compliant", False):
             return self.retime
-        return replace(self.retime, accel=COMPLIANT_ACCEL, decel=COMPLIANT_DECEL, qd_ceiling=COMPLIANT_QD_CEILING)
+        return replace(self.retime, accel=COMPLIANT_ACCEL, decel=COMPLIANT_DECEL, qd_ceiling=COMPLIANT_QD_CEILING,
+                       junction_cruise=COMPLIANT_JUNCTION_SPEED)
 
     # -- preview -----------------------------------------------------------
     def preview(self, legs):

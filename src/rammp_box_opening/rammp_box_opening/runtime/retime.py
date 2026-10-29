@@ -17,7 +17,10 @@ The profile, along the path's joint-space arc length:
   - corners (direction changes along the path, including the junction
     between two chained legs) are taken at the speed their turning
     acceleration allows — a shallow corner flows, a sharp one slows, a
-    reversal (> reversal_deg) is a genuine stop;
+    reversal (> reversal_deg) is a genuine stop — and a chained junction,
+    where one is set, at no more than junction_cruise, whatever its legs'
+    own fractions (a compliant run's, runtime/runner.py
+    Runner.retime_params);
   - per-joint velocity never exceeds vmax_margin x the joint limit, so the
     gates runtime/driver.py applies before every goal (URDF velocity
     limits, per-interval continuity at 3 x vmax x dt) hold by
@@ -89,6 +92,17 @@ class RetimeParams:
     # sets it (constants.COMPLIANT_QD_CEILING): in the driver's joint
     # impedance the wrist follows no faster than ~0.54 rad/s
     qd_ceiling: tuple = None
+    # a chained junction's cruise fraction ceiling (None: none): neither its
+    # sample nor the one on either side of it — the ends of the two
+    # intervals the driver's quintic turns the junction in — cruises faster,
+    # whatever the legs' speeds. Without it a junction takes the lower of its
+    # two legs' fractions, so lines that cruise faster meet faster too, up to
+    # what the corner bounds allow, and those budget a kink over both
+    # adjacent intervals while the quintic turns it in the shorter one. A
+    # compliant run sets it (constants.COMPLIANT_JUNCTION_SPEED): its
+    # free-air lines cruise faster and still meet as they did at
+    # FREE_LINE_SPEED
+    junction_cruise: float = None
 
 
 def _dedup(positions, min_ds):
@@ -251,14 +265,19 @@ def corner_caps(positions, ds, params):
     return cap, stop
 
 
-def cruise_per_sample(seg, speeds):
+def cruise_per_sample(seg, speeds, junction_cruise=None):
     """Segment speed (the leg's cruise fraction) per sample; the sample a
-    junction shares takes the lower of the two."""
+    junction shares takes the lower of the two. Under `junction_cruise`
+    (RetimeParams.junction_cruise) neither that sample nor the one on
+    either side of it cruises faster than it."""
     speeds = np.asarray(speeds, dtype=float)
     cr = speeds[seg].astype(float)
     for k in range(1, len(seg)):
         if seg[k] != seg[k - 1]:
             cr[k - 1] = min(cr[k - 1], cr[k])
+            if junction_cruise is not None:
+                lo, hi = max(0, k - 2), min(len(seg), k + 1)
+                cr[lo:hi] = np.minimum(cr[lo:hi], junction_cruise)
     return cr
 
 
@@ -383,7 +402,7 @@ def retime_group(trajs, speeds, vmax, params=RetimeParams()):
     )
     if len(positions) < 2:
         return trajs[0], {"duration_s": 0.0, "junction_speeds": [], "stops": 0, "n_points": len(positions)}
-    cruise = cruise_per_sample(seg, speeds)
+    cruise = cruise_per_sample(seg, speeds, params.junction_cruise)
     v, ds = speed_profile(positions, cruise, vmax, params)
     cap, _ = joint_caps(positions, vmax, params)
     t = times_from_profile(v, ds, params, cap)
