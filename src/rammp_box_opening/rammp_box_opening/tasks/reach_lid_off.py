@@ -137,6 +137,22 @@ LID_POP_M = (0.004, 0.030)
 # and closing, the pads reach the knob at its base — riding on the lid,
 # the spring giving, where it stands higher than estimated.
 GRIP_BELOW_LID_M = 0.002
+# The fingers come down to the knob opened only to its width and
+# GRIP_SIDE_CLEAR_M either side of it (grip_open_cmd), not to the 2F-85's full
+# ~85 mm. 2026-10-29 14:31:59 (the box 0.74 m out, the hand leaning 15 deg):
+# fully open, the fingertips came down 46-49 mm from the knob's axis, across
+# the line to the box — on the rim of a lid only 52.5 mm in radius — and
+# closed on it (0.147: "on the box ~0.1", runtime/fingers), not on the 44 mm
+# knob; the owner saw "the gripper went down too far while open and grabbed
+# the edge of the box". Opened to 64 mm they stand 32 mm off the knob's axis,
+# 20 mm inside the lid's edge, and the knob may be 10 mm off the aim either
+# side. The open pads stand ~10 mm over the shut ones then (13.5 fully open):
+# they still come down above the lid.
+GRIP_SIDE_CLEAR_M = 0.010
+# The 2F-85's aperture fully open (GRIPPER_CMD_OPEN, knuckle 0) and, as the
+# knuckle closes to GRIPPER_CMD_CLOSED, about linear on it: the 44 mm knob
+# closes it to 0.39-0.42 (the grip band's middle), the line's 0.39.
+GRIPPER_OPEN_WIDTH_M = 0.085
 GRIP_SLOW_M = dp.TOUCH_SLOW_M  # the grip's last stretch down flies at TOUCH_SPEED, as the press's
 # A grip on air is tried once more, at the knob aimed at again. 2026-10-29
 # 12:03:52: the press let the lid go (+6.2 mm), the look found its knob up
@@ -179,6 +195,16 @@ PLACE_TOUCH_SPEED = 0.3
 def lift_off_m(model):
     """How far the knob is lifted straight up: the cap off the rim."""
     return float(model.lid_dims[2]) + LIFT_OFF_CLEAR_M
+
+
+def grip_open_cmd(model):
+    """The knuckle the fingers come down to the knob at: open to its width
+    (model.button_diameter_m) and GRIP_SIDE_CLEAR_M either side, on the
+    2F-85's about-linear aperture (GRIPPER_OPEN_WIDTH_M at GRIPPER_CMD_OPEN,
+    nothing at GRIPPER_CMD_CLOSED); never wider than fully open."""
+    width = float(model.button_diameter_m) + 2.0 * GRIP_SIDE_CLEAR_M
+    frac = min(max(width / GRIPPER_OPEN_WIDTH_M, 0.0), 1.0)
+    return GRIPPER_CMD_OPEN + (GRIPPER_CMD_CLOSED - GRIPPER_CMD_OPEN) * (1.0 - frac)
 
 
 def grip_lid_z(top_z, held_z=None):
@@ -1206,13 +1232,17 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
     runner.note("reach_grip", lid_z=round(lid_z, 4), pads_z=round(way.stroke.pad_z, 4), tilt_deg=tilt,
                 walked=way.down.walked, short_deg=way.down.short_deg, how=how,
                 button=[round(float(v), 4) for v in button], attempt=attempt)
-    print("[press_demo] GRIP%s: the fingers open on the way down; ONE MOTION from the look pose to the knob: %s — "
+    print("[press_demo] GRIP%s: the fingers open to the knob's width on the way down; ONE MOTION from the look pose "
+          "to the knob: %s — "
           "the closed pads %.0f mm under %s%s" % (" ONCE MORE, at the re-aimed knob" if attempt > 1 else "",
                                                  ", ".join(names), 1000 * GRIP_BELOW_LID_M, how,
                                                  ", the hand %.0f deg short of straight down" % way.down.short_deg
                                                  if way.down.short_deg else ""))
     viz_hook("grip", way.stroke, lid_z)  # the grip's way down and the lift, drawn off this thread (perception/viz)
-    opened = _gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:open", GRIPPER_CMD_OPEN, world, defer_join=True)
+    # opened to the knob's width and a margin, not fully: fully open the
+    # fingertips came down on the lid's rim (14:31:59, GRIP_SIDE_CLEAR_M)
+    opened = _gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:open", grip_open_cmd(ctx.model), world,
+                          defer_join=True)
     # the hand leaves the look pose for the knob: the way back's home is not
     # flown from where it comes back (a back-out plans its own, _back_out)
     ctx.home_ahead = None
