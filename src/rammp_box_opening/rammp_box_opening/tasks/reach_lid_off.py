@@ -187,9 +187,11 @@ SETDOWN_OVER_M = 0.006
 # to SETDOWN_SLOW_M over the table is free air, so it flies at the free-air
 # lines' speed (reach_press.free_line_speed: 0.55 in a compliant run; it was
 # setdown_speed, 0.35); the last stretch onto the table at PLACE_TOUCH_SPEED,
-# twice the press's TOUCH_SPEED, the lid's 6 N on the spring the same at the
-# end. 12:02's and 12:04's way down and touch took 1.8 s of the carry.
-PLACE_TOUCH_SPEED = 0.3
+# the press's TOUCH_SPEED. It was twice that from #89 (12:02's and 12:04's way
+# down and touch took 1.8 s of the carry), and the owner found the lid set
+# down "too hard" (2026-10-29 14:45): the faster touch met the table at twice
+# the speed, the damper (zeta 1.0) pushing on while the reference ran on.
+PLACE_TOUCH_SPEED = dp.TOUCH_SPEED
 
 
 def lift_off_m(model):
