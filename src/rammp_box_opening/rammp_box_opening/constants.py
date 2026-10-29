@@ -134,8 +134,9 @@ JOINT_VMAX = [1.396, 1.396, 1.396, 1.396, 1.222, 1.222, 1.222]
 
 # A compliant run re-times every motion to what the arm follows in the driver's
 # joint impedance (runtime/runner.py Runner.retime_params): the robot's, not
-# the scene's. Measured under RIGID on the 2026-10-28 15:45 /joint_states bag
-# (49 Hz, two runs), against a reference rebuilt with retime_group.
+# the scene's. Measured under RIGID at zeta 0.7 on the 2026-10-28 15:45
+# /joint_states bag (49 Hz, two runs), against a reference rebuilt with
+# retime_group.
 # The wrist's speed ceiling, rad/s, ABSOLUTE (RetimeParams.qd_ceiling): it
 # caps what a leg's cruise fraction leaves and no fraction scales it, so a 0.3
 # line whose wrist runs under it is not slowed. On both 15:45 way homes

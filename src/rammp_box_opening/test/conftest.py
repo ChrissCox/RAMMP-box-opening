@@ -55,6 +55,7 @@ class FakeClient:
         self.joint_targets = []  # the q7 each plan_to_joints was asked for
         self.contact_at = [0.45, 0.0, 0.085]  # fingertip TF at a guard trip
         self.primes = []  # the joints each prime_compliant was handed (None: the live ones)
+        self.stills = []  # each wait_still: how many executions had gone out by then
 
     def joints(self):
         return list(self.live)
@@ -62,6 +63,10 @@ class FakeClient:
     def prime_compliant(self, q=None):
         self.primes.append(None if q is None else [float(v) for v in q])
         return True
+
+    def wait_still(self):
+        self.stills.append(len(self.executed))
+        return 0.0, False  # standing still at once: nothing settles here
 
     def wrist_efforts(self):
         return [0.0] * 4 if self.efforts else None

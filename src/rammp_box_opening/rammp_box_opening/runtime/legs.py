@@ -72,6 +72,12 @@ class Leg:
     # every point of that motion (an open during a retreat that starts
     # clear of the box); the usual join still gates the next guarded leg.
     send_with_previous_motion: bool = False
+    # GRIPPER legs only: the command goes out once the arm stands still
+    # (Runner.wait_still, the run's 'still' note) — a close on what the hand
+    # has just come down to: in the joint impedance "arrived" is the
+    # trajectory's clock running out, the arm still settling. Never sent
+    # under the previous motion, send_with_previous_motion or not.
+    send_when_still: bool = False
     world_path: str = None  # generated world YAML to push (SetWorld wants a path)
     # MOTION legs planned with a vertical approach: (index into traj.points,
     # joints) of the waypoint the final straight line starts from, at rest.

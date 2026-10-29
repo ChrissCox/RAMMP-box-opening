@@ -120,7 +120,7 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
         return dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=15.0)
 
     monkeypatch.setattr(dp, "compliant_hold", hold)
-    monkeypatch.setattr(rlo, "spot_look", lambda node, watcher: (rec.events.append("spot-look"), wrist)[1])
+    monkeypatch.setattr(rlo, "spot_look", lambda node, watcher, runner_: (rec.events.append("spot-look"), wrist)[1])
 
     class R(Runner):
         def run(self, legs, execute, lookahead=None):
@@ -576,6 +576,85 @@ def test_no_carry_that_plans_holds_the_lid_and_says_so(ctx, monkeypatch, tmp_pat
     spot, = [r for r in rows if r["leg"] == "lid_spot"]
     assert spot["xyz"] is None and spot["refused"].count("IK_FAIL") == rlo.CARRY_TRIES
     assert "STOP: no carry to a spot the lid could go to plans" in capsys.readouterr().out
+
+
+def test_the_spot_look_takes_the_first_frame_shot_once_the_arm_stands_still(monkeypatch):
+    """The spot look waited a blind 0.3 s (depth_press.look's settle) once
+    the lift and the clear arrived, whatever the arm did: after 15:45's
+    looks it stood still only at +0.80 s. It now waits for the arm to
+    stand still (runner.wait_still, noted before 'spot-look'), then takes
+    the first frame shot after that — never one shot while the arm settled
+    — with no blind settle on top."""
+    from rammp_box_opening.tasks import press_demo as pd
+
+    clock = {"ns": 1_000_000_000}
+    grab = SimpleNamespace(color_stamp=SimpleNamespace(sec=0, nanosec=900_000_000), depth=object())
+    node = SimpleNamespace(get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=clock["ns"])))
+    events = []
+
+    def wait_still(before):
+        events.append(("still", before))
+        clock["ns"] += 800_000_000  # the arm settles 0.8 s
+        grab.color_stamp = SimpleNamespace(sec=1, nanosec=700_000_000)  # a frame shot while it settled
+
+    def spin(node_):
+        events.append("spin")
+        clock["ns"] += 20_000_000
+        if events.count("spin") == 2:  # the first frame shot after the wait
+            grab.color_stamp = SimpleNamespace(sec=1, nanosec=850_000_000)
+
+    monkeypatch.setattr(pd, "_spin_detect", spin)
+    monkeypatch.setattr(pd, "wrist_points", lambda watcher: ("points of", watcher.grab.color_stamp.nanosec))
+    got = rlo.spot_look(node, SimpleNamespace(grab=grab), SimpleNamespace(wait_still=wait_still))
+    assert events == [("still", "spot-look"), "spin", "spin"]
+    assert got == ("points of", 850_000_000)
+
+
+def test_the_lid_s_spot_is_mapped_and_its_carry_planned_from_where_the_arm_stood_still(ctx, monkeypatch, tmp_path):
+    """The joints the wrist's frame is mapped from (spot_map) and the carry
+    planned from (spot_candidates, plan_carry) are read after the spot
+    look's wait for a still arm, where its frame was shot: not before it,
+    the arm still settling from the lift and the clear."""
+    from rammp_box_opening.runtime.runner import Runner
+    from rammp_box_opening.tasks import press_demo as pd
+
+    stood = [0.01 * (k + 1) for k in range(7)]
+    seen = []
+
+    def look(node, watcher, runner_):
+        ctx.client.live = list(stood)  # the arm came to rest while the spot look waited
+        return None
+
+    def candidates(ctx_, tmap, table_z, q, seeds=()):
+        seen.append(("spot_candidates", list(q)))
+        yield SimpleNamespace(xyz=(0.45, -0.25, -0.027)), "beside the box", "beside the box"
+
+    monkeypatch.setattr(rlo, "spot_look", look)
+    monkeypatch.setattr(rlo, "spot_map", lambda ctx_, wrist, q, *rest: seen.append(("spot_map", list(q))))
+    monkeypatch.setattr(rlo, "spot_candidates", candidates)
+    monkeypatch.setattr(pd, "adopt_seen", lambda *a, **k: None)
+    monkeypatch.setattr(rlo, "plan_carry", lambda ctx_, cfg_, q, drop: (seen.append(("plan_carry", list(q))),
+                                                                        (None, "refused"))[1])
+    eyes = (None, SimpleNamespace(table_z=-0.027), None, None)
+    assert rlo.choose_and_carry(ctx, load_press_demo(PINK), Runner(ctx.client, log_dir=tmp_path), eyes) == 1
+    assert seen == [("spot_map", stood), ("spot_candidates", stood), ("plan_carry", stood)]
+
+
+def test_the_fingers_close_on_the_knob_once_the_arm_stands_still(ctx, monkeypatch, tmp_path):
+    """16:23 2026-10-28: grip:close went out about 30 ms after the way down
+    to the knob "arrived" — its trajectory's clock run out, the arm 2.3 mm
+    off its end. The close now goes out once the arm stands still
+    (Leg.send_when_still): after the way down and the open that rode it,
+    before the fingers move, noted 'still' before grip:close. Nothing else
+    waits so."""
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)])
+    assert code == 0
+    assert [name for name, lg in rec.legs.items() if lg.send_when_still] == ["grip:close"]
+    assert ctx.client.stills == [4]  # after the look, the way in, the way back and the way down to the knob
+    legs = [r["leg"] for r in rows]
+    (still,) = [i for i, name in enumerate(legs) if name == "still"]
+    assert rows[still]["before"] == "grip:close"
+    assert legs.index("grip:down") < legs.index("grip:open") < still < legs.index("grip:close")
 
 
 # ---- flatbot's URDF: the five boxes of the owner's brief ------------------------
