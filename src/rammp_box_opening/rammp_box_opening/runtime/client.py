@@ -402,7 +402,8 @@ class PlannerClient:
     # 0.41 s in, the knob -7.2 and -5.5 mm above its lid where the two that
     # agreed after them read +1.1 and +0.7. On 15:45's /joint_states
     # (49 Hz) the arm at rest read at most 0.0032 rad/s on any joint in
-    # RIGID (50 s at HOME) and 0.0010 in POSITION (200 s), and the looks'
+    # RIGID at zeta 0.7 (50 s at HOME; at 1.0 unmeasured: the first run's
+    # 'still' notes show it) and 0.0010 in POSITION (200 s), and the looks'
     # creep read over STILL_QD_RAD_S to +0.70 s. A settling joint turns
     # back through zero, one or two readings under it (the look's turn at
     # +0.07 s, the way homes' at +0.70-0.73), where STILL_HOLD_S takes five
