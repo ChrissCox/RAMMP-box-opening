@@ -25,6 +25,7 @@ from rammp_box_opening.runtime.guards import (
     in_band,
 )
 from rammp_box_opening.runtime.legs import Kind, Leg
+from rammp_box_opening.runtime.planner import Refused, plan_record
 
 # a set-down's success IS the guard trip — overdrive the commanded depth
 # past nominal surface contact so the table is always felt (err-TALL world
@@ -128,6 +129,14 @@ def descent_index(plan):
     return None if wp is None else int(wp[0])
 
 
+class PlanRefused(RuntimeError):
+    """_plan_motion's failure for a plan the planner called a success and
+    the client refused (runtime/planner.Refused): it ends elsewhere than it
+    was asked, or goes the long way round. A RuntimeError like any failed
+    plan's, so every caller's stop or fallback applies; home_arm, whose
+    fallback for a failed plan is a world that knows less, tells it apart."""
+
+
 def _plan_motion(
     ctx,
     state,
@@ -173,6 +182,7 @@ def _plan_motion(
     ok, msg = ctx.client.set_world(world_path)
     if not ok:
         raise RuntimeError("set_world before planning %s failed: %s" % (name, msg))
+    n_refused = len(getattr(ctx.client, "refusals", ()))
     t_plan = time.monotonic()
 
     if kind == "pose":
@@ -185,7 +195,7 @@ def _plan_motion(
         plan = ctx.client.plan_to_joints(rest[0], state.joints)
     plan_s = time.monotonic() - t_plan
     if plan is None or not plan.success:
-        raise RuntimeError(
+        raise (PlanRefused if isinstance(plan, Refused) else RuntimeError)(
             "planning failed for %s: %s"
             % (name, getattr(plan, "message", "no response"))
         )
@@ -208,6 +218,9 @@ def _plan_motion(
         verify=verify,
         plan_s=plan_s,
         plan_server_s=getattr(plan, "planning_time", None),
+        # the client's refusals while it planned this leg: none, or the
+        # joint plan the pose plan stood in for (PlannerClient.refusals)
+        plan=plan_record(plan, target, plan_s, getattr(ctx.client, "refusals", ())[n_refused:]),
         waypoint=getattr(plan, "waypoint", None),
         guard_from=descent_index(plan),
     )

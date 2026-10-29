@@ -54,6 +54,7 @@ from rammp_box_opening.runtime.legs import (
     VerifyCtx,
     merge_groups,
 )
+from rammp_box_opening.runtime.planner import plan_record
 
 
 @dataclass
@@ -1127,6 +1128,8 @@ class Runner:
                 print("REFUSED replan of %s — set_world failed: %s" % (leg.name, msg))
                 return None, next_chain
             kind, *rest = leg.target
+            n_refused = len(getattr(self.client, "refusals", ()))
+            t_plan = time.monotonic()
             if kind == "pose":
                 off = float(rest[2]) if len(rest) > 2 else 0.0
                 plan = self.client.plan_to_pose(
@@ -1134,7 +1137,13 @@ class Runner:
                 )
             else:
                 plan = self.client.plan_to_joints(rest[0], live)
+            plan_s = time.monotonic() - t_plan
+            # the run record keeps what was planned at flight: the plan this
+            # leg now flies, or the one that failed, in a note of its own —
+            # the failure's row shows the leg's old plan, or none (lazy)
+            record = plan_record(plan, leg.target, plan_s, getattr(self.client, "refusals", ())[n_refused:])
             if plan is None or not plan.success:
+                self.note("replan_failed", name=leg.name, plan=record)
                 return None, next_chain
             # replanned trajectories pass the SAME sanity gate as pre-built
             # ones — a wandering replan executed ungated defeats spec §6
@@ -1143,6 +1152,7 @@ class Runner:
                 print("REFUSED replan of %s — %s" % (leg.name, "; ".join(bad)))
                 return None, next_chain
             leg.traj = plan.trajectory
+            leg.plan = dict(record, replanned=True)
             leg.chain = next_chain
             leg.goal_joints = list(plan.trajectory.points[-1].positions)
             # indices into the OLD trajectory mean nothing in this one
@@ -1533,4 +1543,6 @@ class Runner:
         row.pop("leg_name", None)
         row.pop("lookahead", None)
         row.pop("flown_traj", None)
+        if getattr(leg, "plan", None) is not None:
+            row["plan"] = leg.plan  # what the planner said of this leg's plan, and how its end met the target
         self._append(row)

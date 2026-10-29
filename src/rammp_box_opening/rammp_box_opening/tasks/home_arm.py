@@ -27,6 +27,13 @@ the chair goes) and a fresh home_arm process, which measures none, make
 the guarded world the floor alone, the same as the bare one. There the
 caution prints BEFORE planning, and HOME is planned once in the bare
 world: re-planning a refused start in an identical world cannot help.
+
+A home the planner called a success and the client refused, because it
+ends elsewhere than HOME (runtime/planner.py: PlanToJoints' FK-pose
+fallback, another arm at HOME's tool pose, or another goal's plan), is
+not answered with the bare world: the planner did plan in the guarded
+world, and the bare world would only plan the same home blind to where
+the box may be (review 2026-10-28). It stops, saying what is left.
 """
 
 from rammp_box_opening.constants import HOME, TRANSIT_SPEED
@@ -34,22 +41,31 @@ from rammp_box_opening.primitives.core import (
     CLEAR_MARGIN_MAX_STEP_RAD,
     ClearMarginFree,
     LiftFree,
+    PlanRefused,
     PlanState,
     _plan_motion,
 )
 from rammp_box_opening.tasks import cli_common
+
+# what is left when the client refuses the planner's home (core.PlanRefused):
+# another start, or the operator's hand
+REFUSED_HOME_NEXT = "try --lift-first 0.08 (HOME planned from the top of a straight lift), or jog the arm clear by hand"
 
 
 def _plan_home(ctx, state, say=print):
     """HOME from `state`: the guarded bench world first, then the bare
     table world with a caution. Raises the bare world's refusal. With no
     table known the two are the same world: once, in the bare one (the
-    caution was printed before planning)."""
+    caution was printed before planning). A home the client refused
+    (core.PlanRefused) raises at once, with what is left to try."""
     if ctx.worlds.table_top_z is None:
         bare = ctx.worlds.push_name("bench", model=None, tag="bare")
-        leg, _ = _plan_motion(
-            ctx, state, "home", ("joints", list(HOME)), bare, TRANSIT_SPEED
-        )
+        try:
+            leg, _ = _plan_motion(
+                ctx, state, "home", ("joints", list(HOME)), bare, TRANSIT_SPEED
+            )
+        except PlanRefused as e:
+            raise PlanRefused("%s — %s" % (e, REFUSED_HOME_NEXT)) from e
         return leg
     guarded = ctx.worlds.push_name("bench", model=ctx.model)
     try:
@@ -57,6 +73,13 @@ def _plan_home(ctx, state, say=print):
             ctx, state, "home", ("joints", list(HOME)), guarded, TRANSIT_SPEED
         )
         return leg
+    except PlanRefused as e:
+        # the planner did plan in this world: the bare one would plan the
+        # same home blind to where the box may be
+        raise PlanRefused(
+            "%s — not re-planned in the bare world, which would not know where the box may be; %s"
+            % (e, REFUSED_HOME_NEXT)
+        ) from e
     except RuntimeError as e:
         say("[home_arm] home refused in the guarded bench world (%s)" % e)
     # there is no typed confirmation any more (--execute alone arms a run),
