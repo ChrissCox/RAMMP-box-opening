@@ -69,6 +69,10 @@ class LegResult:
     # ImpedanceGains profile it was sent with (None in position)
     mode: str = None
     gains: int = None
+    # ... and a custom spec's zeta (constants.CustomGains), which its name
+    # does not say (RIGID flew at 0.7 from 14:21 to 16:23 2026-10-28): None
+    # for a driver profile (the driver's own zeta) and in position
+    gains_zeta: float = None
     # an arrival's error: the live joints the moment the driver called it
     # arrived against where the trajectory flown ends — the worst joint
     # (rad, wrap-aware), and the tool frame's offset (mm) and turn (deg) by
@@ -295,6 +299,7 @@ def _flight_doc(seq, names, outcome, flew, info, traj, arrived, every):
         "outcome": outcome,
         "mode": flew.get("mode"),
         "gains": flew.get("gains"),
+        "gains_zeta": flew.get("gains_zeta"),
         "joint_names": list(sent.joint_names),
         "sent_t": round(arrived[1] - (arrived[0] - t0), 3),  # time.time() when the goal went out
         "ended_s": round(arrived[0] - t0, 4),  # when the client returned its result, s after that
@@ -1311,7 +1316,9 @@ class Runner:
         return {
             "mode": "impedance" if getattr(self.client, "compliant", False) else "position",
             # a profile's number, or a custom spec's name (constants.GAINS_RIGID)
+            # and its zeta, which one name has flown more than one of
             "gains": getattr(gains, "name", gains),
+            "gains_zeta": getattr(gains, "zeta", None),
             "end_err_rad": rad,
             "end_err_mm": mm,
             "end_err_deg": deg,
