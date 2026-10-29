@@ -23,11 +23,11 @@ the floor, so no lid goes down there.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
-from rammp_box_opening.geometry import yaw_about_world_z
+from rammp_box_opening.geometry import ang_diff, yaw_about_world_z
 from rammp_box_opening.perception.d405 import quat_to_mat
 from rammp_box_opening.perception.planes import fit_plane
 from rammp_box_opening.worlds import SEEN_PREFIX
@@ -65,7 +65,16 @@ HAND_PARTS = (
 )
 UP_SLACK_M = 0.02  # a part clears a thing only by this much more than their heights say
 ROOM_STEP_M = 0.01  # rooms this close are the same room ...
-ENOUGH_M = 0.05  # ... and past this much, a spot needing no turn, nearer the box, is as good
+# ... and past this much, a spot the hand turns less to, nearer the box, is
+# as good. A spot's room is what is left once every part has its own margin
+# (LID_CLEAR_M, HAND_PARTS), and those margins already hold what the map
+# gets wrong: the wrist camera's 40 mm is the scene camera's 2 cm of TF
+# error and a 2 cm cell. One cell (CELL_M) more than they ask is enough;
+# more guards again against what they already guard against. It was 0.05:
+# 2026-10-29 12:02 took a spot with 46 mm to spare that the hand turned 91
+# deg to, and joint_7 turned 151 deg, 6.0 s of the 7.8 s carry. Rooms are
+# counted to the nearest ROOM_STEP_M, so 15 mm counts as enough.
+ENOUGH_M = 0.02
 SPOT_STEP_M = 0.02
 SPOT_REACH_M = 0.20  # spots are sought at most this much farther from the box than the nearest allowed
 SPOT_APART_M = 0.04  # the spots offered are at least this far apart
@@ -76,6 +85,10 @@ MAX_SPOTS = 8
 # open band instead of into what stands across it (17:57: 31 mm of room
 # turned, 20 mm not)
 TURNS = (0.0, math.pi / 2, -math.pi / 2, math.pi)
+# the hand's rotations this close are the same rotation, and the spot
+# nearer the box is as good: the planner's choice of arm turns joint_7 more
+# than that past the hand's own rotation (12:02: 151 deg for 91)
+ROTATION_STEP_RAD = math.radians(10.0)
 
 
 @dataclass(frozen=True)
@@ -198,6 +211,15 @@ def _hand_axes(quat):
     return r[:2, 0], r[:2, 1]
 
 
+def hand_yaw(quat):
+    """Which way the hand at `quat` faces about the vertical: the heading
+    of its x axis (the fingers' closing axis) in the base frame, rad.
+    That axis stays level when the reach-out leans the hand back
+    (reach_press.reach_quat leans it about that axis)."""
+    x, _y = _hand_axes(quat)
+    return math.atan2(float(x[1]), float(x[0]))
+
+
 def _to_square(d, half):
     """Distance from a point to a cell, from the point's offset to its centre."""
     return np.maximum(np.abs(d) - half, 0.0)
@@ -275,17 +297,29 @@ class Spot:
     turn: float  # the hand's turn about its axis from the press attitude, rad
     room_m: float  # the room the set-down and the carry have past what each part needs
     what: str  # the part that comes nearest
+    rotation: float  # how far the hand turns about the vertical from where it holds the lid to here, rad (-pi, pi]
+
+
+def _rank(s):
+    """A clear Spot's rank, the best least: its room (ROOM_STEP_M apart,
+    no more than ENOUGH_M counted), then how far the hand turns to it
+    (ROTATION_STEP_RAD apart)."""
+    return -round(min(s.room_m, ENOUGH_M) / ROOM_STEP_M), round(abs(s.rotation) / ROTATION_STEP_RAD)
 
 
 def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_tips_h, lid_h,
-                step=SPOT_STEP_M, judged_out=None):
+                step=SPOT_STEP_M, judged_out=None, hand_at=None):
     """(spots, why): every spot in `zone` (x0, x1, y0, y1) at least
     `min_from_box` from the box, and at most SPOT_REACH_M more, where the
     hand comes down, at one of TURNS,
     and carries there with room for every part (clearance) — the roomiest
-    first, then (past ENOUGH_M) the least turned and nearest the box — at
-    most MAX_SPOTS, SPOT_APART_M apart. `quat_at(xy)` is the press
-    attitude there. `why` says, when there is none, what was in the way.
+    first, then (past ENOUGH_M) the one the hand turns least to and nearest
+    the box — at most MAX_SPOTS, SPOT_APART_M apart. `quat_at(xy)` is the
+    press attitude there. `hand_at` is which way the hand holding the lid
+    faces (hand_yaw), and each Spot's `rotation` how far it turns from
+    there to come down at the spot; None: the press attitude at the box,
+    so the turn alone. Each spot keeps the turn that ranks best there.
+    `why` says, when there is none, what was in the way.
 
     The spots are judged `step` apart, and again half a step around each
     that came within a step of clear: a spot's room changes no faster than
@@ -294,6 +328,7 @@ def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_
     (tasks/lid_room_view draws them)."""
     bx, by = float(box_xy[0]), float(box_xy[1])
     x0, x1, y0, y1 = zone
+    held = hand_yaw(quat_at((bx, by))) if hand_at is None else float(hand_at)
     judged = {}
 
     def judge(sx, sy):
@@ -305,13 +340,19 @@ def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_
             judged[key] = None
             return None
         q0 = quat_at((sx, sy))
-        (room, what), turn = max(((clearance(tmap, (sx, sy), yaw_about_world_z(q0, t), lid_r, tips_h), t)
-                                  for t in TURNS), key=lambda c: c[0][0])
-        if room >= 0.0:
-            carry, c_what, _at = carry_clearance(tmap, (bx, by), (sx, sy), lid_r, carry_tips_h, lid_h)
-            if carry < room:
-                room, what = carry, "%s on the carry" % c_what
-        judged[key] = Spot(xy=(float(sx), float(sy)), turn=turn, room_m=room, what=what or "nothing")
+        turned = []
+        for t in TURNS:
+            q = yaw_about_world_z(q0, t)
+            room, what = clearance(tmap, (sx, sy), q, lid_r, tips_h)
+            turned.append(Spot(xy=(float(sx), float(sy)), turn=t, room_m=room, what=what or "nothing",
+                               rotation=ang_diff(hand_yaw(q), held)))
+        clear = [s for s in turned if s.room_m >= 0.0]
+        if not clear:
+            judged[key] = max(turned, key=lambda s: s.room_m)
+            return judged[key]
+        carry, c_what, _at = carry_clearance(tmap, (bx, by), (sx, sy), lid_r, carry_tips_h, lid_h)
+        clear = [replace(s, room_m=carry, what="%s on the carry" % c_what) if carry < s.room_m else s for s in clear]
+        judged[key] = min(clear, key=lambda s: (*_rank(s), -s.room_m))
         return judged[key]
 
     coarse = [judge(sx, sy) for sx in np.arange(x0, x1 + 1e-9, step) for sy in np.arange(y0, y1 + 1e-9, step)]
@@ -325,8 +366,7 @@ def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_
         judged_out.extend(every)
     found = [s for s in every if s.room_m >= 0.0]
     nearest = max(every, key=lambda s: s.room_m, default=None)
-    found.sort(key=lambda s: (-round(min(s.room_m, ENOUGH_M) / ROOM_STEP_M), abs(s.turn),
-                              math.hypot(s.xy[0] - bx, s.xy[1] - by)))
+    found.sort(key=lambda s: (*_rank(s), math.hypot(s.xy[0] - bx, s.xy[1] - by)))
     picked = []
     for s in found:
         if all(math.hypot(s.xy[0] - p.xy[0], s.xy[1] - p.xy[1]) >= SPOT_APART_M for p in picked):

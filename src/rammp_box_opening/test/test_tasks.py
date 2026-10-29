@@ -292,6 +292,46 @@ def test_the_lid_goes_where_the_cameras_saw_room_not_onto_the_microwave(monkeypa
     assert all(math.hypot(d.xyz[0] - 0.56, d.xyz[1] + 0.37) > 0.15 for d in drops)
 
 
+def test_the_hands_turn_to_a_spot_counts_the_bearing_it_gripped_the_knob_at():
+    """The reach-out grips the knob with the press attitude turned to the
+    button's bearing from the arm (reach_press.reach_quat), and sets the
+    lid down at the press attitude fixed in the world, turned
+    (place_quat): from a box 60 deg round to the right the hand turns 60
+    deg to come down unturned, and 30 deg to come down a quarter turned
+    back. With room either way the quarter turn goes first, and each spot
+    says how far the hand turns to it. Given where the hand faces (the
+    arm's FK, reach_lid_off.spot_candidates), that is what counts."""
+    import numpy as np
+
+    from rammp_box_opening.geometry import ang_diff
+    from rammp_box_opening.models.container import ContainerModel
+    from rammp_box_opening.perception import clear_table
+    from rammp_box_opening.tasks import press_demo
+
+    pink = ContainerModel.load("src/rammp_box_opening/config/containers/ankou_pink.yaml")
+    table_z = 0.2163
+    box = (0.30, -0.52)
+    g = np.arange(-0.6, 0.6001, 0.006)
+    X, Y = np.meshgrid(g + box[0], g + box[1], indexing="ij")
+    pts = np.stack([X.ravel(), Y.ravel(), np.full(X.size, table_z)], -1)
+    pts[np.hypot(pts[:, 0] - box[0], pts[:, 1] - box[1]) < 0.0525, 2] += 0.121  # the box
+    tmap = clear_table.table_map([(pts, table_z)], box)
+    cpose = ContainerPose(xyz=(box[0], box[1], table_z), yaw=0.0)
+    pressing = clear_table.hand_yaw(pink.press_quat(cpose.xyz))  # fixed in the world
+    bearing = math.atan2(box[1], box[0])  # the button is over the box's centre
+    assert math.degrees(bearing) == pytest.approx(-60.0, abs=0.1)
+    drops, spots, why = press_demo.clear_lid_drops(pink, cpose, tmap, table_z)
+    assert drops and why is None
+    for d, s in zip(drops, spots):
+        down = clear_table.hand_yaw(press_demo.place_quat(pink, d))
+        assert abs(ang_diff(s.rotation, down - (pressing + bearing))) < 1e-9
+    assert drops[0].yaw == pytest.approx(-math.pi / 2)
+    assert math.degrees(spots[0].rotation) == pytest.approx(-30.0, abs=0.1)
+    # the hand facing as the press attitude does: no turn is the least
+    drops, spots, why = press_demo.clear_lid_drops(pink, cpose, tmap, table_z, hand_at=pressing)
+    assert drops[0].yaw == 0.0 and spots[0].rotation == pytest.approx(0.0, abs=1e-9)
+
+
 def test_shipped_config_speeds_are_guard_safe():
     """The shipped values are what actually runs at the bench."""
     import pytest

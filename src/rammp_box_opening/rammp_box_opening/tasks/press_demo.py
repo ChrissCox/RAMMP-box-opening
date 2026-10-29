@@ -744,21 +744,33 @@ def lid_drop_candidates(m, cpose, table_z, prefer_xy=None, zone=None):
 CLEAR_SPOTS_Y_M = 0.45  # the map is searched for a drop spot this far either side of the box
 
 
-def clear_lid_drops(m, cpose, tmap, table_z, judged_out=None):
+def clear_lid_drops(m, cpose, tmap, table_z, judged_out=None, hand_at=None):
     """(drops, spots, why): where the lid may go among what the cameras see
     standing on the table (perception/clear_table), best first: as
     ContainerPoses on the table at `table_z` — each one's yaw the turn the
     hand comes down with, the lid turning with it — and as the Spots that
-    say how much room each has; and, when there is none, why.
+    say how much room each has, and how far the hand turns to it; and, when
+    there is none, why.
 
     The spot used to be derived from the box alone (lid_drop_candidates):
     flatbot 2026-10-23 17:57 put it on the front edge of the microwave
     standing 14 cm in front of the box, and the wrist camera came down on
     it. The search spans the reach band in x and CLEAR_SPOTS_Y_M either side
     of the box; the first the hand reaches is taken
-    (reach_lid_off.resolve_lid_drop)."""
+    (reach_lid_off.resolve_lid_drop).
+
+    `hand_at` is which way the hand holding the lid faces
+    (clear_table.hand_yaw; reach_lid_off.spot_candidates measures it on the
+    arm). None: as the reach-out grips the knob — the press attitude turned
+    to the button's bearing (reach_press.reach_quat; depth_press.down_quat
+    turns the hand down to it), where every spot's set-down (place_quat)
+    is the press attitude at the spot, turned."""
     lid_h = float(m.lid_dims[2])
     bx, by = float(cpose.xyz[0]), float(cpose.xyz[1])
+    if hand_at is None:
+        from rammp_box_opening.tasks.reach_press import reach_quat
+
+        hand_at = clear_table.hand_yaw(reach_quat(m, from_container(cpose, m.button_offset)[:2], 0.0))
     spots, why = clear_table.clear_spots(
         tmap,
         (bx, by),
@@ -770,6 +782,7 @@ def clear_lid_drops(m, cpose, tmap, table_z, judged_out=None):
         float(m.dims[2]) + lid_h + CARRY_CLEAR_M,  # ... and on the carry (Place.hover_for's floor)
         lid_h,
         judged_out=judged_out,
+        hand_at=hand_at,
     )
     return [ContainerPose(xyz=(s.xy[0], s.xy[1], float(table_z)), yaw=s.turn) for s in spots], spots, why
 

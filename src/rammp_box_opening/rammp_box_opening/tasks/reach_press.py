@@ -2393,7 +2393,7 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         lid_z = max(float(prior_button[2]), float(got[0][2]) - float(up_mm) / 1000.0)
         try:
             return reach_lid_off.take_lid_off(ctx, cfg, runner, eyes, button, plan.tilt_deg, lid_z,
-                                              "the open box's lid at %.3f" % lid_z)
+                                              "the open box's lid at %.3f" % lid_z, yaw=yaw)
         except BaseException:
             let_go(ctx)
             raise

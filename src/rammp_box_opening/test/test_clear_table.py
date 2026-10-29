@@ -2,12 +2,13 @@
 the wrist, at staging) see standing around the box, and the spots the lid
 and the hand that carries it fit."""
 
+import dataclasses
 import math
 
 import numpy as np
 import pytest
 
-from rammp_box_opening.geometry import yaw_about_world_z
+from rammp_box_opening.geometry import ang_diff, yaw_about_world_z
 from rammp_box_opening.models.container import ContainerModel
 from rammp_box_opening.perception import clear_table as ct
 
@@ -48,7 +49,7 @@ def _spots(pink, tmap, box_xy, **kw):
     zone = kw.pop("zone", (0.28, 0.65, box_xy[1] - 0.45, box_xy[1] + 0.45))
     return ct.clear_spots(tmap, box_xy, zone, kw.pop("min_from_box", 0.198),
                           lambda xy: pink.press_quat((xy[0], xy[1], TABLE_Z)),
-                          0.5 * pink.lid_dims[0], lid_h, pink.dims[2] + lid_h + 0.04, lid_h)
+                          0.5 * pink.lid_dims[0], lid_h, pink.dims[2] + lid_h + 0.04, lid_h, **kw)
 
 
 BOX = (0.39, -0.20)
@@ -140,6 +141,71 @@ def test_the_hand_turns_so_the_wrist_camera_faces_the_room(pink):
     assert room(math.pi / 2)[0] >= 0 and room(-math.pi / 2)[0] >= 0
     spots, why = _spots(pink, tmap, BOX)
     assert any(abs(s.turn) == pytest.approx(math.pi / 2) and s.xy[0] >= 0.41 for s in spots), (spots, why)
+
+
+def test_with_room_either_way_the_spot_the_hand_turns_less_to_goes_first(pink):
+    """A band of table across the box, between a low block (5 cm: the
+    fingers and the lid must miss it, the wrist camera rides over it) and
+    a 13 cm wall (the wrist camera must miss it; the lid rides over it on
+    the carry). The roomiest spot has the hand turned half round, the wrist
+    camera facing away from the wall, with 45 mm or more to spare; the best
+    with the hand unturned has less, but ENOUGH_M. That is room enough: the
+    unturned spot goes first. 2026-10-29 12:02 took a spot with 46 mm to
+    spare that the hand turned 91 deg to; joint_7 turned 151 deg, 6.0 s of
+    the 7.8 s carry. Where only the turned spot has room, it is still the
+    one."""
+    low, wall = (0.20, 0.30, -0.70, 0.20), (0.575, 0.645, -0.70, 0.20)
+    pts = np.concatenate([_table(x0=0.20, holes=[BOX_AT, low, wall]), _block(*BOX_AT, TABLE_Z + 0.121),
+                          _block(*low, TABLE_Z + 0.05), _block(*wall, TABLE_Z + 0.13)])
+    tmap = ct.table_map([(pts, TABLE_Z)], BOX)
+
+    def room(xy, turn):
+        q = yaw_about_world_z(pink.press_quat((xy[0], xy[1], TABLE_Z)), turn)
+        return ct.clearance(tmap, xy, q, 0.5 * pink.lid_dims[0], pink.lid_dims[2])[0]
+
+    roomiest = (0.44, -0.45)
+    assert room(roomiest, math.pi) >= 0.045 and room(roomiest, 0.0) < 0
+    spots, why = _spots(pink, tmap, BOX)
+    assert spots and all(s.turn == 0.0 for s in spots), (spots, why)
+    assert ct.ENOUGH_M <= spots[0].room_m < room(roomiest, math.pi) - 0.02
+    # where only half round has room, the spot is still found, turned
+    spots, why = _spots(pink, tmap, BOX, zone=(0.48, 0.48, -0.65, -0.45))
+    assert spots and all(abs(s.turn) == pytest.approx(math.pi) for s in spots), why
+    assert room(spots[0].xy, 0.0) < 0 and room(spots[0].xy, math.pi / 2) < 0 and room(spots[0].xy, -math.pi / 2) < 0
+
+
+def test_the_hands_rotation_is_counted_from_where_it_holds_the_lid(pink):
+    """Each spot's `rotation` is how far the hand turns about the vertical
+    from where it holds the lid to where it comes down there, and it is
+    what ranks the spots with room enough, not the turn from the press
+    attitude alone. The press attitude is fixed in the world, so from the
+    hand facing as at the box it is the turn; from a hand facing 115 deg
+    the other way (the arm's FK says where), the spot it turns least to
+    goes first: a quarter turn back. With the attitude steered to each
+    spot's bearing, the spot's bearing round the box counts too."""
+    tmap = ct.table_map([(np.concatenate([_table(holes=[BOX_AT]), _block(*BOX_AT, TABLE_Z + 0.121)]), TABLE_Z)], BOX)
+
+    def same(a, b):
+        return abs(ang_diff(a, b)) < 1e-9
+
+    judged = []
+    spots, _why = _spots(pink, tmap, BOX, judged_out=judged)
+    assert spots[0].turn == 0.0 and all(same(s.rotation, s.turn) for s in judged)
+    facing = ct.hand_yaw(pink.press_quat((BOX[0], BOX[1], TABLE_Z))) - 2.0
+    judged = []
+    spots, _why = _spots(pink, tmap, BOX, judged_out=judged, hand_at=facing)
+    for s in judged:
+        down = ct.hand_yaw(yaw_about_world_z(pink.press_quat((s.xy[0], s.xy[1], TABLE_Z)), s.turn))
+        assert same(s.rotation, down - facing)
+    assert spots and all(s.turn == pytest.approx(-math.pi / 2) for s in spots)
+    assert spots[0].rotation == pytest.approx(2.0 - math.pi / 2)
+    # steered: the hand faces each spot's bearing from the arm, turned
+    steered = dataclasses.replace(pink, press_yaw_steer=True)
+    judged = []
+    spots, _why = _spots(steered, tmap, BOX, judged_out=judged)
+    for s in judged:
+        assert same(s.rotation, math.atan2(s.xy[1], s.xy[0]) - math.atan2(BOX[1], BOX[0]) + s.turn)
+    assert spots[0].turn == 0.0 and abs(spots[0].rotation) < ct.ROTATION_STEP_RAD / 2
 
 
 def test_no_lid_goes_past_the_tables_edge_or_where_the_camera_could_not_see(pink):
