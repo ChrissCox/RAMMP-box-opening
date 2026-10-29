@@ -1344,15 +1344,22 @@ def test_a_compliant_run_retimes_gentler_and_under_the_wrist_ceiling_in_preview_
     rad/s^2 and the arm made ~3; on the way home joint_6 topped out at 0.54
     rad/s, its command at the clamp, where the re-timer allowed 1.10. A
     compliant client's runner re-times every unguarded motion at
-    COMPLIANT_ACCEL / COMPLIANT_DECEL under COMPLIANT_QD_CEILING, and its
-    preview shows the time that flies. In the mission's order: press_demo
+    COMPLIANT_ACCEL / COMPLIANT_DECEL under COMPLIANT_QD_CEILING, its
+    junctions no faster than COMPLIANT_JUNCTION_SPEED, and its preview
+    shows the time that flies. In the mission's order: press_demo
     builds the runner on a position client, run_reach_press sets the flag
     on it and puts it back when the run ends — the runner reads it at every
     re-timing, so a flag kept from when it was built would fly a compliant
     run on the position profile."""
     import numpy as np
 
-    from rammp_box_opening.constants import COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING, JOINT_VMAX
+    from rammp_box_opening.constants import (
+        COMPLIANT_ACCEL,
+        COMPLIANT_DECEL,
+        COMPLIANT_JUNCTION_SPEED,
+        COMPLIANT_QD_CEILING,
+        JOINT_VMAX,
+    )
     from rammp_box_opening.runtime.retime import RetimeParams, retime_group
 
     c = _Flown(compliant=False)
@@ -1360,7 +1367,8 @@ def test_a_compliant_run_retimes_gentler_and_under_the_wrist_ceiling_in_preview_
     assert r.retime_params() is r.retime
     c.compliant = True  # run_reach_press, on the runner press_demo built
     p = r.retime_params()
-    assert (p.accel, p.decel, p.qd_ceiling) == (COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING)
+    assert (p.accel, p.decel, p.qd_ceiling, p.junction_cruise) == (COMPLIANT_ACCEL, COMPLIANT_DECEL,
+                                                                COMPLIANT_QD_CEILING, COMPLIANT_JUNCTION_SPEED)
     # gentler than the position profile, and a wrist ceiling under the joint cap, so it binds below
     assert COMPLIANT_ACCEL < RetimeParams().accel and COMPLIANT_DECEL < RetimeParams().decel
     assert all(top < 0.9 * vmax for top, vmax in zip(COMPLIANT_QD_CEILING[4:], JOINT_VMAX[4:]))

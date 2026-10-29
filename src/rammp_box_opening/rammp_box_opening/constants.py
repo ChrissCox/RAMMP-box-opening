@@ -65,22 +65,43 @@ FREE_LINE_SPEED = 0.3
 # would ask arm_joint_6 0.51-0.60 rad/s at 0.55, past the ~0.54 it makes.
 # 2026-10-28 16:23 walked between the tilted look and the hand turned down
 # 60 mm over the button four times (the way in, the way back, the grip's way
-# in, its back out): 15.9 s of the run's 29.4 s from the scene fix to home,
-# at 0.3. Offline, under the ceiling and the compliant ease, on flatbot's URDF
-# with the mission's own legs: 16:23's way in 7.26 -> 5.57 s, way back
-# 5.11 -> 3.36, grip in 5.28 -> 3.64, back out 4.91 -> 3.27, lift and clear
-# 1.74 -> 1.42, retreat and home 3.97 -> 3.68; 15:45's way in 8.40 -> 7.05,
-# way out 7.35 -> 6.18. The shoulder and elbow then run up to 0.69 rad/s
+# in, its back out): the walks were 15.9 s of the run's 29.4 s from the scene
+# fix to home, at 0.3. Offline, under the ceiling, the compliant ease and the
+# junction ceiling (COMPLIANT_JUNCTION_SPEED), on flatbot's URDF with the
+# mission's own legs: 16:23's way in 7.26 -> 5.65 s, way back 5.11 -> 3.49,
+# grip in 5.28 -> 3.75, back out 4.91 -> 3.39, lift and clear 1.74 -> 1.44,
+# retreat and home 3.97 -> 3.70; 15:45's way in 8.40 -> 7.09, way out
+# 7.35 -> 6.28. The shoulder and elbow then run up to 0.69 rad/s
 # (0.55 x 0.9 x 1.396), the wrist at most its 0.45; 15:45's looks ran
-# arm_joint_2 at 1.50-1.62 without a fault. Where the rise or the grip's way
-# up turns into the walk back (142 deg in joint space, joints 1, 4 and 6
-# reversing) the re-timer flows through at 0.57 rad/s, 0.52-0.53 at 0.3: the
-# driver's quintic asks arm_joint_1 for 59-62 rad/s^2 there for 24 ms, 47-51
-# for 18-20 ms as 16:23 flew it. The legs that meet the button, the knob or
-# the table keep their own speeds. Nothing plans or collision-checks these
-# lines at any speed (rammp-curobo #23, #43): they fly where the proof put
-# them, faster.
+# arm_joint_2 at 1.50-1.62 without a fault. The lines meet each other and
+# the legs around them as they did at 0.3 (COMPLIANT_JUNCTION_SPEED); the
+# legs that meet the button, the knob or the table keep their own speeds.
+# Nothing plans or collision-checks these lines at any speed (rammp-curobo
+# #23, #43): they fly where the proof put them, faster.
 COMPLIANT_FREE_LINE_SPEED = 0.55
+# A compliant run's junctions (RetimeParams.junction_cruise,
+# Runner.retime_params): the sample two chained legs share, and the one on
+# either side of it, cruise no faster than this, whatever the legs' speeds.
+# A junction otherwise takes the lower of its two legs' fractions, and the
+# re-timer's corner bounds budget its turn over both adjacent intervals
+# while the driver's quintic turns it inside the shorter one. At
+# COMPLIANT_FREE_LINE_SPEED without it (offline 2026-10-28, flatbot's URDF,
+# the full run's executions at 30 boxes 0.50-0.80 m out) 79 of 393 junctions
+# flowed faster than at 0.3, up to 1.83x: the slide in into the turn at
+# (0.68, -0.35) 0.50 -> 0.92 rad/s, the quintic asking arm_joint_6 for 65
+# rad/s^2 where 0.3 asked 19; the rise into the walk back at (0.56, -0.25)
+# 0.53 -> 0.72, arm_joint_1 101 where 55; at 16:23's box the three 142 deg
+# turns (the rise or the grip's way up into the walk back, the grip's walk
+# into its approach; joints 1, 4 and 6 reversing) 0.52-0.53 -> 0.57, 59-62
+# where 16:23 flew them at 47-51 without a fault. At FREE_LINE_SPEED's 0.3 the
+# lines meet as they did: no junction at the 30 boxes faster, 16:23's within
+# 2 %, the quintic's peak, where over 10 rad/s^2, within 6 % (16:23's
+# 48.6-50.8); 16:23's and 15:45's ways in and back, grip in and back out give
+# back 0.04-0.17 s each of the 1.35-1.74 s they gain at 0.55 without it. The
+# one junction of two legs faster than 0.3 that is not a free-air line's, the
+# carry into the set-down (TRANSIT_SPEED into setdown_speed 0.35, never
+# flown), meets at it too: up to 0.55 -> 0.51 rad/s, 0-0.08 s longer.
+COMPLIANT_JUNCTION_SPEED = FREE_LINE_SPEED
 DRIFT_REPLAN_RAD = 0.04  # < START_GATE_RAD: replan before the gate would refuse
 # The driver commands a trajectory's first waypoint at once, wherever the arm
 # is; runtime/driver.py refuses a goal whose start is farther than this from

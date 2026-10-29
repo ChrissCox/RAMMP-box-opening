@@ -698,12 +698,13 @@ def free_guard(ctx, reference, hang_k=None):
 
 
 def free_line_speed(ctx):
-    """The cruise fraction of a plan-free line in free air, off the button
-    and the lid: COMPLIANT_FREE_LINE_SPEED in a compliant run, which no
-    guard has to stop in time and whose every motion the runner re-times
-    under the wrist's ceiling — read from the same flag
-    (runtime/runner.py Runner.retime_params), so no line flies at it
-    without that ceiling; else FREE_LINE_SPEED, a guarded run's."""
+    """The cruise fraction of a plan-free line in free air, nothing under
+    the hand but the lid it may carry: COMPLIANT_FREE_LINE_SPEED in a
+    compliant run, which no guard has to stop in time and whose every
+    motion the runner re-times under the wrist's ceiling and meets at
+    COMPLIANT_JUNCTION_SPEED — read from the same flag (runtime/runner.py
+    Runner.retime_params), so no line flies at it without them; else
+    FREE_LINE_SPEED, a guarded run's."""
     return COMPLIANT_FREE_LINE_SPEED if compliant(ctx) else FREE_LINE_SPEED
 
 

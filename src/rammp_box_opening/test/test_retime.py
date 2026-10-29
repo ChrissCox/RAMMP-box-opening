@@ -433,3 +433,79 @@ def test_a_rest_to_rest_interval_averages_under_the_ceiling_too():
     assert 1.0 / (t[-1] - t[0]) < 0.45
     assert info["duration_s"] > 1.0 / 0.45
     assert check_like_executor(out, JOINT_VMAX) == []
+
+
+# -- the junction ceiling (RetimeParams.junction_cruise): a compliant run's faster lines meet as at 0.3 --
+
+
+def _near_reversal(turn_deg):
+    """16:23's rise into its walk back in miniature: a stroke sampled every
+    0.023 rad, then a walk every 0.15 rad, turning `turn_deg` in joint space
+    where they meet (joints 1, 4 and 6 reversing at 132 deg)."""
+    d1 = np.array([1.0, 0, 0, 0.6, 0, 0.5, 0])
+    d1 /= np.linalg.norm(d1)
+    e = np.array([0, 0.8, 0.3, 0, 0, 0, 0.0])
+    e -= e.dot(d1) * d1
+    e /= np.linalg.norm(e)
+    th = math.radians(turn_deg)
+    d2 = math.cos(th) * d1 + math.sin(th) * e
+    p0 = np.zeros(7)
+    p1 = p0 + d1 * 0.023 * 11
+    p2 = p1 + d2 * 0.15 * 5
+    return [_traj(_line(p0, p1, 12)), _traj(_line(p1, p2, 6))]
+
+
+def test_the_junction_ceiling_holds_the_junction_and_the_sample_either_side_and_no_other():
+    """Without one, the sample a junction shares cruises at the lower of its
+    two legs' fractions and every other at its own leg's. Under
+    junction_cruise neither that sample nor the one on either side of it —
+    the ends of the two intervals the driver's quintic turns the junction
+    in — cruises faster, whichever leg each is of; one slower keeps its
+    own, and every other sample its leg's. Nothing sets one but a compliant
+    run (Runner.retime_params)."""
+    from rammp_box_opening.runtime.retime import cruise_per_sample
+
+    seg = np.asarray([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2])
+    speeds = [0.55, 0.55, 0.175]  # a walk, a turn, the stroke's approach
+    assert list(cruise_per_sample(seg, speeds)) == [0.55] * 7 + [0.175] * 4
+    held = cruise_per_sample(seg, speeds, 0.3)
+    assert list(held) == [0.55, 0.55, 0.3, 0.3, 0.3, 0.55, 0.3, 0.175, 0.175, 0.175, 0.175]
+    assert RetimeParams().junction_cruise is None
+
+
+@pytest.mark.parametrize("turn_deg", [132.0, 60.0, 31.5])
+def test_lines_that_cruise_faster_under_the_junction_ceiling_meet_as_the_slower_lines_did(turn_deg):
+    """Offline 2026-10-28, flatbot's URDF: at COMPLIANT_FREE_LINE_SPEED a
+    junction of two free-air lines took their 0.55 and flowed through up to
+    1.83x as fast as at FREE_LINE_SPEED, and the driver's quintic, which
+    turns it inside the shorter adjacent interval, was asked up to 3.4x the
+    acceleration there (16:23's rise into its walk back 47 -> 59 rad/s^2).
+    Under a compliant run's COMPLIANT_JUNCTION_SPEED the junction meets at
+    the speed the slower lines gave it and the quintic is asked what it was,
+    while the lines between cruise faster: shorter, the same positions, no
+    stop gained or lost."""
+    from dataclasses import replace
+
+    from jtc_model import peak_accel
+
+    from rammp_box_opening.constants import (
+        COMPLIANT_ACCEL,
+        COMPLIANT_DECEL,
+        COMPLIANT_FREE_LINE_SPEED,
+        COMPLIANT_JUNCTION_SPEED,
+        FREE_LINE_SPEED,
+    )
+
+    legs = _near_reversal(turn_deg)
+    p = RetimeParams(accel=COMPLIANT_ACCEL, decel=COMPLIANT_DECEL, qd_ceiling=WRIST_CEILING)
+    slow, was = retime_group(legs, [FREE_LINE_SPEED] * 2, JOINT_VMAX, p)
+    loose, free = retime_group(legs, [COMPLIANT_FREE_LINE_SPEED] * 2, JOINT_VMAX, p)
+    held, info = retime_group(legs, [COMPLIANT_FREE_LINE_SPEED] * 2, JOINT_VMAX,
+                              replace(p, junction_cruise=COMPLIANT_JUNCTION_SPEED))
+    assert free["junction_speeds"][0] > 1.3 * was["junction_speeds"][0]  # what it did without
+    assert peak_accel(loose)[0] > 1.5 * peak_accel(slow)[0]
+    assert info["junction_speeds"] == pytest.approx(was["junction_speeds"])
+    assert peak_accel(held)[0] <= 1.02 * peak_accel(slow)[0]
+    assert info["duration_s"] < 0.85 * was["duration_s"] and info["stops"] == was["stops"] == 0
+    assert np.array_equal(_arrays(held)[0], _arrays(loose)[0])  # positions never touched
+    assert check_like_executor(held, JOINT_VMAX) == []

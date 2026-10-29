@@ -952,13 +952,17 @@ def test_a_line_up_that_does_not_fly_falls_back_to_the_back_off_and_logs_each_re
         ctx, monkeypatch, tmp_path, capsys, compliant):
     """A compliant run's clear goes up and back toward the arm
     (rp.clear_targets): where neither of its lines flies, the same back-off
-    as a guarded run's, unguarded. The back-off says what the planner
-    refused, not always "inside the box's padded volume"."""
+    as a guarded run's, unguarded, and at a guarded run's FREE_LINE_SPEED,
+    not a compliant run's faster free-air lines': it flies where the planner
+    refused the start, the arm perhaps inside the box's padded volume. The
+    back-off says what the planner refused, not always "inside the box's
+    padded volume"."""
     import json
 
     import test_reach_press as trp
     from test_reach_press import _Chain
 
+    from rammp_box_opening.constants import FREE_LINE_SPEED
     from rammp_box_opening.worlds import planned_top_z
 
     real = _Chain.straight_line
@@ -980,6 +984,7 @@ def test_a_line_up_that_does_not_fly_falls_back_to_the_back_off_and_logs_each_re
     clear, = [r for r in rows if r["leg"] == "depth_clear"]
     assert clear["flown"] is False and "joint_6 limit" in clear["why"]
     assert (rec.legs["reach:back-off"].guard is None) is compliant
+    assert rec.legs["reach:back-off"].speed == FREE_LINE_SPEED
     ups = [xyz for xyz, _q in chain.lines if xyz[2] > 0.49]  # the clear's last, after the refused move to the look
     top = planned_top_z(ctx.model, ctx.cpose)
     if compliant:
