@@ -47,10 +47,14 @@ after the press as before (reach_press._fly_way_in).
           a failure (owner 2026-10-28: "it should go no matter what"):
           nothing clear, the most room seen; no map, beside the box; else
           the nearest table point the hand reaches, off the box
-          (spot_candidates) — one line says which, and why.
-  PLACE   the carry (planned there), down onto the table: ONE execution, home
-          planned while it flies. The fingers open; back up to the carry's
-          height and home: one more.
+          (spot_candidates) — one line says which, and why. While the lift
+          flies, what needs no wrist frame is done ahead (carry_ahead): the
+          scene camera's map, its spots the hand reaches and the carry to
+          the best; the spot chosen there is the same, the arm where that
+          carry starts: it flies, no plan at rest.
+  PLACE   the carry (planned there, or ahead), down onto the table: ONE
+          execution, home planned while it flies. The fingers open; back up
+          to the carry's height and home: one more.
 
 Every move flies in the driver's joint impedance under the run's one gains
 spec (depth_press.COMPLIANT_GAINS, RIGID), unguarded, merged where its legs
@@ -69,11 +73,11 @@ arm to stand still (runner.wait_still): between motions, never a stop.
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
-from rammp_box_opening.constants import GRIPPER_CMD_CLOSED, GRIPPER_CMD_OPEN, TRANSIT_SPEED
+from rammp_box_opening.constants import DRIFT_REPLAN_RAD, GRIPPER_CMD_CLOSED, GRIPPER_CMD_OPEN, TRANSIT_SPEED
 from rammp_box_opening.models.container import ContainerPose
 from rammp_box_opening.perception import clear_table
 from rammp_box_opening.primitives.core import (
@@ -240,6 +244,23 @@ HELD_LID_CLEAR_M = 0.03
 # and the carry planned to at most CARRY_TRIES of those that pass
 TIER_TRIES = {"clear": 8, "most room": 10, "beside the box": 8, "nearest": 24}
 CARRY_TRIES = 4
+# The carry planned while the lift flies (carry_ahead) flies where the spot
+# chosen after the lift is its own — this near, the hand turned the same —
+# and the arm stands within DRIFT_REPLAN_RAD of where it starts. 2026-10-29
+# 13:37: the arm stood 3.2 s with the lid in the fingers between the lift's
+# arrival and the carry's start — 0.63 s for the arm to stand still, 0.10 s
+# for the wrist's frame, 2.38 s choosing the spot and planning the carry,
+# 0.06 s sending it. Replayed off the robot on flatbot's URDF with that
+# run's wrist and scene frames, the choice took 1.6 s: 0.07 s of map, 0.82 s
+# judging its room (press_demo.clear_lid_drops) and 0.47 s of the hand's
+# reach (8 spots' drop_reachable: IK and the set-down's line), then the
+# carry: the planner's 0.19 s (its plan_s in the record) and 0.07 s of
+# set-down lines. Only the room needs the wrist's frame: the reach of the
+# spots, judged from the same joints, and the carry to the best are done
+# while the lift flies (lid_spot notes each part's time at rest). The same
+# replay through carry_ahead: 1.64 s of it under 13:37's 2.54 s lift, the
+# same spot chosen after it, 0.89 s at rest instead of 1.67.
+AHEAD_SAME_SPOT_M = 0.01
 # The last resort: table points on rings round the box, from the lid's
 # disc off the box's (and LID_CLEAR_M) outward NEAREST_STEP_M apart to
 # NEAREST_MAX_M, every NEAREST_DEG, nearest the box first, then nearest
@@ -413,9 +434,10 @@ def _nearest_points(ctx, table_z):
     return out
 
 
-def spot_candidates(ctx, tmap, table_z, q, seeds=()):
+def spot_candidates(ctx, tmap, table_z, q, seeds=(), reach=None):
     """Where the lid may go, best first, each one the hand reaches straight
-    down from joints `q` (drop_reachable): (spot, tier, what it says).
+    down from joints `q` (`reach`, drop_reachable's stand-in — _Reach, the
+    verdicts kept —, else drop_reachable): (spot, tier, what it says).
     Tiers, each tried at most TIER_TRIES: 'clear' — where `tmap` shows
     room for the lid and the hand (press_demo.clear_lid_drops, best first);
     'most room' — nothing clear, the spots it judged, the most room first;
@@ -459,9 +481,50 @@ def spot_candidates(ctx, tmap, table_z, q, seeds=()):
                 continue
             n += 1
             tried.append(d)
-            why = drop_reachable(ctx, d, q, seeds)
+            why = (reach or drop_reachable)(ctx, d, q, seeds)
             if why is None:
                 yield d, tier, says
+
+
+def _spot_key(d):
+    """A spot's identity for _Reach: where, to 0.1 mm, and the hand's turn."""
+    return (round(float(d.xyz[0]), 4), round(float(d.xyz[1]), 4), round(float(d.yaw) % (2 * math.pi), 3))
+
+
+def _same_spot(a, b):
+    """Whether spots `a` and `b` are the one spot for a carry planned to
+    either: AHEAD_SAME_SPOT_M apart at most, the hand turned the same."""
+    turn = abs(math.remainder(float(a.yaw) - float(b.yaw), 2 * math.pi))
+    return math.hypot(a.xyz[0] - b.xyz[0], a.xyz[1] - b.xyz[1]) <= AHEAD_SAME_SPOT_M and turn < 1e-3
+
+
+class _Reach:
+    """drop_reachable kept by spot (_spot_key): (why, how long it took).
+    `known`, the verdicts of another one from (nearly) the same joints —
+    carry_ahead's, the arm within DRIFT_REPLAN_RAD of where it judged them
+    — are taken as they are, their time saved (saved_s); every spot not
+    among them is judged here (ik_s) and kept (`found`)."""
+
+    def __init__(self, known=None):
+        self.known = dict(known or {})
+        self.found = {}
+        self.ik_s = 0.0
+        self.saved_s = 0.0
+        self.reused = 0
+
+    def __call__(self, ctx, drop, q, seeds=()):
+        key = _spot_key(drop)
+        if key in self.known:
+            why, took = self.known[key]
+            self.saved_s += took
+            self.reused += 1
+            return why
+        t = time.monotonic()
+        why = drop_reachable(ctx, drop, q, seeds)
+        took = time.monotonic() - t
+        self.ik_s += took
+        self.found[key] = (why, took)
+        return why
 # ---- the way back to the look pose, and the look ----------------------------
 
 
@@ -1110,9 +1173,11 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
     grip's way down (solve_grip_way, from where the arm stands), the
     fingers opening as it flies, ONE execution, the lift planned while it
     does (plan_lift); the close, judged by the grip band; the lift and the
-    clear, ONE execution; there the spot look (choose_and_carry); the carry
-    and the set-down, ONE execution, home planned while it flies; the
-    release; the retreat and home, ONE execution. `eyes` (node, watcher,
+    clear, ONE execution, the carry to the scene camera's best spot
+    planned while it flies (carry_ahead); there the spot look
+    (choose_and_carry); the carry and the set-down, ONE execution, home
+    planned while it flies; the release; the retreat and home, ONE
+    execution. `eyes` (node, watcher,
     scene_fix, the joints the scene camera looked at the arm in) the
     cameras; `how` says what the grip's lid height `lid_z` is. A first
     close on air (_on_air), `yaw` given (the box's, for the aim): back out
@@ -1167,7 +1232,12 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
                          verify=band_verify(cfg.grip_band), send_when_still=True)
     print("[press_demo] CLOSE, then ONE MOTION: %s — %.0f mm straight up, then %.0f mm back toward the arm" % (
         ", ".join(lg.name for lg in lift.legs), 1000 * lift_off_m(ctx.model), 1000 * lift.back_m))
-    res = runner.run([close, *lift.legs], execute=True)
+    # while the lift and the clear fly, the carry to the scene camera's best
+    # spot from where the clear ends (carry_ahead): flown after the lift
+    # where the spot chosen there is the same. A close that fails returns
+    # before the lift: none is made, and a grip once more makes its own
+    res = runner.run([close, *lift.legs], execute=True, lookahead=lambda end: carry_ahead(ctx, cfg, eyes, end))
+    carried = runner.lookahead_result
     grip = [r for r in res if r.leg_name in ("grip:open", "grip:close")]
     if not grip or not grip[-1].ok or grip[-1].leg_name != "grip:close":
         detail = grip[-1].detail if grip else res[-1].detail
@@ -1198,41 +1268,154 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
             rp._in_flight(lift.legs, last, runner.last_retime), last.detail or last.outcome))
         rp.let_go(ctx)
         return 1
-    return choose_and_carry(ctx, cfg, runner, eyes)
+    return choose_and_carry(ctx, cfg, runner, eyes, ahead=carried)
 
 
-def choose_and_carry(ctx, cfg, runner, eyes):
+@dataclass
+class CarryAhead:
+    """What carry_ahead made while the lift and the clear flew, from the
+    joints `q` the clear ends at: the scene camera's map's best spot the
+    carry plans to (`drop`, its tier and what it says) and that carry
+    (Carry; None where none planned, `refused` saying why), the reach
+    verdicts it judged (`known`, _Reach.found), how long it all took
+    (`spent_s`) and the carry's own plan (`plan_s`)."""
+
+    q: list
+    drop: object = None
+    tier: str = None
+    says: str = None
+    carry: object = None
+    refused: list = field(default_factory=list)
+    known: dict = field(default_factory=dict)
+    spent_s: float = 0.0
+    plan_s: float = 0.0
+
+
+def carry_ahead(ctx, cfg, eyes, q_end):
+    """The lift's lookahead (runner.run's, while the lift and the clear
+    fly): what choosing the spot needs but the wrist's frame after the lift
+    — the scene camera's map alone (spot_map, no wrist frame), its
+    spot_candidates the hand reaches from `q_end`, where the clear ends,
+    and the carry from there to the first that plans (plan_carry, at most
+    CARRY_TRIES). The spot is still chosen after the lift, the wrist's frame
+    in its map (choose_and_carry): this carry flies only where that spot is
+    its own. The one planner call in that flight. Returns a CarryAhead."""
+    from rammp_box_opening.primitives.look import look_joints
+    from rammp_box_opening.tasks import press_demo as pd
+
+    t0 = time.monotonic()
+    _node, watcher, scene_fix, scene_q = eyes
+    q = [float(v) for v in q_end]
+    table_z = _table_z(watcher, scene_fix, ctx.cpose)
+    tmap = spot_map(ctx, None, q, scene_fix, scene_q, table_z)
+    rest = list(pd.rest_joints(cfg))
+    reach = _Reach()
+    ahead = CarryAhead(q)
+    for drop, tier, says in spot_candidates(ctx, tmap, table_z, q, seeds=(look_joints(rest), rest), reach=reach):
+        if len(ahead.refused) >= CARRY_TRIES:
+            break
+        t = time.monotonic()
+        carry, why = plan_carry(ctx, cfg, q, drop)
+        if carry is not None:
+            ahead.drop, ahead.tier, ahead.says, ahead.carry = drop, tier, says, carry
+            ahead.plan_s = time.monotonic() - t
+            break
+        ahead.refused.append("[%.2f, %.2f]: %s" % (drop.xyz[0], drop.xyz[1], why))
+    ahead.known = reach.found
+    ahead.spent_s = time.monotonic() - t0
+    return ahead
+
+
+def _ahead_note(ahead, off, flew, chosen, reach):
+    """lid_spot's 'ahead': whether the carry carry_ahead planned flew, why
+    not, how far the arm stood from where it was planned from (`off`, rad)
+    and the time it saved at rest — its plan where it flew, and the reach
+    verdicts taken from it (`reach`, _Reach). None without one."""
+    if ahead is None:
+        return None
+    why = None
+    if not flew:
+        if ahead.carry is None:
+            why = "none planned (%s)" % ("; ".join(ahead.refused) or "no spot the hand reaches")
+        elif off > DRIFT_REPLAN_RAD:
+            why = "the arm stands %.3f rad from where it was planned from (gate %.2f)" % (off, DRIFT_REPLAN_RAD)
+        elif chosen is None:
+            why = "no carry plans here"
+        else:
+            d = chosen[0]
+            why = "the spot chosen with the lid lifted is %.0f mm from it%s" % (
+                1000 * math.hypot(d.xyz[0] - ahead.drop.xyz[0], d.xyz[1] - ahead.drop.xyz[1]),
+                "" if abs(math.remainder(float(d.yaw) - float(ahead.drop.yaw), 2 * math.pi)) < 1e-3
+                else ", the hand turned otherwise")
+    return dict(flown=flew, why=why, off_rad=round(off, 4),
+                xyz=None if ahead.drop is None else [round(v, 4) for v in ahead.drop.xyz],
+                spent_s=round(ahead.spent_s, 3), reused=reach.reused,
+                saved_s=round(reach.saved_s + (ahead.plan_s if flew else 0.0), 3))
+
+
+def choose_and_carry(ctx, cfg, runner, eyes, ahead=None):
     """The lid lifted and clear of the box, in the fingers: its one stop.
     The wrist's frame (spot_look) and the scene camera's table make the map
     (spot_map) the spot is chosen on; the first of spot_candidates the carry plans to
     (plan_carry, at most CARRY_TRIES) is where the lid goes, one line saying
-    which tier and why. Then the carry and the set-down, ONE execution,
+    which tier and why. `ahead` (carry_ahead's, made while the lift flew):
+    the arm within DRIFT_REPLAN_RAD of where it was made, its reach
+    verdicts are taken (_Reach), and its carry flies where the spot chosen
+    is its own (_same_spot) — no plan at rest; else the carry is planned
+    here, as without one. Then the carry and the set-down, ONE execution,
     home planned while it flies (plan_home_after); the knuckle read (the
-    lid slipped?); the release; the retreat and home, ONE execution.
-    Returns the exit code: 0 with the lid set down and the arm home."""
+    lid slipped?); the release; the retreat and home, ONE execution. The
+    lid_spot note says how long each part took here, and whether the carry
+    planned ahead flew (_ahead_note). Returns the exit code: 0 with the lid
+    set down and the arm home."""
+    from rammp_box_opening.geometry import ang_diff
     from rammp_box_opening.primitives.look import look_joints
     from rammp_box_opening.tasks import press_demo as pd
 
     node, watcher, scene_fix, scene_q = eyes
     world = _full_world(ctx)
     table_z = _table_z(watcher, scene_fix, ctx.cpose)
+    t0 = time.monotonic()
     wrist = spot_look(node, watcher, runner)
+    t_look = time.monotonic()
     q = [float(v) for v in ctx.client.joints()]  # where the arm stood still for the frame
     tmap = spot_map(ctx, wrist, q, scene_fix, scene_q, table_z,
                     getattr(getattr(watcher, "grab", None), "wrist_lens_in_hand_m", None))
+    t_map = time.monotonic()
+    # the reach of a spot judged from where the clear was to end is the
+    # reach from here where the arm stands as near as the runner flies a
+    # planned leg from (its drift gate): ahead's verdicts are taken, and its
+    # carry, planned from there, flies from here
+    off = None if ahead is None else max(abs(ang_diff(a, b)) for a, b in zip(q, ahead.q))
+    near = off is not None and off <= DRIFT_REPLAN_RAD
+    reach = _Reach(ahead.known if near else None)
     rest = list(pd.rest_joints(cfg))
-    carry, refused, chosen = None, [], None
-    for drop, tier, says in spot_candidates(ctx, tmap, table_z, q, seeds=(look_joints(rest), rest)):
+    carry, refused, chosen, carry_s, flew = None, [], None, 0.0, False
+    for drop, tier, says in spot_candidates(ctx, tmap, table_z, q, seeds=(look_joints(rest), rest), reach=reach):
         if len(refused) >= CARRY_TRIES:
             break
+        if near and ahead.carry is not None and _same_spot(drop, ahead.drop):
+            carry, chosen, flew = ahead.carry, (ahead.drop, tier, says), True
+            break
+        t = time.monotonic()
         carry, why = plan_carry(ctx, cfg, q, drop)
+        carry_s += time.monotonic() - t
         if carry is not None:
             chosen = (drop, tier, says)
             break
         refused.append("[%.2f, %.2f]: %s" % (drop.xyz[0], drop.xyz[1], why))
+    t_end = time.monotonic()
+    note = _ahead_note(ahead, off, flew, chosen, reach)
     runner.note("lid_spot", xyz=None if chosen is None else [round(v, 4) for v in chosen[0].xyz],
                 tier=None if chosen is None else chosen[1], wrist_points=0 if wrist is None else len(wrist),
-                mapped=tmap is not None, refused="; ".join(refused) or None)
+                mapped=tmap is not None, refused="; ".join(refused) or None,
+                look_s=round(t_look - t0, 3), map_s=round(t_map - t_look, 3),
+                candidates_s=round(t_end - t_map - carry_s, 3), ik_s=round(reach.ik_s, 3),
+                carry_s=round(carry_s, 3), ahead=note)
+    if note is not None:
+        print("[press_demo] %s" % ("the carry planned while the lift flew goes (%.2f s not spent here)"
+                                   % note["saved_s"] if flew else
+                                   "the carry planned while the lift flew is not flown: %s" % note["why"]))
     if carry is None:
         print("[press_demo] STOP: no carry to a spot the lid could go to plans (%s) — the arm holds the lid"
               % ("; ".join(refused) or "no spot the hand reaches"))
