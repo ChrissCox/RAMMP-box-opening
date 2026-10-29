@@ -390,3 +390,42 @@ def test_a_refusal_is_the_one_the_finite_difference_gave(chain, monkeypatch):
     now, ref = _line_both_ways(chain, monkeypatch, q_start, [t0[0] + 1.5, t0[1], t0[2]], [1.0, 0.0, 0.0, 0.0])
     assert now[0] is None and now[1]
     _assert_same_line(now, ref)
+
+
+def test_the_self_motion_swings_the_elbow_with_the_tool_standing_still():
+    """ArmChain.self_motion on flatbot's URDF, from the posture the client
+    plans the reach-out's look to for 2026-10-28 16:23's box (nearest_solution
+    from HOME): every posture holds tool_frame where that one does, inside
+    the limits, each SELF_MOTION_STEP_RAD of joint space on from the last
+    with no jump; the + way first — joint_3 first turning up — then the
+    other, each in order, the posture itself in neither. The elbow (joint_4's
+    origin) swings 0.2 m over 1.2 rad of it; the wrist (joint_6's origin)
+    and joint_7's, which the tool's pose holds, stand still."""
+    from rammp_box_opening.models.container import ContainerModel, load_press_demo
+    from rammp_box_opening.primitives.look import look_joints
+    from rammp_box_opening.runtime.branches import planner_branch
+    from rammp_box_opening.tasks import reach_press
+
+    pink = "src/rammp_box_opening/config/containers/ankou_pink.yaml"
+    arm = ArmChain(FLATBOT_URDF, root="arm_mount")
+    quat, _start, _bottom, look = reach_press.reach_geometry(ContainerModel.load(pink), (0.5921, -0.2869, 0.3123), 30,
+                                                             load_press_demo(pink).travel_m)
+    q0 = arm.nearest_solution(planner_branch(HOME), look, quat, seeds=(look_joints(HOME),))
+    R0, t0 = arm.fk(q0)
+    p0 = arm.points(q0)
+    swung = arm.self_motion(q0, 1.2)
+    step = kin.SELF_MOTION_STEP_RAD
+    assert [s for s, _q in swung] == pytest.approx([step * k for k in range(1, 13)] + [-step * k for k in range(1, 13)])
+    assert swung[0][1][2] > q0[2] and swung[12][1][2] < q0[2]  # joint_3 first turning up, the + way
+    for k, (s, q) in enumerate(swung):
+        R, t = arm.fk(q)
+        assert float(np.linalg.norm(t - t0)) < 1e-4 and float(np.linalg.norm(rotvec(R @ R0.T))) < 1e-4
+        assert arm.within_limits(q)
+        before = q0 if k in (0, 12) else swung[k - 1][1]
+        assert float(np.linalg.norm(q - before)) == pytest.approx(step, abs=0.01)
+        assert float(np.abs(q - before).max()) < kin.MAX_REACH_STEP_RAD
+        p = arm.points(q)
+        assert float(np.linalg.norm(p[5] - p0[5])) < 1e-3 and float(np.linalg.norm(p[6] - p0[6])) < 1e-4
+    for k in (11, 23):  # 1.2 rad either way
+        assert float(np.linalg.norm(arm.points(swung[k][1])[3] - p0[3])) > 0.18
+    assert all(float(np.abs(q - q0).max()) > 1e-3 for _s, q in swung)

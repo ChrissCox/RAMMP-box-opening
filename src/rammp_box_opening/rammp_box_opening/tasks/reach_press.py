@@ -63,23 +63,35 @@ grip, the lift, the carry and the set-down (tasks/reach_lid_off) — unless
 
 Each tilt is proven from its look pose's joints before the planner is asked
 for anything, and only the first that proves has its look planned
-(plan_reach).
+(plan_reach). A compliant depth press's look goes to the posture — the same
+pose, the elbow swung elsewhere — whose walks to the hand turned down over
+the button are quickest, where that is LOOK_POSTURE_GAIN_S quicker than the
+posture nearest HOME and its centre line keeps clear of the table and the
+box (quickest_look, posture_refusal: a minimal guard, not a collision
+check).
 """
 
 import dataclasses
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
 
 from rammp_box_opening.constants import (
+    COMPLIANT_ACCEL,
+    COMPLIANT_DECEL,
     COMPLIANT_FREE_LINE_SPEED,
+    COMPLIANT_JUNCTION_SPEED,
+    COMPLIANT_QD_CEILING,
     COMPLIANT_RUN_GAINS,
     CONTACT_SPEED,
     DRIFT_REPLAN_RAD,
     FREE_LINE_SPEED,
     IMPEDANCE_KQ,
     IMPEDANCE_NAMES,
+    JOINT_VMAX,
+    PLANNER_LIMIT_MARGIN_RAD,
     TIP_TO_TOOL_M,
     TRANSIT_SPEED,
     CustomGains,
@@ -99,6 +111,7 @@ from rammp_box_opening.primitives.core import (
 from rammp_box_opening.runtime import fingers
 from rammp_box_opening.runtime.guards import GuardSpec
 from rammp_box_opening.runtime.legs import Kind, Leg, can_merge, merge_groups
+from rammp_box_opening.runtime.retime import RetimeParams, positions_to_traj, retime_group
 
 REACH_TILTS_DEG = (30, 35, 40, 45)
 # How far the rest of the gripper stands above the flush lid when the
@@ -284,7 +297,12 @@ class ReachPlan:
     # plan_reach's: the joints its slide and the rest were proven from — the
     # arm's own IK's for the look pose (client.pose_goal_joints), or the
     # planned look's end where that IK found none or the plan ended elsewhere
+    # — or, with shortest_walk, the posture quickest_look chose
     look_joints: list = None
+    # plan_reach shortest_walk's: how the look's posture was chosen
+    # (quickest_look's note, for the run record's reach_plan); None where it
+    # was not asked
+    posture: dict = None
 
 
 def _short(e):
@@ -464,7 +482,292 @@ def _proven(ctx, cfg, chain, tilt, button, geometry, q_look, depth):
     return ReachPlan(tilt, quat, button, look, start, bottom, None, slide, stroke, look_joints=q_look), None, None
 
 
-def plan_reach(ctx, cfg, button, q_from, tilts=REACH_TILTS_DEG, depth=False, looks=None):
+# The look pose's POSTURE (plan_reach shortest_walk, the compliant depth
+# press). The 7-joint arm holds the look pose — the same tool pose, the
+# same wrist camera view — with its elbow anywhere along a swing about the
+# line from its shoulder to its wrist (kinematics.ArmChain.self_motion). The
+# client plans the look to the posture quickest to fly to from HOME
+# (client.pose_goal_joints: ArmChain.nearest_solution), which minimises the
+# one transit to the look and nothing after it. The run then walks between
+# the look and the hand turned down over the button 3-4 times — the way in,
+# the way back, the grip's way in, a back out — and on 2026-10-29 13:37
+# those walks were ~15 s of a 34.5 s run: from that posture each is 1.9-2.4
+# rad of joint travel for ~16 cm of the hand's. The elbow swung elsewhere,
+# the same walk is shorter. Offline (flatbot's URDF, the compliant run's own
+# timing: flown_s, transit_s), the posture quickest_look chooses:
+#   10-28 16:23 (r 0.66 m, az -26 deg) walk 2.79 -> 1.79 s, look +0.34 s:
+#               2.7 s quicker over the three walks
+#   10-28 15:45 (r 0.75)  walk 3.15 -> 2.16 s, +0.15 s: 2.8 s
+#   10-29 12:04 (r 0.65)  walk 2.79 -> 1.70 s, +0.38 s: 2.9 s
+#   10-29 13:37 (r 0.76), 10-28 14:21 (r 0.73): today's kept — the best
+#               other elbow there saves 0.6-0.7 s, under LOOK_POSTURE_GAIN_S
+# The candidates: the self-motion walked LOOK_POSTURE_SWING_RAD each way
+# from today's posture, one every LOOK_POSTURE_EVERY_RAD, inside the
+# planner's joint limits (a goal within PLANNER_LIMIT_MARGIN_RAD of one is
+# refused: GOAL_IN_LIMIT_MARGIN), none within LOOK_POSTURE_DEDUP_RAD of
+# today's or of one before it. They are ranked by a bound — the transit and
+# the walk as straight joint lines at their joint speed caps — and the
+# LOOK_POSTURE_PROOFS best are proven as today's is (_proven: the slide and
+# the way down, every line one the runner flies), then GUARDED
+# (posture_refusal) and timed as flown. The best is taken only where it is
+# LOOK_POSTURE_GAIN_S quicker than today's over the transit and
+# LOOK_POSTURE_WALKS walks: elsewhere today's posture stands, exactly as it
+# was planned before.
+LOOK_POSTURE_SWING_RAD = 2.4  # past ~2 rad the look's transit costs more than the walks save
+LOOK_POSTURE_EVERY_RAD = 0.3
+LOOK_POSTURE_DEDUP_RAD = 0.2  # any joint: closer than this is the same posture
+LOOK_POSTURE_PROOFS = 3
+# IK time the search may spend (s): no proof is started that the time left
+# would not hold at the slowest one so far. Flatbot's Jetson (offline,
+# 2026-10-29): the sweep ~0.04 s, the ranking ~0.05, each proof 0.09-0.20
+LOOK_POSTURE_BUDGET_S = 0.6
+# How much quicker another posture must be, over the transit and the walks,
+# for the look to go there (s). The estimate times each walk alone; the
+# runner flies it merged into a longer execution (way_in_legs), so a few
+# tenths are inside what the estimate cannot tell: at 14:21 and 13:37 the
+# best other elbow saved 0.6-0.7 s by it, and the research pass of 10-28
+# found no gain at 14:21
+LOOK_POSTURE_GAIN_S = 1.0
+LOOK_POSTURE_WALKS = 3  # the way in, the way back, the grip's way in (a back out only where the grip misses)
+# posture_refusal: the arm's centre line kept this far off the table and
+# the box — the links' radius (the Gen3's are ~0.06 m from their joints'
+# axes) and 0.03 m more
+POSTURE_LINK_RADIUS_M = 0.06
+POSTURE_CLEAR_M = POSTURE_LINK_RADIUS_M + 0.03
+POSTURE_LINE_STEP_M = 0.02  # the centre line sampled this finely between joint origins
+# ArmChain.points' rows: joint_1 .. joint_7's origins, then the tool. The
+# shoulder (joint_1 and joint_2) stands where the arm is mounted, below the
+# table's top on flatbot (joint_2 0.244 m above arm_mount, the table 0.21),
+# whatever the posture: the line is judged from joint_3's origin to
+# joint_7's. The hand past joint_7 is not judged: the tool's pose alone puts
+# it — the walk's and the stroke's poses are the same from every posture —
+# and it must come down over the box, to the lid ~0.10 m above the table.
+CENTRE_LINE = (2, 7)  # ArmChain.points rows [2, 7): joint_3 .. joint_7
+CENTRE_LINE_NAMES = ("joint_3", "joint_4", "joint_5", "joint_6", "joint_7")
+
+
+def compliant_retime():
+    """The profile a compliant run re-times every motion with
+    (runtime/runner.py Runner.retime_params for a compliant client — the
+    depth press flies only in one): the compliant ease out of rest and into
+    it, the wrist's ceiling and the junction ceiling."""
+    return dataclasses.replace(RetimeParams(), accel=COMPLIANT_ACCEL, decel=COMPLIANT_DECEL,
+                               qd_ceiling=COMPLIANT_QD_CEILING, junction_cruise=COMPLIANT_JUNCTION_SPEED)
+
+
+def flown_s(legs, speed):
+    """How long the chained joint paths `legs` take at the cruise fraction
+    `speed` as ONE execution under a compliant run's profile (retime_group,
+    as Runner._run_motion re-times a merged group): an estimate, rest to
+    rest; the runner flies a walk merged into a longer execution."""
+    names = ["joint_%d" % (i + 1) for i in range(len(JOINT_VMAX))]
+    trajs = [positions_to_traj(names, [[float(v) for v in q] for q in pts]) for pts in legs if len(pts) > 1]
+    if not trajs:
+        return 0.0
+    _traj, info = retime_group(trajs, [float(speed)] * len(trajs), JOINT_VMAX, compliant_retime())
+    return float(info["duration_s"])
+
+
+def _joint_line(a, b, step_rad=0.02):
+    """The straight joint-space line from `a` to `b`, a waypoint every
+    `step_rad` of the joint that moves most."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    n = max(1, int(math.ceil(float(np.abs(b - a).max()) / step_rad)))
+    return [a + (b - a) * (k / n) for k in range(n + 1)]
+
+
+def transit_s(q_from, q):
+    """The look's transit from `q_from` to `q` (each continuous joint the
+    short way round from q_from's planner branch, as the client sends the
+    goal: plan_to_joints) as a straight joint line at TRANSIT_SPEED under a
+    compliant run's profile — a stand-in for the planner's path, which in an
+    empty world is near it, not it."""
+    from rammp_box_opening.runtime.branches import nearest_branch, planner_branch
+
+    start = planner_branch(q_from)
+    return flown_s([_joint_line(start, nearest_branch(q, start))], TRANSIT_SPEED)
+
+
+def _line_bound_s(a, b, speed):
+    """The slowest joint's travel from `a` to `b` over its cruise cap at
+    `speed` under a compliant run's profile (RetimeParams.vmax_margin x the
+    limit x speed, no faster than COMPLIANT_QD_CEILING): quickest_look's
+    ranking, no ease in or out."""
+    p = compliant_retime()
+    caps = [min(p.vmax_margin * v * float(speed), c) for v, c in zip(JOINT_VMAX, COMPLIANT_QD_CEILING)]
+    return max(abs(float(x) - float(y)) / c for x, y, c in zip(a, b, caps))
+
+
+def walk_legs(plan):
+    """A depth ReachPlan's WALK: the joint paths from its look pose to the
+    hand turned down over the button — the walk in, or the slide and the
+    turn after it (way_in_legs flies them so)."""
+    if plan.down.walked:
+        return [plan.down.pts]
+    return [plan.slide_pts, plan.down.pts]
+
+
+def posture_refusal(ctx, chain, legs, button):
+    """Why the arm's centre line along the joint paths `legs` comes nearer
+    than POSTURE_CLEAR_M to the table or into the box padded by it, or None.
+    A MINIMAL GUARD, NOT A COLLISION CHECK: nothing collision-checks the
+    plan-free walks, and the planner's world is empty (worlds.py), so an
+    elbow swung elsewhere (quickest_look) is held to this before its walk is
+    taken. The centre line is ArmChain.points' joint origins from joint_3's
+    to joint_7's (CENTRE_LINE) joined by straight lines, sampled every
+    POSTURE_LINE_STEP_M at every waypoint; the links' bulk is the margin's
+    POSTURE_LINK_RADIUS_M. Not judged: the shoulder, which stands where the
+    arm is mounted at every posture, and the hand past joint_7 — the
+    gripper, its fingers and the wrist camera — which the tool's poses put
+    where they put it from every posture, down over the box. The table:
+    ctx.worlds.table_top_z, the scene camera's
+    (press_demo.adopt_scene_table), else the base of the scene camera's box
+    (ctx.cpose). The box: ctx.cpose with the model's dims — the round
+    model's disc a vertical cylinder, any other a cuboid at its yaw — up to
+    its top or `button`'s, whichever is higher."""
+    worlds, cpose, m = getattr(ctx, "worlds", None), getattr(ctx, "cpose", None), ctx.model
+    if cpose is None:
+        return "no box to keep the arm out of"
+    table_z = getattr(worlds, "table_top_z", None)
+    if table_z is None or not math.isfinite(float(table_z)):
+        table_z = float(cpose.xyz[2])
+    floor = float(table_z) + POSTURE_CLEAR_M
+    top = max(float(cpose.xyz[2]) + float(m.dims[2]), float(button[2])) + POSTURE_CLEAR_M
+    cx, cy = float(cpose.xyz[0]), float(cpose.xyz[1])
+    c, s = math.cos(float(cpose.yaw)), math.sin(float(cpose.yaw))
+    for k_leg, pts in enumerate(legs):
+        if pts is None or len(pts) == 0:
+            continue
+        P = np.array([chain.points(q)[CENTRE_LINE[0]:CENTRE_LINE[1]] for q in pts])  # (n, 5, 3)
+        n = len(P)
+        for j in range(P.shape[1] - 1):  # the segment from row j to row j + 1
+            a, b = P[:, j], P[:, j + 1]
+            steps = max(1, int(math.ceil(float(np.linalg.norm(b - a, axis=1).max()) / POSTURE_LINE_STEP_M)))
+            f = np.linspace(0.0, 1.0, steps + 1)
+            S = a[:, None, :] + f[None, :, None] * (b - a)[:, None, :]  # (n, steps + 1, 3)
+            low = S[..., 2] < floor
+            if low.any():
+                i = int(np.argwhere(low)[0][0])
+                return ("the centre line %.0f mm above the table between %s and %s (path %d, %.0f%% of the way): "
+                        "under the %.0f mm kept" % (1000 * (float(S[i, :, 2].min()) - float(table_z)),
+                                                    CENTRE_LINE_NAMES[j], CENTRE_LINE_NAMES[j + 1], k_leg + 1,
+                                                    100.0 * i / max(1, n - 1), 1000 * POSTURE_CLEAR_M))
+            dx, dy = S[..., 0] - cx, S[..., 1] - cy
+            if m.round:
+                foot = np.hypot(dx, dy) < float(m.dims[0]) / 2.0 + POSTURE_CLEAR_M
+            else:
+                u, v = c * dx + s * dy, -s * dx + c * dy
+                foot = ((np.abs(u) < float(m.dims[0]) / 2.0 + POSTURE_CLEAR_M)
+                        & (np.abs(v) < float(m.dims[1]) / 2.0 + POSTURE_CLEAR_M))
+            inside = foot & (S[..., 2] < top)
+            if inside.any():
+                i = int(np.argwhere(inside)[0][0])
+                return ("the centre line between %s and %s inside the box padded %.0f mm (path %d, %.0f%% of the way)"
+                        % (CENTRE_LINE_NAMES[j], CENTRE_LINE_NAMES[j + 1], 1000 * POSTURE_CLEAR_M, k_leg + 1,
+                           100.0 * i / max(1, n - 1)))
+    return None
+
+
+def quickest_look(ctx, cfg, chain, tilt, button, geometry, q_from, plan):
+    """plan_reach shortest_walk's posture for the look pose: of the arm's
+    postures holding it (the LOOK POSTURE comment above), the one whose
+    look and walks are quickest, where that is LOOK_POSTURE_GAIN_S quicker
+    than today's — `plan`, the depth ReachPlan proven from the joints the
+    client plans the look to (client.pose_goal_joints) — else `plan`
+    itself. Every other posture is proven as `plan` was (_proven at
+    `tilt`, `geometry`: reach_geometry's for `button`, from the posture)
+    and must pass posture_refusal along its walk and its stroke; `plan`
+    is not held to it, as it never was. Returns (the ReachPlan, the note:
+    `chosen` 0 for today's posture, else its number among the candidates
+    in self_motion's order, `swing_rad` how far along the elbow's swing it
+    stands, `joint_gap_rad` its largest joint difference from today's;
+    `walk_s` / `walk_s_today` and `transit_s` / `transit_s_today` as
+    flown_s and transit_s time them, `saved_s` over the transit and
+    LOOK_POSTURE_WALKS walks; `candidates`, `proven` and `refused` (why,
+    by number); `ik_s` the time it took)."""
+    from rammp_box_opening.runtime.branches import (
+        CONTINUOUS_JOINTS, PLANNER_CONTINUOUS_LIMIT_RAD, nearest_branch, planner_branch,
+    )
+    from rammp_box_opening.runtime.kinematics import SELF_MOTION_STEP_RAD
+
+    t0 = time.monotonic()
+    start = planner_branch(q_from)
+    q_today = np.asarray(plan.look_joints, float)
+    walk0, transit0 = flown_s(walk_legs(plan), COMPLIANT_FREE_LINE_SPEED), transit_s(start, q_today)
+    best = (transit0 + LOOK_POSTURE_WALKS * walk0, 0, 0.0, plan, walk0, transit0)
+    every = max(1, int(round(LOOK_POSTURE_EVERY_RAD / SELF_MOTION_STEP_RAD)))
+    cands, kept = [], [q_today]
+    for s, q in chain.self_motion(q_today, LOOK_POSTURE_SWING_RAD):
+        if int(round(abs(s) / SELF_MOTION_STEP_RAD)) % every:
+            continue
+        q = np.array(nearest_branch(q, start), float)
+        if not chain.within_limits(q, PLANNER_LIMIT_MARGIN_RAD) or any(
+                abs(q[i]) > PLANNER_CONTINUOUS_LIMIT_RAD for i in CONTINUOUS_JOINTS):
+            continue
+        if any(float(np.abs(q - u).max()) < LOOK_POSTURE_DEDUP_RAD for u in kept):
+            continue
+        kept.append(q)
+        cands.append((len(cands) + 1, s, q))
+    # ranked by the bound, each posture's walk ending where today's turns the hand down
+    R_end, t_end = chain.fk(next(p[-1] for p in reversed(walk_legs(plan)) if len(p)))
+    ranked = []
+    for number, s, q in cands:
+        end = chain.solve_pose(q, t_end, R_end)
+        if end is not None:
+            bound = _line_bound_s(start, q, TRANSIT_SPEED) + LOOK_POSTURE_WALKS * _line_bound_s(
+                q, end, COMPLIANT_FREE_LINE_SPEED)
+            ranked.append((bound, number, s, q))
+    ranked.sort(key=lambda r: r[0])  # stable: a tie keeps self_motion's order
+    proven, refused, slowest = 0, {}, 0.0
+    for _bound, number, s, q in ranked[:LOOK_POSTURE_PROOFS]:
+        if time.monotonic() - t0 + slowest > LOOK_POSTURE_BUDGET_S:
+            refused[number] = "not proven: the IK time left (LOOK_POSTURE_BUDGET_S)"
+            continue
+        t1 = time.monotonic()
+        alt, why, _kept = _proven(ctx, cfg, chain, tilt, button, geometry, [float(v) for v in q], True)
+        if alt is not None:
+            why = posture_refusal(ctx, chain, walk_legs(alt) + [p for _name, p, _speed in alt.stroke.legs], button)
+        slowest = max(slowest, time.monotonic() - t1)
+        if why is not None:
+            refused[number] = why
+            continue
+        proven += 1
+        walk, transit = flown_s(walk_legs(alt), COMPLIANT_FREE_LINE_SPEED), transit_s(start, q)
+        est = transit + LOOK_POSTURE_WALKS * walk
+        if est < best[0]:
+            best = (est, number, s, alt, walk, transit)
+    _est, number, s, chosen, walk, transit = best
+    if number and best[0] > transit0 + LOOK_POSTURE_WALKS * walk0 - LOOK_POSTURE_GAIN_S:
+        number, s, chosen, walk, transit = 0, 0.0, plan, walk0, transit0
+    note = {
+        "chosen": number, "swing_rad": round(s, 2),
+        "joint_gap_rad": round(float(np.abs(np.asarray(chosen.look_joints, float) - q_today).max()), 3),
+        "walk_s": round(walk, 2), "walk_s_today": round(walk0, 2),
+        "transit_s": round(transit, 2), "transit_s_today": round(transit0, 2),
+        "saved_s": round((transit0 + LOOK_POSTURE_WALKS * walk0) - (transit + LOOK_POSTURE_WALKS * walk), 2),
+        "candidates": len(cands), "proven": proven, "refused": {str(k): v for k, v in refused.items()},
+        "ik_s": round(time.monotonic() - t0, 3),
+    }
+    return chosen, note
+
+
+def _plan_look_to(ctx, q_from, q_look):
+    """The look leg from joints `q_from` to the posture `q_look`
+    (quickest_look's), planned as a joint goal — full world, TRANSIT_SPEED,
+    as _plan_look's — which the client sends on the start's branch and
+    takes back only where it ends there (plan_to_joints). Returns (leg,
+    None) or (None, why)."""
+    try:
+        leg, _st = _plan_motion(
+            ctx, PlanState(joints=list(q_from), chain=0), "reach:look", ("joints", [float(v) for v in q_look]),
+            _full_world(ctx), TRANSIT_SPEED,
+        )
+    except RuntimeError as e:
+        return None, _short(e)
+    return leg, None
+
+
+def plan_reach(ctx, cfg, button, q_from, tilts=REACH_TILTS_DEG, depth=False, looks=None, shortest_walk=False):
     """The smallest tilt whose slide and stroke the arm's own kinematics
     can fly as straight lines from its look pose, and whose look pose plans
     (full world, from `q_from`). The way back out retraces both. `depth`
@@ -472,7 +775,11 @@ def plan_reach(ctx, cfg, button, q_from, tilts=REACH_TILTS_DEG, depth=False, loo
     it — but the hand must turn down from the look pose over the slide and
     stroke from there (way_down); a tilt whose look pose and slide solve but
     whose way down does not is passed over, and appended to `looks` (a
-    list) with no `down`.
+    list) with no `down`. `depth` and `shortest_walk` (the proof before the
+    look, from HOME): the tilt proven, its look goes to the posture whose
+    walks are quickest where that is LOOK_POSTURE_GAIN_S quicker
+    (quickest_look; ReachPlan.posture says which), planned as a joint goal
+    (_plan_look_to) — and to today's, as always, where that does not plan.
 
     Each tilt is proven from the joints the client plans its look pose to
     (client.pose_goal_joints: the arm's own IK) before the planner is asked
@@ -511,8 +818,28 @@ def plan_reach(ctx, cfg, button, q_from, tilts=REACH_TILTS_DEG, depth=False, loo
                 continue
             q_look = leg.goal_joints
         plan, why, kept = _proven(ctx, cfg, chain, tilt, (bx, by, bz), geometry, q_look, depth)
+        posture = None
         if plan is not None and leg is None:  # the first tilt that proves: the one look planned
-            leg, why_leg = _plan_look(ctx, q_from, look, quat)
+            if depth and shortest_walk:
+                today = plan
+                try:
+                    plan, posture = quickest_look(ctx, cfg, chain, tilt, (bx, by, bz), geometry, q_from, plan)
+                except Exception as e:  # noqa: BLE001 - a kinematics problem never costs the look: today's posture
+                    plan, posture = today, {"chosen": 0, "error": _short(e)}
+                if posture["chosen"]:
+                    # the client takes a joint plan back only where it ends within PLAN_END_RAD (LOOK_END_RAD)
+                    # of its goal, so the proof below is never made again from elsewhere unguarded
+                    leg, why_leg = _plan_look_to(ctx, q_from, plan.look_joints)
+                    if leg is None:  # today's posture, planned as it always was
+                        print("  NOTE reach:look at %d deg: the quicker posture's look does not plan (%s) — the look "
+                              "goes to today's" % (tilt, why_leg))
+                        posture = dict(posture, chosen=0, swing_rad=0.0, joint_gap_rad=0.0,
+                                       walk_s=posture["walk_s_today"], transit_s=posture["transit_s_today"],
+                                       saved_s=0.0, not_planned={str(posture["chosen"]): why_leg})
+                        plan = today
+                    q_look = plan.look_joints
+            if leg is None:
+                leg, why_leg = _plan_look(ctx, q_from, look, quat)
             if leg is None:
                 plan, why = None, "the look pose (%s)" % why_leg
             else:
@@ -528,6 +855,7 @@ def plan_reach(ctx, cfg, button, q_from, tilts=REACH_TILTS_DEG, depth=False, loo
                 looks.append(kept)
             continue
         plan.look_leg = leg
+        plan.posture = posture
         return plan, None
     return None, "; ".join(refused)
 
@@ -1931,7 +2259,9 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         prime = getattr(ctx.client, "prime_compliant", None)
         if prime is not None and prime(q0):
             print("[press_demo] the driver enters its joint impedance now, while the reach is planned")
-    plan, why = plan_reach(ctx, cfg, prior_button, q0, depth=proof, looks=looks)
+    # the proof also picks the look's posture for the shortest walks (quickest_look): from here, not from the
+    # look pose once the aim moved the button — the look's re-plan below keeps the elbow it flew there with
+    plan, why = plan_reach(ctx, cfg, prior_button, q0, depth=proof, looks=looks, shortest_walk=True)
     proven = "scene" if proof and plan is not None else None
     if plan is None and proof and looks:
         # no look was planned for it: the shifted press's is, once it flies
@@ -1955,7 +2285,15 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
                 button=list(prior_button), proof=proven,
                 down=None if plan.down is None else dict(
                     {"walked": plan.down.walked, "short_deg": plan.down.short_deg},
-                    **({} if plan.down.above_m is None else {"turn_above_mm": round(1000 * plan.down.above_m)})))
+                    **({} if plan.down.above_m is None else {"turn_above_mm": round(1000 * plan.down.above_m)})),
+                look_posture=plan.posture)
+    if plan.posture is not None and plan.posture["chosen"]:
+        p = plan.posture
+        print("[press_demo] REACH-OUT: the look holds the same pose with the elbow swung %.1f rad along its swing "
+              "(joints up to %.2f rad from the nearest posture): each walk to the hand turned down %.2f s against "
+              "%.2f, the look %.2f s against %.2f — %.1f s quicker over %d walks (%.2f s of IK)"
+              % (p["swing_rad"], p["joint_gap_rad"], p["walk_s"], p["walk_s_today"], p["transit_s"],
+                 p["transit_s_today"], p["saved_s"], LOOK_POSTURE_WALKS, p["ik_s"]))
     try:
         slide_nm, stroke_nm = _predicted_drift(plan)
         drift = "; gravity alone moves joint_4 %.2f Nm along the slide and %.2f down the stroke (taken out)" % (slide_nm, stroke_nm)

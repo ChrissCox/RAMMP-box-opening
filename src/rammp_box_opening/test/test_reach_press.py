@@ -1637,11 +1637,13 @@ def _on_flatbot(ctx, monkeypatch):
     ctx.model = ContainerModel.load(PINK)
 
     def plan(ctx_, state, name, target, world, speed):
+        if target[0] == "joints":  # a look posture chosen for its walks (quickest_look): planned to, as the planner's
+            return SimpleNamespace(goal_joints=[float(v) for v in target[1]], target=target), state
         _kind, look, quat = target
         q = chain.nearest_solution(planner_branch(HOME), look, quat, seeds=(look_joints(HOME),))
         if q is None:
             raise RuntimeError("planning failed for %s: MotionGenStatus.IK_FAIL" % name)
-        return SimpleNamespace(goal_joints=[float(v) for v in q]), state
+        return SimpleNamespace(goal_joints=[float(v) for v in q], target=target), state
 
     monkeypatch.setattr(reach_press, "_plan_motion", plan)
     return chain, load_press_demo(PINK), list(HOME)
@@ -1948,6 +1950,325 @@ def test_the_look_planned_is_the_request_the_client_always_sent_for_it(ctx, monk
     worlds.clear()
     plan, why = reach_press.plan_reach(ctx, cfg, SCENE_142812, home, depth=True, looks=[])
     assert plan is None and sent == [] and worlds == []
+
+
+# ---- the look's posture for the shortest walks (plan_reach shortest_walk) ----------
+
+# 2026-10-28/29's scene camera boxes and the table each was seen on (run records' scene_fix top_xyz, table_z_scene)
+SCENE_162353 = ((0.5921, -0.2869, 0.3123), 0.2105)  # r 0.66 m, az -26 deg
+SCENE_154524 = ((0.7214, -0.2167, 0.3126), 0.2146)  # r 0.75 m
+SCENE_120459 = ((0.6135, -0.2267, 0.3115), 0.2129)  # 10-29 12:04, r 0.65 m
+SCENE_142121 = ((0.7169, -0.1311, 0.3131), 0.2116)  # r 0.73 m
+SCENE_133716 = ((0.7459, -0.1532, 0.3098), 0.2162)  # 10-29 13:37, r 0.76 m
+
+
+def _seen(ctx, scene):
+    """The scene camera's box as run_reach_press has it: ctx.cpose at the
+    scene fix (its origin on the table), the table the scene camera
+    measured (press_demo.adopt_scene_table). Returns its button."""
+    from rammp_box_opening.models.container import ContainerPose
+
+    top, table_z = scene
+    ctx.cpose = ContainerPose(xyz=(top[0], top[1], table_z), yaw=0.0)
+    ctx.worlds.table_top_z = table_z
+    return top
+
+
+def _walk(plan):
+    """The look's walk to the hand turned down (reach_press.walk_legs) as one path."""
+    return [q for pts in reach_press.walk_legs(plan) for q in pts]
+
+
+def _guarded(plan):
+    """What posture_refusal holds another posture's plan to: its walk, then its stroke."""
+    return reach_press.walk_legs(plan) + [pts for _name, pts, _speed in plan.stroke.legs]
+
+
+def _every_proof(monkeypatch):
+    """quickest_look's choice whatever the machine's load: every one of its
+    LOOK_POSTURE_PROOFS proven (the budget itself:
+    test_the_posture_search_never_starts_a_proof_the_ik_time_left_would_not_hold)."""
+    monkeypatch.setattr(reach_press, "LOOK_POSTURE_BUDGET_S", math.inf)
+
+
+def _targets(monkeypatch):
+    """reach_press._plan_motion as it is, each target it is asked kept in the list returned."""
+    asked = []
+    real = reach_press._plan_motion
+
+    def plan(ctx_, state, name, target, world, speed):
+        asked.append(target)
+        return real(ctx_, state, name, target, world, speed)
+
+    monkeypatch.setattr(reach_press, "_plan_motion", plan)
+    return asked
+
+
+@pytest.mark.parametrize("scene", [SCENE_162353, SCENE_154524, SCENE_120459],
+                         ids=["10-28 16:23", "10-28 15:45", "10-29 12:04"])
+def test_on_flatbot_the_look_goes_to_the_elbow_whose_walks_are_quickest(ctx, monkeypatch, tmp_path, scene):
+    """2026-10-29 13:37: the walks between the tilted look and the hand
+    turned down over the button were ~15 s of a 34.5 s run, each 1.9-2.4
+    rad of joint travel for ~16 cm of the hand's, from the posture HOME's
+    nearest IK picks for the look. Asked for the shortest walks (the proof
+    before the look), the look holds the same pose — the same view — with
+    the elbow swung elsewhere: at these boxes each walk is ~1 s quicker as
+    a compliant run flies it, 2.7-2.9 s over the three walks with the
+    look's longer transit taken off, its joint arc down by over 0.5 rad.
+    The look is planned once, a joint goal to that posture; the way down
+    is proven from it as it was from today's, it passed the guard, and the
+    way in from where the look ends is one the runner flies."""
+    from rammp_box_opening.constants import COMPLIANT_FREE_LINE_SPEED
+    from rammp_box_opening.runtime.runner import Runner
+    from rammp_box_opening.tasks import depth_press as dp
+
+    chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    _every_proof(monkeypatch)
+    button = _seen(ctx, scene)
+    today, why = reach_press.plan_reach(ctx, cfg, button, home, depth=True)
+    assert why is None and today.posture is None  # not asked: as it always was
+    asked = _targets(monkeypatch)
+    plan, why = reach_press.plan_reach(ctx, cfg, button, home, depth=True, shortest_walk=True)
+    assert why is None and plan.tilt_deg == today.tilt_deg == 30
+    p = plan.posture
+    assert p["chosen"] > 0 and p["saved_s"] >= 2.5 and p["proven"] >= 1, p
+    assert p["walk_s_today"] == round(reach_press.flown_s(reach_press.walk_legs(today), COMPLIANT_FREE_LINE_SPEED), 2)
+    assert p["walk_s"] == round(reach_press.flown_s(reach_press.walk_legs(plan), COMPLIANT_FREE_LINE_SPEED), 2)
+    assert p["walk_s"] <= p["walk_s_today"] - 0.9 and p["transit_s"] > p["transit_s_today"]
+    assert dp.joint_arc(_walk(plan)) <= dp.joint_arc(_walk(today)) - 0.5
+    # the same look pose, another posture
+    R0, t0 = chain.fk(today.look_joints)
+    R1, t1 = chain.fk(plan.look_joints)
+    assert np.asarray(t1) == pytest.approx(np.asarray(t0), abs=1e-4)
+    assert np.asarray(R1) == pytest.approx(np.asarray(R0), abs=1e-4)
+    gap = float(np.abs(np.asarray(plan.look_joints) - np.asarray(today.look_joints)).max())
+    assert gap > 0.5 and p["joint_gap_rad"] == pytest.approx(gap, abs=1e-3)
+    # planned once, a joint goal to it; proven from it and guarded
+    assert asked == [("joints", plan.look_joints)] and plan.look_leg.goal_joints == plan.look_joints
+    assert plan.slide_pts[0] == pytest.approx(plan.look_joints) and plan.down.pts and plan.stroke.legs
+    assert reach_press.posture_refusal(ctx, chain, _guarded(plan), button) is None
+    way, why, kind = reach_press.solve_way_in(ctx, cfg, button, plan.tilt_deg, plan.look_leg.goal_joints)
+    assert way is not None, (why, kind)
+    runner = Runner(ctx.client, log_dir=tmp_path)
+    legs = reach_press.way_in_legs(ctx, cfg, way)
+    assert [(lg.name, runner._refusal(lg)) for lg in legs] == [(lg.name, None) for lg in legs]
+
+
+@pytest.mark.parametrize("scene", [SCENE_142121, SCENE_133716], ids=["10-28 14:21", "10-29 13:37"])
+def test_on_flatbot_where_no_other_elbow_is_quicker_by_enough_the_look_is_todays_exactly(ctx, monkeypatch, scene):
+    """10-28 14:21 (where the research pass of 10-28 found no gain) and
+    10-29 13:37: the best other elbow proven saves 0.6-0.7 s over the look's
+    transit and the three walks, under LOOK_POSTURE_GAIN_S — inside what an
+    estimate timing each walk alone cannot tell. The look goes where it
+    always did: today's posture exactly, planned as the pose goal it always
+    was, the slide, the way down and the stroke the same proof. Only with the
+    margin under that saving does the look move."""
+    chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    _every_proof(monkeypatch)
+    button = _seen(ctx, scene)
+    today, _why = reach_press.plan_reach(ctx, cfg, button, home, depth=True)
+    asked = _targets(monkeypatch)
+    plan, why = reach_press.plan_reach(ctx, cfg, button, home, depth=True, shortest_walk=True)
+    assert why is None and plan.posture["chosen"] == 0 and plan.posture["proven"] >= 1, plan.posture
+    assert plan.posture["walk_s"] == plan.posture["walk_s_today"] and plan.posture["saved_s"] == 0.0
+    assert plan.look_joints == today.look_joints and plan.look_leg.goal_joints == today.look_leg.goal_joints
+    quat, _start, _bottom, look = reach_press.reach_geometry(ctx.model, button, 30, cfg.travel_m)
+    assert asked == [("pose", look, quat)]  # as _plan_look always asked it
+    assert np.array_equal(np.asarray(plan.slide_pts), np.asarray(today.slide_pts))
+    assert np.array_equal(np.asarray(_walk(plan)), np.asarray(_walk(today)))
+    assert [(n, np.asarray(p).tolist()) for n, p, _s in plan.stroke.legs] == [
+        (n, np.asarray(p).tolist()) for n, p, _s in today.stroke.legs]
+    monkeypatch.setattr(reach_press, "LOOK_POSTURE_GAIN_S", 0.3)
+    plan, why = reach_press.plan_reach(ctx, cfg, button, home, depth=True, shortest_walk=True)
+    assert why is None and plan.posture["chosen"] > 0 and 0.3 <= plan.posture["saved_s"] < 1.0, plan.posture
+
+
+@pytest.mark.parametrize("near", ["table", "box"])
+def test_on_flatbot_an_elbow_whose_centre_line_comes_near_the_table_or_the_box_is_refused(ctx, monkeypatch, near):
+    """Nothing collision-checks the plan-free walks, and the planner's world
+    is empty: another elbow is taken only where its centre line — joint_3's
+    origin to joint_7's, along the walk and the stroke — stays
+    POSTURE_CLEAR_M above the table and out of the box padded by it (a
+    minimal guard, not a collision check; today's posture is not held to
+    it, as it never was). 16:23's quickest elbow with the table measured 5
+    mm too high for it, or a box standing 10 mm too tall under its elbow
+    where that stands lowest: refused, and the look goes to a posture that
+    passes, or to today's."""
+    from rammp_box_opening.models.container import ContainerPose
+
+    chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    _every_proof(monkeypatch)
+    button = _seen(ctx, SCENE_162353)
+    plan, _why = reach_press.plan_reach(ctx, cfg, button, home, depth=True, shortest_walk=True)
+    k = plan.posture["chosen"]
+    assert k > 0
+    rows = [chain.points(q)[2:7] for pts in _guarded(plan) for q in pts]  # joint_3's origin to joint_7's
+    if near == "table":
+        ctx.worlds.table_top_z = min(float(r[:, 2].min()) for r in rows) - reach_press.POSTURE_CLEAR_M + 0.005
+        said = "above the table between"
+    else:
+        elbow = min((r[1] for r in rows), key=lambda e: float(e[2]))  # joint_4's origin, lowest
+        z = float(elbow[2]) - float(ctx.model.dims[2]) - reach_press.POSTURE_CLEAR_M + 0.01
+        ctx.cpose = ContainerPose(xyz=(float(elbow[0]), float(elbow[1]), z), yaw=0.0)
+        said = "inside the box padded 90 mm"
+    again, why = reach_press.plan_reach(ctx, cfg, button, home, depth=True, shortest_walk=True)
+    assert why is None and said in again.posture["refused"][str(k)], again.posture
+    assert again.posture["chosen"] != k
+    if again.posture["chosen"]:
+        assert reach_press.posture_refusal(ctx, chain, _guarded(again), button) is None
+
+
+class _Line:
+    """posture_refusal's chain: ArmChain.points' eight rows — joint_1 ..
+    joint_7's origins, then the tool — the same at every waypoint."""
+
+    def __init__(self, rows):
+        self.rows = np.asarray(rows, float)
+
+    def points(self, q):
+        return self.rows
+
+
+def test_the_posture_guard_judges_the_line_from_joint_3_to_joint_7_not_the_shoulder_nor_the_hand(ctx):
+    """posture_refusal on flatbot's numbers: the table 0.21 m up, the pink
+    canister's disc 105 mm across and 121 mm tall at (0.60, 0), the margin
+    POSTURE_CLEAR_M. The shoulder stands below the table's top and the hand
+    comes down onto the lid: neither is judged. Judged: the line between the
+    joints — a forearm crossing over the box with both its ends outside the
+    padded disc is in it — and every point of it over the table: an elbow 85
+    mm above it is under the 90 kept. A cuboid box is judged at its yaw."""
+    import dataclasses
+
+    from rammp_box_opening.models.container import ContainerPose
+
+    ctx.model = ContainerModel.load(PINK)
+    ctx.cpose = ContainerPose(xyz=(0.60, 0.0, 0.21), yaw=0.0)
+    ctx.worlds.table_top_z = 0.21
+    button = (0.60, 0.0, 0.331)
+    arm = [[0.08, 0.0, 0.135], [0.14, 0.0, 0.245],  # the shoulder, under the table's top
+           [0.15, 0.0, 0.45], [0.30, 0.0, 0.65], [0.45, 0.0, 0.66], [0.55, 0.0, 0.66], [0.60, 0.0, 0.56],
+           [0.60, 0.0, 0.34]]  # the hand, down onto the lid
+    walk = [[Q, Q]]
+    assert reach_press.posture_refusal(ctx, _Line(arm), walk, button) is None
+    over = [list(r) for r in arm]
+    over[4], over[5] = [0.45, 0.0, 0.40], [0.75, 0.0, 0.40]  # 150 mm either side of the disc's axis, 89 mm above its top
+    assert reach_press.posture_refusal(ctx, _Line(over), walk, button).startswith(
+        "the centre line between joint_5 and joint_6 inside the box padded 90 mm (path 1")
+    low = [list(r) for r in arm]
+    low[3] = [0.30, 0.30, 0.21 + 0.085]
+    assert reach_press.posture_refusal(ctx, _Line(low), walk, button).startswith(
+        "the centre line 85 mm above the table between joint_3 and joint_4 (path 1, 0% of the way): under the 90 mm")
+    # a cuboid 200 x 100 mm along x: joint_5 170 mm to its side is out of it — turned 90 deg, in it
+    ctx.model = dataclasses.replace(ctx.model, round=False, dims=(0.20, 0.10, 0.121))
+    beside = [list(r) for r in arm]
+    beside[3], beside[4] = [0.30, 0.17, 0.65], [0.60, 0.17, 0.40]
+    assert reach_press.posture_refusal(ctx, _Line(beside), walk, button) is None
+    ctx.cpose = ContainerPose(xyz=(0.60, 0.0, 0.21), yaw=math.pi / 2)
+    assert reach_press.posture_refusal(ctx, _Line(beside), walk, button).startswith(
+        "the centre line between joint_4 and joint_5 inside the box padded 90 mm")
+    ctx.cpose = None
+    assert reach_press.posture_refusal(ctx, _Line(arm), walk, button) == "no box to keep the arm out of"
+
+
+def test_the_posture_search_never_starts_a_proof_the_ik_time_left_would_not_hold(ctx, monkeypatch):
+    """quickest_look spends at most about LOOK_POSTURE_BUDGET_S of IK at
+    HOME: no proof of another posture starts that the time left would not
+    hold at the slowest so far. Each proof taking 0.25 s by the clock, the
+    first two of LOOK_POSTURE_PROOFS fit in 0.6 s, the third is not
+    proven, and the search ends at 0.5 s with the quicker of the two."""
+    chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    button = _seen(ctx, SCENE_162353)
+    clock = [100.0]
+    real = reach_press._proven
+
+    def proven(*a, **k):
+        clock[0] += 0.25
+        return real(*a, **k)
+
+    monkeypatch.setattr(reach_press, "_proven", proven)
+    monkeypatch.setattr(reach_press, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    plan, why = reach_press.plan_reach(ctx, cfg, button, home, depth=True, shortest_walk=True)
+    p = plan.posture
+    assert why is None and p["ik_s"] == 0.5 and p["proven"] == 2 and p["chosen"] > 0, p
+    assert list(p["refused"].values()) == ["not proven: the IK time left (LOOK_POSTURE_BUDGET_S)"]
+
+
+@pytest.mark.parametrize("scene", [SCENE_162353, SCENE_154524, SCENE_142121, SCENE_133716, SCENE_120459],
+                         ids=["10-28 16:23", "10-28 15:45", "10-28 14:21", "10-29 13:37", "10-29 12:04"])
+def test_on_flatbot_the_posture_search_takes_a_bounded_ik_time(ctx, monkeypatch, scene):
+    """The search's own cost at HOME, on the machine the test runs on: at
+    most 2 x LOOK_POSTURE_SWING_RAD / LOOK_POSTURE_EVERY_RAD candidates,
+    LOOK_POSTURE_PROOFS of them proven, the time it took in the record. On
+    flatbot's Jetson (offline 2026-10-29) it took 0.42-0.60 s at these
+    boxes: the bound here leaves room for a loaded machine."""
+    _chain, cfg, home = _on_flatbot(ctx, monkeypatch)
+    button = _seen(ctx, scene)
+    plan, why = reach_press.plan_reach(ctx, cfg, button, home, depth=True, shortest_walk=True)
+    p = plan.posture
+    assert why is None and 0 < p["candidates"] <= 2 * reach_press.LOOK_POSTURE_SWING_RAD / \
+        reach_press.LOOK_POSTURE_EVERY_RAD
+    assert p["proven"] + len(p["refused"]) <= reach_press.LOOK_POSTURE_PROOFS
+    assert 0.0 < p["ik_s"] < 1.0
+
+
+def test_the_walks_are_timed_on_the_profile_a_compliant_run_flies_them_on(ctx, tmp_path):
+    from rammp_box_opening.runtime.runner import Runner
+
+    ctx.client.compliant = True
+    assert reach_press.compliant_retime() == Runner(ctx.client, log_dir=tmp_path).retime_params()
+
+
+Q_ELBOW = [0.07] * 7  # the posture a faked quickest_look chooses
+
+
+@pytest.mark.parametrize("case", ["chosen", "its look does not plan", "the search fails"])
+def test_the_look_flies_to_the_posture_chosen_for_its_walks_and_the_record_says_so(ctx, monkeypatch, tmp_path, capsys,
+                                                                                   case):
+    """run_reach_press asks for the shortest walks once, at the proof before
+    the look, from where the arm stands — never for the aimed button. The
+    look flies to the posture chosen, a joint goal, and the record's
+    reach_plan keeps quickest_look's note (look_posture). Where that
+    posture's look does not plan, or the search fails, the look goes to
+    today's posture as the pose goal it always was, and the note says
+    why."""
+    import dataclasses
+    import json
+
+    note = {"chosen": 2, "swing_rad": 1.2, "joint_gap_rad": 0.707, "walk_s": 1.79, "walk_s_today": 2.79,
+            "transit_s": 2.16, "transit_s_today": 1.82, "saved_s": 2.67, "candidates": 9, "proven": 3, "refused": {},
+            "ik_s": 0.43}
+    asked = []
+
+    def quickest(ctx_, cfg_, chain_, tilt, button, geometry, q_from, plan):
+        asked.append((tilt, [float(v) for v in q_from], list(plan.look_joints)))
+        if case == "the search fails":
+            raise RuntimeError("SVD did not converge")
+        return dataclasses.replace(plan, look_joints=list(Q_ELBOW)), dict(note)
+
+    monkeypatch.setattr(reach_press, "quickest_look", quickest)
+    if case == "its look does not plan":
+        monkeypatch.setattr(reach_press, "_plan_look_to", lambda ctx_, q_from, q: (None, "MotionGenStatus.IK_FAIL"))
+    code, rec, _chain, _h, got = _depth_press_flow(ctx, monkeypatch, tmp_path, _way_down([], lambda t, tip: True),
+                                                   chain=_IKChain())
+    assert code == 0 and asked == [(30, [0.0] * 7, Q_LOOK)]
+    rows = [json.loads(line) for line in open(next(tmp_path.glob("run-*.jsonl")))]
+    plan, = [r for r in rows if r["leg"] == "reach_plan"]
+    target = rec.legs["reach:look"].target
+    out = capsys.readouterr().out
+    if case == "chosen":
+        assert target == ("joints", Q_ELBOW) and plan["look_posture"] == note
+        assert ("REACH-OUT: the look holds the same pose with the elbow swung 1.2 rad along its swing (joints up to "
+                "0.71 rad from the nearest posture): each walk to the hand turned down 1.79 s against 2.79, the look "
+                "2.16 s against 1.82 — 2.7 s quicker over 3 walks (0.43 s of IK)") in out
+        return
+    assert target[0] == "pose" and plan["look_posture"]["chosen"] == 0 and "the look holds the same pose" not in out
+    if case == "its look does not plan":
+        assert plan["look_posture"]["not_planned"] == {"2": "MotionGenStatus.IK_FAIL"}
+        assert plan["look_posture"]["walk_s"] == 2.79 and plan["look_posture"]["saved_s"] == 0.0
+        assert ("NOTE reach:look at 30 deg: the quicker posture's look does not plan (MotionGenStatus.IK_FAIL) — the "
+                "look goes to today's") in out
+    else:
+        assert plan["look_posture"] == {"chosen": 0, "error": "SVD did not converge"}
 
 
 def test_the_wrist_aim_is_moved_1_cm_out_from_the_arm_for_the_press_and_the_grip():
