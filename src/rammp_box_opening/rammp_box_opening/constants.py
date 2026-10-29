@@ -51,10 +51,36 @@ CONTACT_SPEED = 0.15
 # pivoting about the fingertip): the reach-out's rise, slide out and back
 # off, the depth press's turn, rise and centring. Every line toward the lid,
 # or loaded, stays at CONTACT_SPEED in a guarded run; a compliant run, which
-# nothing it reads stops, flies its free-air lines here too. Run 2026-10-22
-# 20:04 flew its turn, rise and back off at 0.15: 18 s of a 45 s press; the
-# compliant 2026-10-27 16:23 its re-aim, slide in and clear: 10.5 s.
+# nothing it reads stops, flies its free-air lines faster still
+# (COMPLIANT_FREE_LINE_SPEED). Run 2026-10-22 20:04 flew its turn, rise and
+# back off at 0.15: 18 s of a 45 s press; the compliant 2026-10-27 16:23 its
+# re-aim, slide in and clear: 10.5 s.
 FREE_LINE_SPEED = 0.3
+# A compliant run's free-air lines (reach_press.free_line_speed): the re-aim,
+# the slide in or the walk, the turn, the rise off the hold, the way down
+# backwards, the grip's way back up, the clears and the retreat from the lid:
+# the same plan-free lines, the same positions, at 1.8x FREE_LINE_SPEED. Only
+# there: a compliant run is re-timed under the wrist's ceiling
+# (COMPLIANT_QD_CEILING, Runner.retime_params), and without it these lines
+# would ask arm_joint_6 0.51-0.60 rad/s at 0.55, past the ~0.54 it makes.
+# 2026-10-28 16:23 walked between the tilted look and the hand turned down
+# 60 mm over the button four times (the way in, the way back, the grip's way
+# in, its back out): 15.9 s of the run's 29.4 s from the scene fix to home,
+# at 0.3. Offline, under the ceiling and the compliant ease, on flatbot's URDF
+# with the mission's own legs: 16:23's way in 7.26 -> 5.57 s, way back
+# 5.11 -> 3.36, grip in 5.28 -> 3.64, back out 4.91 -> 3.27, lift and clear
+# 1.74 -> 1.42, retreat and home 3.97 -> 3.68; 15:45's way in 8.40 -> 7.05,
+# way out 7.35 -> 6.18. The shoulder and elbow then run up to 0.69 rad/s
+# (0.55 x 0.9 x 1.396), the wrist at most its 0.45; 15:45's looks ran
+# arm_joint_2 at 1.50-1.62 without a fault. Where the rise or the grip's way
+# up turns into the walk back (142 deg in joint space, joints 1, 4 and 6
+# reversing) the re-timer flows through at 0.57 rad/s, 0.52-0.53 at 0.3: the
+# driver's quintic asks arm_joint_1 for 59-62 rad/s^2 there for 24 ms, 47-51
+# for 18-20 ms as 16:23 flew it. The legs that meet the button, the knob or
+# the table keep their own speeds. Nothing plans or collision-checks these
+# lines at any speed (rammp-curobo #23, #43): they fly where the proof put
+# them, faster.
+COMPLIANT_FREE_LINE_SPEED = 0.55
 DRIFT_REPLAN_RAD = 0.04  # < START_GATE_RAD: replan before the gate would refuse
 # The driver commands a trajectory's first waypoint at once, wherever the arm
 # is; runtime/driver.py refuses a goal whose start is farther than this from

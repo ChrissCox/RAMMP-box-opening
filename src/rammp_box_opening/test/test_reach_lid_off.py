@@ -299,6 +299,60 @@ def test_fingers_that_close_on_air_open_again_and_back_out_the_way_they_came(ctx
     assert "GRIP FAILED" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("knuckle", [KNOB_ON, AIR], ids=["lid off", "grip on air"])
+def test_the_full_runs_free_air_lines_fly_at_the_compliant_speed_and_only_under_the_wrists_ceiling(
+        ctx, monkeypatch, tmp_path, knuckle):
+    """Every plan-free line of the full run that moves in free air — the
+    re-aim, the slide in and the turn of the way in and of the grip's, the
+    rise, the turn back and the slide out, the grip's way back up after a
+    close on air, the clear with the lid and the retreat from it — flies at
+    COMPLIANT_FREE_LINE_SPEED, and every execution carrying one is re-timed
+    under the wrist's COMPLIANT_QD_CEILING (Runner.retime_params). The legs
+    that meet the button, the knob or the table keep their own speeds, the
+    planned ones TRANSIT_SPEED. Outside the run, the client as press_demo
+    built it, free_line_speed is a guarded run's FREE_LINE_SPEED."""
+    from rammp_box_opening.constants import (
+        COMPLIANT_FREE_LINE_SPEED,
+        COMPLIANT_QD_CEILING,
+        FREE_LINE_SPEED,
+        TRANSIT_SPEED,
+    )
+    from rammp_box_opening.runtime import runner as runner_mod
+    from rammp_box_opening.runtime.retime import RetimeParams
+    from rammp_box_opening.runtime.runner import Runner
+
+    flown, timed = [], []  # (name, speed) of every motion leg handed to the runner; (speeds, params) per re-timing
+    real_run, real_group = Runner.run, runner_mod.retime_group
+
+    def run(self, legs, execute, lookahead=None):
+        flown.extend((lg.name, lg.speed) for lg in legs if lg.kind.value == "motion")
+        return real_run(self, legs, execute, lookahead)
+
+    def retime_group(trajs, speeds, vmax, params=RetimeParams()):
+        timed.append((list(speeds), params))
+        return real_group(trajs, speeds, vmax, params)
+
+    monkeypatch.setattr(Runner, "run", run)
+    monkeypatch.setattr(runner_mod, "retime_group", retime_group)
+    assert rp.free_line_speed(ctx) == FREE_LINE_SPEED
+    cfg = load_press_demo(PINK)
+    code, rec, _chain, _rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], knuckle=knuckle)
+    assert code == (0 if knuckle == KNOB_ON else 1)
+    want = {n: COMPLIANT_FREE_LINE_SPEED for n in ("reach:re-aim", "reach:slide-in", "depth:turn", "depth:rise",
+                                                   "depth:turn-back", "reach:slide-out", "grip:up", "lid:clear",
+                                                   "place:retreat")}
+    # the stroke's own speed: here the faked way down's (test_reach_press._way_down), its press at TOUCH_SPEED
+    want.update({"depth:press": dp.TOUCH_SPEED, "grip:approach": cfg.grip_speed, "grip:down": dp.TOUCH_SPEED,
+                 "lid:lift": cfg.lift_speed, "place:down": cfg.setdown_speed, "place:touch": dp.TOUCH_SPEED,
+                 "reach:look": TRANSIT_SPEED, "lid:carry": TRANSIT_SPEED, "home": TRANSIT_SPEED})
+    assert [(n, s) for n, s in flown if s != want[n]] == []
+    names = {n for n, _s in flown}
+    assert ("grip:up" in names) is (knuckle == AIR) and ("place:retreat" in names) is (knuckle == KNOB_ON)
+    fast = [params for speeds, params in timed if COMPLIANT_FREE_LINE_SPEED in speeds]
+    assert fast and all(p.qd_ceiling == COMPLIANT_QD_CEILING for p in fast)
+    assert not ctx.client.compliant and rp.free_line_speed(ctx) == FREE_LINE_SPEED  # put back once the run is over
+
+
 def test_a_lid_that_slipped_on_the_way_is_released_the_arm_goes_home_and_the_run_says_so(ctx, monkeypatch, tmp_path,
                                                                                          capsys):
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], slipped=True)
@@ -571,3 +625,90 @@ def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ct
 
     assert t_clear[2] >= planned_top_z(ctx.model, ctx.cpose) + rp.HOME_CLEAR_M
     assert math.hypot(*t_clear[:2]) < math.hypot(*t_lift[:2])  # back toward the arm
+
+
+@pytest.mark.parametrize("box", FLATBOT_BOXES, ids=["%.3f,%.2f" % b for b in FLATBOT_BOXES])
+def test_on_flatbot_the_free_air_lines_fly_faster_under_the_wrists_ceiling_and_stop_nowhere_new(
+        ctx, monkeypatch, tmp_path, box):
+    """2026-10-28 16:23: the walks between the tilted look pose and the hand
+    turned down over the button — the way in, the way back, the grip's way
+    in and its back out — were 15.9 s of the run's 29.4 at FREE_LINE_SPEED.
+    A compliant run flies the same lines at COMPLIANT_FREE_LINE_SPEED,
+    re-timed as the runner flies them (Runner.retime_params). Flatbot's own
+    kinematics, every box of the brief: each execution carrying one — the
+    way in, the way back, the grip in, the back out, the lift and the clear,
+    the retreat and home — is shorter than at FREE_LINE_SPEED and stops
+    where it stopped there, no more, no less; in no interval does a wrist
+    joint run past COMPLIANT_QD_CEILING, nor any other past 0.9 x its
+    execution's fastest leg's speed x its limit (0.69 rad/s on the walks);
+    the press stroke is entered no faster than before; and the runner's and
+    the driver's gates pass every one."""
+    from rammp_box_opening.constants import (
+        COMPLIANT_FREE_LINE_SPEED,
+        COMPLIANT_QD_CEILING,
+        FREE_LINE_SPEED,
+        JOINT_VMAX,
+    )
+    from rammp_box_opening.primitives.core import _full_world
+    from rammp_box_opening.runtime.retime import check_like_executor, retime_group
+    from rammp_box_opening.runtime.runner import Runner
+    from rammp_box_opening.runtime.stamps import secs
+
+    chain, cfg, home = trp._on_flatbot(ctx, monkeypatch)
+    ctx.client.compliant = True  # as run_reach_press sets it: every leg below is a compliant run's
+    button = (box[0], box[1], LID)
+    ctx.cpose = rp.cpose_for_button(button, 0.0, ctx.model.button_offset)
+    plan, why = rp.plan_reach(ctx, cfg, button, home, depth=True)
+    assert why is None and plan.tilt_deg == 30
+    way, why, _kind = rp.solve_way_in(ctx, cfg, button, plan.tilt_deg, plan.look_leg.goal_joints)
+    assert way is not None, why
+    q_held = _held_at_bottom(chain, way.stroke, LID, cfg)
+    back, kind, why = rlo.way_back_legs(ctx, way, q_held)
+    assert kind is None, why
+    grip, why = rlo.solve_grip_way(ctx, cfg, button, plan.tilt_deg, back[-1].goal_joints,
+                                   rlo.grip_lid_z(LID, dp._pads_z(chain, q_held)))
+    assert grip is not None, why
+    grip_in = rp.way_in_legs(ctx, cfg, grip)
+
+    def plan_ik(ctx_, state, name, target, world, speed):
+        # the planner stood in for by the arm's IK, as the reachability test's
+        q = list(target[1]) if target[0] == "joints" else chain.nearest_solution(list(state.joints), target[1],
+                                                                                 target[2], seeds=(home,))
+        assert q is not None, name
+        return rp.line_leg(ctx_, name, [list(state.joints), [float(v) for v in q]], target[2] if len(target) > 2 else
+                           [0, 0, 0, 1], speed, None, world), state
+
+    monkeypatch.setattr(rp, "_plan_motion", plan_ik)
+    lift, why = rlo.plan_lift(ctx, cfg, grip_in[-1].goal_joints, grip.stroke.quat)
+    assert lift is not None, why
+    drop, _tier, _says = next(rlo.spot_candidates(ctx, None, LID - 0.10, lift.legs[-1].goal_joints, seeds=(home,)))
+    carry, why = rlo.plan_carry(ctx, cfg, lift.legs[-1].goal_joints, drop)
+    assert carry is not None, why
+    retreat, why = rlo.plan_home_after(ctx, cfg, carry)
+    assert retreat is not None, why
+    executions = {"way in": rp.way_in_legs(ctx, cfg, way), "way back": back, "grip in": grip_in,
+                  "back out": rlo._grip_backwards(ctx, grip, _full_world(ctx)), "lift": lift.legs, "retreat": retreat}
+    runner = Runner(ctx.client, log_dir=tmp_path)
+    params = runner.retime_params()
+    assert params.qd_ceiling == COMPLIANT_QD_CEILING
+    wrist = np.asarray(COMPLIANT_QD_CEILING[4:], float)
+    for what, legs in executions.items():
+        assert any(lg.speed == COMPLIANT_FREE_LINE_SPEED for lg in legs), (what, [lg.speed for lg in legs])
+        plan_free = [lg for lg in legs if lg.plan_free]
+        assert [(lg.name, runner._refusal(lg)) for lg in plan_free] == [(lg.name, None) for lg in plan_free], what
+        trajs = [lg.traj for lg in legs]
+        flown, info = retime_group(trajs, [lg.speed for lg in legs], JOINT_VMAX, params)
+        slow = [FREE_LINE_SPEED if lg.speed == COMPLIANT_FREE_LINE_SPEED else lg.speed for lg in legs]
+        _was, before = retime_group(trajs, slow, JOINT_VMAX, params)
+        assert info["duration_s"] < before["duration_s"] and info["stops"] == before["stops"], (what, info, before)
+        assert check_like_executor(flown, JOINT_VMAX) == [], what
+        q = np.asarray([p.positions for p in flown.points])
+        t = np.asarray([secs(p.time_from_start) for p in flown.points])
+        # each interval's joint speed, as the driver flies it (its stamps whole nanoseconds: 4e-8 of a 25 ms one)
+        qd = np.abs(np.diff(q, axis=0)) / np.diff(t)[:, None]
+        assert (qd[:, 4:] <= wrist * (1 + 1e-6)).all(), (what, qd[:, 4:].max(axis=0))
+        arm = 0.9 * max(lg.speed for lg in legs) * np.asarray(JOINT_VMAX[:4], float)  # the planned home's: 1.0
+        assert (qd[:, :4] <= arm * (1 + 1e-6)).all(), (what, qd[:, :4].max(axis=0))
+        if what == "way in":
+            k = next(i for i, lg in enumerate(legs) if lg.name in ("depth:approach", "depth:press"))
+            assert info["junction_speeds"][k - 1] <= before["junction_speeds"][k - 1] + 1e-9, (info, before)

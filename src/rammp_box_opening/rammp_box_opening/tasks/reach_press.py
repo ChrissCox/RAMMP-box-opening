@@ -69,6 +69,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from rammp_box_opening.constants import (
+    COMPLIANT_FREE_LINE_SPEED,
     COMPLIANT_RUN_GAINS,
     CONTACT_SPEED,
     FREE_LINE_SPEED,
@@ -568,12 +569,13 @@ def way_in_legs(ctx, cfg, way):
     walk turning down when the way down is walked, else the slide at the
     plan's attitude, then 'depth:turn' in place; then the press stroke
     (way.stroke.legs: 'depth:approach' at press_speed, 'depth:press' at
-    TOUCH_SPEED). The free-air lines fly at FREE_LINE_SPEED. Each starts at
-    the last waypoint of the one before — solve_way_in chains them — and
-    every one is unguarded under depth_press.COMPLIANT_GAINS
-    (compliant_line): the one gains spec legs.can_merge asks of one
-    execution, and the spring the press is modelled on. `cfg` is the press
-    config the stroke was solved with (its press_speed is in way.stroke)."""
+    TOUCH_SPEED). The free-air lines fly at free_line_speed (a compliant
+    run's COMPLIANT_FREE_LINE_SPEED). Each starts at the last waypoint of
+    the one before — solve_way_in chains them — and every one is unguarded
+    under depth_press.COMPLIANT_GAINS (compliant_line): the one gains spec
+    legs.can_merge asks of one execution, and the spring the press is
+    modelled on. `cfg` is the press config the stroke was solved with (its
+    press_speed is in way.stroke)."""
     from rammp_box_opening.tasks import depth_press as dp
 
     # Their world is a label: a plan-free line is never planned, re-planned
@@ -582,12 +584,13 @@ def way_in_legs(ctx, cfg, way):
     # satisfies Runner._refusal's spec §6 rule that an unguarded leg faster
     # than CONTACT_SPEED be labelled full or bench.
     world = _full_world(ctx)
-    lines = [("reach:re-aim", way.move, way.plan.quat, FREE_LINE_SPEED)]
+    fast = free_line_speed(ctx)
+    lines = [("reach:re-aim", way.move, way.plan.quat, fast)]
     if way.down.walked:
-        lines.append(("reach:slide-in", way.down.pts, way.down.quat, FREE_LINE_SPEED))
+        lines.append(("reach:slide-in", way.down.pts, way.down.quat, fast))
     else:
-        lines += [("reach:slide-in", way.slide, way.plan.quat, FREE_LINE_SPEED),
-                  ("depth:turn", way.down.pts, way.down.quat, FREE_LINE_SPEED)]
+        lines += [("reach:slide-in", way.slide, way.plan.quat, fast),
+                  ("depth:turn", way.down.pts, way.down.quat, fast)]
     lines += [(name, pts, way.stroke.quat, speed) for name, pts, speed in way.stroke.legs]
     return [dp.compliant_line(ctx, name, pts, quat, speed, world) for name, pts, quat, speed in lines
             if pts is not None and len(pts) > 0]
@@ -692,6 +695,16 @@ def free_guard(ctx, reference, hang_k=None):
     """drag_guard for a free-air leg — none in a compliant run, which stops
     for nothing it reads."""
     return None if compliant(ctx) else drag_guard(reference, hang_k)
+
+
+def free_line_speed(ctx):
+    """The cruise fraction of a plan-free line in free air, off the button
+    and the lid: COMPLIANT_FREE_LINE_SPEED in a compliant run, which no
+    guard has to stop in time and whose every motion the runner re-times
+    under the wrist's ceiling — read from the same flag
+    (runtime/runner.py Runner.retime_params), so no line flies at it
+    without that ceiling; else FREE_LINE_SPEED, a guarded run's."""
+    return COMPLIANT_FREE_LINE_SPEED if compliant(ctx) else FREE_LINE_SPEED
 
 
 def residual(gravity, ref, now):
@@ -889,7 +902,10 @@ def _back_off(ctx, runner, ref=None, why=None, lets_go=True):
     said = ("the planner sees the arm inside the box's padded volume" if why is None
             else "the planner refused home from here (%s)" % _short(why))
     print("[press_demo] %s — backing %.0f cm straight off toward the arm first" % (said, 100 * REACH_PULLBACK_M))
-    # from free air only (_go_home's callers), level and away from the box
+    # from free air only (_go_home's callers), level and away from the box —
+    # at FREE_LINE_SPEED in a compliant run too, not free_line_speed: it flies
+    # only where the planner refused the start, the arm perhaps inside the
+    # box's padded volume
     res = runner.run([line_leg(ctx, "reach:back-off", pts, quat, FREE_LINE_SPEED, free_guard(ctx, ref),
                                _full_world(ctx))], execute=True)
     if lets_go:
@@ -966,7 +982,7 @@ def _clear_up_and_back(ctx, runner, R, t):
     """_clear_over_box for a compliant run: up and back toward the arm to
     the first of clear_targets whose straight line flies and leaves every
     joint room for home to plan from (_near_a_limit), else the first whose
-    line flies — unguarded, at FREE_LINE_SPEED. Flatbot's URDF, 15:19's box
+    line flies — unguarded, at free_line_speed. Flatbot's URDF, 15:19's box
     pressed from the scene camera's top (0.3111), turned down: the 50 mm
     line ends with arm_joint_6 0.160 rad from its limit, the 150 mm one
     0.368. True when there (or already high enough), None when no line
@@ -1002,7 +1018,8 @@ def _clear_up_and_back(ctx, runner, R, t):
     print("[press_demo] up %.0f mm and %.0f mm back toward the arm (the hand leaning %.0f deg), clear of the box's "
           "padded volume, before home%s" % (1000 * up, 1000 * back, lean, " (%s)" % "; ".join(whys) if whys else ""))
     # up and away from the box, toward the look pose the hand came in from
-    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, FREE_LINE_SPEED, None, _full_world(ctx))], execute=True)
+    res = runner.run([line_leg(ctx, "depth:clear", pts, quat, free_line_speed(ctx), None, _full_world(ctx))],
+                     execute=True)
     if any(not r.ok for r in res):
         print("[press_demo] STOP: the way up from over the box %s — the arm holds; check the box" % _stopped_by(res))
         return False
@@ -1458,8 +1475,8 @@ def _rise_legs(ctx, stroke, q, world):
     button under `stroke`, as the legs that fly it, labelled `world`:
     'depth:rise' back up the stroke to its start (depth_press.rise_back_up)
     — else a straight line from where the arm stands to there; none when it
-    stands there. Returns (legs, True where it goes back up the stroke,
-    None), or (None, False, why) where no way up flies."""
+    stands there — at free_line_speed. Returns (legs, True where it goes
+    back up the stroke, None), or (None, False, why) where no way up flies."""
     from rammp_box_opening.runtime import approach
     from rammp_box_opening.tasks import depth_press as dp
 
@@ -1469,7 +1486,7 @@ def _rise_legs(ctx, stroke, q, world):
         pts, why = _line(ctx, [float(v) for v in stroke.t0], stroke.quat)
         if pts is None:
             return None, False, why
-    legs = [dp.compliant_line(ctx, "depth:rise", pts, stroke.quat, FREE_LINE_SPEED, world)] if pts else []
+    legs = [dp.compliant_line(ctx, "depth:rise", pts, stroke.quat, free_line_speed(ctx), world)] if pts else []
     return legs, on_stroke, None
 
 
@@ -1533,7 +1550,7 @@ def _way_home(ctx, cfg, runner, stroke, held, q_held, ahead, scene_fix, locator)
         print("[press_demo] no way home was planned while the way in flew (%s) — up off the button, then home from "
               "over the box" % why)
         return _rise_then_home(ctx, cfg, runner, up, held, scene_fix, locator)
-    legs = up + [dp.compliant_line(ctx, "depth:clear", way.clear, way.quat, FREE_LINE_SPEED, world)]
+    legs = up + [dp.compliant_line(ctx, "depth:clear", way.clear, way.quat, free_line_speed(ctx), world)]
     for leg in way.home:
         if leg.traj is not None:
             leg.traj = approach.on_branch_of(leg.traj, legs[-1].goal_joints)
@@ -1599,9 +1616,10 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     nothing the run reads stops the arm — no torque guard, no at-rest read
     or check, no look after the press (depth_press.press_compliant). Its
     free-air lines (the re-aim, the slide in, the clear before home) fly at
-    FREE_LINE_SPEED: CONTACT_SPEED is there so a guard can stop a line in
-    time, and these carry none (16:23 crawled 10.5 s of them at 0.15). The
-    box's height is the higher of the aim's and the scene camera's (15:19:
+    COMPLIANT_FREE_LINE_SPEED (free_line_speed), the turn and the rise too,
+    under the wrist's ceiling: CONTACT_SPEED is there so a guard can stop a
+    line in time, and these carry none (16:23 crawled 10.5 s of them at 0.15).
+    The box's height is the higher of the aim's and the scene camera's (15:19:
     the touch met the button at 0.312, the scene said 0.311, the wrist
     camera's aim 0.288). 0 then means pressed, by the spring's hold. Its
     press is proven by the arm's own kinematics before the arm moves
@@ -1804,17 +1822,18 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
         except BaseException:
             let_go(ctx)
             raise
-    # A compliant run flies the re-aim and the slide in at FREE_LINE_SPEED:
-    # CONTACT_SPEED is there so a guard can stop a line in time, and these
-    # carry none (16:23 2026-10-27 crawled them 9.9 s at 0.15). Their world
-    # is a label: a plan-free line is never planned, re-planned or
-    # collision-checked against it (line_leg builds it, Runner._replan_group
-    # refuses plan-free legs, push_name only writes a YAML). "full" only
-    # satisfies Runner._refusal's spec §6 rule that an unguarded leg faster
-    # than CONTACT_SPEED be labelled full or bench, as depth:turn, approach,
-    # press and rise already are; the speed without it is refused, and the
-    # arm holds at the look pose with nothing pressed.
-    line_speed, line_world = (FREE_LINE_SPEED, _full_world(ctx)) if soft else (CONTACT_SPEED, world)
+    # A compliant run flies the re-aim and the slide in at
+    # COMPLIANT_FREE_LINE_SPEED, as its one-execution way in does
+    # (way_in_legs): CONTACT_SPEED is there so a guard can stop a line in
+    # time, and these carry none (16:23 2026-10-27 crawled them 9.9 s at
+    # 0.15). Their world is a label: a plan-free line is never planned,
+    # re-planned or collision-checked against it (line_leg builds it,
+    # Runner._replan_group refuses plan-free legs, push_name only writes a
+    # YAML). "full" only satisfies Runner._refusal's spec §6 rule that an
+    # unguarded leg faster than CONTACT_SPEED be labelled full or bench, as
+    # depth:turn, approach, press and rise already are; the speed without it
+    # is refused, and the arm holds at the look pose with nothing pressed.
+    line_speed, line_world = (COMPLIANT_FREE_LINE_SPEED, _full_world(ctx)) if soft else (CONTACT_SPEED, world)
     # To the look pose for the AIMED button. Where the scene camera's box was
     # wrong, the arm may already stand inside the padded cuboid of the box
     # where it really is, and the planner refuses every start there

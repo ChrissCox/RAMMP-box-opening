@@ -46,7 +46,10 @@ after the press as before (reach_press._fly_way_in).
 
 Every move flies in the driver's joint impedance under the run's one gains
 spec (depth_press.COMPLIANT_GAINS, RIGID), unguarded, merged where its legs
-meet: nothing the run reads stops the arm. It decides only what it must:
+meet: nothing the run reads stops the arm. Its free-air lines — the rise and
+the way back, the grip's way up, the clear, the retreat — fly at
+reach_press.free_line_speed; the legs that meet the box, the knob or the
+table at their own. It decides only what it must:
 the knob up or not, the box where it was, the fingers on the knob or on
 air, where the lid goes, the lid still in them at the table. Contact is bounded by the spring,
 not stopped by a guard: the grip's pads ride on the lid where it stands
@@ -60,7 +63,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rammp_box_opening.constants import FREE_LINE_SPEED, GRIPPER_CMD_CLOSED, GRIPPER_CMD_OPEN, TRANSIT_SPEED
+from rammp_box_opening.constants import GRIPPER_CMD_CLOSED, GRIPPER_CMD_OPEN, TRANSIT_SPEED
 from rammp_box_opening.models.container import ContainerPose
 from rammp_box_opening.perception import clear_table
 from rammp_box_opening.primitives.core import (
@@ -386,7 +389,8 @@ def _down_backwards(ctx, way, world):
         lines.append(("reach:slide-out" if way.down.walked else "depth:turn-back", list(way.down.pts)[::-1]))
     if not way.down.walked and way.slide is not None and len(way.slide) > 1:
         lines.append(("reach:slide-out", list(way.slide)[::-1]))
-    return [dp.compliant_line(ctx, name, [[float(v) for v in q] for q in pts], way.plan.quat, FREE_LINE_SPEED, world)
+    fast = rp.free_line_speed(ctx)
+    return [dp.compliant_line(ctx, name, [[float(v) for v in q] for q in pts], way.plan.quat, fast, world)
             for name, pts in lines]
 
 
@@ -418,7 +422,7 @@ def way_back_legs(ctx, way, q_held):
         why = dp.line_refusal(chain, pts)
     if pts is None or why is not None:
         return up, "look", "no way from the stroke's start back to the look pose flies (%s)" % why
-    return up + [dp.compliant_line(ctx, "reach:slide-out", pts, quat, FREE_LINE_SPEED, world)], None, None
+    return up + [dp.compliant_line(ctx, "reach:slide-out", pts, quat, rp.free_line_speed(ctx), world)], None, None
 
 
 @dataclass
@@ -576,7 +580,8 @@ def _grip_backwards(ctx, way, world):
     pts = []
     for _name, p, _speed in way.stroke.legs:
         pts += [[float(v) for v in q] for q in (p[1:] if pts else p)]
-    legs = [dp.compliant_line(ctx, "grip:up", pts[::-1], way.stroke.quat, FREE_LINE_SPEED, world)] if len(pts) > 1 else []
+    legs = ([dp.compliant_line(ctx, "grip:up", pts[::-1], way.stroke.quat, rp.free_line_speed(ctx), world)]
+            if len(pts) > 1 else [])
     return legs + _down_backwards(ctx, way, world)
 
 
@@ -641,7 +646,7 @@ def plan_lift(ctx, cfg, q_grip, quat):
     if clear is None:
         return None, why
     return LiftOff([dp.compliant_line(ctx, "lid:lift", lift, quat, cfg.lift_speed, world),
-                    dp.compliant_line(ctx, "lid:clear", clear, quat, FREE_LINE_SPEED, world)], back), None
+                    dp.compliant_line(ctx, "lid:clear", clear, quat, rp.free_line_speed(ctx), world)], back), None
 
 
 @dataclass
@@ -718,7 +723,8 @@ def plan_home_after(ctx, cfg, carry):
             q = leg.goal_joints
         if leg.guard is None:
             leg.gains = dp.COMPLIANT_GAINS  # one gains spec: the retreat and home merge
-    return [dp.compliant_line(ctx, "place:retreat", carry.retreat, carry.quat, FREE_LINE_SPEED, world), *home], None
+    retreat = dp.compliant_line(ctx, "place:retreat", carry.retreat, carry.quat, rp.free_line_speed(ctx), world)
+    return [retreat, *home], None
 
 
 # ---- the runs ---------------------------------------------------------------
@@ -1040,7 +1046,7 @@ def choose_and_carry(ctx, cfg, runner, eyes):
     release = _gripper_leg(ctx, PlanState(joints=None, chain=0), "place:open", GRIPPER_CMD_OPEN, world)
     ctx.lid_at = drop  # every world from here holds the lid where it was set down
     retreat = home if home is not None else [
-        dp.compliant_line(ctx, "place:retreat", carry.retreat, carry.quat, FREE_LINE_SPEED, world)]
+        dp.compliant_line(ctx, "place:retreat", carry.retreat, carry.quat, rp.free_line_speed(ctx), world)]
     print("[press_demo] RELEASE, then ONE MOTION: %s" % ", ".join(lg.name for lg in retreat))
     res = runner.run([release, *retreat], execute=True)
     if not res[0].ok:
@@ -1056,7 +1062,7 @@ def choose_and_carry(ctx, cfg, runner, eyes):
             return 1
         up, _why = rp._line(ctx, retreat[0].target[1], carry.quat)
         if up:
-            res = runner.run([dp.compliant_line(ctx, "place:retreat", up, carry.quat, FREE_LINE_SPEED, world)],
+            res = runner.run([dp.compliant_line(ctx, "place:retreat", up, carry.quat, rp.free_line_speed(ctx), world)],
                              execute=True)
             if not all(r.ok for r in res):
                 print("[press_demo] STOP: the way up from the lid stopped (%s) — the arm holds" % res[-1].detail)
