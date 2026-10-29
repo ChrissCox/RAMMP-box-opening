@@ -37,6 +37,7 @@ MAX_STEP_RAD = 0.15  # a bigger joint jump per 2 mm is a singularity, refuse
 REACH_STEP_M = 0.02  # reach(): the pose walked in steps this long ...
 REACH_STEP_RAD = math.radians(6.0)  # ... and this much turn
 MAX_REACH_STEP_RAD = 0.6  # a bigger joint jump over one such step is a branch change, refuse
+SELF_MOTION_STEP_RAD = 0.1  # self_motion(): the elbow swung in steps this long in joint space
 
 
 def _rpy(r, p, y):
@@ -300,6 +301,43 @@ class ArmChain:
             self._nearest_memo = (key, best)
         best = self._nearest_memo[1]
         return None if best is None else np.array(best, float)  # a copy: the caller may change it
+
+    def self_motion(self, q, max_rad, step_rad=SELF_MOTION_STEP_RAD):
+        """The arm's SELF-MOTION through `q`: other joints holding tool_frame
+        exactly where `q` holds it, the elbow swung about the line from the
+        shoulder to the wrist — the one way the 7-joint arm moves with its
+        tool standing still. Walked from `q` both ways along the Jacobian's
+        null space, `step_rad` of joint space a step, each step re-solved to
+        the pose (solve_pose), up to `max_rad` each way, or to where a step
+        does not converge, jumps (MAX_REACH_STEP_RAD: a singularity) or
+        leaves the limits. Returns [(s, joints)], `s` the signed distance
+        walked (rad; + the way joint_3 first turns up), the + way first,
+        each in walk order; `q` itself is not in it.
+
+        reach() from other seeds does not find these: its continuation keeps
+        the elbow the seed's walk starts with, and from HOME, the look above
+        HOME or q with joint_3 turned 0.5-1.0 rad either way it came back to
+        q's own elbow or its folded wrist (flatbot's URDF, the reach-out's
+        look poses of 2026-10-28/29, offline 2026-10-29). The wrist folded
+        the other way (equivalents) is a half turn of joint_5 and joint_7
+        from wherever the arm is: never the quicker look from HOME."""
+        q0 = np.array(q, float)
+        R, t = self.fk(q0)
+        out = []
+        for sign in (1.0, -1.0):
+            qk, prev, s = q0, None, 0.0
+            while s + step_rad <= float(max_rad) + 1e-9:
+                n = np.linalg.svd(self._fk_jac(qk)[2])[2][-1]  # the null space of the 6 x 7 Jacobian
+                if prev is None:
+                    n = n * (sign if n[2] >= 0.0 else -sign)  # joint_3's sign says which way is which
+                elif float(n @ prev) < 0.0:
+                    n = -n  # an SVD's vector comes either way round: keep walking the way it was
+                nxt = self.solve_pose(qk + step_rad * n, t, R)
+                if nxt is None or float(np.abs(nxt - qk).max()) > MAX_REACH_STEP_RAD or not self.within_limits(nxt):
+                    break
+                qk, prev, s = nxt, n, s + step_rad
+                out.append((sign * s, qk))
+        return out
 
     def equivalents(self, q_start, q):
         """Every way this arm can hold tool_frame where `q` holds it, written

@@ -1237,8 +1237,10 @@ def _plan_by_ik(chain, home):
     return plan_ik
 
 
+@pytest.mark.parametrize("shortest_walk", [False, True], ids=["today's posture", "the quickest walks' posture"])
 @pytest.mark.parametrize("box", FLATBOT_BOXES, ids=["%.3f,%.2f" % b for b in FLATBOT_BOXES])
-def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ctx, monkeypatch, tmp_path, box):
+def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ctx, monkeypatch, tmp_path, box,
+                                                                              shortest_walk):
     """Flatbot's own kinematics, the pink canister's lid at 0.3125: the
     press is proven at 30 deg; from the hold the way back to the look pose
     — the rise and the way down backwards — is one the runner flies; the
@@ -1248,15 +1250,24 @@ def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ct
     start); the grip comes down to the lid; the lift, the clear, the carry
     (IK standing in for the planner), the set-down and the retreat are
     lines the runner flies; and a spot beside the box is one the hand
-    reaches straight down."""
+    reaches straight down. All of it as well from the posture the look
+    takes for the quickest walks where one is quicker (rp.quickest_look,
+    run_reach_press's proof; at two of the five): every leg after the look
+    starts from it."""
     from rammp_box_opening.runtime.runner import Runner
     from rammp_box_opening.tasks import press_demo
 
     chain, cfg, home = trp._on_flatbot(ctx, monkeypatch)
     button = (box[0], box[1], LID)
     ctx.cpose = rp.cpose_for_button(button, 0.0, ctx.model.button_offset)
-    plan, why = rp.plan_reach(ctx, cfg, button, home, depth=True)
+    ctx.worlds.table_top_z = LID - 0.10  # the scene camera's table (press_demo.adopt_scene_table)
+    if shortest_walk:
+        monkeypatch.setattr(rp, "LOOK_POSTURE_BUDGET_S", math.inf)  # every proof, however loaded the machine
+    plan, why = rp.plan_reach(ctx, cfg, button, home, depth=True, shortest_walk=shortest_walk)
     assert why is None and plan.tilt_deg == 30
+    assert plan.look_leg.goal_joints == pytest.approx(plan.look_joints, abs=1e-9)
+    if shortest_walk:  # two of the five take another elbow: 3.1 and 1.8 s quicker over the transit and three walks
+        assert (plan.posture["chosen"] > 0) is (box in ((0.668, -0.33), (0.60, -0.49))), plan.posture
     way, why, _kind = rp.solve_way_in(ctx, cfg, button, plan.tilt_deg, plan.look_leg.goal_joints)
     assert way is not None, why
     runner = Runner(ctx.client, log_dir=tmp_path)
