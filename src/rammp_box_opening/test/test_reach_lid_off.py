@@ -797,9 +797,48 @@ def test_the_spot_look_takes_the_first_frame_shot_once_the_arm_stands_still(monk
 
     monkeypatch.setattr(pd, "_spin_detect", spin)
     monkeypatch.setattr(pd, "wrist_points", lambda watcher: ("points of", watcher.grab.color_stamp.nanosec))
-    got = rlo.spot_look(node, SimpleNamespace(grab=grab), SimpleNamespace(wait_still=wait_still))
+    notes = []
+    runner = SimpleNamespace(wait_still=wait_still, note=lambda kind, **kw: notes.append((kind, kw)))
+    got = rlo.spot_look(node, SimpleNamespace(grab=grab), runner)
     assert events == [("still", "spot-look"), "spin", "spin"]
     assert got == ("points of", 850_000_000)
+    assert notes == [("spot_look", {"points": 2, "why": None, "frame": None})]  # no colour image: nothing to keep
+
+
+def test_a_spot_look_with_no_points_says_why(monkeypatch):
+    """10:28 2026-10-29: the spot look gave the room map no points and the
+    record could not say why. It now notes it: no new frame once the arm
+    stood still, no pose for the frame, or what the depth held — the lid in
+    the fingers nearer the lens than the hand's cut, nothing read, or past
+    2 m."""
+    from rammp_box_opening.perception import depth_source
+    from rammp_box_opening.tasks import press_demo as pd
+
+    clock = {"ns": 1_000_000_000}
+    node = SimpleNamespace(get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=clock["ns"])))
+    notes = []
+    runner = SimpleNamespace(wait_still=lambda before: None, note=lambda kind, **kw: notes.append((kind, kw)))
+    # no frame newer than the arm standing still
+    grab = SimpleNamespace(color_stamp=SimpleNamespace(sec=0, nanosec=500_000_000), depth=np.zeros((4, 4)))
+    monkeypatch.setattr(pd, "_spin_detect", lambda node_: None)
+    monkeypatch.setattr(rlo, "SPOT_FRAME_S", 0.05)
+    assert rlo.spot_look(node, SimpleNamespace(grab=grab), runner) is None
+    assert notes[-1][1]["points"] == 0 and notes[-1][1]["why"].startswith("no new wrist frame within 0.1 s")
+    # a frame, no points: why, from the frame
+    depth = np.zeros((10, 10), np.float32)
+    depth[:4] = 0.12  # the lid, 12 cm off the lens
+    depth[4:6] = 2.5  # past the cut
+    grab = SimpleNamespace(color_stamp=SimpleNamespace(sec=2, nanosec=0), depth=depth, k=np.eye(3))
+    monkeypatch.setattr(pd, "wrist_points", lambda watcher: np.zeros((0, 3)))
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g: (np.eye(3), np.zeros(3)))
+    assert len(rlo.spot_look(node, SimpleNamespace(grab=grab), runner)) == 0
+    assert notes[-1] == ("spot_look", {"points": 0, "frame": None, "why": (
+        "no depth in range: of 100 pixels 40 read nothing, 40 nearer than %.2f m, 20 past 2 m" % rlo.clear_table.WRIST_NEAREST_M)})
+    monkeypatch.setattr(depth_source, "camera_pose_at", lambda g: None)
+    rlo.spot_look(node, SimpleNamespace(grab=grab), runner)
+    assert notes[-1][1]["why"] == "no camera pose at the frame's stamp (TF)"
+    assert rlo.spot_look(None, SimpleNamespace(grab=grab), runner) is None and notes[-1][1]["why"] == "no node to spin"
+    assert rlo.spot_look(node, SimpleNamespace(), runner) is None and notes[-1][1]["why"] == "no wrist camera"
 
 
 def test_the_lid_s_spot_is_mapped_and_its_carry_planned_from_where_the_arm_stood_still(ctx, monkeypatch, tmp_path):

@@ -238,11 +238,16 @@ def spot_look(node, watcher, runner):
     """The wrist camera's points in the base frame (press_demo.wrist_points)
     from its first frame shot once the arm stands still (runner.wait_still,
     noted 'still' before the spot look), or None: no camera, no node, no
-    new frame within SPOT_FRAME_S, or no pose for it."""
+    new frame within SPOT_FRAME_S, or no pose for it. Noted 'spot_look':
+    how many points, else why none (spot_look_why), and the frame kept
+    (captures/wrist-spot-look-*): 2026-10-29 10:28's look gave the room map
+    no points, and nothing said whether it had no frame, no pose for it or
+    no depth in range with the lid in the fingers."""
     from rammp_box_opening.tasks.press_demo import _spin_detect, wrist_points
 
     g = getattr(watcher, "grab", None)
     if node is None or g is None:
+        runner.note("spot_look", points=0, why="no wrist camera" if g is None else "no node to spin")
         return None
     runner.wait_still("spot-look")
     after = node.get_clock().now().nanoseconds
@@ -250,8 +255,53 @@ def spot_look(node, watcher, runner):
     while time.monotonic() < t_end:
         _spin_detect(node)
         if g.color_stamp is not None and g.depth is not None and dp._stamp_ns(g.color_stamp) > after:
-            return wrist_points(watcher)
+            pts = wrist_points(watcher)
+            n = 0 if pts is None else len(pts)
+            runner.note("spot_look", points=n, why=None if n else spot_look_why(g), frame=_keep_spot_frame(g, n))
+            return pts
+    runner.note("spot_look", points=0, why="no new wrist frame within %.1f s of the arm standing still" % SPOT_FRAME_S)
     return None
+
+
+def spot_look_why(g):
+    """Why the wrist frame `g` (press_demo.wrist_points') gave no points: no
+    pose for it at its stamp (camera_pose_at), or what its depth held —
+    how many pixels read nothing, how many stood nearer the lens than
+    clear_table.WRIST_NEAREST_M (the fingers and the lid in them) or past
+    its 2 m."""
+    from rammp_box_opening.perception.depth_source import camera_pose_at
+
+    if getattr(g, "k", None) is None:
+        return "no camera intrinsics"
+    try:
+        if camera_pose_at(g) is None:
+            return "no camera pose at the frame's stamp (TF)"
+    except Exception as e:  # what the note says, never what stops the run
+        return "the camera pose failed (%s)" % e
+    d = np.asarray(g.depth, np.float32)
+    seen = np.isfinite(d) & (d > 0)
+    near = seen & (d <= clear_table.WRIST_NEAREST_M)
+    far = seen & (d >= 2.0)
+    return "no depth in range: of %d pixels %d read nothing, %d nearer than %.2f m, %d past 2 m" % (
+        d.size, int(d.size - seen.sum()), int(near.sum()), clear_table.WRIST_NEAREST_M, int(far.sum()))
+
+
+def _keep_spot_frame(g, n):
+    """The spot look's frame into captures/wrist-spot-look-<stamp>/
+    (press_demo._save_wrist_frame, written on a thread off the carry's
+    planning; the newest AIM_CAPTURES_KEPT kept). Its folder, or None
+    where there is no frame or no pose to keep it with."""
+    from rammp_box_opening.tasks.press_demo import CAPTURES_DIR, _prune_captures, _save_wrist_frame
+
+    if getattr(g, "color", None) is None or getattr(g, "k", None) is None:
+        return None
+    try:
+        out = _save_wrist_frame(g, CAPTURES_DIR / ("wrist-spot-look-%s" % time.strftime("%Y%m%d-%H%M%S")),
+                                "the spot look, the lid lifted: %d table points" % n, background=True,
+                                after=lambda: _prune_captures("spot-look"))
+    except Exception:  # a frame that cannot be kept costs the note its folder, never the run
+        return None
+    return None if out is None else str(out)
 
 
 def _off_line(pts, line, clear_m):
