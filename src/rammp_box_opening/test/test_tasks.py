@@ -292,46 +292,6 @@ def test_the_lid_goes_where_the_cameras_saw_room_not_onto_the_microwave(monkeypa
     assert all(math.hypot(d.xyz[0] - 0.56, d.xyz[1] + 0.37) > 0.15 for d in drops)
 
 
-def test_what_the_cameras_see_standing_goes_into_the_planners_worlds(monkeypatch, capsys):
-    """Owner 2026-10-27: nothing in the environment is hard coded. The map
-    the lid's spot comes from becomes the planner's worlds too (adopt_seen):
-    the microwave the wrist camera hit at 17:57 is in them, the box and the
-    lid's spots are not, and the run's record says how much went in."""
-    import numpy as np
-    from types import SimpleNamespace
-
-    from rammp_box_opening.models.container import ContainerModel
-    from rammp_box_opening.tasks import press_demo
-
-    f = np.load("src/rammp_box_opening/test/data/table_room_flatbot_20261023_1757.npz")
-    pink = ContainerModel.load("src/rammp_box_opening/config/containers/ankou_pink.yaml")
-    table_z = float(f["table_z"])
-    scene_fix = SimpleNamespace(table_points=f["scene_mm"] / 1000.0, table_z_scene=table_z,
-                                pose=ContainerPose(xyz=(*f["scene_box"], table_z), yaw=0.0))
-    cpose = ContainerPose(xyz=(*f["wrist_box"], table_z), yaw=0.0)
-    monkeypatch.setattr(press_demo, "wrist_points", lambda watcher: f["wrist_mm"] / 1000.0)
-    tmap = press_demo.room_map(None, scene_fix, cpose, at_staging=True)
-    drops, _spots, _why = press_demo.clear_lid_drops(pink, cpose, tmap, table_z)
-    notes = []
-    ctx = SimpleNamespace(model=pink, client=SimpleNamespace(joints=lambda: [0.0] * 7), worlds=SimpleNamespace(seen=[]))
-    runner = SimpleNamespace(note=lambda kind, **kw: notes.append((kind, kw)))
-    press_demo.adopt_seen(ctx, runner, tmap, cpose.xyz[:2], table_z, keep_clear=[d.xyz for d in drops],
-                          when="scene camera and wrist")
-    boxes = ctx.worlds.seen
-
-    def covered(x, y):
-        return any(abs(x - b["position"][0]) <= b["dims"][0] / 2 and abs(y - b["position"][1]) <= b["dims"][1] / 2
-                   for b in boxes)
-
-    assert boxes and notes == [("seen_obstacles", dict(notes[0][1], when="scene camera and wrist"))]
-    assert notes[0][1]["boxes"] == len(boxes)
-    assert covered(0.56, -0.37) and not covered(*cpose.xyz[:2])
-    assert drops and not any(covered(*d.xyz[:2]) for d in drops)
-    assert "the planner keeps the arm clear of what the cameras see standing on the table" in capsys.readouterr().out
-    press_demo.adopt_seen(ctx, runner, None, cpose.xyz[:2], table_z)  # no map: the worlds keep what they had
-    assert ctx.worlds.seen is boxes and len(notes) == 1
-
-
 def test_shipped_config_speeds_are_guard_safe():
     """The shipped values are what actually runs at the bench."""
     import pytest

@@ -1,339 +1,80 @@
+"""The planner's world is the one its deployment starts it with
+(rammp_curobo's world_empty.yaml): box opening builds, writes and sends
+none (owner 2026-10-29). WorldStore keeps the run's measured table and the
+bench file's robot settings for the mission's own geometry."""
+
+from types import SimpleNamespace
+
 import pytest
 import yaml
 
 from rammp_box_opening.models.container import ContainerModel, ContainerPose
-from rammp_box_opening.worlds import (
-    PLANE_MARGIN_M,
-    WorldStore,
-    full_world,
-    interaction_world,
-    reduction_plane_z,
-)
+from rammp_box_opening.worlds import PLANNER_WORLD, WorldStore
 
 CFG = "src/rammp_box_opening/config/containers/oxo_pop.yaml"
 BENCH = "src/rammp_box_opening/config/world_bench.yaml"
-
-
-def _bench():
-    with open(BENCH) as f:
-        return yaml.safe_load(f)
-
-
-def _model_pose():
-    m = ContainerModel.load(CFG)
-    return m, ContainerPose(xyz=(0.45, 0.0, -0.07), yaw=0.0)
-
-
-def _cuboids(world):
-    return {o["name"]: o for o in world["obstacles"]}
-
-
-def test_full_world_is_cuboids_only_and_err_tall():
-    m, cp = _model_pose()
-    w = full_world(_bench(), m, cp)
-    for o in w["obstacles"]:
-        assert set(o) == {"name", "position", "dims"}  # cuboids only (§2)
-    c = _cuboids(w)["container"]
-    assert c["dims"][2] > m.dims[2]  # err tall
-    top = c["position"][2] + c["dims"][2] / 2
-    assert top > cp.xyz[2] + m.dims[2]
-
-
-def test_bench_obstacles_survive_in_all_variants():
-    m, cp = _model_pose()
-    names_full = set(_cuboids(full_world(_bench(), m, cp)))
-    w = interaction_world(
-        _bench(), m, cp, contact_z=0.09, depth_max=0.012
-    )
-    names_int = set(_cuboids(w))
-    assert {"pedestal", "table"} <= names_full
-    assert {"pedestal", "table"} <= names_int
-
-
-def test_reduction_plane_below_deepest_command():
-    z = reduction_plane_z(contact_z=0.09, depth_max=0.012)
-    assert z <= 0.09 - 0.012 - PLANE_MARGIN_M + 1e-9
-
-
-def test_interaction_world_keeps_the_container_body_below_the_plane():
-    m, cp = _model_pose()
-    w = interaction_world(_bench(), m, cp, contact_z=0.09, depth_max=0.012)
-    cs = _cuboids(w)
-    body = cs["container_body"]
-    body_top = body["position"][2] + body["dims"][2] / 2
-    assert body_top <= reduction_plane_z(0.09, 0.012) + 1e-9
-
-
-def test_lid_cuboid_added_after_place():
-    m, cp = _model_pose()
-    lid_at = ContainerPose(xyz=(0.45, -0.25, -0.07), yaw=0.0)
-    w = full_world(_bench(), m, cp, lid_at=lid_at)
-    lid = _cuboids(w)["placed_lid"]
-    assert lid["position"][:2] == pytest.approx([0.45, -0.25])
-
-
-def test_store_idempotent_names(tmp_path):
-    m, cp = _model_pose()
-    store = WorldStore(BENCH, out_dir=tmp_path)
-    n1, p1 = store.push_name("full", model=m, cpose=cp)
-    n2, p2 = store.push_name("full", model=m, cpose=cp)
-    assert n1 == n2 == "full" and p1 == p2
-    assert p1.exists()
-
-
-def test_bench_world_is_bench_only(tmp_path):
-    from rammp_box_opening.worlds import bench_world
-
-    w = bench_world(_bench())
-    names = set(_cuboids(w))
-    assert {"pedestal", "table"} <= names
-    assert not any(n.startswith(("container", "placed_lid")) for n in names)
-    store = WorldStore(BENCH, out_dir=tmp_path)
-    n, p = store.push_name("bench")
-    assert n == "bench" and p.exists()
-
-
-def test_bench_world_keepout_band_when_container_unseen():
-    from rammp_box_opening.worlds import ERR_TALL_M, bench_world
-
-    m, _cp = _model_pose()
-    w = bench_world(_bench(), unseen_model=m)
-    band = _cuboids(w)["unseen_container_band"]
-    top = band["position"][2] + band["dims"][2] / 2
-    table = _cuboids(w)["table"]
-    table_top = table["position"][2] + table["dims"][2] / 2
-    assert top == pytest.approx(table_top + m.dims[2] + ERR_TALL_M)
-    assert band["dims"][0] >= 0.5 and band["dims"][1] >= 0.9  # covers the band
-
-
-def test_interaction_world_caps_bench_at_the_reduction_plane():
-    """A set-down onto the bench must be PLANNABLE to its overdrive depth
-    (field 2026-08-26: IK_FAIL 25 mm over the solid table); a
-    button-height contact leaves the bench untouched."""
-    m, cp = _model_pose()
-    bench = _bench()
-    table = next(o for o in bench["obstacles"] if o["name"] == "table")
-    table_top = table["position"][2] + table["dims"][2] / 2
-    contact = table_top + 0.03  # lid-height above the table
-    w = interaction_world(bench, m, cp, contact, 0.005)
-    plane = reduction_plane_z(contact, 0.005)
-    assert plane < table_top
-    for o in w["obstacles"]:
-        if o["name"].startswith(("container", "placed_lid", "pedestal")):
-            continue
-        assert o["position"][2] + o["dims"][2] / 2 <= plane + 1e-9
-    # press-like: contact at button height leaves the bench untouched
-    w = interaction_world(bench, m, cp, 0.09, 0.015)
-    tops = {o["name"]: o["position"][2] + o["dims"][2] / 2 for o in w["obstacles"]}
-    assert tops["table"] == pytest.approx(table_top)
-
-
-def test_pedestal_survives_a_plane_below_its_base():
-    """The arm's own mount is thinned, never deleted.
-
-    A set-down low enough to push the reduction plane under the pedestal's
-    base used to drop it from the world entirely — the planner would then
-    route the arm through the column it is bolted to."""
-    m, cp = _model_pose()
-    bench = _bench()
-    ped = next(o for o in bench["obstacles"] if o["name"] == "pedestal")
-    base = ped["position"][2] - ped["dims"][2] / 2
-    # a contact low enough that the plane sits BELOW the pedestal's base
-    contact = base - PLANE_MARGIN_M + 0.005
-    plane = reduction_plane_z(contact, 0.005)
-    assert plane < base, "test needs a plane under the pedestal base"
-
-    w = interaction_world(bench, m, cp, contact, 0.005)
-    kept = [o for o in w["obstacles"] if o["name"] == "pedestal"]
-    assert kept, "pedestal must never be dropped from a collision world"
-    stub = kept[0]
-    assert stub["dims"][0] == ped["dims"][0] and stub["dims"][1] == ped["dims"][1]
-    assert stub["position"][2] - stub["dims"][2] / 2 == pytest.approx(base)
-
-
-def test_world_path_is_content_derived(tmp_path):
-    """A world whose CONTENT changed must get a new path, or the SetWorld
-    dedup skips the push and the arm plans against a stale container."""
-    m, _cp = _model_pose()
-    store = WorldStore(BENCH, out_dir=tmp_path)
-    near = ContainerPose(xyz=(0.45, 0.0, -0.07), yaw=0.0)
-    far = ContainerPose(xyz=(0.52, -0.03, -0.07), yaw=0.0)  # after a re-fix
-
-    n1, p1 = store.push_name("full", model=m, cpose=near)
-    n2, p2 = store.push_name("full", model=m, cpose=far)
-    n3, p3 = store.push_name("full", model=m, cpose=near)
-
-    assert n1 == n2 == n3 == "full"  # the NAME still drives the gates
-    assert p1 != p2, "a moved container must produce a different world path"
-    assert p1 == p3, "an identical rebuild must reuse its file"
-    assert p1.exists() and p2.exists()
-
-
-def test_full_world_container_pad_inflates_xy_only(tmp_path):
-    """After a contact leg the box may have been scooted off its detected
-    pose — post-contact FULL worlds widen the container cuboid so a
-    transit cannot thread the needle beside a stale box (field
-    2026-09-01: an 8.1 Nm press moved it ~2 cm and the home sweep
-    clipped it)."""
-    m, cp = _model_pose()
-    plain = _cuboids(full_world(_bench(), m, cp))["container"]
-    padded = _cuboids(full_world(_bench(), m, cp, container_pad_xy=0.03))["container"]
-    assert padded["dims"][0] == pytest.approx(plain["dims"][0] + 0.06)
-    assert padded["dims"][1] == pytest.approx(plain["dims"][1] + 0.06)
-    assert padded["dims"][2] == pytest.approx(plain["dims"][2])  # z untouched
-    assert padded["position"] == plain["position"]
-
-    store = WorldStore(BENCH, out_dir=tmp_path)
-    _, p1 = store.push_name("full", model=m, cpose=cp)
-    _, p2 = store.push_name("full", model=m, cpose=cp, container_pad_xy=0.03)
-    assert p1 != p2  # content-hashed: the padded world is its own file
-
-
-def test_written_worlds_keep_the_padded_table_on_its_true_surface(tmp_path):
-    """RAMMP-CuRobo v1.0.0 pads the table (its no_pad_names is the pedestal
-    alone): written at its true height, the table reads 2 cm too tall to the
-    planner and swallows the arm's own base spheres. The file carries it that
-    much lower; the pedestal is still exempt, and the floor_* keep-outs were
-    always meant to be padded. Perception keeps the true surface."""
-    store = WorldStore(BENCH, out_dir=tmp_path)
-    _, path = store.push_name("bench")
-    written = _cuboids(yaml.safe_load(path.read_text()))
-    table = written["table"]
-    assert table["position"][2] + table["dims"][2] / 2 + 0.02 == pytest.approx(-0.027)
-    assert written["pedestal"]["position"] == [0.0, 0.0, -0.05]
-    assert written["floor_front"]["position"][2] == pytest.approx(-0.057)
-    assert store.table_top_z == pytest.approx(-0.027)
-
-
-def test_a_table_capped_at_the_reduction_plane_still_ends_there_when_padded(tmp_path):
-    """A set-down's interaction world caps the table at the reduction plane
-    (-0.082 here); padded, it must end AT the plane, not 2 cm above it."""
-    m, cp = _model_pose()
-    store = WorldStore(BENCH, out_dir=tmp_path)
-    contact = -0.027 + 0.03
-    _, path = store.push_name(
-        "interaction",
-        model=m,
-        cpose=cp,
-        contact_z=contact,
-        depth_max=0.005,
-    )
-    table = _cuboids(yaml.safe_load(path.read_text()))["table"]
-    assert table["position"][2] + table["dims"][2] / 2 + 0.02 == pytest.approx(-0.082)
-
-
 FLATBOT = "src/rammp_box_opening/config/world_flatbot.yaml"
 
 
-def _written(path):
-    with open(path) as f:
-        return _cuboids(yaml.safe_load(f))
-
-
-def test_a_measured_table_is_planned_around_wherever_it_stands(tmp_path):
-    """Flatbot 2026-10-22: no table in its world file (the chair goes to a
-    different one every time), and the table the scene camera measured
-    never reached the planner, which planned as if there were none."""
-    from rammp_box_opening.worlds import PLANNER_PADDING_M
-
+def test_every_world_a_leg_names_is_the_planners_own_and_nothing_is_written(tmp_path, monkeypatch):
+    """Owner 2026-10-29: "we need to be using the standard world empty yaml
+    that everyone is using. we need to not dynamically populate objects into
+    the yaml and we need to move away from statically adding a table". Every
+    kind of world a leg plans in — whatever box, pad, lid or contact it once
+    described — is rammp_curobo's world_empty.yaml by name, and no file is
+    written; the name keeps its kind (the runner's gates read the prefix)."""
+    monkeypatch.setenv("RAMMP_BOX_OPENING_STATE", str(tmp_path))
     m = ContainerModel.load(CFG)
-    store = WorldStore(FLATBOT, out_dir=tmp_path)
     cp = ContainerPose(xyz=(0.55, -0.40, 0.30), yaw=0.0)
-    assert "table" not in _written(store.push_name("full", model=m, cpose=cp)[1])  # nothing measured yet
-    store.table_top_z, store.table_extent = 0.30, (0.45, 1.10, -0.90, -0.10)
-    for kind in ("full", "bench"):
-        t = _written(store.push_name(kind, model=m, cpose=cp)[1])["table"]
-        assert t["position"][2] + t["dims"][2] / 2 == pytest.approx(0.30 - PLANNER_PADDING_M)  # padded back onto 0.30
-        assert t["position"][0] - t["dims"][0] / 2 == pytest.approx(0.45)  # its near edge where it was seen
-        assert t["position"][1] + t["dims"][1] / 2 == pytest.approx(-0.10)
-    band = _written(store.push_name("bench", model=m)[1])["unseen_container_band"]
-    assert band["position"][0] - band["dims"][0] / 2 == pytest.approx(0.45)  # over the table seen, not the dojo's reach map
-    assert band["position"][2] - band["dims"][2] / 2 == pytest.approx(0.30)
+    for bench in (BENCH, FLATBOT):
+        store = WorldStore(bench)
+        store.table_top_z, store.table_extent = 0.30, (0.45, 1.10, -0.90, -0.10)
+        assert store.push_name("bench", model=m) == ("bench", PLANNER_WORLD)
+        assert store.push_name("bench", model=None, tag="bare") == ("bench_bare", PLANNER_WORLD)
+        assert store.push_name("full", model=m, cpose=cp, container_pad_xy=0.03) == ("full", PLANNER_WORLD)
+        assert store.push_name("full", model=m, cpose=cp, lid_at=cp, tag="lid") == ("full_lid", PLANNER_WORLD)
+        assert store.push_name("interaction", model=m, cpose=cp, contact_z=0.31, depth_max=0.02,
+                               tag="button") == ("interaction_button", PLANNER_WORLD)
+    assert PLANNER_WORLD == "world_empty.yaml"
+    assert not list(tmp_path.rglob("*.yaml"))  # no world file anywhere under the state dir
+    with pytest.raises(ValueError):
+        WorldStore(FLATBOT).push_name("kitchen")
 
 
-def test_a_measured_table_height_without_extent_says_the_planner_has_no_table(tmp_path, capsys):
-    """Review 2026-10-22: a height with no extent was dropped from every
-    world without a word. worlds does not invent a slab; it says so, once."""
-    m = ContainerModel.load(CFG)
-    store = WorldStore(FLATBOT, out_dir=tmp_path)
-    cp = ContainerPose(xyz=(0.55, -0.40, 0.2933), yaw=0.0)
-    store.table_top_z, store.table_extent = 0.2933, None
-    assert sorted(_written(store.push_name("bench", model=m)[1])) == ["floor"]
-    assert sorted(_written(store.push_name("full", model=m, cpose=cp)[1])) == ["container", "floor"]
-    assert capsys.readouterr().out.count("measured but no extent: the planner has NO table") == 1
+def test_the_client_sends_the_planner_no_world():
+    """rammp_curobo refuses an empty scene sent at runtime (compose_cuboids
+    allows one only when the planner is built), and box opening sends none:
+    PlannerClient.set_world records the name and calls no service."""
+    from rammp_box_opening.runtime.client import PlannerClient
+
+    client = SimpleNamespace(world_held=None)  # no _set_world: a service call would raise
+    ok, msg = PlannerClient.set_world(client, PLANNER_WORLD)
+    assert ok and client.world_held == PLANNER_WORLD and "sends no world" in msg
 
 
-def test_a_measured_table_height_with_the_assumed_ring_square_is_planned(tmp_path):
-    import numpy as np
-
-    from rammp_box_opening.perception.scene_source import seen_table_extent
-    from rammp_box_opening.worlds import PLANNER_PADDING_M
-
-    m = ContainerModel.load(CFG)
-    store = WorldStore(FLATBOT, out_dir=tmp_path)
-    ext, assumed = seen_table_extent(np.zeros((0, 3)), 0.2933, (0.55, -0.40))
-    assert assumed
-    store.table_top_z, store.table_extent = 0.2933, ext
-    world = _written(store.push_name("bench", model=m)[1])
-    assert sorted(world) == ["floor", "table", "unseen_container_band"]
-    t = world["table"]
-    assert t["position"][2] + t["dims"][2] / 2 == pytest.approx(0.2933 - PLANNER_PADDING_M)
-    assert t["dims"][:2] == pytest.approx([0.60, 0.60])
+def test_the_measured_table_is_the_missions_and_overrides_the_bench_files():
+    """The table the scene camera measures each run is the mission's own
+    (the lid's spot, the set-down's height) — never the planner's. The lab
+    bench's file states one; flatbot's states none (the chair goes to a
+    different table every time) until the scene camera measures it."""
+    bench = WorldStore(BENCH)
+    with open(BENCH) as f:
+        t = next(o for o in yaml.safe_load(f)["obstacles"] if o["name"] == "table")
+    assert bench.table_top_z == pytest.approx(t["position"][2] + t["dims"][2] / 2)
+    flatbot = WorldStore(FLATBOT)
+    assert flatbot.table_top_z is None and flatbot.table_extent is None
+    flatbot.table_top_z, flatbot.table_extent = 0.2933, (0.45, 1.10, -0.90, -0.10)
+    assert flatbot.table_top_z == pytest.approx(0.2933)
+    assert flatbot.table_extent == (0.45, 1.10, -0.90, -0.10)
+    assert flatbot.base_frame == "arm_mount"
 
 
 def test_the_flatbot_world_file_carries_only_keys_worldstore_reads():
     """world_flatbot.yaml once set depth_collision: true, which nothing read,
     under a comment claiming OAK depth streamed into the planner's collision
-    world. Its table comes only from the scene fix (above)."""
+    world. It holds the robot's settings, no table."""
     with open(FLATBOT) as f:
         w = yaml.safe_load(f)
     assert set(w) <= {"base_frame", "table_normal_base", "wrist_camera_config",
                       "scene_camera_config", "external_static_tf", "obstacles"}
     assert "table" not in {o["name"] for o in w["obstacles"]}
-
-
-def test_a_surveyed_table_is_not_doubled_by_a_measured_one(tmp_path):
-    m, cp = _model_pose()
-    store = WorldStore(BENCH, out_dir=tmp_path)
-    store.table_top_z, store.table_extent = -0.06, (0.2, 0.9, -0.5, 0.5)
-    tables = [o for o in yaml.safe_load(open(store.push_name("full", model=m, cpose=cp)[1]))["obstacles"] if o["name"] == "table"]
-    assert len(tables) == 1 and tables[0]["dims"][0] == pytest.approx(1.68)  # the bench file's own
-
-
-def test_flatbot_guarded_bench_world_exists_only_with_a_measured_table(tmp_path):
-    """home_arm's guarded world on flatbot: the floor alone (the bare one)
-    until a table is measured, then the table and the band over it."""
-    m = ContainerModel.load(CFG)
-    store = WorldStore(FLATBOT, out_dir=tmp_path)
-    assert store.table_top_z is None
-    guarded = _written(store.push_name("bench", model=m)[1])
-    bare = _written(store.push_name("bench", model=None, tag="bare")[1])
-    assert guarded == bare  # why home_arm plans once there, with the caution first
-    store.table_top_z, store.table_extent = 0.30, (0.45, 1.10, -0.90, -0.10)
-    guarded = _written(store.push_name("bench", model=m)[1])
-    bare = _written(store.push_name("bench", model=None, tag="bare")[1])
-    assert {"table", "unseen_container_band"} <= set(guarded)
-    assert "unseen_container_band" not in bare and guarded != bare
-
-
-def test_what_the_cameras_see_standing_is_in_every_world_and_whole_at_a_contact(tmp_path):
-    """Owner 2026-10-27: nothing in the environment is hard coded — what
-    stands on the table comes from the cameras, each run (WorldStore.seen,
-    press_demo.adopt_seen). A contact's world cuts the table to the plane
-    below the contact; what stands beside the contact stays whole (17:57:
-    the set-down's descent is where the wrist camera met the microwave)."""
-    from rammp_box_opening.worlds import SEEN_PREFIX
-
-    m = ContainerModel.load(CFG)
-    store = WorldStore(FLATBOT, out_dir=tmp_path)
-    cp = ContainerPose(xyz=(0.39, -0.21, 0.187), yaw=0.0)
-    store.table_top_z, store.table_extent = 0.187, (0.30, 0.75, -0.70, 0.20)
-    assert not any(n.startswith(SEEN_PREFIX) for n in _written(store.push_name("full", model=m, cpose=cp)[1]))
-    microwave = {"name": SEEN_PREFIX + "00", "position": [0.60, -0.42, 0.187 + 0.155], "dims": [0.16, 0.50, 0.31]}
-    store.seen = [microwave]
-    for kind, kw in (("full", dict(model=m, cpose=cp)), ("bench", dict(model=m)),
-                     ("interaction", dict(model=m, cpose=cp, contact_z=0.227, depth_max=0.01))):
-        w = _written(store.push_name(kind, **kw)[1])
-        assert w[microwave["name"]] == microwave, kind
-    w = _written(store.push_name("interaction", model=m, cpose=cp, contact_z=0.227, depth_max=0.01)[1])
-    assert w["table"]["position"][2] + w["table"]["dims"][2] / 2 < 0.187 - 0.03  # the table under it IS cut

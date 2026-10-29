@@ -700,8 +700,8 @@ class Carry:
 
 def plan_carry(ctx, cfg, q_from, drop):
     """The carry from joints `q_from` (where the spot look stands) to the
-    spot `drop`, in the full world — the box and what the cameras see
-    standing (press_demo.adopt_seen) — then the set-down's straight lines
+    spot `drop` (planned in the planner's own world, worlds.PLANNER_WORLD:
+    it is told nothing of the box or the table) — then the set-down's straight lines
     from its end and the retreat's back up. Returns (Carry, None) or (None,
     why)."""
     from rammp_box_opening.runtime import approach
@@ -1052,8 +1052,7 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how):
 def choose_and_carry(ctx, cfg, runner, eyes):
     """The lid lifted and clear of the box, in the fingers: its one stop.
     The wrist's frame (spot_look) and the scene camera's table make the map
-    (spot_map) the planner's world is made from too (press_demo.adopt_seen,
-    the spot kept clear); the first of spot_candidates the carry plans to
+    (spot_map) the spot is chosen on; the first of spot_candidates the carry plans to
     (plan_carry, at most CARRY_TRIES) is where the lid goes, one line saying
     which tier and why. Then the carry and the set-down, ONE execution,
     home planned while it flies (plan_home_after); the knuckle read (the
@@ -1074,8 +1073,6 @@ def choose_and_carry(ctx, cfg, runner, eyes):
     for drop, tier, says in spot_candidates(ctx, tmap, table_z, q, seeds=(look_joints(rest), rest)):
         if len(refused) >= CARRY_TRIES:
             break
-        pd.adopt_seen(ctx, runner, tmap, ctx.cpose.xyz[:2], table_z, keep_clear=[drop.xyz],
-                      when="wrist and scene camera, the lid lifted")
         carry, why = plan_carry(ctx, cfg, q, drop)
         if carry is not None:
             chosen = (drop, tier, says)

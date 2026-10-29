@@ -705,8 +705,7 @@ def test_a_clear_spot_the_wrist_sees_after_the_lift_is_where_the_lid_goes(ctx, m
     assert "where the cameras see room for it and the hand" in capsys.readouterr().out
     d = math.hypot(ctx.lid_drop.xyz[0] - BOX_XY[0], ctx.lid_drop.xyz[1] - BOX_XY[1])
     assert d >= 0.19  # lid_place_min_clear from the box
-    seen, = [r for r in rows if r["leg"] == "seen_obstacles"]  # the carry's world from the same map
-    assert seen["when"] == "wrist and scene camera, the lid lifted"
+    assert not [r for r in rows if r["leg"] == "seen_obstacles"]  # the map is the mission's: no planner world gets it
 
 
 def test_nothing_clear_still_sets_the_lid_down_at_the_most_room_seen(ctx, monkeypatch, tmp_path, capsys):
@@ -808,7 +807,6 @@ def test_the_lid_s_spot_is_mapped_and_its_carry_planned_from_where_the_arm_stood
     look's wait for a still arm, where its frame was shot: not before it,
     the arm still settling from the lift and the clear."""
     from rammp_box_opening.runtime.runner import Runner
-    from rammp_box_opening.tasks import press_demo as pd
 
     stood = [0.01 * (k + 1) for k in range(7)]
     seen = []
@@ -824,7 +822,6 @@ def test_the_lid_s_spot_is_mapped_and_its_carry_planned_from_where_the_arm_stood
     monkeypatch.setattr(rlo, "spot_look", look)
     monkeypatch.setattr(rlo, "spot_map", lambda ctx_, wrist, q, *rest: seen.append(("spot_map", list(q))))
     monkeypatch.setattr(rlo, "spot_candidates", candidates)
-    monkeypatch.setattr(pd, "adopt_seen", lambda *a, **k: None)
     monkeypatch.setattr(rlo, "plan_carry", lambda ctx_, cfg_, q, drop: (seen.append(("plan_carry", list(q))),
                                                                         (None, "refused"))[1])
     eyes = (None, SimpleNamespace(table_z=-0.027), None, None)
