@@ -68,7 +68,7 @@ class RoomView:
     spots: list = None
     judged: list = None
     why: str = None
-    boxes: list = None  # what the planner's worlds get from the same map (press_demo.adopt_seen)
+    boxes: list = None  # the standing cuboids clear_table.obstacle_boxes makes of the same map (no planner gets them)
 
 
 def fix_around(pts_base, box_xy, model):

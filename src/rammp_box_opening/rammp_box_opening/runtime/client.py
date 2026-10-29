@@ -553,9 +553,9 @@ class PlannerClient:
     def planner_reachable(self, timeout_s=5.0):
         """True when both planner actions AND its set_world service respond.
 
-        set_world is the first thing every plan calls, and it is advertised
-        only once cuRobo has finished loading, so an action that answers
-        before it does is not a planner that can plan yet."""
+        set_world is advertised only once cuRobo has finished loading, so
+        an action that answers before it does is not a planner that can plan
+        yet (box opening never calls it: worlds.py)."""
         return (
             self._plan_pose.wait_for_server(timeout_sec=timeout_s)
             and self._plan_joints.wait_for_server(timeout_sec=2.0)
@@ -1271,23 +1271,13 @@ class PlannerClient:
 
     # -- services / gripper ------------------------------------------------
     def set_world(self, path_or_name):
-        """Push a world; a no-op when the planner already holds it. This is
-        the ONE record of what the planner holds (plan-time pushes and
-        replans both route here; two trackers drifted, review 2026-09-02).
-        Worlds are content-hashed paths, so equal path == equal world. The
-        planner runs in a container: the path must exist inside it too."""
-        key = str(path_or_name)
-        if key == self.world_held:
-            return True, "held"
-        if not self._set_world.wait_for_service(timeout_sec=5.0):
-            return False, "set_world service unavailable"
-        req = SetWorld.Request(world=key)
-        resp = spin_until_done(self.node, self._set_world.call_async(req), 10.0)
-        if resp is None or not resp.success:
-            self.world_held = None
-            return False, "set_world timed out" if resp is None else resp.message
-        self.world_held = key
-        return True, resp.message
+        """Box opening sends the planner no world (worlds.py): it plans in
+        the one its deployment started it with, world_empty.yaml on flatbot,
+        and refuses an empty scene sent at runtime anyway. Kept as the one
+        place every plan and replan asks, so nothing sneaks a SetWorld in;
+        `path_or_name` (worlds.PLANNER_WORLD) is what it records as held."""
+        self.world_held = str(path_or_name)
+        return True, "box opening sends no world: the planner plans in the one it was started with"
 
     def gripper_cmd(self, position):
         """Command the gripper and wait (knuckle rad: 0.0 open .. 0.8 closed);

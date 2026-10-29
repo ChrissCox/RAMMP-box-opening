@@ -27,7 +27,7 @@ from rammp_box_opening.constants import FINGERTIP_FRAMES, GRIPPER_STATE_TOPIC
 from rammp_box_opening.runtime.client import PlannerClient
 from rammp_box_opening.runtime.driver import rmw_refusal
 from rammp_box_opening.tasks import cli_common
-from rammp_box_opening.worlds import WorldStore
+from rammp_box_opening.worlds import PLANNER_WORLD, WorldStore
 
 
 STREAM_WINDOW_S = 3.0  # how long every camera and detector topic is listened to
@@ -204,6 +204,26 @@ def _gripper_state(node, timeout_s=3.0):
     return got[0] if got else None
 
 
+def planner_world(node, timeout_s=3.0):
+    """The planner node's `world` parameter (rammp_curobo's own name for the
+    world it was started with), or None when it does not answer."""
+    from rcl_interfaces.srv import GetParameters
+
+    cli = node.create_client(GetParameters, "/rammp_curobo/get_parameters")
+    try:
+        if not cli.wait_for_service(timeout_sec=timeout_s):
+            return None
+        fut = cli.call_async(GetParameters.Request(names=["world"]))
+        t_end = time.monotonic() + timeout_s
+        while not fut.done() and time.monotonic() < t_end:
+            rclpy.spin_once(node, timeout_sec=0.05)
+        if not fut.done() or fut.result() is None or not fut.result().values:
+            return None
+        return fut.result().values[0].string_value or None
+    finally:
+        node.destroy_client(cli)
+
+
 def main():
     args = cli_common.make_parser(__doc__).parse_args()
     why = rmw_refusal(os.environ)
@@ -247,21 +267,17 @@ def main():
         print("FAIL  planner actions unreachable — is sheppy's `planner` node up?")
         failures += 1
 
-    # 4. the planner can read the worlds this repo writes. It runs in a
-    #    container: a path that exists here is invisible there unless its
-    #    directory is mounted at the same path.
+    # 4. the world the planner plans in: the one its deployment started it
+    #    with (box opening sends none, worlds.py) — world_empty.yaml, the arm
+    #    and nothing else. Said, not failed: the deployment owns it.
     store = WorldStore(args.bench_world or cli_common.default_bench_yaml())
     client._base_frame = store.base_frame
-    _name, path = store.push_name("bench")
-    ok, msg = client.set_world(path)
-    if ok:
-        print("PASS  planner loaded %s" % path)
+    world = planner_world(node)
+    if world == PLANNER_WORLD:
+        print("PASS  planner started with %s" % world)
     else:
-        print(
-            "FAIL  planner could not load %s (%s) — mount %s into the planner "
-            "container at the same path" % (path, msg, path.parent)
-        )
-        failures += 1
+        print("WARN  planner started with %s, not %s — box opening plans in it as it is (the deployment's "
+              "planner `world` parameter sets it)" % (world or "an unknown world", PLANNER_WORLD))
 
     # 5. TF for the finger tips (robot_state_publisher from the launch)
     tips = client.contact_xyz(timeout_s=3.0)
