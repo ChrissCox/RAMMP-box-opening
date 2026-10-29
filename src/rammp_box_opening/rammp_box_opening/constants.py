@@ -276,10 +276,17 @@ class CustomGains(namedtuple("CustomGains", "name kq zeta torque_limit")):
 # 1050-1160 N/m straight down (STIFF: 420-460), so 1.5 N·m of friction or
 # model error on each of joints 1-4 and 0.5 on 5-7 puts them 3-4 mm off
 # (STIFF: 8-11). 400 on the wrist too buys only 0.3-0.5 mm more, on the
-# joints with the least inertia, where nothing above 60 has flown. zeta and
+# joints with the least inertia, where nothing above 60 had flown. zeta and
 # the torque limits are STIFF's: the driver derives damping from zeta and each
 # joint's inertia, so the damping ratio stays STIFF's.
-GAINS_RIGID = CustomGains("RIGID", (400.0,) * 4 + (200.0,) * 3, 0.7, (39.0,) * 4 + (9.0,) * 3)
+# Owner 2026-10-29, after that day's full runs: "we need to double the spring
+# coefficient when in impedance mode because it's still too loose". The wrist
+# doubles, 200 -> 400 (flown at 200 since 10-28 14:21). Joints 1-4 stay at
+# 400: it is the driver's ceiling for a custom spec (kinova-gen3-driver
+# interface/gains.h kKqMax), and a goal asking more is refused, not clamped.
+# The wrist's 9 N·m torque limit, its ceiling too, is now reached 22 mrad
+# off its reference instead of 45.
+GAINS_RIGID = CustomGains("RIGID", (400.0,) * 7, 0.7, (39.0,) * 4 + (9.0,) * 3)
 IMPEDANCE_KQ[GAINS_RIGID] = GAINS_RIGID.kq
 IMPEDANCE_NAMES[GAINS_RIGID] = GAINS_RIGID.name
 # Every compliant goal that names no gains flies this (PlannerClient

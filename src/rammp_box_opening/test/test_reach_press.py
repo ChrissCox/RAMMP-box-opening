@@ -1155,7 +1155,7 @@ def test_a_compliant_run_says_which_gains_every_move_flies(ctx, monkeypatch, cap
     args = SimpleNamespace(compliant=True, depth_press=True, execute=True)
     assert reach_press.run_reach_press(None, ctx, None, None, None, args, None, None) == 0
     out = capsys.readouterr().out
-    assert ("COMPLIANT: every move in the arm's joint impedance, RIGID (Kq 400/200 N·m/rad on joints 1-4/5-7), "
+    assert ("COMPLIANT: every move in the arm's joint impedance, RIGID (Kq 400/400 N·m/rad on joints 1-4/5-7), "
             "and nothing the run reads stops it") in out
     ctx.client.compliant_gains = GAINS_MEDIUM
     reach_press.run_reach_press(None, ctx, None, None, None, args, None, None)
