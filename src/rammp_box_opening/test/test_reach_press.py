@@ -1145,9 +1145,9 @@ def test_the_reach_out_preview_moves_nothing(ctx, monkeypatch, tmp_path, capsys,
 def test_a_compliant_run_says_which_gains_every_move_flies(ctx, monkeypatch, capsys):
     """Owner 2026-10-27: "impedance mode needs to be firmer"; 2026-10-28:
     "extreamly rigid". The banner names the tuning in force — the client's
-    compliant_gains, a custom spec (RIGID) or a driver profile — and the
-    client is back in position once the run is over; a guarded run has no
-    banner."""
+    compliant_gains, a custom spec (RIGID, with its own zeta) or a driver
+    profile — and the client is back in position once the run is over; a
+    guarded run has no banner."""
     from rammp_box_opening.constants import GAINS_MEDIUM
 
     during = []
@@ -1155,8 +1155,8 @@ def test_a_compliant_run_says_which_gains_every_move_flies(ctx, monkeypatch, cap
     args = SimpleNamespace(compliant=True, depth_press=True, execute=True)
     assert reach_press.run_reach_press(None, ctx, None, None, None, args, None, None) == 0
     out = capsys.readouterr().out
-    assert ("COMPLIANT: every move in the arm's joint impedance, RIGID (Kq 400/400 N·m/rad on joints 1-4/5-7), "
-            "and nothing the run reads stops it") in out
+    assert ("COMPLIANT: every move in the arm's joint impedance, RIGID (Kq 400/400 N·m/rad on joints 1-4/5-7, "
+            "zeta 1.0), and nothing the run reads stops it") in out
     ctx.client.compliant_gains = GAINS_MEDIUM
     reach_press.run_reach_press(None, ctx, None, None, None, args, None, None)
     assert "impedance, MEDIUM (Kq 80/30 N·m/rad on joints 1-4/5-7), and" in capsys.readouterr().out

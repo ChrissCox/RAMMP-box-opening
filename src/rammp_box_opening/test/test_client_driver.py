@@ -668,7 +668,7 @@ def _sent(gains):
 
 
 # constants.GAINS_RIGID as the driver must receive it, the numbers copied here
-RIGID_SENT = (4, [400.0] * 7, 0.7, [39.0] * 4 + [9.0] * 3)
+RIGID_SENT = (4, [400.0] * 7, 1.0, [39.0] * 4 + [9.0] * 3)
 
 
 def test_a_compliant_leg_flies_in_impedance_under_its_gains(monkeypatch):
@@ -676,7 +676,7 @@ def test_a_compliant_leg_flies_in_impedance_under_its_gains(monkeypatch):
     after 13:43's press under STIFF: "extreamly rigid"; 2026-10-29: "double
     the spring coefficient". A compliant goal that names no gains flies the
     run's, RIGID — PROFILE_CUSTOM with its own Kq 400 N·m/rad on every joint
-    (the driver's ceiling), zeta 0.7 and torque limits 39/9 N·m — never the
+    (the driver's ceiling), zeta 1.0 and torque limits 39/9 N·m — never the
     driver's session default, MEDIUM, which every goal of 16:23 flew; one
     that names a profile flies that one, as its number, and so does a
     client told another run default."""
@@ -782,7 +782,7 @@ def test_fill_gains_writes_a_custom_spec_as_profile_custom_and_a_profile_as_its_
     msg = ImpedanceGains()
     client_mod.fill_gains(msg, client_mod.GAINS_RIGID)
     assert msg.profile == ImpedanceGains.PROFILE_CUSTOM == 4
-    assert list(msg.custom.kq) == [400.0] * 7 and msg.custom.zeta == 0.7
+    assert list(msg.custom.kq) == [400.0] * 7 and msg.custom.zeta == 1.0
     assert list(msg.custom.torque_limit) == [39.0] * 4 + [9.0] * 3
     for profile in (client_mod.GAINS_SOFT, client_mod.GAINS_MEDIUM, client_mod.GAINS_STIFF):
         msg = ImpedanceGains()
@@ -806,7 +806,7 @@ def test_every_custom_gains_spec_lies_within_the_drivers_profile_custom_bounds()
     bounds, with a reason, and never clamps (validate_custom, at accept):
     under the run's default, every compliant goal of the run, its primer
     first, would be refused. GAINS_RIGID: Kq at the 400 ceiling on joints
-    1-4 and 200 on 5-7, zeta 0.7, each torque limit at its joint's ceiling,
+    1-4 and 200 on 5-7, zeta 1.0, each torque limit at its joint's ceiling,
     above the floor that holds gravity (joint 2: 39 against 37.6)."""
     from rammp_box_opening import constants
 
