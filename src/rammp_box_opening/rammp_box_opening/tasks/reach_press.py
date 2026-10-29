@@ -847,7 +847,7 @@ def let_go_part_way(ctx, res):
 
 def gains_text(profile):
     """A driver gains profile, or a custom spec (constants.CustomGains), as
-    the console names it, e.g. "RIGID (Kq 400/200 N·m/rad on joints 1-4/5-7)"."""
+    the console names it, e.g. "RIGID (Kq 400/400 N·m/rad on joints 1-4/5-7)"."""
     p = profile if isinstance(profile, CustomGains) else int(profile)
     kq = IMPEDANCE_KQ.get(p)
     name = IMPEDANCE_NAMES.get(p, "gains profile %s" % (p,))
