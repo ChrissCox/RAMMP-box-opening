@@ -1579,6 +1579,7 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
     clear or home, _home_from_over_box), anything raised. Returns the
     process exit code."""
     from rammp_box_opening.tasks import depth_press as dp
+    from rammp_box_opening.tasks.press_demo import viz_hook
 
     names = [lg.name for lg in legs]
     if way.down.short_deg:
@@ -1586,6 +1587,7 @@ def _fly_way_in(ctx, cfg, runner, way, legs, top_z, scene_fix, locator):
               % way.down.short_deg)
     print("[press_demo] ONE MOTION from the look pose to below the button: %s" % ", ".join(names))
     print("[press_demo] %s" % dp.press_text(way.stroke, cfg))
+    viz_hook("press", way.stroke, top_z, cfg)  # the stroke, drawn off this thread (perception/viz)
     # The stroke meets the box by design: from here every world pads it for
     # a shove, as depth_press.press_compliant's does — home's too, planned
     # while the way in flies, so it is padded before it flies

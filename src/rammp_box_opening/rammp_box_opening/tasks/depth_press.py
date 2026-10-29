@@ -1256,6 +1256,7 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     moved nothing, and nothing is let go: after the stroke's, the arm
     stands over the button in free air, free to go home."""
     from rammp_box_opening.runtime import approach
+    from rammp_box_opening.tasks.press_demo import viz_hook
 
     if top_z is None:
         return DepthPress(free=True, why="a compliant press needs the button's height (the aim or the scene camera)")
@@ -1271,6 +1272,7 @@ def press_compliant(ctx, cfg, runner, contact_tool, seen, turned=None, top_z=Non
     world = _full_world(ctx)
     legs = [compliant_line(ctx, name, pts, quat, speed, world) for name, pts, speed in stroke.legs]
     print("[press_demo] %s" % press_text(stroke, cfg))
+    viz_hook("press", stroke, top_z, cfg)  # the stroke, drawn off this thread (perception/viz)
     try:
         res = runner.run(legs, execute=True)
         if len(res) == 1 and not res[0].ok and (res[0].outcome == "refused" or not res[0].progress):

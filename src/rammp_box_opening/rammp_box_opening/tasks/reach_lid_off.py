@@ -802,6 +802,8 @@ def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
     a move stopped part-way, up off the button and home from over the box
     where the way back did not start. Home is planned from the look pose
     while the way back flies: ctx.home_ahead, for a stop there (_stop_home)."""
+    from rammp_box_opening.tasks.press_demo import viz_hook
+
     names = [lg.name for lg in legs]
     if way.down.short_deg:
         print("[press_demo] TURN: %.0f deg short of straight down (no hand nearer straight down flies here)"
@@ -810,6 +812,7 @@ def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
         "PRESS %d of %d: " % (press, PRESSES) if press > 1 else "", ", ".join(names)))
     print("[press_demo] %s" % dp.press_text(way.stroke, cfg))
     ctx.home_ahead = None  # the arm leaves the look pose: no home planned before is flown from where it comes back
+    viz_hook("press", way.stroke, top_z, cfg)  # the stroke, drawn off this thread (perception/viz)
     res = runner.run(legs, execute=True)
     last = res[-1]
     flown = all(r.ok for r in res)
@@ -979,6 +982,8 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how):
     scene_fix, the joints the scene camera looked at the arm in) the
     cameras; `how` says what the grip's lid height `lid_z` is. Returns the
     exit code: 0 with the lid set down and the arm home."""
+    from rammp_box_opening.tasks.press_demo import viz_hook
+
     world = _full_world(ctx)
     ctx.contact_pad = CONTACT_SHIFT_PAD_M  # the grip meets the box by design
     way, why = solve_grip_way(ctx, cfg, button, tilt, ctx.client.joints(), lid_z)
@@ -992,6 +997,7 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how):
           "closed pads %.0f mm under %s%s" % (", ".join(names), 1000 * GRIP_BELOW_LID_M, how,
                                              ", the hand %.0f deg short of straight down" % way.down.short_deg
                                              if way.down.short_deg else ""))
+    viz_hook("grip", way.stroke, lid_z)  # the grip's way down and the lift, drawn off this thread (perception/viz)
     opened = _gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:open", GRIPPER_CMD_OPEN, world, defer_join=True)
     # the hand leaves the look pose for the knob: the way back's home is not
     # flown from where it comes back (a back-out plans its own, _back_out)
@@ -1088,6 +1094,7 @@ def choose_and_carry(ctx, cfg, runner, eyes):
         drop.xyz[0], drop.xyz[1], drop.xyz[2], 1000 * math.hypot(drop.xyz[0] - ctx.cpose.xyz[0],
                                                                  drop.xyz[1] - ctx.cpose.xyz[1]),
         says, "; the planner refused %s" % "; ".join(refused) if refused else ""))
+    pd.viz_hook("spot", tmap, drop, tier, says, table_z)  # the map and the spot, drawn off this thread (perception/viz)
     print("[press_demo] ONE MOTION: %s — to [%.2f, %.2f] and down onto the table" % (
         ", ".join(lg.name for lg in carry.legs), drop.xyz[0], drop.xyz[1]))
     res = runner.run(carry.legs, execute=True, lookahead=lambda _end: plan_home_after(ctx, cfg, carry))

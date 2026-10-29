@@ -215,6 +215,120 @@ enough mode"), and then the lid comes off and is set down.
    rad wrist flip twice per run). It then holds the tool out over the
    table. Off by default — the run ends at HOME (owner, 2026-09-04).
 
+### 4a. Watching a run in Foxglove
+
+sheppy's `foxglove` node runs foxglove_bridge on the robot (host network,
+port 8765). A press_demo run started with `RAMMP_BOX_OPENING_VIZ=1` —
+`--detect-only` and a dry run included — publishes what its perception saw
+and decided under `/box_opening/viz/` (`perception/viz.py`), beside the
+cameras' own topics. It is off by default: it has not yet been watched on
+the robot (2026-10-28), and a run without it is exactly what it was.
+
+1. Open https://app.foxglove.dev (or the Foxglove desktop app) → **Open
+   connection** → **Foxglove WebSocket** → `ws://<snorlax's address>:8765`
+   (`ws://localhost:8765` on the robot's own screen).
+2. **Layouts** → **Import from file** →
+   `docs/foxglove/box_opening_perception.json`.
+3. Start the run with the viz on:
+   `RAMMP_BOX_OPENING_VIZ=1 scripts/sheppy_task.sh press_demo ...` (1, on,
+   true or yes; `ros2 run rammp_box_opening press_demo` takes it the same
+   way). Foxglove may connect before, during or after it: the markers and
+   the status are latched, and so is each annotated image once drawn.
+   A run started from sheppy (its TUI, `sheppy restart`) has it off: the
+   `press_demo_*` task nodes (rammp-deployments' `sheppy-manifest.yaml`)
+   set no environment. sheppy runs a process node's `command:` under
+   `bash -c` with sheppyd's own environment, and sheppy_task.sh execs the
+   task, so a node whose command reads `RAMMP_BOX_OPENING_VIZ=1
+   /home/snorlax/RAMMP-box-opening/scripts/sheppy_task.sh press_demo ...`
+   has it on, and so does every task node with the variable in sheppyd's
+   environment.
+
+The panels:
+
+- **box opening: the scene look** (`/box_opening/viz/scene/annotated/compressed`)
+  — the scene frame the look's gate judged. Every box each detector gave it
+  is numbered: green the fix, yellow passed but no fix came of it (a pass
+  is one sighting: the fix needs two that agree, or the other detector's
+  made it), red refused, orange two places, grey not judged (a box ahead of
+  it passed); the segmenter's own holder box thin grey under its lid band.
+  The fix's lid (its outline at the measured top, its centre a cross) and
+  holder (its outline on the table) are projected into it, the table it
+  stands on cyan. Under it: the console's SCENE line, and each box's
+  verdict in the gate's own words.
+- **wrist camera: box opening's aim** (`/box_opening/viz/wrist/annotated/compressed`)
+  — the layout's only wrist view. It shows the aim's last tick: the frame
+  the tilted aim judged then (not the camera's newest), drawn once the
+  mission waits — the first aim's from the look pose, and in the full run,
+  after a press, the knob look's from there. Every hit and the fix are
+  handed over as they come, a refused frame at most every 0.2 s, and only
+  the newest is drawn: not every frame the aim judged. A hit's frame shows
+  the button it found (green, the press point a red cross) and the lid
+  round it (magenta, at the lid ring's measured height); every frame,
+  through its own camera pose, the button the aim was given (yellow: where
+  the scene camera put it, or after a press where the press was aimed) and
+  every hit so far (dots; the fix's agreeing ones green). Under it: the AIM
+  line — then, for a box the aim finds open, the ALREADY OPEN line, and
+  after a press the AFTER PRESS line, the knob's verdict — this frame's
+  verdict ("camera moving", "no circle ..."), and for a hit the lid ring
+  against the scene camera's lid (after a press, the press's top) and the
+  table the wrist read.
+- **box opening in 3D** — TF, the arm (`/arm/robot_description`), the scene
+  camera's frustum and image, and `/box_opening/viz/markers` in
+  `arm_mount`: the holder and the lid at the scene fix, the table the look
+  measured, two places where a message passed in two, the aimed button and
+  each hit, the button the aim was given, and the stroke — the pads' start,
+  the approach (white) to 35 mm over the button, the press (orange) to its
+  bottom, on (red) to where the springs' reference ends: straight down, or
+  for a bent stroke aside to where its joints end (the label says how far).
+  Then the lid off: the grip — the closed pads' way down (white, then
+  violet) to 2 mm under the lid, and the lift (cyan) straight up off the
+  canister, its cap's height and 15 mm (40 mm for the pink one) — and the
+  lid's spot: the lid where it goes down, its tier and why (clear, most
+  room, beside the box, nearest), over the tops of what stands on the map
+  the spot was chosen on (orange squares: the wrist's frame with the lid
+  lifted, pooled with the scene camera's points from the first look).
+- **the phase and the last decision** (`/box_opening/viz/status`) — the
+  console's last line that opens in capitals: SCENE, REACH-OUT, AIM,
+  AIMED, ONE MOTION, PRESS, PRESSED, AFTER PRESS, GRIP, CLOSE, LID
+  GRIPPED, RELEASE, STOP, NO BOX, DONE ... — and the press once more ("the
+  knob is not up ... pressing once more", AGAIN) and where the lid goes
+  ("lid goes to ...", SPOT).
+- **scene camera colour**, **RF-DETR scene segmenter overlay** and
+  **/rosout**, as sheppy's nodes publish them.
+
+The wrist camera's own stream is left out on purpose. flatbot's wrist
+driver publishes no `/wrist_camera/color/image_raw/compressed` today
+(2026-10-28: its CompressedImage stream sits on `.../image_raw/ffmpeg`,
+beside the FFMPEGPacket one — a rammp-deployments question), so a panel on
+it would read the raw `/wrist_camera/color/image_raw`: 640×400 at 30 Hz,
+~23 MB/s, and an open panel makes foxglove_bridge a second reader of that
+stream on the Jetson the mission runs on. To watch it anyway: **Add panel**
+→ **Image** → topic `/wrist_camera/color/image_raw` — and close it again
+for a run whose timing matters, or on a slow link.
+
+None of it stops the run, and almost none of it slows it. The mission's
+thread starts the viz's own thread (~0.3 ms) and then only hands over what
+it computed anyway (microseconds, never a wait); loading the viz, making
+its publishers, the drawing and the publishing wait until that thread
+waits on the driver, a frame or a plan, never while it aims, solves or
+re-times — the marker type's one long import until it has waited a whole
+second — and an image nobody watches is not drawn at all. So the first
+images come a moment into the run, and an annotated image a moment after
+the line that says it — the wrist's after the aim, while the arm flies. A
+mission thread that wakes inside a step nothing breaks into waits for its
+end: the marker type's import (~27 ms of compiles, /opt/ros ships no
+`.pyc`) kept one waiting 3-5 ms, up to 17 ms with the Jetson loaded, once
+a run; a publish holds it about a millisecond, the lid spot's with its map
+about 2 ms, once, as the carry flies (2026-10-28). A run that ends on a
+Ctrl+C publishes nothing more. Without `RAMMP_BOX_OPENING_VIZ=1` in the
+task's environment (the default), the viz is not even loaded, nor its
+thread started.
+
+The segmenter's detections themselves (`/perception/object_detections`)
+do not decode in Foxglove: the bridge's image lacks
+`rammp_perception_interfaces` (a rammp-deployments fix). Its overlay image
+shows them.
+
 ## 5. Retired: the Phase-1 primitive ladder
 
 The per-primitive CLIs (approach / press / grasp / lift / place /

@@ -54,6 +54,7 @@ sent to the driver: the client is not armed.
 
 import argparse
 import math
+import os
 import sys
 import threading
 import time
@@ -71,6 +72,7 @@ from rammp_box_opening.constants import (
     SEARCH_SPEED,
     TRANSIT_SPEED,
     state_dir,
+    viz_enabled,
 )
 from rammp_box_opening.geometry import ang_diff, yaw_about_world_z
 from rammp_box_opening.models.container import (
@@ -258,6 +260,112 @@ def _table_offset_words(off, off_raw):
     return ""
 
 
+# perception/viz, the run's perception drawn for Foxglove, is never loaded
+# by the mission's thread: start_viz only starts the viz's own thread
+# (_run_viz), and only with it on, and that thread loads it once the
+# mission's thread waits. Loaded at a module level it was ~4 ms of every
+# launch, on or off; in start_viz ~1.8 ms with it on (reviews 2026-10-28).
+# A run with it off — the default (constants.viz_enabled) — never loads it,
+# and every hook (viz_hook) is then a dict lookup
+VIZ_MODULE = "rammp_box_opening.perception.viz"
+# The viz's thread loads it at the first VIZ_BOOT_S in which the mission's
+# thread ran under VIZ_BOOT_RUN_FRAC of the time (thread_runtime): the
+# viz's own gate (viz.PERIOD_S, viz.IDLE_RUN_FRAC), which is not loaded yet
+VIZ_BOOT_S = 0.25
+VIZ_BOOT_RUN_FRAC = 0.2
+_VIZ_STOPPED = None  # the started viz thread's stop (an Event): stop_viz sets it
+
+
+def thread_runtime(tid):
+    """A callable saying how long (ns) thread `tid` of this process has run
+    (/proc/self/task/<tid>/schedstat, read with one pread), or None where
+    the kernel does not keep it."""
+    try:
+        fd = os.open("/proc/self/task/%d/schedstat" % int(tid), os.O_RDONLY)
+    except OSError:
+        return None
+
+    def ran():
+        return int(os.pread(fd, 64, 0).split()[0])
+
+    try:
+        ran()
+    except (OSError, ValueError, IndexError):
+        os.close(fd)
+        return None
+    return ran
+
+
+def start_viz(node, model, frame, env=None):
+    """perception/viz for this run on `node`, when it is turned on
+    ($RAMMP_BOX_OPENING_VIZ=1, constants.viz_enabled: off by default) and
+    `node` can publish (else said): a thread of its own started (~0.3 ms)
+    and nothing more — that thread loads the module and runs the viz
+    (_run_viz). Its stop (an Event), else None."""
+    global _VIZ_STOPPED
+    if _VIZ_STOPPED is not None:
+        stop_viz(False)  # one viz at a time
+    if not viz_enabled(env):
+        return None
+    if not callable(getattr(node, "create_publisher", None)):
+        print("[viz] (no Foxglove view of this run: %s publishes nothing)" % type(node).__name__)
+        return None
+    stopped = threading.Event()
+    threading.Thread(target=_run_viz, args=(node, model, frame, threading.get_native_id(), stopped, env),
+                     name="viz", daemon=True).start()
+    _VIZ_STOPPED = stopped
+    return stopped
+
+
+def _run_viz(node, model, frame, mission, stopped, env):
+    """The viz's thread: perception/viz loaded once the mission's thread
+    (native id `mission`) waits — a VIZ_BOOT_S it ran under
+    VIZ_BOOT_RUN_FRAC of — then the viz run on this thread until stop_viz
+    (viz.run, the gate reading that thread's run time); nothing at all once
+    `stopped`. Never raises."""
+    try:
+        ran = thread_runtime(mission)
+        last = None if ran is None else (ran(), time.monotonic())
+        while not stopped.wait(VIZ_BOOT_S):
+            if ran is None:
+                break  # no reading, no gate (viz's own)
+            now = (ran(), time.monotonic())
+            if now[0] - last[0] < VIZ_BOOT_RUN_FRAC * (now[1] - last[1]) * 1e9:
+                break
+            last = now
+        if stopped.is_set():
+            return
+        from rammp_box_opening.perception import viz
+
+        viz.run(node, model, frame, ran, stopped, env=env)
+    except Exception as e:  # noqa: BLE001 -- no viz is no reason to stop a run
+        print("[viz] (no Foxglove view of this run: %s)" % (str(e) or type(e).__name__))
+
+
+def viz_hook(name, *args):
+    """perception/viz's entry point `name` (scene, aim, press, grip, spot)
+    called with `args` once the viz runs (viz._VIZ, set last: never a module
+    still loading), else nothing. None of them raises or waits: each hands
+    over what was computed anyway."""
+    viz = sys.modules.get(VIZ_MODULE)
+    if viz is not None and getattr(viz, "_VIZ", None) is not None:
+        getattr(viz, name)(*args)
+
+
+def stop_viz(last=True):
+    """The viz stopped (viz.stop: `last`, after it published what the run
+    left; not `last` — the run unwinds from a Ctrl+C — at once); its thread,
+    should it not have started the viz yet, never does."""
+    global _VIZ_STOPPED
+    stopped, _VIZ_STOPPED = _VIZ_STOPPED, None
+    if stopped is None:
+        return
+    stopped.set()
+    stop = getattr(sys.modules.get(VIZ_MODULE), "stop", None)  # None: not loaded, or still loading
+    if stop is not None:
+        stop(last)
+
+
 def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=None, tag="aim", out=None,
                           lid_z=None, prior_xy=None, min_hits=None):
     """The wrist's press aim: the button's circle alone (owner's design
@@ -283,7 +391,9 @@ def aim_button_at_staging(node, watcher, yaw, timeout_s=STAGING_FIX_S, runner=No
     while time.monotonic() - t0 < timeout_s:
         _spin_detect(node)
         n0 = getattr(aimer, "frames", None)
-        if aimer.tick():
+        fixed = aimer.tick()
+        viz_hook("aim", aimer, fixed, n0, tag)  # the frame it judged and what it found, drawn off this thread
+        if fixed:
             xyz = aimer.fix()  # its z raised by the wrist's table offset, where that is agreed
             measured = aimer.fix(measured=True)
             agreeing = aimer.fix_hits()  # which hits the fix was made from
@@ -922,6 +1032,7 @@ def scene_detect_report(locator, duration_s=DETECT_REPORT_S):
     said = None
     while time.monotonic() - t0 < duration_s:
         fix = locator.locate(min(SCENE_LOCATE_S, max(0.5, duration_s - (time.monotonic() - t0))))
+        viz_hook("scene", locator, fix)  # what it judged, drawn off this thread (perception/viz)
         if fix is None:
             if locator.last_why != said:  # a refusal repeats every OWL tick: say it once
                 print("[press_demo]   no fix: %s" % locator.last_why)
@@ -1188,6 +1299,12 @@ def main():
         from rammp_box_opening.perception.owl_source import announce_container
 
         announce_container(pnode, cfg_path)
+        # what the perception sees and decides, drawn for Foxglove on a thread
+        # of its own (perception/viz), which loads it once this thread waits:
+        # nothing here waits on it, and starting it is that thread's start.
+        # Only with RAMMP_BOX_OPENING_VIZ=1: off (the default), the module is
+        # not even loaded
+        start_viz(pnode, model, worlds.base_frame)
 
         # the wrist camera's frames: the aim from the look pose
         # (aim_button_at_staging) and the wrist-mount observation
@@ -1296,6 +1413,7 @@ def main():
         # scene fix, and the run stops.
         t_scene = time.monotonic()
         scene_fix = locator.locate(SCENE_FIRST_LOCATE_S)
+        viz_hook("scene", locator, scene_fix)  # what it judged, drawn off this thread (perception/viz)
         if ctx.mission_frames is not None:
             ctx.mission_frames.scene(
                 scene_frame(locator.grab, locator.base_to_link()),
@@ -1368,21 +1486,32 @@ def main():
         sys.exit(130)  # the abort path already reported what was confirmed
     finally:
         ending = sys.exc_info()[1]  # how the run ended, for its record
-        # Stop the perception thread BEFORE the interpreter tears rclpy
-        # down: an executor still inside spin() on another thread at exit
-        # ends in "terminate called without an active exception" and an
-        # abort that eats the exit code (field 2026-09-16).
-        pexec.shutdown()
-        pthread.join(timeout=3.0)
         try:
-            pexec.remove_node(pnode)
-            pnode.destroy_node()
-        except Exception:
-            pass
-        # the run is over and the arm stopped: now the last arrival's settle
-        # is noted, from what was heard (runner.flush), and its frames written
-        runner.flush()
-        keep_mission_frames(getattr(ctx, "mission_frames", None), ending)
+            # the console as it was, before the node the viz's publishers
+            # live on goes, and the viz's thread stopped (never left inside
+            # OpenCV for the interpreter's teardown, a second Ctrl+C or
+            # not); a run unwinding from a Ctrl+C (the 130 above) publishes
+            # nothing more
+            ctrl_c = isinstance(ending, KeyboardInterrupt) or isinstance(
+                getattr(ending, "__context__", None), KeyboardInterrupt)
+            stop_viz(not ctrl_c)
+        finally:
+            # Stop the perception thread BEFORE the interpreter tears rclpy
+            # down: an executor still inside spin() on another thread at exit
+            # ends in "terminate called without an active exception" and an
+            # abort that eats the exit code (field 2026-09-16). Whatever the
+            # viz's stop did — a second Ctrl+C in it included.
+            pexec.shutdown()
+            pthread.join(timeout=3.0)
+            try:
+                pexec.remove_node(pnode)
+                pnode.destroy_node()
+            except Exception:
+                pass
+            # the run is over and the arm stopped: now the last arrival's settle
+            # is noted, from what was heard (runner.flush), and its frames written
+            runner.flush()
+            keep_mission_frames(getattr(ctx, "mission_frames", None), ending)
 
 
 if __name__ == "__main__":

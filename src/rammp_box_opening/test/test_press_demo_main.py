@@ -332,6 +332,35 @@ def test_the_wrist_mount_observation_flies_the_look_pose_from_the_exact_rest_pos
     assert previewed == ["look"]
 
 
+def test_the_perception_executor_shuts_down_whatever_the_viz_stop_does(monkeypatch, tmp_path):
+    """The finally stops the viz first, then the perception executor: a
+    second Ctrl+C in the viz's stop (KeyboardInterrupt regardless,
+    runtime/abort) must not skip the executor's shutdown, or the
+    interpreter tears rclpy down under a live spin. A run that unwinds from
+    a Ctrl+C asks the viz for nothing more (last=False)."""
+    from rammp_box_opening.tasks import press_demo
+
+    calls = []
+    monkeypatch.setattr(_Exec, "shutdown", lambda self: calls.append("shutdown"))
+
+    def stop(last=True):
+        calls.append(("stop", last))
+        raise KeyboardInterrupt  # viz.stop lets none out (test_viz); the finally holds without that
+
+    monkeypatch.setattr(press_demo, "stop_viz", stop)
+    with pytest.raises(KeyboardInterrupt):
+        run_main(monkeypatch, tmp_path, ["--press-only"], _at_staging())
+    assert calls == [("stop", True), "shutdown"]
+    calls.clear()
+    monkeypatch.setattr(press_demo, "stop_viz", lambda last=True: calls.append(("stop", last)))
+
+    def ctrl_c(ctx):
+        raise KeyboardInterrupt
+
+    code, _c, _rows = run_main(monkeypatch, tmp_path, ["--press-only"], ctrl_c)
+    assert code == 130 and calls == [("stop", False), "shutdown"]
+
+
 """main()'s shape around the perception thread, read from its source (no
 rclpy): once the thread spins, every exit — a failed startup included — must
 pass through the finally that stops it, or the interpreter tears rclpy down
