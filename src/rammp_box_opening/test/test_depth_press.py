@@ -952,13 +952,17 @@ def test_a_line_up_that_does_not_fly_falls_back_to_the_back_off_and_logs_each_re
         ctx, monkeypatch, tmp_path, capsys, compliant):
     """A compliant run's clear goes up and back toward the arm
     (rp.clear_targets): where neither of its lines flies, the same back-off
-    as a guarded run's, unguarded. The back-off says what the planner
-    refused, not always "inside the box's padded volume"."""
+    as a guarded run's, unguarded, and at a guarded run's FREE_LINE_SPEED,
+    not a compliant run's faster free-air lines': it flies where the planner
+    refused the start, the arm perhaps inside the box's padded volume. The
+    back-off says what the planner refused, not always "inside the box's
+    padded volume"."""
     import json
 
     import test_reach_press as trp
     from test_reach_press import _Chain
 
+    from rammp_box_opening.constants import FREE_LINE_SPEED
     from rammp_box_opening.worlds import planned_top_z
 
     real = _Chain.straight_line
@@ -980,6 +984,7 @@ def test_a_line_up_that_does_not_fly_falls_back_to_the_back_off_and_logs_each_re
     clear, = [r for r in rows if r["leg"] == "depth_clear"]
     assert clear["flown"] is False and "joint_6 limit" in clear["why"]
     assert (rec.legs["reach:back-off"].guard is None) is compliant
+    assert rec.legs["reach:back-off"].speed == FREE_LINE_SPEED
     ups = [xyz for xyz, _q in chain.lines if xyz[2] > 0.49]  # the clear's last, after the refused move to the look
     top = planned_top_z(ctx.model, ctx.cpose)
     if compliant:
@@ -1347,7 +1352,10 @@ def test_a_compliant_press_is_one_stroke_held_and_back_up_with_no_look_and_no_gu
     there — under the STIFF tuning, is held, and comes back up to where it
     began. No look (the harness has none to give), no guard on any leg.
     The stroke meets the box by design: from it on every world, home's
-    included, pads the box for a shove, as a guarded touch does."""
+    included, pads the box for a shove, as a guarded touch does. The turn
+    before it and the rise after it, in free air, fly at a compliant run's
+    COMPLIANT_FREE_LINE_SPEED."""
+    from rammp_box_opening.constants import COMPLIANT_FREE_LINE_SPEED
     from rammp_box_opening.primitives.core import CONTACT_SHIFT_PAD_M
 
     cfg = load_press_demo(PINK)
@@ -1360,6 +1368,7 @@ def test_a_compliant_press_is_one_stroke_held_and_back_up_with_no_look_and_no_gu
     # half their speed (owner 2026-10-28): 0.075 and 0.175 for the pink box
     assert legs["depth:press"].speed == dp.COMPLIANT_STROKE_SLOWDOWN * dp.TOUCH_SPEED == pytest.approx(0.075)
     assert legs["depth:approach"].speed == dp.COMPLIANT_STROKE_SLOWDOWN * cfg.press_speed == pytest.approx(0.175)
+    assert legs["depth:turn"].speed == legs["depth:rise"].speed == COMPLIANT_FREE_LINE_SPEED
     k = note["stiffness_n_per_m"]
     over = min(max(dp.COMPLIANT_PRESS_N / k, dp.COMPLIANT_OVERSHOOT_M[0]), dp.COMPLIANT_OVERSHOOT_M[1])
     assert note["end_z"] == pytest.approx(COMPLIANT_TOP - cfg.button_travel_m - over, abs=1e-4)
@@ -1670,11 +1679,12 @@ def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx,
     stroke or the way up, and the press stroked and judged at the higher
     top — the scene camera's, as at 15:19 when the wrist's aim stood 24 mm
     low and the touch met the scene's. With no guard to stop them in time,
-    the free-air lines fly at FREE_LINE_SPEED, not the CONTACT_SPEED 16:23
-    crawled 10.5 s of them at, and each is labelled with the full world:
-    the runner refuses an unguarded leg faster than CONTACT_SPEED in any
-    other (spec §6), and the arm would hold at the look pose with nothing
-    pressed. The clear before home goes up and back toward the arm
+    the free-air lines fly at COMPLIANT_FREE_LINE_SPEED — not the
+    CONTACT_SPEED 16:23 crawled 10.5 s of them at, nor a guarded run's
+    FREE_LINE_SPEED — and each is labelled with the full world: the runner
+    refuses an unguarded leg faster than CONTACT_SPEED in any other (spec
+    §6), and the arm would hold at the look pose with nothing pressed. The
+    clear before home goes up and back toward the arm
     (rp.clear_targets), planned while the way in flew (rp.plan_way_out):
     with the hand straight down, CLEAR_EXTRA_M over HOME_CLEAR_M and
     CLEAR_BACK_M back. Straight down already within TOUCH_SLOW_M of the
@@ -1683,7 +1693,7 @@ def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx,
 
     import test_reach_press as trp
 
-    from rammp_box_opening.constants import FREE_LINE_SPEED
+    from rammp_box_opening.constants import COMPLIANT_FREE_LINE_SPEED
     from rammp_box_opening.worlds import planned_top_z
 
     monkeypatch.setattr(trp._Chain, "R", trp.STRAIGHT_DOWN)
@@ -1695,7 +1705,7 @@ def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx,
     assert all(rec.legs[n].guard is None for n in ("reach:re-aim", "reach:slide-in", "depth:turn", "depth:press",
                                                    "depth:clear"))
     for n in ("reach:re-aim", "reach:slide-in", "depth:turn", "depth:clear"):
-        assert rec.legs[n].speed == FREE_LINE_SPEED and rec.legs[n].world.startswith("full"), (
+        assert rec.legs[n].speed == COMPLIANT_FREE_LINE_SPEED and rec.legs[n].world.startswith("full"), (
             n, rec.legs[n].speed, rec.legs[n].world)
     up = [xyz for xyz, _q in chain.lines][-1]  # from the fake fk's (0.5, -0.4, 0.45)
     u = np.asarray(ctx.cpose.xyz[:2]) / np.hypot(*ctx.cpose.xyz[:2])
@@ -1717,10 +1727,10 @@ def test_a_compliant_reach_out_reads_nothing_at_rest_and_no_leg_can_stop_it(ctx,
 def test_a_compliant_walk_in_flies_at_the_free_line_speed_too(ctx, monkeypatch, tmp_path):
     """Where the slide in turns the hand down on the way (the walk, as at
     20:04), the walk is the compliant run's slide in: unguarded, at
-    FREE_LINE_SPEED, labelled with the full world, and not refused."""
+    COMPLIANT_FREE_LINE_SPEED, labelled with the full world, and not refused."""
     import test_reach_press as trp
 
-    from rammp_box_opening.constants import FREE_LINE_SPEED
+    from rammp_box_opening.constants import COMPLIANT_FREE_LINE_SPEED
 
     monkeypatch.setattr(trp._Chain, "walk", lambda self, q0, xyz, quat, **k: ([list(q0), [v + 0.01 for v in q0]], None),
                         raising=False)
@@ -1730,7 +1740,28 @@ def test_a_compliant_walk_in_flies_at_the_free_line_speed_too(ctx, monkeypatch, 
                           "depth:press", "depth:clear", "home"]
     leg = rec.legs["reach:slide-in"]
     assert rp._rot(leg.target[2])[2, 2] == pytest.approx(-1.0)  # the walk's: the hand turned straight down
-    assert leg.guard is None and leg.speed == FREE_LINE_SPEED and leg.world.startswith("full"), (leg.speed, leg.world)
+    assert leg.guard is None and leg.speed == COMPLIANT_FREE_LINE_SPEED and leg.world.startswith("full"), (
+        leg.speed, leg.world)
+
+
+def test_a_compliant_way_in_flown_leg_by_leg_flies_its_free_air_lines_at_the_compliant_speed_too(
+        ctx, monkeypatch, tmp_path):
+    """Where the way in's legs do not make one execution (_not_one_execution)
+    a press-only compliant run flies them leg by leg, each solved again from
+    where the arm stands: the re-aim, the slide in, the press, then the
+    clear before home (_clear_up_and_back). Its free-air lines fly as the one
+    execution's do — unguarded, at COMPLIANT_FREE_LINE_SPEED — never at the
+    CONTACT_SPEED or FREE_LINE_SPEED of a guarded run."""
+    from rammp_box_opening.constants import COMPLIANT_FREE_LINE_SPEED
+
+    monkeypatch.setattr(rp, "_not_one_execution", lambda ctx_, legs: "its legs do not meet")
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True)
+    assert code == 0 and got["compliant"] and got["client_compliant"] and rec.reads == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", "reach:re-aim", "reach:slide-in", "depth:clear", "home"]
+    for n in ("reach:re-aim", "reach:slide-in", "depth:clear"):
+        lg = rec.legs[n]
+        assert lg.guard is None and lg.speed == COMPLIANT_FREE_LINE_SPEED and lg.world.startswith("full"), (
+            n, lg.speed, lg.world)
 
 
 def test_a_compliant_reach_out_primes_the_impedance_once_before_the_reach_is_planned(ctx, monkeypatch, tmp_path,
@@ -1768,6 +1799,48 @@ def test_a_compliant_reach_out_primes_the_impedance_once_before_the_reach_is_pla
     assert primed_by_then == 1 and first_from == q0  # ... primed before the reach is planned from it
     assert list(rec.legs["reach:look"].traj.points[0].positions) == q0  # the look starts at the hold
     assert "the driver enters its joint impedance now, while the reach is planned" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("compliant", [False, True])
+def test_a_reach_out_re_times_every_motion_on_its_own_runs_profile(ctx, monkeypatch, tmp_path, compliant):
+    """press_demo builds the runner on a position client; run_reach_press
+    makes the client compliant only then, and puts it back when the run
+    ends. Every motion a compliant reach-out re-times — the look, the way in,
+    the way out — eases at COMPLIANT_ACCEL / COMPLIANT_DECEL under the
+    wrist's COMPLIANT_QD_CEILING (Runner.retime_params reads the flag at
+    each re-timing: a flag kept from when the runner was built would fly
+    the whole run on the position profile); a guarded one, in position,
+    keeps RetimeParams' and no ceiling."""
+    from rammp_box_opening.constants import COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING
+    from rammp_box_opening.runtime import runner as runner_mod
+    from rammp_box_opening.runtime.retime import RetimeParams
+
+    seen = []  # the profile each re-timing is handed: a group's, in flight and preview, and a free-air line's
+    in_line = []
+    real_group, real_line = runner_mod.retime_group, runner_mod.line_profile
+
+    def retime_group(trajs, speeds, vmax, params=RetimeParams()):
+        if not in_line:  # line_profile's own re-timings scale the ease by the line's speed: what it is handed counts
+            seen.append(params)
+        return real_group(trajs, speeds, vmax, params)
+
+    def line_profile(leg, params, time_scale=1.0):
+        seen.append(params)
+        in_line.append(leg)
+        try:
+            return real_line(leg, params, time_scale)
+        finally:
+            in_line.pop()
+
+    monkeypatch.setattr(runner_mod, "retime_group", retime_group)
+    monkeypatch.setattr(runner_mod, "line_profile", line_profile)
+    assert not getattr(ctx.client, "compliant", False)  # as press_demo built its runner
+    code, rec, _chain, _h, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=compliant)
+    assert code == 0 and got["client_compliant"] is compliant and seen
+    plain = RetimeParams()
+    want = (COMPLIANT_ACCEL, COMPLIANT_DECEL, COMPLIANT_QD_CEILING) if compliant else (plain.accel, plain.decel, None)
+    assert {(p.accel, p.decel, p.qd_ceiling) for p in seen} == {want}
+    assert not ctx.client.compliant  # put back once the run is over
 
 
 def test_a_guarded_reach_out_is_as_before(ctx, monkeypatch, tmp_path):
@@ -1906,7 +1979,7 @@ def test_a_compliant_reach_out_flies_its_way_in_as_one_execution(ctx, monkeypatc
 
     import test_reach_press as trp
 
-    from rammp_box_opening.constants import FREE_LINE_SPEED
+    from rammp_box_opening.constants import COMPLIANT_FREE_LINE_SPEED
     from rammp_box_opening.runtime.legs import merge_groups
 
     cfg = load_press_demo(PINK)
@@ -1923,14 +1996,14 @@ def test_a_compliant_reach_out_flies_its_way_in_as_one_execution(ctx, monkeypatc
     for lg in legs:
         assert lg.guard is None and lg.gains == dp.COMPLIANT_GAINS and lg.plan_free and lg.world.startswith("full"), (
             lg.name, lg.guard, lg.gains, lg.world)
-    speeds = {n: FREE_LINE_SPEED for n in way_in[:-2]}
+    speeds = {n: COMPLIANT_FREE_LINE_SPEED for n in way_in[:-2]}
     speeds.update({"depth:approach": dp.COMPLIANT_STROKE_SLOWDOWN * cfg.press_speed,
                    "depth:press": dp.COMPLIANT_STROKE_SLOWDOWN * dp.TOUCH_SPEED})
     assert {lg.name: lg.speed for lg in legs} == speeds
     # then the rise back up to where the stroke began, the clear and home: one run, one execution
     assert rec.runs[-1] == (["depth:rise", "depth:clear", "home"], [dp.COMPLIANT_GAINS])
     rise = rec.legs["depth:rise"]
-    assert rise.gains == dp.COMPLIANT_GAINS and rise.speed == FREE_LINE_SPEED and rise.guard is None
+    assert rise.gains == dp.COMPLIANT_GAINS and rise.speed == COMPLIANT_FREE_LINE_SPEED and rise.guard is None
     assert list(rise.traj.points[0].positions) == list(legs[-1].traj.points[-1].positions)
     assert rise.target[1] == pytest.approx(list(got["stroke"].t0))
     # the hold judged the stroke that flew, at the button's top
@@ -2455,9 +2528,9 @@ def test_a_compliant_clear_from_a_leaning_hand_rises_as_far_as_the_lean_needs_an
     spheres, 0.045 sin 30 deg lower than straight down, stood 7 mm inside
     it: home INVALID_START, then a 15 cm back-off. Now one line, the hand's
     attitude held, to HOME_CLEAR_M + 0.045 sin 30 deg + 0.005 over it and
-    50 mm back toward the arm: unguarded, at FREE_LINE_SPEED, in the full
-    world."""
-    from rammp_box_opening.constants import FREE_LINE_SPEED
+    50 mm back toward the arm: unguarded, at COMPLIANT_FREE_LINE_SPEED, in
+    the full world."""
+    from rammp_box_opening.constants import COMPLIANT_FREE_LINE_SPEED
     from rammp_box_opening.worlds import planned_top_z
 
     R30 = _tilted30()
@@ -2465,7 +2538,7 @@ def test_a_compliant_clear_from_a_leaning_hand_rises_as_far_as_the_lean_needs_an
     assert got is True
     (leg,) = flown
     assert leg.name == "depth:clear" and leg.plan_free
-    assert leg.speed == FREE_LINE_SPEED and leg.guard is None and leg.world.startswith("full"), (
+    assert leg.speed == COMPLIANT_FREE_LINE_SPEED and leg.guard is None and leg.world.startswith("full"), (
         leg.speed, leg.guard, leg.world)
     (xyz, quat), = chain.lines
     u = np.asarray(ctx.cpose.xyz[:2]) / np.hypot(*ctx.cpose.xyz[:2])
@@ -3059,7 +3132,7 @@ def test_a_compliant_reach_out_flies_from_the_button_to_home_as_one_execution(ct
     planner asked after the hold."""
     import json
 
-    from rammp_box_opening.constants import FREE_LINE_SPEED
+    from rammp_box_opening.constants import COMPLIANT_FREE_LINE_SPEED
     from rammp_box_opening.primitives.core import CONTACT_SHIFT_PAD_M
 
     code, rec, _chain, home, got = _depth_flow(ctx, monkeypatch, tmp_path, _popped, compliant=True,
@@ -3072,7 +3145,7 @@ def test_a_compliant_reach_out_flies_from_the_button_to_home_as_one_execution(ct
         assert list(b.traj.points[0].positions) == list(a.traj.points[-1].positions), (a.name, b.name)
     for lg in legs:
         assert lg.guard is None and lg.gains == dp.COMPLIANT_GAINS and lg.world.startswith("full"), lg.name
-    assert rec.legs["depth:rise"].speed == rec.legs["depth:clear"].speed == FREE_LINE_SPEED
+    assert rec.legs["depth:rise"].speed == rec.legs["depth:clear"].speed == COMPLIANT_FREE_LINE_SPEED
     # home was planned from the clear's end while the way in flew — the way in handed over, the arm still at
     # its start, nothing of the way home yet — around the box padded for the stroke's shove
     assert home["start"] == list(rec.legs["depth:clear"].traj.points[-1].positions)

@@ -38,6 +38,19 @@ def test_fk_matches_the_planner_at_a_press_staging(chain):
     assert np.allclose(_R[:, 2], [0.0, 0.0, -1.0], atol=2e-3)  # tool down
 
 
+def test_the_tools_of_many_readings_at_once_are_fk_row_by_row():
+    """The run record's settle note puts the tool of a window of
+    /joint_states readings against its end (runtime/runner): all at once,
+    the same numbers fk() gives one by one, on both chains."""
+    rng = np.random.default_rng(7)
+    qs = rng.uniform(-3.2, 3.2, size=(40, 7))
+    for arm in (ArmChain(), ArmChain(FLATBOT_URDF, root="arm_mount")):
+        many = arm.tool_positions(qs)
+        assert many.shape == (40, 3)
+        assert np.allclose(many, [arm.fk(q)[1] for q in qs], atol=1e-12)
+        assert arm.tool_positions(np.zeros((0, 7))).shape == (0, 3)
+
+
 def test_the_line_is_straight_and_holds_the_attitude(chain):
     # the planner's waypoint joints 60 mm above the press target for the
     # bearing -15 deg box (live probe 2026-09-16)
@@ -68,6 +81,28 @@ def test_an_unreachable_line_is_refused_with_a_reason(chain):
     _R0, t0 = chain.fk(q_start)
     pts, why = chain.straight_line(q_start, [t0[0] + 1.5, t0[1], t0[2]], [1.0, 0.0, 0.0, 0.0])
     assert pts is None and why
+
+
+def test_the_reach_bound_never_refuses_a_pose_the_arm_holds():
+    """past_reach_m on flatbot's URDF: the tool pose any joint values hold
+    reads at or inside the reach — the arm stretched straight within 6 mm
+    of it, its links' offsets — and the same tool 0.5 m further out, joint_6
+    moved straight away from the shoulder, reads 0.5 m further past."""
+    arm = ArmChain(path=FLATBOT_URDF, root="arm_mount")
+    rng = np.random.default_rng(0)
+    worst = -1.0
+    for q in rng.uniform(-math.pi, math.pi, (2000, 7)):
+        R, t = arm.fk(q)
+        worst = max(worst, arm.past_reach_m(t, mat_to_quat_xyzw(R)))
+    assert worst <= 0.0
+    R, t = arm.fk([0.0] * 7)  # every link in line
+    assert -0.006 < arm.past_reach_m(t, mat_to_quat_xyzw(R)) <= 0.0
+    R, t = arm.fk(HOME)
+    quat = mat_to_quat_xyzw(R)
+    p = arm.points(HOME)
+    away = (p[5] - p[1]) / np.linalg.norm(p[5] - p[1])  # joint_6's origin, from joint_2's
+    assert arm.past_reach_m(t + 0.5 * away, quat) == pytest.approx(arm.past_reach_m(t, quat) + 0.5, abs=1e-3)
+    assert float(np.linalg.norm(p[-1] - p[5])) == pytest.approx(0.2875, abs=5e-4)  # the wrist, back from tool_frame
 
 
 def test_the_same_reach_question_twice_is_walked_once(monkeypatch):

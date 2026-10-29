@@ -377,6 +377,20 @@ mount, `--press-only` for the press, the full run for the lid.
   held, obstruction-guarded — anything met on the way UP stops it), then
   HOME planned from where the lift ends. Straight up is the one direction
   that cannot meet the table; keep the space above the fingers clear.
+- "[client] plan refused: the plan ends N rad from its joint goal (joint
+  J; goal_mismatch_rad …)", "… N mm and D deg from its pose …" or "… goes
+  the long way round …" → the planner called a plan a success that does
+  not end where it was asked (PlanToJoints' FK-pose fallback, another arm
+  at the same tool pose; or cuRobo's previous plan handed back,
+  rammp-curobo #37), or that turns a joint the long way round. Nothing
+  flies it: whatever planned the leg takes it as a failed plan (the next
+  tilt, the pose plan, a home that holds). `home_arm` stops on it too
+  rather than re-plan blind in the bare world: try `--lift-first 0.08`,
+  or jog the arm. Keep the run record (the leg's `plan.refused`, a
+  `home_refused` or `replan_failed` note) and `~/.sheppy/logs/planner/`.
+- "[client] planner busy (another goal is planning) — asking again in
+  0.2 s (1/2)" → teleop, the microwave engine or a GoTo was planning at
+  the same moment. The goal is asked twice more, then fails as before.
 - press_demo refuses to start "N rad from any rest pose" → the previous
   run ended badly. Recover with `home_arm --execute` before anything
   else; never plan a mission from wreckage.
@@ -480,6 +494,14 @@ mount, `--press-only` for the press, the full run for the lid.
   not up (…): pressing once more — the same press, from the look pose" →
   the first press did not pop it; "STOP: pressed 2 times and the knob is
   not up" → the button did not pop under the spring's push: check the box.
+- "AFTER PRESS N: knob …, and its LID ROSE +M mm — the box is open" → the
+  press let the lid go, the button where it was aimed. With the knob UP
+  the grip goes by the lid where it now stands. With the knob not up
+  (flush) it is "STOP: the lid rose +M mm (released) but its knob is not
+  up (…)" and home, the box left open: the fingers have nothing to hold,
+  and a released lid is not pressed again (pushing it down may latch it).
+  Lift the lid off by hand, or shut it, before the next run: its aim takes
+  a flush knob for a shut box and would press it.
 - "scene camera: … — reaching out to its box anyway" → on the last run
   that recorded a scene-versus-wrist pair the scene camera's box stood
   more than 5 cm from the button the wrist found. Those pairs were
