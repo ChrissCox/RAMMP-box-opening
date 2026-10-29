@@ -498,6 +498,36 @@ def test_the_spot_look_takes_the_first_frame_shot_once_the_arm_stands_still(monk
     assert got == ("points of", 850_000_000)
 
 
+def test_the_lid_s_spot_is_mapped_and_its_carry_planned_from_where_the_arm_stood_still(ctx, monkeypatch, tmp_path):
+    """The joints the wrist's frame is mapped from (spot_map) and the carry
+    planned from (spot_candidates, plan_carry) are read after the spot
+    look's wait for a still arm, where its frame was shot: not before it,
+    the arm still settling from the lift and the clear."""
+    from rammp_box_opening.runtime.runner import Runner
+    from rammp_box_opening.tasks import press_demo as pd
+
+    stood = [0.01 * (k + 1) for k in range(7)]
+    seen = []
+
+    def look(node, watcher, runner_):
+        ctx.client.live = list(stood)  # the arm came to rest while the spot look waited
+        return None
+
+    def candidates(ctx_, tmap, table_z, q, seeds=()):
+        seen.append(("spot_candidates", list(q)))
+        yield SimpleNamespace(xyz=(0.45, -0.25, -0.027)), "beside the box", "beside the box"
+
+    monkeypatch.setattr(rlo, "spot_look", look)
+    monkeypatch.setattr(rlo, "spot_map", lambda ctx_, wrist, q, *rest: seen.append(("spot_map", list(q))))
+    monkeypatch.setattr(rlo, "spot_candidates", candidates)
+    monkeypatch.setattr(pd, "adopt_seen", lambda *a, **k: None)
+    monkeypatch.setattr(rlo, "plan_carry", lambda ctx_, cfg_, q, drop: (seen.append(("plan_carry", list(q))),
+                                                                        (None, "refused"))[1])
+    eyes = (None, SimpleNamespace(table_z=-0.027), None, None)
+    assert rlo.choose_and_carry(ctx, load_press_demo(PINK), Runner(ctx.client, log_dir=tmp_path), eyes) == 1
+    assert seen == [("spot_map", stood), ("spot_candidates", stood), ("plan_carry", stood)]
+
+
 def test_the_fingers_close_on_the_knob_once_the_arm_stands_still(ctx, monkeypatch, tmp_path):
     """16:23 2026-10-28: grip:close went out about 30 ms after the way down
     to the knob "arrived" — its trajectory's clock run out, the arm 2.3 mm

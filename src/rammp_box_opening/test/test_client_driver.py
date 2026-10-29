@@ -1317,8 +1317,9 @@ def test_the_creep_after_the_look_is_not_still_and_the_arm_at_rest_after_it_is(m
     frames while joint_2 crept back. Every joint under STILL_QD_RAD_S for
     STILL_HOLD_S is still — not the one reading under it where joint_2
     turns back, but the fifth in a row from +0.72 s, the 40th reading (the
-    bag's +0.80 s, the tool 0.5 mm from where it came to rest). Nothing
-    goes to the driver: the wait only spins the node."""
+    bag's +0.80 s: the creep over, joint_6 between two swings, the tool
+    1.2 mm from where it stood when the way in left). Nothing goes to the
+    driver: the wait only spins the node."""
     c, clock = _still_stream(monkeypatch, LOOK_1545)
     waited, timed_out = c.wait_still()
     assert not timed_out
@@ -1373,6 +1374,37 @@ def test_the_wait_runs_out_carries_on_and_says_so_in_one_line(monkeypatch, capsy
     assert c.wait_still()[1]
     assert capsys.readouterr().out.splitlines() == [
         "[client] the arm is not still after 1.2 s (no /joint_states reading says how fast it moves) — carrying on"]
+
+
+def test_a_ctrl_c_while_the_arm_settles_ends_the_run_as_a_ctrl_c(monkeypatch):
+    """No goal is in flight while the wait spins, so a Ctrl+C raises at once
+    (abort.sigint_handler), and raised inside a subscription's take it
+    surfaces as RuntimeError (press_demo._spin_detect): the wait hands it
+    on as the KeyboardInterrupt it is — main's exit 130, not a traceback.
+    A RuntimeError with no Ctrl+C behind it goes on as it is."""
+    from rammp_box_opening.runtime.abort import AbortFlag, sigint_handler
+
+    c, _clock = _still_stream(monkeypatch, [0.05] * 200)
+    c._abort = AbortFlag()
+    handler = sigint_handler(c._abort)
+
+    def ctrl_c_in_a_take(node, timeout_sec=0.0):
+        try:
+            handler(2, None)
+        except KeyboardInterrupt as e:
+            raise RuntimeError("the take failed") from e
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", ctrl_c_in_a_take)
+    with pytest.raises(KeyboardInterrupt):
+        c.wait_still()
+    c._abort = AbortFlag()  # nobody pressed Ctrl+C
+
+    def broken(node, timeout_sec=0.0):
+        raise RuntimeError("the context is gone")
+
+    monkeypatch.setattr(client_mod.rclpy, "spin_once", broken)
+    with pytest.raises(RuntimeError, match="the context is gone"):
+        c.wait_still()
 
 
 def test_still_is_the_newest_readings_each_joint_under_the_limit_none_further_apart_than_the_gap():

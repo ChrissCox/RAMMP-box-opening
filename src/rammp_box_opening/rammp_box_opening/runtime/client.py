@@ -399,20 +399,26 @@ class PlannerClient:
     # arm creeping 22-25 mm/s: on 2026-10-28 15:45 both looks arrived with
     # joint_2 45-47 mrad past their end and crept back at up to 0.12-0.13
     # rad/s, and at 16:23 the look's aim took its first two hits 0.32 and
-    # 0.41 s in, 7.2 and 5.5 mm off the two that agreed after them. On
-    # 15:45's /joint_states (49 Hz) the arm at rest read at most 0.0032
-    # rad/s on any joint in RIGID (50 s at HOME) and 0.0010 in POSITION
-    # (200 s), and the looks' creep read over STILL_QD_RAD_S to +0.70 s. A
-    # settling joint turns back through zero, one or two readings under it
-    # (the look's turn at +0.07 s, the way homes' at +0.70-0.73), where
-    # STILL_HOLD_S takes five in a row at 49 Hz: the looks passed at
-    # +0.80 s, the tool 0.5-0.6 mm from where it came to rest (within 1 mm
-    # from +0.60-0.62), the POSITION home at +0.10. Readings further apart
-    # than STILL_GAP_S make no one still stretch (the aim spins this node
-    # once a frame, and between frames messages are dropped): the arm
-    # swings at 0.7-1.1 Hz, its turns 0.45 s and more apart. The way homes,
-    # 86-88 mm short when they ended, passed only at +1.49-1.50 s: past
-    # STILL_TIMEOUT_S, and the wait carries on (no camera reads there).
+    # 0.41 s in, the knob -7.2 and -5.5 mm above its lid where the two that
+    # agreed after them read +1.1 and +0.7. On 15:45's /joint_states
+    # (49 Hz) the arm at rest read at most 0.0032 rad/s on any joint in
+    # RIGID (50 s at HOME) and 0.0010 in POSITION (200 s), and the looks'
+    # creep read over STILL_QD_RAD_S to +0.70 s. A settling joint turns
+    # back through zero, one or two readings under it (the look's turn at
+    # +0.07 s, the way homes' at +0.70-0.73), where STILL_HOLD_S takes five
+    # in a row at 49 Hz: the looks passed at +0.81 s, the POSITION home at
+    # +0.08 (+0.10 by positions). The looks' pass is the creep over, not
+    # the arm at its last rest: joint_6 stopped between two swings, the
+    # tool 1.2-1.5 mm from where it stood when the way in left (+1.4-1.6 s),
+    # drifting back at up to 5 mm/s (joint_6 at up to 0.012-0.017 rad/s),
+    # within 1 mm of it for good from +1.03-1.07 s — far inside the
+    # camera's still test, and each frame's pose is TF's at its stamp.
+    # Readings further apart than STILL_GAP_S make no one still stretch
+    # (the aim spins this node once a frame, and between frames messages
+    # are dropped): the arm swings at 0.7-1.1 Hz, its turns 0.45 s and more
+    # apart. The way homes, 86-88 mm short when they ended, passed only at
+    # +1.49-1.50 s: past STILL_TIMEOUT_S, and the wait carries on (no
+    # camera reads there).
     STILL_QD_RAD_S = 0.02
     STILL_HOLD_S = 0.08
     STILL_GAP_S = 0.25
@@ -427,13 +433,24 @@ class PlannerClient:
         once. Returns (s waited, timed out): after STILL_TIMEOUT_S it
         carries on, saying so in one line. Sends nothing and stops nothing:
         it spins this node while the arm settles (or the stream is
-        silent), no more."""
+        silent), no more.
+
+        No goal is in flight here, so a Ctrl+C raises at once
+        (abort.sigint_handler); raised inside a subscription's take it
+        surfaces as RuntimeError (press_demo._spin_detect), and goes on as
+        the KeyboardInterrupt it is: the run ends as a Ctrl+C (exit 130),
+        not a traceback."""
         t0 = time.monotonic()
         sent = self.goals_sent()
         since = sent[-1] if sent else None
         last = None
         while True:
-            rclpy.spin_once(self.node, timeout_sec=0.02)
+            try:
+                rclpy.spin_once(self.node, timeout_sec=0.02)
+            except RuntimeError as e:
+                if self._abort is not None and self._abort.requested:
+                    raise KeyboardInterrupt from e
+                raise
             waited = time.monotonic() - t0
             if self._eff_at != last:  # a new reading to judge
                 last = self._eff_at

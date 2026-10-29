@@ -626,11 +626,12 @@ def test_both_reach_out_aims_take_their_own_budget_and_two_agreeing_hits(monkeyp
 
 def test_every_reach_out_aim_waits_for_a_still_arm_and_the_record_says_how_long(monkeypatch, tmp_path):
     """2026-10-28 16:23: the look's aim took its first two hits 0.32 and
-    0.41 s in, the arm creeping back from past the look, 7.2 and 5.5 mm off
-    the pair that agreed after; the aim's own still test (4 mm and 0.02 rad
-    between frames) passed them. Each aim — the look's, the one after the
-    press, knob_look's recheck alike — now starts once the arm stands
-    still (runner.wait_still), noted 'still' before its tag."""
+    0.41 s in, the arm creeping back from past the look, the knob -7.2 and
+    -5.5 mm above its lid where the pair that agreed after read +1.1 and
+    +0.7; the aim's own still test (4 mm and 0.02 rad between frames)
+    passed them. Each aim — the look's, the one after the press,
+    knob_look's recheck alike — now starts once the arm stands still
+    (runner.wait_still), noted 'still' before its tag."""
     import json
 
     from conftest import FakeClient

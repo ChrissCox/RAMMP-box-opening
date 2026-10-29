@@ -767,9 +767,12 @@ def _aim(node, watcher, yaw, lid_z, prior_xy, runner, tag):
 
     The arm stands still first (runner.wait_still, noted 'still' before
     `tag`): the aim's own still test passes frames from an arm creeping
-    after the look (16:23 2026-10-28: its first two hits 7.2 and 5.5 mm off
-    the pair that agreed). A recheck right after an aim, nothing flown
-    between, finds it still at once (client.wait_still)."""
+    after the look (16:23 2026-10-28: its first two hits read the knob
+    -7.2 and -5.5 mm above its lid, the pair that agreed +1.1 and +0.7).
+    Its first frame may be one shot just before the wait passed (on 15:45's
+    looks, in the creep's last 0.1-0.15 s, the tool under 15 mm/s). A
+    recheck right after an aim, nothing flown between, finds it still at
+    once (client.wait_still)."""
     from rammp_box_opening.tasks.press_demo import aim_button_at_staging
 
     if runner is not None:
