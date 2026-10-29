@@ -204,6 +204,8 @@ def test_a_knob_up_after_the_press_is_gripped_lifted_carried_set_down_and_the_ar
     planned = {name: at for name, at in rec.plans}
     assert rec.events.index("spot-look") < planned["lid:carry"] <= rec.events.index("lid:carry")
     assert rec.events.index("place:touch") < planned["home"] <= rec.events.index("place:open")
+    # ... and from the look pose while the way back flew, for a stop there: unused, the lid coming off
+    assert [at for name, at in rec.plans if name == "home"] == [rec.events.index("aim:reach-after"), planned["home"]]
     # nothing chose the lid's spot before the lift: no camera data, so beside the box
     assert [r["leg"] for r in rows].index("lid_spot") > [r["leg"] for r in rows].index("reach_grip_result")
     spot, = [r for r in rows if r["leg"] == "lid_spot"]
@@ -450,6 +452,122 @@ def test_an_open_box_has_its_lid_taken_off_unpressed(ctx, monkeypatch, tmp_path,
 def test_with_press_only_an_open_box_still_stops_the_run(ctx, monkeypatch, tmp_path):
     code, rec, _chain, _rows = _full_flow(ctx, monkeypatch, tmp_path, [(UP, 9.0)], press_only=True)
     assert code == 1 and rec.events == ["reach:look", "aim:reach-aim", "home"]
+
+
+# ---- home, planned from the look pose while the way back flies -----------------
+
+MOVED = (BUTTON[0] + 0.02, BUTTON[1], BUTTON[2] + 0.009)  # the aim after a press that moved the box 20 mm
+NOT_UP_TWICE = [(BUTTON, 0.4), (BUTTON, 2.0), (BUTTON, 1.5), (BUTTON, 3.0), (BUTTON, 2.5)]
+
+
+def _home_plans(monkeypatch, refuse=()):
+    """reach_press._home_legs with each call kept as (where it plans home
+    from — None: where the arm stands —, the legs it returned, None where
+    refused); the calls numbered in `refuse` (the first is 1) refused, as
+    the planner can."""
+    real, plans = rp._home_legs, []
+
+    def home_legs(ctx_, cfg_, start=None):
+        at = None if start is None else [float(v) for v in start]
+        if len(plans) + 1 in refuse:
+            plans.append((at, None))
+            raise RuntimeError("planning failed for home: MotionGenStatus.TRAJOPT_FAIL")
+        plans.append((at, real(ctx_, cfg_, start=start)))
+        return plans[-1][1]
+
+    monkeypatch.setattr(rp, "_home_legs", home_legs)
+    return plans
+
+
+@pytest.mark.parametrize("aims, presses, grip_way", [
+    ([(BUTTON, 0.4), (MOVED, 9.0)], 1, True),
+    ([(BUTTON, 0.4), None, None], 1, True),
+    (NOT_UP_TWICE, 2, True),
+    ([(BUTTON, 0.4), (UP, 9.0)], 1, False),
+], ids=["the box moved", "the box not found", "not up after the second press", "no way down to the knob"])
+def test_a_stop_at_the_look_pose_flies_the_home_planned_while_the_way_back_flew(ctx, monkeypatch, tmp_path, aims,
+                                                                                presses, grip_way):
+    """2026-10-28 16:15:35 and 16:16:09: the knob looked at, the run
+    stopped, and the arm stood 0.21 and 0.23 s at the look pose while home
+    was planned. Home is planned from the look pose while each way back
+    flies — a second press's from where its own ends — and the stop flies
+    the last: no planner call at rest. So does a knob up that no way down
+    to it reaches: the arm has not left the look pose."""
+    if not grip_way:
+        monkeypatch.setattr(rlo, "solve_grip_way", lambda *a, **k: (None, "no straight-down hand reaches the knob"))
+    plans = _home_plans(monkeypatch)
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims)
+    assert code == 1 and rec.events[-1] == "home"
+    backs = [i + 1 for i, e in enumerate(rec.events) if e == "reach:slide-out"]  # where each way back's legs end
+    assert len(backs) == presses
+    # each home planned while a way back flew (the record then ended with its legs), none since
+    assert [at for name, at in rec.plans if name == "home"] == backs
+    assert [at is not None for at, _legs in plans] == [True] * presses
+    assert plans[-1][0] == pytest.approx(rec.legs["reach:slide-out"].goal_joints)  # from where the last ends
+    assert rec.legs["home"] is plans[-1][1][-1]
+    ahead, = [r for r in rows if r["leg"] == "home_ahead"]
+    assert ahead["flown"] is True and ahead["off_rad"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("push, flown", [(0.03, True), (0.05, False)])
+def test_the_home_planned_on_the_way_back_flies_only_from_where_it_starts(ctx, monkeypatch, tmp_path, capsys, push,
+                                                                          flown):
+    """The arm pushed `push` rad on joint_2 off the look pose while it
+    looked: within DRIFT_REPLAN_RAD the home planned while the way back
+    flew is flown, as the runner flies any planned leg from there; beyond,
+    home is planned from where the arm stands — a plan from somewhere else
+    is never flown."""
+    real = rlo.knob_look
+
+    def pushed(node, ctx_, *rest):
+        ctx_.client.live[1] += push
+        return real(node, ctx_, *rest)
+
+    monkeypatch.setattr(rlo, "knob_look", pushed)
+    plans = _home_plans(monkeypatch)
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (MOVED, 9.0)])
+    assert code == 1 and rec.events[-2:] == ["aim:reach-after", "home"]
+    ahead, = [r for r in rows if r["leg"] == "home_ahead"]
+    assert ahead["flown"] is flown and ahead["off_rad"] == pytest.approx(push)
+    look = plans[0][0]  # where the way back ended
+    here = [v + (push if j == 1 else 0.0) for j, v in enumerate(look)]
+    if flown:
+        assert len(plans) == 1 and rec.legs["home"] is plans[0][1][-1]
+    else:
+        assert [at for at, _legs in plans] == [look, None] and rec.legs["home"] is plans[1][1][-1]
+        assert rec.legs["home"].traj.points[0].positions == pytest.approx(here)
+        assert "home is planned again from here" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("aims, knuckle, ends, refuse, at_rest", [
+    ([(BUTTON, 0.4), (UP, 9.0)], AIR, None, (), False),
+    ([(BUTTON, 0.4), (UP, 9.0)], AIR, None, (2,), True),
+    ([(BUTTON, 0.4), (UP, 9.0)], KNOB_ON, {4: trp.REJECTED}, (), True),
+    (NOT_UP_TWICE, KNOB_ON, None, (2,), True),
+    (NOT_UP_TWICE[:3], KNOB_ON, {4: trp.REJECTED}, (), True),
+], ids=["backed out", "backed out, its home refused", "the grip's way down did not start",
+        "pressed once more, its home refused", "the way in once more did not start"])
+def test_the_home_planned_on_the_way_back_is_dropped_once_the_arm_moves_on(ctx, monkeypatch, tmp_path, aims, knuckle,
+                                                                           ends, refuse, at_rest):
+    """The grip's way down to the knob, or a press once more, sends the arm
+    off the look pose; it comes back within DRIFT_REPLAN_RAD of where the
+    home planned on the way back starts (the fake re-aim is 0.01 rad; a
+    way down, or in, that did not start, 0). That home is never flown
+    after: the stop flies the one planned while the arm came back (the
+    back-out's), else one planned where the arm stands, the run log saying
+    none was in hand."""
+    from rammp_box_opening.constants import DRIFT_REPLAN_RAD
+
+    plans = _home_plans(monkeypatch, refuse)
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=knuckle, ends=ends)
+    assert code == 1 and rec.events[-1] == "home"
+    first = plans[0]  # the way back's
+    home = rec.legs["home"]
+    assert max(abs(a - b) for a, b in zip(home.traj.points[0].positions, first[0])) <= DRIFT_REPLAN_RAD
+    assert home is not first[1][-1] and home is plans[-1][1][-1]
+    assert (plans[-1][0] is None) is at_rest  # at rest: from where the arm stands
+    ahead, = [r for r in rows if r["leg"] == "home_ahead"]
+    assert ahead["flown"] is not at_rest and (ahead["off_rad"] is None) is at_rest  # none in hand: off_rad None
 
 
 # ---- the lid's spot, chosen with the lid lifted: never a refusal ---------------

@@ -964,6 +964,40 @@ def test_a_home_refused_for_a_joint_on_its_limit_steps_off_it_first(ctx, tmp_pat
     assert len(ctx.client.executed) == 2 and ctx.client.live == pytest.approx(rest)
 
 
+@pytest.mark.parametrize("off, flown", [(0.0, True), (0.039, True), (0.041, False)])
+def test_a_home_planned_ahead_flies_as_planned_only_from_where_it_starts(ctx, tmp_path, capsys, off, flown):
+    """_go_home handed home's legs planned before the arm stood here (the
+    full run's, while the way back to the look pose flew): within
+    DRIFT_REPLAN_RAD of where they start — joint_3 a whole turn round is
+    where it starts, the short way round — they fly as planned and the
+    planner is not asked; beyond it, home is planned from where the arm
+    stands, as with none. Either way in the run log."""
+    import json
+
+    from conftest import leg as make_leg
+    from conftest import runner as make_runner
+
+    from rammp_box_opening.tasks import press_demo
+
+    cfg = load_press_demo(PINK)
+    ctx.press_cfg = cfg
+    rest = list(press_demo.rest_joints(cfg))
+    look = [0.3, -0.9, 0.4, -1.9, 0.2, -1.0, 1.5]
+    ahead = [make_leg("home", start=look, end=rest, speed=1.0)]
+    here = [v + (off if j == 1 else 2.0 * math.pi if j == 2 else 0.0) for j, v in enumerate(look)]
+    ctx.client.live = list(here)
+    assert reach_press._go_home(ctx, cfg, make_runner(ctx.client, tmp_path), "STOP: test", ahead=ahead) is True
+    if flown:
+        assert ctx.client.joint_starts == [] and ctx.client.exec_starts == [pytest.approx(look)]
+    else:
+        assert ctx.client.joint_starts == [pytest.approx(here)] and ctx.client.exec_starts == [pytest.approx(here)]
+        assert "home is planned again from here" in capsys.readouterr().out
+    assert ctx.client.live == pytest.approx(rest)
+    rows = [json.loads(line) for f in sorted(tmp_path.glob("run-*.jsonl")) for line in open(f)]
+    note, = [r for r in rows if r["leg"] == "home_ahead"]
+    assert note["flown"] is flown and note["off_rad"] == pytest.approx(off, abs=1e-6)
+
+
 def test_an_open_box_is_not_reached_for(ctx, monkeypatch, tmp_path):
     code, rec, _c, _h = _flow(ctx, monkeypatch, tmp_path, first=(POPPED, 14.0))
     assert code == 1 and "reach:slide-in" not in rec.events and rec.events[-1] == "home"
