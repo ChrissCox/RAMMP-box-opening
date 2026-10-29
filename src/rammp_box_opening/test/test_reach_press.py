@@ -1950,16 +1950,17 @@ def test_the_look_planned_is_the_request_the_client_always_sent_for_it(ctx, monk
     assert plan is None and sent == [] and worlds == []
 
 
-def test_the_wrist_aim_is_moved_2_cm_out_from_the_arm_for_the_press_and_the_grip():
+def test_the_wrist_aim_is_moved_1_cm_out_from_the_arm_for_the_press_and_the_grip():
     """Owner 2026-10-29: "the camera calibration is slightly off, we need to
     make the arm move just 2 cm forward when pressing the box and gripping
-    the lid so it grabs the middle, not the edge". The aim's point goes
-    AIM_FORWARD_M farther out along its bearing from arm_mount, its height
-    kept; the wrist's own measured point (what its later readings are judged
-    against) is not moved."""
-    assert reach_press.AIM_FORWARD_M == pytest.approx(0.02)
+    the lid so it grabs the middle, not the edge"; then, after flying it,
+    "2 cm was too much, change it to 1". The aim's point goes AIM_FORWARD_M
+    farther out along its bearing from arm_mount, its height kept; the
+    wrist's own measured point (what its later readings are judged against)
+    is not moved."""
+    assert reach_press.AIM_FORWARD_M == pytest.approx(0.01)  # 2 cm was too much (owner, after flying it)
     for xyz in [(0.5475, -0.3106, 0.2941), (0.6339, -0.0094, 0.3117), (0.40, 0.30, 0.25)]:
         moved = reach_press.aim_forward(xyz)
         assert moved[2] == xyz[2]
-        assert math.hypot(*moved[:2]) - math.hypot(*xyz[:2]) == pytest.approx(0.02)
+        assert math.hypot(*moved[:2]) - math.hypot(*xyz[:2]) == pytest.approx(0.01)
         assert math.atan2(moved[1], moved[0]) == pytest.approx(math.atan2(xyz[1], xyz[0]))
