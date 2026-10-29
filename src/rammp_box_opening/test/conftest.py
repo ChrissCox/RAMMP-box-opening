@@ -9,6 +9,8 @@ world's name as its path. `leg` and `runner` build Runner inputs; the
 with a detected pose on the bench.
 """
 
+import os
+
 import pytest
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -16,6 +18,9 @@ from rammp_box_opening.models.container import ContainerModel, ContainerPose
 from rammp_box_opening.primitives.core import Ctx
 from rammp_box_opening.runtime.legs import Kind, Leg
 from rammp_box_opening.runtime.runner import Runner
+
+# no test run records the lid-off's video of the cameras (perception/camera_video) unless it asks
+os.environ.setdefault("RAMMP_BOX_OPENING_VIDEO", "0")
 
 CFG = "src/rammp_box_opening/config/containers/oxo_pop.yaml"
 

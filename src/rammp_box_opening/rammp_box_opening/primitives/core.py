@@ -69,6 +69,11 @@ class Ctx:
     # home's legs planned from the look pose while the way back to it flew
     # (reach_lid_off), for a stop there; dropped once the arm moves on
     home_ahead: list = None
+    # the scene camera's SceneLocator (its grabber streams the whole run) and
+    # the lid-off's video of both cameras (perception/camera_video), --execute
+    # full runs (reach_press._reach_press)
+    scene_locator: object = None
+    lid_video: object = None
 
 
 @dataclass

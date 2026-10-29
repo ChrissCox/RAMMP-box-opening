@@ -1102,6 +1102,7 @@ def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
     top_z = float(button[2])
     ctx.contact_pad = CONTACT_SHIFT_PAD_M  # the stroke meets the box by design: every world pads it from here
     held_z = None
+    video = None
     try:
         for press in range(1, PRESSES + 1):
             code, z = _press_and_back(ctx, cfg, runner, way, legs, top_z, press)
@@ -1137,11 +1138,65 @@ def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
             # cancels)
             lid_z += float(knob.lid_dz_m)
             rose = ", %+.0f mm: the lid rose" % (1000 * knob.lid_dz_m)
-        return take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, "the lid at %.3f (the press's top %.3f%s%s)" % (
+        video = ctx.lid_video.start() if getattr(ctx, "lid_video", None) is not None else None
+        code = take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, "the lid at %.3f (the press's top %.3f%s%s)" % (
             lid_z, top_z, "" if held_z is None else ", the pads held at %.3f" % held_z, rose), yaw=yaw)
-    except BaseException:
+        _finish_video(video, "the end: %s" % ("the lid set down, the arm home" if code == 0 else "exit %d" % code))
+        return code
+    except BaseException as e:
         rp.let_go(ctx)
+        _finish_video(video, "stopped: %s" % (type(e).__name__))  # after the let-go: the arm first
         raise
+
+
+def _video(ctx, text):
+    """The lid video's caption from now on (perception/camera_video), where
+    this run records one."""
+    v = getattr(ctx, "lid_video", None)
+    if v is not None:
+        v.mark(text)
+
+
+def _finish_video(video, caption):
+    """The lid video written, `caption` its last picture's, and where it is
+    said; None, no video. Never what stops the run's ending."""
+    if video is None:
+        return
+    try:
+        path = video.finish(caption)
+    except Exception as e:  # a video that cannot be written is said, never raised
+        print("[press_demo] the cameras' video was not written (%s)" % e)
+        return
+    if path is not None:
+        print("[press_demo] VIDEO: what the wrist and scene cameras saw from the grip on: %s" % path)
+
+
+def _video_spot(ctx, eyes, drop):
+    """The lid's rim at the spot `drop` drawn on the lid video's scene panel,
+    where the scene camera itself sees that place: spot_map moved the scene's
+    points by its error at the box, so the rim is moved back by as much."""
+    v, loc = getattr(ctx, "lid_video", None), getattr(ctx, "scene_locator", None)
+    if v is None or loc is None:
+        return
+    try:
+        T, K = loc.base_to_color(), getattr(loc.grab, "k", None)
+        if T is None or K is None:
+            return
+        fix = eyes[2]
+        dx, dy = (0.0, 0.0) if fix is None else (float(fix.pose.xyz[0]) - float(ctx.cpose.xyz[0]),
+                                                 float(fix.pose.xyz[1]) - float(ctx.cpose.xyz[1]))
+        r = 0.5 * max(float(ctx.model.lid_dims[0]), float(ctx.model.lid_dims[1]))
+        a = np.linspace(0.0, 2.0 * math.pi, 48, endpoint=False)
+        pts = np.stack([float(drop.xyz[0]) + dx + r * np.cos(a), float(drop.xyz[1]) + dy + r * np.sin(a),
+                        np.full_like(a, float(drop.xyz[2]))], axis=1)
+        T = np.asarray(T, float)
+        cam = (pts - T[:3, 3]) @ T[:3, :3]  # into the colour frame
+        if (cam[:, 2] <= 0.05).any():
+            return
+        uv = cam @ np.asarray(K, float).T
+        v.overlay("scene", uv[:, :2] / uv[:, 2:3], "the lid goes here")
+    except Exception:  # the drawing is the video's, never the run's
+        return
 
 
 def _back_out(ctx, cfg, runner, way, why, opened=True):
@@ -1275,6 +1330,7 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
     # the hand leaves the look pose for the knob: the way back's home is not
     # flown from where it comes back (a back-out plans its own, _back_out)
     ctx.home_ahead = None
+    _video(ctx, "GRIP%s: the fingers open on the way down to the knob" % (" once more" if attempt > 1 else ""))
     res = runner.run([opened, *legs], execute=True, lookahead=lambda end: plan_lift(ctx, cfg, end, way.stroke.quat))
     ahead = runner.lookahead_result
     last = res[-1]
@@ -1302,6 +1358,7 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
     # spot from where the clear ends (carry_ahead): flown after the lift
     # where the spot chosen there is the same. A close that fails returns
     # before the lift: none is made, and a grip once more makes its own
+    _video(ctx, "CLOSE on the knob, then LIFT %.0f mm and CLEAR the box" % (1000 * lift_off_m(ctx.model)))
     res = runner.run([close, *lift.legs], execute=True, lookahead=lambda end: carry_ahead(ctx, cfg, eyes, end))
     carried = runner.lookahead_result
     grip = [r for r in res if r.leg_name in ("grip:open", "grip:close")]
@@ -1313,6 +1370,7 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
         if retry:
             print("[press_demo] GRIP MISSED — %s: the fingers closed on air; opening them, backing out to the look "
                   "pose and aiming at the knob once more" % detail)
+            _video(ctx, "GRIP MISSED (%s): back out to the look pose and aim again" % detail)
             regrip, code = _regrip(ctx, cfg, runner, eyes, way, button, yaw, detail)
             if regrip is None:
                 return code
@@ -1442,6 +1500,7 @@ def choose_and_carry(ctx, cfg, runner, eyes, ahead=None):
     world = _full_world(ctx)
     table_z = _table_z(watcher, scene_fix, ctx.cpose)
     t0 = time.monotonic()
+    _video(ctx, "SPOT LOOK: the arm stands still for the wrist's frame, the lid lifted")
     wrist = spot_look(node, watcher, runner)
     t_look = time.monotonic()
     q = [float(v) for v in ctx.client.joints()]  # where the arm stood still for the frame
@@ -1493,6 +1552,9 @@ def choose_and_carry(ctx, cfg, runner, eyes, ahead=None):
                                                                  drop.xyz[1] - ctx.cpose.xyz[1]),
         says, "; the planner refused %s" % "; ".join(refused) if refused else ""))
     pd.viz_hook("spot", tmap, drop, tier, says, table_z)  # the map and the spot, drawn off this thread (perception/viz)
+    _video_spot(ctx, eyes, drop)
+    _video(ctx, "CARRY to [%.2f, %.2f] (%s) and SET DOWN, %.1f mm past the table" % (
+        drop.xyz[0], drop.xyz[1], tier, 1000 * (carry.over_m or 0.0)))
     print("[press_demo] ONE MOTION: %s — to [%.2f, %.2f] and down onto the table, %.1f mm past where the lid "
           "meets it (%.1f N on the hand's %.0f N/m)" % (
               ", ".join(lg.name for lg in carry.legs), drop.xyz[0], drop.xyz[1], 1000 * (carry.over_m or 0.0),
@@ -1523,6 +1585,7 @@ def choose_and_carry(ctx, cfg, runner, eyes, ahead=None):
     retreat = home if home is not None else [
         dp.compliant_line(ctx, "place:retreat", carry.retreat, carry.quat, rp.free_line_speed(ctx), world)]
     print("[press_demo] RELEASE, then ONE MOTION: %s" % ", ".join(lg.name for lg in retreat))
+    _video(ctx, "RELEASE, then RETREAT and HOME")
     res = runner.run([release, *retreat], execute=True)
     if not res[0].ok:
         print("[press_demo] STOP: the fingers did not open at the table (%s) — the arm holds" % res[0].detail)
