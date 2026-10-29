@@ -67,7 +67,8 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
     """run_reach_press as a full run (compliant --depth-press, no
     --press-only), everything faked: `aims` the wrist's aims in order, each
     (press point, knob mm) or None — the look's, then each after a press
-    (and its recheck); `knuckle` what closing on the knob reads, `slipped`
+    (and its recheck); `knuckle` what closing on the knob reads (a list:
+    each close's in turn, the last for every one after), `slipped`
     whether the fingers read that still at the table; `extent` the table
     the scene camera saw (no room map: the lid goes beside the box, in its
     zone); `ends`: {n: (outcome, info)} for the n-th goal sent; `wrist`
@@ -143,13 +144,16 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
         return (got[0], 0.0), "3/3 frames", got[1], got[0]
 
     monkeypatch.setattr(rp, "_aim", aim)
-    held = {"on": True}
+    closes = list(knuckle) if isinstance(knuckle, (list, tuple)) else [knuckle]
+    held = {"on": True, "reads": closes[0]}
 
     def gripper_cmd(pos):
         if pos is None:  # query only
-            return True, (AIR if slipped else knuckle) if held["on"] else 0.0, False
+            return True, (AIR if slipped else held["reads"]) if held["on"] else 0.0, False
         held["on"] = pos > 0.5
-        return True, knuckle if pos > 0.5 else 0.0, False
+        if held["on"]:
+            held["reads"] = closes.pop(0) if len(closes) > 1 else closes[0]
+        return True, held["reads"] if held["on"] else 0.0, False
 
     ctx.client.gripper_cmd = gripper_cmd
     ctx.client.lets_go = []
@@ -361,20 +365,153 @@ def test_a_knob_still_not_up_after_the_second_press_sends_the_arm_home_with_noth
     assert ctx.client.gripper_sent == []  # the fingers never opened
 
 
+BACK_OUT = ["grip:up", "depth:turn-back", "reach:slide-out"]  # the grip's way down backwards, to the look pose
+
+
 def test_fingers_that_close_on_air_open_again_and_back_out_the_way_they_came(ctx, monkeypatch, tmp_path, capsys):
     """The close reads air (outside the grip band): nothing is lifted. The
     fingers open, the hand backs out the grip's way down to the look pose,
+    the wrist aims at the knob again there (_regrip) — here it finds none —
     and goes home from there: exit 1."""
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], knuckle=AIR)
     assert code == 1
-    back_out = ["grip:up", "depth:turn-back", "reach:slide-out"]
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
-                          "grip:open", *back_out, "home"]
+                          "grip:open", *BACK_OUT, "aim:reach-regrip", "home"]
     assert (CLOSE, []) in _executions(rec)  # the lift's run returned at the close: handed, nothing sent
     assert [r["leg"] for r in rows if r["leg"].startswith(("lid:", "place:"))] == []
     result, = [r for r in rows if r["leg"] == "reach_grip_result"]
     assert result["ok"] is False and "0.790" in result["detail"]
+    assert "GRIP MISSED" in capsys.readouterr().out
+
+
+# ---- a grip on air, tried once more at the knob aimed at again -----------------
+
+# 12:03:52 2026-10-29: the grip came down where the press was aimed, 11 mm
+# short of the knob; from the look pose the wrist sees it there
+REGRIP = (BUTTON[0] + 0.011, BUTTON[1], BUTTON[2] + 0.009)
+
+
+def _grip_ways(monkeypatch, refuse=()):
+    """solve_grip_way with the button each call went by kept, the calls
+    numbered in `refuse` (the first is 1) unsolved."""
+    real, asked = rlo.solve_grip_way, []
+
+    def solve(ctx_, cfg_, button, tilt, q_from, lid_z):
+        asked.append((tuple(float(v) for v in button), float(lid_z), tilt))
+        if len(asked) in refuse:
+            return None, "no straight-down hand reaches the knob"
+        return real(ctx_, cfg_, button, tilt, q_from, lid_z)
+
+    monkeypatch.setattr(rlo, "solve_grip_way", solve)
+    return asked
+
+
+def test_a_grip_on_air_is_aimed_again_from_the_look_pose_and_gripped_once_more_where_the_knob_is(
+        ctx, monkeypatch, tmp_path, capsys):
+    """12:03:52 2026-10-29: the fingers closed on air (0.789 against the
+    band [0.30, 0.55]) 11 mm short of the knob, and the run went home, exit
+    1. Now the fingers open, the hand backs out to the look pose, the wrist
+    aims at the knob again from there — once — and the hand comes down to
+    the knob it sees, the first grip's tilt and lid height kept: the
+    second close holds it, and the lid comes off as ever, exit 0. The
+    record says each step."""
+    asked = _grip_ways(monkeypatch)
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0), (REGRIP, 9.0)],
+                                         knuckle=[AIR, KNOB_ON])
+    assert code == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
+                          "grip:open", *BACK_OUT, "aim:reach-regrip", *GRIP, *CLOSE, "spot-look", *CARRY, *HOME]
+    assert rec.events.count("aim:reach-regrip") == 1 and rec.events.count("grip:close") == 2
+    # the second way down solved for the re-aimed button, at the first's height, lid and tilt
+    (first, lid1, tilt1), (second, lid2, tilt2) = asked
+    assert first == pytest.approx(BUTTON) and second == pytest.approx((REGRIP[0], REGRIP[1], BUTTON[2]))
+    assert (lid2, tilt2) == (lid1, tilt1)
+    grips = [r for r in rows if r["leg"] == "reach_grip"]
+    assert [(g["attempt"], g["button"][:2]) for g in grips] == [(1, pytest.approx(list(BUTTON[:2]))),
+                                                                 (2, pytest.approx(list(REGRIP[:2])))]
+    regrip, = [r for r in rows if r["leg"] == "reach_regrip"]
+    assert (regrip["found"], regrip["outcome"], regrip["knob_up_mm"]) == (True, "grip again", 9.0)
+    assert regrip["shift_mm"] == pytest.approx(11.0) and regrip["xyz"] == pytest.approx(list(REGRIP))
+    results = [(r["attempt"], r["ok"], r.get("on_air"), r.get("retry")) for r in rows if r["leg"] == "reach_grip_result"]
+    assert results == [(1, False, True, True), (2, True, None, None)]
+    out = capsys.readouterr().out
+    assert "GRIP MISSED" in out and "RE-AIMED from the look pose" in out and "GRIP ONCE MORE" in out
+    assert "LID GRIPPED" in out and out.rstrip().endswith("arm home")
+    assert ctx.client.lets_go == []  # nothing stopped part-way: nothing let go
+
+
+def test_a_grip_on_air_twice_backs_out_and_goes_home_after_one_retry_only(ctx, monkeypatch, tmp_path, capsys):
+    """The second close reads air as well: the fingers open, the hand backs
+    out to the look pose once more and goes home from there, exit 1 — never
+    a third grip, nor a second re-aim, whatever the wrist would see."""
+    plans = _home_plans(monkeypatch)
+    aims = [(BUTTON, 0.4), (UP, 9.0), (REGRIP, 9.0), (REGRIP, 9.0)]
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=AIR)
+    assert code == 1
+    assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
+                          "grip:open", *BACK_OUT, "aim:reach-regrip", *GRIP, *CLOSE, "grip:open", *BACK_OUT, "home"]
+    results = [(r["attempt"], r["ok"], r["on_air"], r["retry"]) for r in rows if r["leg"] == "reach_grip_result"]
+    assert results == [(1, False, True, True), (2, False, True, False)]
+    assert len([r for r in rows if r["leg"] == "reach_regrip"]) == 1
+    # home flown is the one planned while the second back-out flew, from where it ends
+    assert rec.legs["home"] is plans[-1][1][-1] and plans[-1][0] == pytest.approx(rec.legs["reach:slide-out"].goal_joints)
+    out = capsys.readouterr().out
+    assert "GRIP FAILED AGAIN, at the re-aimed knob" in out
+    assert "STOP: the grip failed twice, the second time at the re-aimed knob (grip 0.790" in out
+
+
+@pytest.mark.parametrize("regrip, refuse, found, said", [
+    (None, (), False, "STOP: the grip closed on air (grip 0.790 vs band [0.3, 0.55]) and the wrist does not find the "
+                      "button again from the look pose (no circle) — the lid is not taken off"),
+    ((BUTTON[0] + 0.02, BUTTON[1], BUTTON[2] + 0.009), (), True,
+     "STOP: the grip closed on air (grip 0.790 vs band [0.3, 0.55]) and the wrist now sees the button 20 mm from where "
+     "the first grip went — the box moved; the lid is not taken off"),
+    (REGRIP, (2,), True, "STOP: the hand does not come down to the re-aimed knob (no straight-down hand reaches the "
+                         "knob) — the lid is not taken off"),
+], ids=["no button", "the box moved", "no way down to it"])
+def test_a_re_aim_that_finds_no_knob_to_grip_sends_the_arm_home_from_the_look_pose(ctx, monkeypatch, tmp_path, capsys,
+                                                                                  regrip, refuse, found, said):
+    """After a close on air the re-aim finds no button, or one farther
+    from where the first grip went than a slid box is gripped
+    (depth_press.SLIDE_OK_M), or no way down to it solves: home from the
+    look pose, flying the home planned while the back-out flew (no planner
+    call at rest), exit 1 — nothing gripped again."""
+    _grip_ways(monkeypatch, refuse)
+    plans = _home_plans(monkeypatch)
+    aims = [(BUTTON, 0.4), (UP, 9.0), None if regrip is None else (regrip, 9.0)]
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=[AIR, KNOB_ON])
+    assert code == 1
+    assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
+                          "grip:open", *BACK_OUT, "aim:reach-regrip", "home"]
+    note, = [r for r in rows if r["leg"] == "reach_regrip"]
+    assert (note["found"], note["outcome"]) == (found, "grip again" if refuse else "home")
+    assert [r["attempt"] for r in rows if r["leg"] == "reach_grip_refused"] == ([2] if refuse else [])
+    ahead, = [r for r in rows if r["leg"] == "home_ahead"]
+    assert ahead["flown"] is True and rec.legs["home"] is plans[-1][1][-1]
+    assert said in capsys.readouterr().out
+
+
+def test_a_grip_that_fails_but_not_on_air_is_not_tried_again(ctx, monkeypatch, tmp_path, capsys):
+    """Fingers stopped wide, below the grip band, closed on something larger
+    than the knob: not a miss a re-aim mends. They open, the hand backs out
+    and goes home, as before: no re-aim. Nor is a gripper that failed, or an
+    open, ever a close on air (_on_air)."""
+    from rammp_box_opening.runtime.runner import LegResult
+
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0), (REGRIP, 9.0)],
+                                         knuckle=0.2)
+    assert code == 1
+    assert rec.events[-len(BACK_OUT) - 4:] == [*CLOSE[1:], "grip:open", *BACK_OUT, "home"]
+    assert "aim:reach-regrip" not in rec.events and not [r for r in rows if r["leg"] == "reach_regrip"]
+    result, = [r for r in rows if r["leg"] == "reach_grip_result"]
+    assert (result["on_air"], result["retry"]) == (False, False)
     assert "GRIP FAILED" in capsys.readouterr().out
+    band = (0.30, 0.55)
+    assert rlo._on_air(LegResult("grip:close", "arrived", False, "", gripper_pos=0.789), band)
+    assert not rlo._on_air(LegResult("grip:close", "arrived", False, "", gripper_pos=0.2), band)
+    assert not rlo._on_air(LegResult("grip:close", "failed", False, "", gripper_pos=0.789), band)
+    assert not rlo._on_air(LegResult("grip:open", "arrived", False, "", gripper_pos=0.789), band)
+    assert not rlo._on_air(LegResult("grip:close", "arrived", True, "band unchecked"), band)
 
 
 class _ReachingChain(_Chain):
@@ -521,6 +658,19 @@ def test_an_open_box_has_its_lid_taken_off_unpressed(ctx, monkeypatch, tmp_path,
     grip, = [r for r in rows if r["leg"] == "reach_grip"]
     assert grip["lid_z"] == pytest.approx(BUTTON[2])  # the scene's top, above the aim's knob less its height
     assert "ALREADY OPEN" in capsys.readouterr().out
+
+
+def test_an_open_box_s_grip_on_air_is_tried_once_more_at_the_knob_aimed_at_again(ctx, monkeypatch, tmp_path):
+    """The open box's lid, taken off unpressed (reach_press._reach_press
+    calls take_lid_off itself), gets the same one retry after a close on
+    air: the re-aim from the look pose, the second grip there."""
+    asked = _grip_ways(monkeypatch)
+    again = (UP[0] + 0.011, UP[1], UP[2])
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(UP, 9.0), (again, 9.0)], knuckle=[AIR, KNOB_ON])
+    assert code == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", *GRIP, *CLOSE, "grip:open", *BACK_OUT, "aim:reach-regrip",
+                          *GRIP, *CLOSE, "spot-look", *CARRY, *HOME]
+    assert [b[:2] for b, _lid, _tilt in asked] == [pytest.approx(UP[:2]), pytest.approx(again[:2])]
 
 
 def test_with_press_only_an_open_box_still_stops_the_run(ctx, monkeypatch, tmp_path):
