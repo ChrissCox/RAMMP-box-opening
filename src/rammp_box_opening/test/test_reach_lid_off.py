@@ -1449,3 +1449,27 @@ def test_the_lid_is_set_down_faster_and_the_hand_turns_it_at_the_wrists_measured
     assert rlo.PLACE_TOUCH_SPEED == pytest.approx(2 * dp.TOUCH_SPEED)
     assert COMPLIANT_FREE_LINE_SPEED > load_press_demo(PINK).setdown_speed
     assert COMPLIANT_QD_CEILING[4:] == (0.45, 0.45, 0.9)
+
+
+def test_the_fingers_come_down_to_the_knob_opened_to_its_width_not_fully(ctx, monkeypatch, tmp_path):
+    """2026-10-29 14:31:59: fully open (~85 mm), the fingertips came down
+    46-49 mm from the knob's axis, on the rim of a lid only 52.5 mm in
+    radius, and closed on it (0.147, "on the box"). The grip's way down
+    opens them to the knob's width and GRIP_SIDE_CLEAR_M either side (64 mm
+    for the pink canister's 44 mm knob: 32 mm off its axis, 20 mm inside the
+    lid's edge); the release at the table still opens them fully."""
+    from rammp_box_opening.constants import GRIPPER_CMD_CLOSED, GRIPPER_CMD_OPEN
+
+    code, rec, _chain, _rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)])
+    assert code == 0
+    m = ctx.model
+    width = m.button_diameter_m + 2 * rlo.GRIP_SIDE_CLEAR_M
+    assert width == pytest.approx(0.064)
+    assert rec.legs["grip:open"].gripper_cmd == pytest.approx(rlo.grip_open_cmd(m))
+    assert GRIPPER_CMD_OPEN < rlo.grip_open_cmd(m) < GRIPPER_CMD_CLOSED
+    assert rlo.grip_open_cmd(m) == pytest.approx(GRIPPER_CMD_CLOSED * (1 - 0.064 / rlo.GRIPPER_OPEN_WIDTH_M))
+    # the fingertips' place across the knob: inside the lid's edge by more than the knob's aim can be off
+    lid_r = 0.5 * m.lid_dims[0]
+    assert lid_r - width / 2 >= 0.02
+    assert width / 2 - m.button_diameter_m / 2 >= 0.01
+    assert rec.legs["place:open"].gripper_cmd == GRIPPER_CMD_OPEN  # the lid let go fully at the table
