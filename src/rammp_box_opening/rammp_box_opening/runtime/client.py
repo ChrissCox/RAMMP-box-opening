@@ -20,8 +20,9 @@ as it came when the planner says it goes the long way round.
 import copy
 import math
 import sys
+import threading
 import time
-from collections import namedtuple
+from collections import deque, namedtuple
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -81,6 +82,56 @@ LATEST_WINS = 1  # replaces the goal running, and any queued behind it, at once 
 
 # a gripper command in flight: knuckle-radian target, the knuckle at send, when
 GripperHandle = namedtuple("GripperHandle", "target start t0")
+# one /joint_states message as PlannerClient.joint_history keeps it: when it
+# was heard (time.monotonic()), its header stamp (s, the driver's clock: when
+# it was measured), and the arm's joints in order — positions, velocities and
+# efforts, None where the message carried none
+JointSample = namedtuple("JointSample", "t stamp q qd effort")
+
+
+def _measured_at(s):
+    """When the JointSample `s` was measured: its stamp, else (a message
+    sent unstamped) when it was heard."""
+    return s.stamp if s.stamp else s.t
+
+
+def _speeds(samples, i):
+    """Each joint's speed (rad/s) at samples[i]: its velocities, else its
+    positions differenced, wrap-aware, over when it and the reading before
+    it were measured; None where neither says."""
+    s = samples[i]
+    if s.qd is not None:
+        return [abs(float(v)) for v in s.qd]
+    if i == 0:
+        return None
+    dt = _measured_at(s) - _measured_at(samples[i - 1])
+    if not dt > 0.0:
+        return None
+    from rammp_box_opening.geometry import ang_diff
+
+    return [abs(ang_diff(a, b)) / dt for a, b in zip(s.q, samples[i - 1].q)]
+
+
+def still_for(samples, qd_max, gap_s, enough=None):
+    """How long the newest of `samples` (JointSample, oldest first) have read
+    the arm still, by when they were measured: from the first of the
+    trailing run in which every reading has each joint under `qd_max`
+    (_speeds) and was measured at most `gap_s` after the reading before it,
+    to the newest. 0.0 when the newest is not still; the count stops once
+    it reaches `enough`."""
+    newest = first = None
+    for i in range(len(samples) - 1, -1, -1):
+        v = _speeds(samples, i)
+        if v is None or not all(x < qd_max for x in v):
+            break
+        t = _measured_at(samples[i])
+        if first is not None and not 0.0 <= first - t <= gap_s:
+            break
+        newest = t if newest is None else newest
+        first = t
+        if enough is not None and newest - first >= enough:
+            break
+    return 0.0 if newest is None else newest - first
 
 
 def fill_gains(msg, spec):
@@ -130,6 +181,19 @@ class PlannerClient:
         self._q = None
         self._eff = None
         self._eff_at = 0.0  # monotonic stamp of the last joint_states message
+        # the newest JOINT_HISTORY_N /joint_states messages, oldest first
+        # (joint_history), appended under the lock by whichever thread
+        # spins this node
+        self._history = deque(maxlen=self.JOINT_HISTORY_N)
+        self._history_lock = threading.Lock()
+        # when each goal went to the driver (time.monotonic()), newest last:
+        # what the arm does after an arrival stops being that arrival's
+        # settle when the next goal goes out (goals_sent)
+        self._sent_at = deque(maxlen=self.GOALS_KEPT)
+        # the last execute call's info, filled as it runs: a Ctrl+C's
+        # unwinding hands none back, and the runner keeps the stopped
+        # motion's side file from this (runner._keep_aborted)
+        self.last_execution = None
         # Set on first /joint_states message: 'joint_1..7' on bench,
         # 'arm_joint_1..7' on flatbot (nightly driver renders arm_mount URDF).
         self._active_joints = None
@@ -184,6 +248,17 @@ class PlannerClient:
         return self._active_joints if self._active_joints is not None else list(JOINTS)
 
     # -- state streams -----------------------------------------------------
+    # What the arm does after the driver calls a goal arrived is read from
+    # here (runner._note_settle). /joint_states runs 49 Hz on flatbot (the
+    # driver's state_publish_divisor 2; 1 would be ~98 Hz), so 600 messages
+    # are 6-12 s: an arrival's settle window (runner.SETTLE_WINDOW_S, 1.5 s)
+    # is noted when the next goal goes out, the aim or the planning between.
+    # Its stamp, not when it was heard, says when the arm was where it says:
+    # the aim spins this node once a frame and the subscription keeps 5
+    # (SensorDataQoS), so between frames messages wait, and some are dropped
+    JOINT_HISTORY_N = 600
+    GOALS_KEPT = 8
+
     def _js_cb(self, msg):
         if self._active_joints is None:
             if "arm_joint_1" in msg.name:
@@ -204,11 +279,19 @@ class PlannerClient:
                 if len(msg.effort) == len(msg.name)
                 else None
             )
+            qd = (
+                [float(msg.velocity[idx[n]]) for n in self._active_joints]
+                if len(msg.velocity) == len(msg.name)
+                else None
+            )
         except (KeyError, IndexError):
             return
         self._q = q
         self._eff = eff
         self._eff_at = time.monotonic()
+        stamp = msg.header.stamp
+        with self._history_lock:
+            self._history.append(JointSample(self._eff_at, stamp.sec + 1e-9 * stamp.nanosec, q, qd, eff))
         for name in msg.name:
             if any(h in name for h in _GRIPPER_JOINT_HINTS):
                 self._gripper_pos = float(msg.position[idx[name]])
@@ -228,6 +311,30 @@ class PlannerClient:
                     "shell export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp?"
                 )
         return list(self._q)
+
+    def joint_history(self, since=None):
+        """The /joint_states messages kept (JointSample, the newest
+        JOINT_HISTORY_N), oldest first: a copy, only those heard at or after
+        `since` (time.monotonic()) when it is given. Spins nothing, waits
+        for nothing: what this node has heard is what there is."""
+        lock = getattr(self, "_history_lock", None)
+        if lock is None:
+            return []
+        with lock:
+            kept = list(self._history)
+        return kept if since is None else [s for s in kept if s.t >= since]
+
+    def goals_sent(self):
+        """When each of the last GOALS_KEPT goals went to the driver
+        (time.monotonic()), oldest first: every execution, the hold that
+        primes the joint impedance and the release."""
+        return list(getattr(self, "_sent_at", ()))
+
+    def _mark_sent(self):
+        """A goal is about to go to the driver: when (goals_sent)."""
+        sent = getattr(self, "_sent_at", None)
+        if sent is not None:
+            sent.append(time.monotonic())
 
     # A guarded leg polls wrist_efforts() and trips on deviation from a
     # baseline. If the /joint_states subscription STALLS, self._eff keeps
@@ -287,6 +394,86 @@ class PlannerClient:
         q0 = qs[0]
         q = [q0[j] + sum(ang_diff(row[j], q0[j]) for row in qs) / n for j in range(len(q0))]
         return [sum(c) / n for c in zip(*effs)], q
+
+    # A camera read at rest, and a grip's close, wait here for the arm to
+    # stand still (wait_still; the runner notes it, runner.wait_still).
+    # "Arrived" is the driver's trajectory clock running out, and the
+    # camera's own still test (perception/depth_source STILL_TRANS_M 4 mm,
+    # STILL_ROT_RAD 0.02 between processed frames 75-90 ms apart) passes an
+    # arm creeping 22-25 mm/s: on 2026-10-28 15:45 both looks arrived with
+    # joint_2 45-47 mrad past their end and crept back at up to 0.12-0.13
+    # rad/s, and at 16:23 the look's aim took its first two hits 0.32 and
+    # 0.41 s in, the knob -7.2 and -5.5 mm above its lid where the two that
+    # agreed after them read +1.1 and +0.7. On 15:45's /joint_states
+    # (49 Hz) the arm at rest read at most 0.0032 rad/s on any joint in
+    # RIGID at zeta 0.7 (50 s at HOME; at 1.0 unmeasured: the first run's
+    # 'still' notes show it) and 0.0010 in POSITION (200 s), and the looks'
+    # creep read over STILL_QD_RAD_S to +0.70 s. A settling joint turns
+    # back through zero, one or two readings under it (the look's turn at
+    # +0.07 s, the way homes' at +0.70-0.73), where STILL_HOLD_S takes five
+    # in a row at 49 Hz: the looks passed at +0.81 s, the POSITION home at
+    # +0.08 (+0.10 by positions). The looks' pass is the creep over, not
+    # the arm at its last rest: joint_6 stopped between two swings, the
+    # tool 1.2-1.5 mm from where it stood when the way in left (+1.4-1.6 s),
+    # drifting back at up to 5 mm/s (joint_6 at up to 0.012-0.017 rad/s),
+    # within 1 mm of it for good from +1.03-1.07 s — far inside the
+    # camera's still test, and each frame's pose is TF's at its stamp.
+    # Readings further apart than STILL_GAP_S make no one still stretch
+    # (the aim spins this node once a frame, and between frames messages
+    # are dropped): the arm swings at 0.7-1.1 Hz, its turns 0.45 s and more
+    # apart. The way homes, 86-88 mm short when they ended, passed only at
+    # +1.49-1.50 s: past STILL_TIMEOUT_S, and the wait carries on (no
+    # camera reads there).
+    STILL_QD_RAD_S = 0.02
+    STILL_HOLD_S = 0.08
+    STILL_GAP_S = 0.25
+    STILL_TIMEOUT_S = 1.2
+
+    def wait_still(self):
+        """Wait, the arm at rest after a motion, until it stands still: every
+        joint under STILL_QD_RAD_S in each /joint_states reading over
+        STILL_HOLD_S (still_for), of those heard since the last goal went to
+        the driver (goals_sent), the newest heard during this call — so a
+        call right after another, nothing sent between, finds it still at
+        once. Returns (s waited, timed out): after STILL_TIMEOUT_S it
+        carries on, saying so in one line. Sends nothing and stops nothing:
+        it spins this node while the arm settles (or the stream is
+        silent), no more.
+
+        No goal is in flight here, so a Ctrl+C raises at once
+        (abort.sigint_handler); raised inside a subscription's take it
+        surfaces as RuntimeError (press_demo._spin_detect), and goes on as
+        the KeyboardInterrupt it is: the run ends as a Ctrl+C (exit 130),
+        not a traceback."""
+        t0 = time.monotonic()
+        sent = self.goals_sent()
+        since = sent[-1] if sent else None
+        last = None
+        while True:
+            try:
+                rclpy.spin_once(self.node, timeout_sec=0.02)
+            except RuntimeError as e:
+                if self._abort is not None and self._abort.requested:
+                    raise KeyboardInterrupt from e
+                raise
+            waited = time.monotonic() - t0
+            if self._eff_at != last:  # a new reading to judge
+                last = self._eff_at
+                kept = self.joint_history(since=since)
+                if (kept and kept[-1].t > t0
+                        and still_for(kept, self.STILL_QD_RAD_S, self.STILL_GAP_S, self.STILL_HOLD_S)
+                        >= self.STILL_HOLD_S):
+                    return waited, False
+            if waited >= self.STILL_TIMEOUT_S:
+                kept = self.joint_history(since=since)
+                v = _speeds(kept, len(kept) - 1) if kept and kept[-1].t > t0 else None
+                if v is None:
+                    said = "no /joint_states reading says how fast it moves"
+                else:
+                    j = max(range(len(v)), key=lambda k: v[k])
+                    said = "%s at %.3f rad/s at the last reading" % (self.joint_names[j], v[j])
+                print("[client] the arm is not still after %.1f s (%s) — carrying on" % (waited, said))
+                return waited, True
 
     def efforts_present(self):
         self.joints()  # ensure at least one message arrived
@@ -732,10 +919,12 @@ class PlannerClient:
 
     def _note_sent(self, goal):
         """Keep what release() needs of `goal`, about to be sent: its
-        control_mode and a copy of its gains. Nothing has let it go yet."""
+        control_mode and a copy of its gains. Nothing has let it go yet.
+        And when it went (goals_sent)."""
         self._last_mode = int(goal.control_mode)
         self._last_gains = copy.deepcopy(goal.gains)
         self._released = False
+        self._mark_sent()
 
     # release()'s hold: as prime_compliant's, two points at the arm's joints,
     # the first past t=0 (check_like_executor refuses a first point at 0)
@@ -800,6 +989,7 @@ class PlannerClient:
             goal.gains = self._last_gains
             goal.preemption = LATEST_WINS
             goal.sender_id = "rammp_box_opening"
+            self._mark_sent()
             # no abort: after a Ctrl+C the flag is already set
             send = spin_until_done(self.node, self._execute.send_goal_async(goal), 2.0)
         except Exception as e:  # noqa: BLE001 - a release must never cost the unwinding it rides on
@@ -812,6 +1002,18 @@ class PlannerClient:
         self._released = True
         print("[client] released: the joint spring now holds where the arm stands")
         return True
+
+    # The driver sends a feedback every sampler tick, 1 kHz by code, its
+    # `actual` the measured joints (kinova-gen3-driver 94736cd
+    # supervisor.cpp), and what this node hears of it is deserialized here
+    # anyway: every FEEDBACK_EVERY-th heard is kept (~100 a second, if all
+    # are; how many are has never been measured — the side file's times
+    # say) with its fraction (the driver's own trajectory clock) and when it
+    # was heard — the newest FEEDBACK_KEEP, a minute of motion (the longest
+    # of 2026-10-28 flew 9.2 s, 15:46:37's way in) — for the run record's
+    # side file (runner._keep_flight)
+    FEEDBACK_EVERY = 10
+    FEEDBACK_KEEP = 6000
 
     def execute(self, traj, speed, guard=None, while_running=None, stop_when=None, gains=None):
         """Run one trajectory on the driver; outcome 'arrived' | 'touch' | 'failed'.
@@ -849,8 +1051,17 @@ class PlannerClient:
         this motion instead of after it (the planner is its own container).
         Its blocking plans spin this same node, so feedback keeps flowing;
         its result lands in info["while_running"], an exception in
-        info["while_running_error"] — never past the cancel path."""
+        info["while_running_error"] — never past the cancel path.
+
+        Once the goal goes out, info["sent_at"] is when (time.monotonic()),
+        info["sent_traj"] the trajectory sent (dilated where `speed` asked)
+        and info["feedback_q"] what flew: every FEEDBACK_EVERY-th feedback
+        as (when it was heard, its fraction, the measured joints). The same
+        info is self.last_execution from the call's start: a Ctrl+C raises
+        through here, once the cancel and the release are out, with
+        nothing returned."""
         info = {"message": "", "progress": 0.0, "torque_peak": None, "gains": None}
+        self.last_execution = info
         if self._abort is not None and self._abort.requested:
             raise KeyboardInterrupt  # aborted before this leg ever started
         if not self._armed:
@@ -887,9 +1098,15 @@ class PlannerClient:
         goal.preemption = QUEUE  # never displace a goal that is still settling
         goal.sender_id = "rammp_box_opening"
         self._note_sent(goal)
+        # what flew, at the price of a count and an append a feedback
+        kept, every, heard = deque(maxlen=self.FEEDBACK_KEEP), self.FEEDBACK_EVERY, 0
 
         def _fb(msg):
+            nonlocal heard
             info["progress"] = float(msg.feedback.fraction_complete)
+            if heard % every == 0:
+                kept.append((time.monotonic(), info["progress"], list(msg.feedback.actual.positions)))
+            heard += 1
             if guard is not None:
                 guard.on_progress(info["progress"])
 
@@ -899,6 +1116,7 @@ class PlannerClient:
             self._abort.goal_in_flight = True
         unwinding = False
         try:
+            info.update(sent_at=time.monotonic(), sent_traj=flown, feedback_q=kept)
             send = spin_until_done(
                 self.node,
                 self._execute.send_goal_async(goal, feedback_callback=_fb),

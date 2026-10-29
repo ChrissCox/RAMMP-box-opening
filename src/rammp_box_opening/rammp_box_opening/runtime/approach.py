@@ -105,7 +105,10 @@ def line_trajectory(joint_names, points):
     """A JointTrajectory through joint-space `points` with a rest-to-rest
     velocity profile at full cruise (positions untouched, runtime/retime):
     exactly what a planner trajectory is, so a leg's speed dilates it, a
-    warp reshapes it and a merged group re-profiles it like any other."""
+    warp reshapes it and a merged group re-profiles it like any other.
+    Only a guarded leg flown on its own flies this timing (dilated by its
+    speed, or warped): the runner re-times every other motion's positions
+    itself (Runner.retime_params, a compliant run's own profile)."""
     traj, _info = retime_group(
         [positions_to_traj(joint_names, points)], [1.0], JOINT_VMAX, RetimeParams()
     )
