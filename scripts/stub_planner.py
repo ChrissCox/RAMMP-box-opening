@@ -116,7 +116,11 @@ class StubPlanner(Node):
         # bounded oscillation, not accumulation: an unconditional +0.3 rad
         # per plan walked joint_1 ~3 rad across a mission, which no real
         # plan does — and the runner's joint-swing cap (a REAL safety gate,
-        # field 2026-09-01) rightly refused the fake home
+        # field 2026-09-01) rightly refused the fake home. It does not end
+        # at the pose asked for, so the client refuses it wherever it has
+        # the arm's chain to measure by (PlannerClient._checked_pose); a
+        # pose the arm's own IK solves goes out as a joint goal instead,
+        # which ends on its target here. abort_e2e plans joints only.
         q1[0] += 0.3 if q0[0] < 1.0 else -0.3
         res = PlanToPose.Result()
         res.success = True

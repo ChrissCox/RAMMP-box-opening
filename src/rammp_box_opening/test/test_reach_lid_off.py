@@ -63,7 +63,7 @@ def _walk_or_turn(ctx_, q_look, slide, start, quat, top_z=None):
 
 
 def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False, press_only=False, chain=None,
-               extent=None, ends=None, home_refusals=0, wrist=None, scene=None, refuse_carry=False):
+               extent=None, ends=None, home_refusals=0, wrist=None, scene=None, refuse_carry=False, rise=None):
     """run_reach_press as a full run (compliant --depth-press, no
     --press-only), everything faked: `aims` the wrist's aims in order, each
     (press point, knob mm) or None — the look's, then each after a press
@@ -72,7 +72,8 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
     the scene camera saw (no room map: the lid goes beside the box, in its
     zone); `ends`: {n: (outcome, info)} for the n-th goal sent; `wrist`
     the wrist's points at the spot look, `scene` the scene camera's (None:
-    no camera data). Returns
+    no camera data); `rise` depth_press.rise_back_up's stand-in (None:
+    back up the stroke). Returns
     (exit code, the record, the chain, the run log's rows)."""
     from conftest import leg as make_leg
 
@@ -109,7 +110,8 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
     monkeypatch.setattr(rp, "way_down", trp._way_down([], lambda tilt, tip: True))
     monkeypatch.setattr(rp, "walk_or_turn", _walk_or_turn)
     # the arm held on the button 32 mm above the stroke's end, the way up back along it
-    monkeypatch.setattr(dp, "rise_back_up", lambda chain_, stroke, q, join_above_m=None: [list(q), list(stroke.q0)])
+    monkeypatch.setattr(dp, "rise_back_up",
+                        rise or (lambda chain_, stroke, q, join_above_m=None: [list(q), list(stroke.q0)]))
     held_pad = (BUTTON[0], BUTTON[1], BUTTON[2] - 0.006)
 
     def hold(ctx_, cfg_, runner_, stroke, top_z, seen):
@@ -118,7 +120,7 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
         return dp.DepthPress(free=True, contact=True, felt=True, judged=False, press_n=15.0)
 
     monkeypatch.setattr(dp, "compliant_hold", hold)
-    monkeypatch.setattr(rlo, "spot_look", lambda node, watcher: (rec.events.append("spot-look"), wrist)[1])
+    monkeypatch.setattr(rlo, "spot_look", lambda node, watcher, runner_: (rec.events.append("spot-look"), wrist)[1])
 
     class R(Runner):
         def run(self, legs, execute, lookahead=None):
@@ -299,6 +301,116 @@ def test_fingers_that_close_on_air_open_again_and_back_out_the_way_they_came(ctx
     result, = [r for r in rows if r["leg"] == "reach_grip_result"]
     assert result["ok"] is False and "0.790" in result["detail"]
     assert "GRIP FAILED" in capsys.readouterr().out
+
+
+class _ReachingChain(_Chain):
+    """_Chain whose fk puts the hand where the straight line that ended at
+    those joints went (its IK reaching the target), so a line from where the
+    arm stands to somewhere else has a length; and whose turning walk flies
+    (the way back to the look pose from a rise off the stroke)."""
+
+    def __init__(self):
+        super().__init__()
+        self.at = {}
+
+    def straight_line(self, q0, xyz, quat):
+        pts, why = super().straight_line(q0, xyz, quat)
+        if pts:
+            self.at[tuple(round(float(v), 9) for v in pts[-1])] = list(xyz)
+        return pts, why
+
+    def walk(self, q0, xyz, quat, step_m=None, step_rad=None, max_step_rad=None):
+        return self.straight_line(q0, xyz, quat)
+
+    def fk(self, q):
+        R, t = super().fk(q)
+        return R, np.array(self.at.get(tuple(round(float(v), 9) for v in q), t), float)
+
+
+FREE_AIR_RUNS = {
+    "lid off": {},
+    "grip on air": dict(knuckle=AIR),
+    # no way back up the stroke: a straight line to its start, then the walk from there to the look pose
+    "off the stroke": dict(rise=lambda chain_, stroke, q, join_above_m=None: None, chain=_ReachingChain()),
+    # no home plans after the set-down, the carry's lookahead's nor again (plan_home_after): the retreat alone,
+    # then home from up there
+    "no home after the set-down": {},
+    # the release's retreat and home turned down by the driver (the 7th goal): the retreat alone, then home
+    "the retreat and home refused": dict(ends={7: trp.REJECTED}, chain=_ReachingChain()),
+}
+
+
+@pytest.mark.parametrize("case", list(FREE_AIR_RUNS))
+def test_the_full_runs_free_air_lines_fly_at_the_compliant_speed_and_only_under_the_wrists_ceiling(
+        ctx, monkeypatch, tmp_path, case):
+    """Every plan-free line of the full run that moves in free air — the
+    re-aim, the slide in and the turn of the way in and of the grip's, the
+    rise, the turn back and the slide out (or, from a rise off the stroke,
+    the walk back to the look pose), the grip's way back up after a close on
+    air, the clear with the lid and the retreat from it (with home, or alone
+    where home does not plan or fly) — flies at COMPLIANT_FREE_LINE_SPEED,
+    and every execution carrying one is re-timed under the wrist's
+    COMPLIANT_QD_CEILING and meets its legs at COMPLIANT_JUNCTION_SPEED
+    (Runner.retime_params). The legs that meet the button, the knob or the
+    table keep their own speeds, the planned ones TRANSIT_SPEED. Outside
+    the run, the client as press_demo built it, free_line_speed is a
+    guarded run's FREE_LINE_SPEED."""
+    from rammp_box_opening.constants import (
+        COMPLIANT_FREE_LINE_SPEED,
+        COMPLIANT_JUNCTION_SPEED,
+        COMPLIANT_QD_CEILING,
+        FREE_LINE_SPEED,
+        TRANSIT_SPEED,
+    )
+    from rammp_box_opening.runtime import runner as runner_mod
+    from rammp_box_opening.runtime.retime import RetimeParams
+    from rammp_box_opening.runtime.runner import Runner
+
+    flown, timed = [], []  # (name, speed) of every motion leg handed to the runner; (speeds, params) per re-timing
+    real_run, real_group = Runner.run, runner_mod.retime_group
+
+    def run(self, legs, execute, lookahead=None):
+        flown.extend((lg.name, lg.speed) for lg in legs if lg.kind.value == "motion")
+        return real_run(self, legs, execute, lookahead)
+
+    def retime_group(trajs, speeds, vmax, params=RetimeParams()):
+        timed.append((list(speeds), params))
+        return real_group(trajs, speeds, vmax, params)
+
+    monkeypatch.setattr(Runner, "run", run)
+    monkeypatch.setattr(runner_mod, "retime_group", retime_group)
+    if case == "no home after the set-down":
+        monkeypatch.setattr(rlo, "plan_home_after", lambda ctx_, cfg_, carry: (None, "home after the set-down "
+                            "(planning failed for home: MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION)"))
+    assert rp.free_line_speed(ctx) == FREE_LINE_SPEED
+    cfg = load_press_demo(PINK)
+    code, rec, _chain, _rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)],
+                                          **FREE_AIR_RUNS[case])
+    lid_off = case != "grip on air"
+    assert code == (0 if lid_off else 1)
+    want = {n: COMPLIANT_FREE_LINE_SPEED for n in ("reach:re-aim", "reach:slide-in", "depth:turn", "depth:rise",
+                                                   "depth:turn-back", "reach:slide-out", "grip:up", "lid:clear",
+                                                   "place:retreat")}
+    # the stroke's own speed: here the faked way down's (test_reach_press._way_down), its press at TOUCH_SPEED
+    want.update({"depth:press": dp.TOUCH_SPEED, "grip:approach": cfg.grip_speed, "grip:down": dp.TOUCH_SPEED,
+                 "lid:lift": cfg.lift_speed, "place:down": cfg.setdown_speed, "place:touch": dp.TOUCH_SPEED,
+                 "reach:look": TRANSIT_SPEED, "lid:carry": TRANSIT_SPEED, "home": TRANSIT_SPEED})
+    assert [(n, s) for n, s in flown if s != want[n]] == []
+    names = {n for n, _s in flown}
+    assert ("grip:up" in names) is not lid_off and ("place:retreat" in names) is lid_off
+    runs = [legs for legs, _gains in rec.runs]
+    if case == "off the stroke":
+        # the walk from where the rise ends (here where the arm stands: the fake hand is at the stroke's start
+        # already), not the way down backwards
+        assert runs[2] == ["reach:slide-out"], runs
+    elif case == "no home after the set-down":
+        assert runs[-2:] == [["place:open", "place:retreat"], ["home"]], runs
+    elif case == "the retreat and home refused":
+        assert runs[-3:] == [["place:open", "place:retreat", "home"], ["place:retreat"], ["home"]], runs
+    fast = [params for speeds, params in timed if COMPLIANT_FREE_LINE_SPEED in speeds]
+    assert fast and all(p.qd_ceiling == COMPLIANT_QD_CEILING and p.junction_cruise == COMPLIANT_JUNCTION_SPEED
+                        for p in fast)
+    assert not ctx.client.compliant and rp.free_line_speed(ctx) == FREE_LINE_SPEED  # put back once the run is over
 
 
 def test_a_lid_that_slipped_on_the_way_is_released_the_arm_goes_home_and_the_run_says_so(ctx, monkeypatch, tmp_path,
@@ -584,6 +696,85 @@ def test_no_carry_that_plans_holds_the_lid_and_says_so(ctx, monkeypatch, tmp_pat
     assert "STOP: no carry to a spot the lid could go to plans" in capsys.readouterr().out
 
 
+def test_the_spot_look_takes_the_first_frame_shot_once_the_arm_stands_still(monkeypatch):
+    """The spot look waited a blind 0.3 s (depth_press.look's settle) once
+    the lift and the clear arrived, whatever the arm did: after 15:45's
+    looks it stood still only at +0.80 s. It now waits for the arm to
+    stand still (runner.wait_still, noted before 'spot-look'), then takes
+    the first frame shot after that — never one shot while the arm settled
+    — with no blind settle on top."""
+    from rammp_box_opening.tasks import press_demo as pd
+
+    clock = {"ns": 1_000_000_000}
+    grab = SimpleNamespace(color_stamp=SimpleNamespace(sec=0, nanosec=900_000_000), depth=object())
+    node = SimpleNamespace(get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=clock["ns"])))
+    events = []
+
+    def wait_still(before):
+        events.append(("still", before))
+        clock["ns"] += 800_000_000  # the arm settles 0.8 s
+        grab.color_stamp = SimpleNamespace(sec=1, nanosec=700_000_000)  # a frame shot while it settled
+
+    def spin(node_):
+        events.append("spin")
+        clock["ns"] += 20_000_000
+        if events.count("spin") == 2:  # the first frame shot after the wait
+            grab.color_stamp = SimpleNamespace(sec=1, nanosec=850_000_000)
+
+    monkeypatch.setattr(pd, "_spin_detect", spin)
+    monkeypatch.setattr(pd, "wrist_points", lambda watcher: ("points of", watcher.grab.color_stamp.nanosec))
+    got = rlo.spot_look(node, SimpleNamespace(grab=grab), SimpleNamespace(wait_still=wait_still))
+    assert events == [("still", "spot-look"), "spin", "spin"]
+    assert got == ("points of", 850_000_000)
+
+
+def test_the_lid_s_spot_is_mapped_and_its_carry_planned_from_where_the_arm_stood_still(ctx, monkeypatch, tmp_path):
+    """The joints the wrist's frame is mapped from (spot_map) and the carry
+    planned from (spot_candidates, plan_carry) are read after the spot
+    look's wait for a still arm, where its frame was shot: not before it,
+    the arm still settling from the lift and the clear."""
+    from rammp_box_opening.runtime.runner import Runner
+    from rammp_box_opening.tasks import press_demo as pd
+
+    stood = [0.01 * (k + 1) for k in range(7)]
+    seen = []
+
+    def look(node, watcher, runner_):
+        ctx.client.live = list(stood)  # the arm came to rest while the spot look waited
+        return None
+
+    def candidates(ctx_, tmap, table_z, q, seeds=()):
+        seen.append(("spot_candidates", list(q)))
+        yield SimpleNamespace(xyz=(0.45, -0.25, -0.027)), "beside the box", "beside the box"
+
+    monkeypatch.setattr(rlo, "spot_look", look)
+    monkeypatch.setattr(rlo, "spot_map", lambda ctx_, wrist, q, *rest: seen.append(("spot_map", list(q))))
+    monkeypatch.setattr(rlo, "spot_candidates", candidates)
+    monkeypatch.setattr(pd, "adopt_seen", lambda *a, **k: None)
+    monkeypatch.setattr(rlo, "plan_carry", lambda ctx_, cfg_, q, drop: (seen.append(("plan_carry", list(q))),
+                                                                        (None, "refused"))[1])
+    eyes = (None, SimpleNamespace(table_z=-0.027), None, None)
+    assert rlo.choose_and_carry(ctx, load_press_demo(PINK), Runner(ctx.client, log_dir=tmp_path), eyes) == 1
+    assert seen == [("spot_map", stood), ("spot_candidates", stood), ("plan_carry", stood)]
+
+
+def test_the_fingers_close_on_the_knob_once_the_arm_stands_still(ctx, monkeypatch, tmp_path):
+    """16:23 2026-10-28: grip:close went out about 30 ms after the way down
+    to the knob "arrived" — its trajectory's clock run out, the arm 2.3 mm
+    off its end. The close now goes out once the arm stands still
+    (Leg.send_when_still): after the way down and the open that rode it,
+    before the fingers move, noted 'still' before grip:close. Nothing else
+    waits so."""
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)])
+    assert code == 0
+    assert [name for name, lg in rec.legs.items() if lg.send_when_still] == ["grip:close"]
+    assert ctx.client.stills == [4]  # after the look, the way in, the way back and the way down to the knob
+    legs = [r["leg"] for r in rows]
+    (still,) = [i for i, name in enumerate(legs) if name == "still"]
+    assert rows[still]["before"] == "grip:close"
+    assert legs.index("grip:down") < legs.index("grip:open") < still < legs.index("grip:close")
+
+
 # ---- flatbot's URDF: the five boxes of the owner's brief ------------------------
 
 FLATBOT_BOXES = [(0.51, -0.27), (0.57, -0.19), (0.716, -0.13), (0.668, -0.33), (0.60, -0.49)]
@@ -596,6 +787,22 @@ def _held_at_bottom(chain, stroke, top_z, cfg):
     pts = stroke.legs[-1][1]
     bottom = top_z - cfg.button_travel_m
     return min(pts, key=lambda q: abs(dp._pads_z(chain, q) - bottom))
+
+
+def _plan_by_ik(chain, home):
+    """rp._plan_motion's stand-in on flatbot: the planner stood in for by
+    the arm's IK, a goal it reaches flown as two points."""
+
+    def plan_ik(ctx_, state, name, target, world, speed):
+        if target[0] == "joints":
+            q = list(target[1])
+        else:
+            q = chain.nearest_solution(list(state.joints), target[1], target[2], seeds=(home,))
+            assert q is not None, name
+        return rp.line_leg(ctx_, name, [list(state.joints), [float(v) for v in q]], target[2] if len(target) > 2 else
+                           [0, 0, 0, 1], speed, None, world), state
+
+    return plan_ik
 
 
 @pytest.mark.parametrize("box", FLATBOT_BOXES, ids=["%.3f,%.2f" % b for b in FLATBOT_BOXES])
@@ -652,17 +859,7 @@ def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ct
     reached = [d for d in spots if rlo.drop_reachable(ctx, d, home) is None]
     assert reached, [rlo.drop_reachable(ctx, d, home) for d in spots]
 
-    def plan_ik(ctx_, state, name, target, world, speed):
-        # the planner stood in for by the arm's IK: a goal it reaches, flown as two points
-        if target[0] == "joints":
-            q = list(target[1])
-        else:
-            q = chain.nearest_solution(list(state.joints), target[1], target[2], seeds=(home,))
-            assert q is not None, name
-        return rp.line_leg(ctx_, name, [list(state.joints), [float(v) for v in q]], target[2] if len(target) > 2 else
-                           [0, 0, 0, 1], speed, None, world), state
-
-    monkeypatch.setattr(rp, "_plan_motion", plan_ik)
+    monkeypatch.setattr(rp, "_plan_motion", _plan_by_ik(chain, home))
     lift, why = rlo.plan_lift(ctx, cfg, legs[-1].goal_joints, grip.stroke.quat)
     assert lift is not None, why
     assert [lg.name for lg in lift.legs] == ["lid:lift", "lid:clear"]
@@ -689,3 +886,109 @@ def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ct
 
     assert t_clear[2] >= planned_top_z(ctx.model, ctx.cpose) + rp.HOME_CLEAR_M
     assert math.hypot(*t_clear[:2]) < math.hypot(*t_lift[:2])  # back toward the arm
+
+
+@pytest.mark.parametrize("box", FLATBOT_BOXES, ids=["%.3f,%.2f" % b for b in FLATBOT_BOXES])
+def test_on_flatbot_the_free_air_lines_fly_faster_under_the_wrists_ceiling_and_stop_nowhere_new(
+        ctx, monkeypatch, tmp_path, box):
+    """2026-10-28 16:23: the walks between the tilted look pose and the hand
+    turned down over the button — the way in, the way back, the grip's way
+    in and its back out — were 15.9 s of the run's 29.4 at FREE_LINE_SPEED.
+    A compliant run flies the same lines at COMPLIANT_FREE_LINE_SPEED,
+    re-timed as the runner flies them (Runner.retime_params). Flatbot's own
+    kinematics, every box of the brief: each execution carrying one — the
+    way in, the way back, the grip in, the back out, the lift and the clear,
+    the retreat and home (the retreat alone where home first steps a joint
+    off its limit, guarded) — timed as the runner flies it, against the
+    same lines at FREE_LINE_SPEED under compliant-timing's profile (no
+    junction ceiling): it is shorter and stops where it stopped there, no
+    more, no less; it meets its legs no faster (2 %: the profile's rounding
+    sees the faster samples beyond the junction's three) and asks the
+    driver's quintic for no more acceleration than 10 % over what it asked,
+    or 10 rad/s^2; the press stroke is entered no faster than before; in no
+    interval does a wrist joint run past COMPLIANT_QD_CEILING, nor any other
+    past 0.9 x its execution's fastest leg's speed x its limit (0.69 rad/s
+    on the walks); and the runner's and the driver's gates pass every one."""
+    from dataclasses import replace
+
+    from jtc_model import peak_accel
+
+    from rammp_box_opening.constants import (
+        COMPLIANT_FREE_LINE_SPEED,
+        COMPLIANT_JUNCTION_SPEED,
+        COMPLIANT_QD_CEILING,
+        FREE_LINE_SPEED,
+        JOINT_VMAX,
+    )
+    from rammp_box_opening.primitives.core import _full_world
+    from rammp_box_opening.runtime.legs import merge_groups
+    from rammp_box_opening.runtime.retime import check_like_executor, retime_group
+    from rammp_box_opening.runtime.runner import Runner, line_profile
+    from rammp_box_opening.runtime.stamps import secs
+
+    def as_flown(group, p, slow=False):
+        # what Runner._run_motion sends for the execution `group` (one profile over it, a lone free-air line its
+        # own) and retime_group's report of it; its free-air lines at FREE_LINE_SPEED where `slow`
+        group = [replace(lg, speed=FREE_LINE_SPEED) if slow and lg.speed == COMPLIANT_FREE_LINE_SPEED else lg
+                 for lg in group]
+        if len(group) > 1:
+            return retime_group([lg.traj for lg in group], [lg.speed for lg in group], JOINT_VMAX, p)
+        traj = line_profile(group[0], p)
+        return traj, {"duration_s": secs(traj.points[-1].time_from_start), "junction_speeds": [], "stops": 0}
+
+    chain, cfg, home = trp._on_flatbot(ctx, monkeypatch)
+    ctx.client.compliant = True  # as run_reach_press sets it: every leg below is a compliant run's
+    button = (box[0], box[1], LID)
+    ctx.cpose = rp.cpose_for_button(button, 0.0, ctx.model.button_offset)
+    plan, why = rp.plan_reach(ctx, cfg, button, home, depth=True)
+    assert why is None and plan.tilt_deg == 30
+    way, why, _kind = rp.solve_way_in(ctx, cfg, button, plan.tilt_deg, plan.look_leg.goal_joints)
+    assert way is not None, why
+    q_held = _held_at_bottom(chain, way.stroke, LID, cfg)
+    back, kind, why = rlo.way_back_legs(ctx, way, q_held)
+    assert kind is None, why
+    grip, why = rlo.solve_grip_way(ctx, cfg, button, plan.tilt_deg, back[-1].goal_joints,
+                                   rlo.grip_lid_z(LID, dp._pads_z(chain, q_held)))
+    assert grip is not None, why
+    grip_in = rp.way_in_legs(ctx, cfg, grip)
+
+    monkeypatch.setattr(rp, "_plan_motion", _plan_by_ik(chain, home))
+    lift, why = rlo.plan_lift(ctx, cfg, grip_in[-1].goal_joints, grip.stroke.quat)
+    assert lift is not None, why
+    drop, _tier, _says = next(rlo.spot_candidates(ctx, None, LID - 0.10, lift.legs[-1].goal_joints, seeds=(home,)))
+    carry, why = rlo.plan_carry(ctx, cfg, lift.legs[-1].goal_joints, drop)
+    assert carry is not None, why
+    retreat, why = rlo.plan_home_after(ctx, cfg, carry)
+    assert retreat is not None, why
+    executions = {"way in": rp.way_in_legs(ctx, cfg, way), "way back": back, "grip in": grip_in,
+                  "back out": rlo._grip_backwards(ctx, grip, _full_world(ctx)), "lift": lift.legs, "retreat": retreat}
+    runner = Runner(ctx.client, log_dir=tmp_path)
+    params = runner.retime_params()
+    assert params.qd_ceiling == COMPLIANT_QD_CEILING and params.junction_cruise == COMPLIANT_JUNCTION_SPEED
+    wrist = np.asarray(COMPLIANT_QD_CEILING[4:], float)
+    timed = []
+    for what, legs in executions.items():
+        assert any(lg.speed == COMPLIANT_FREE_LINE_SPEED for lg in legs), (what, [lg.speed for lg in legs])
+        plan_free = [lg for lg in legs if lg.plan_free]
+        assert [(lg.name, runner._refusal(lg)) for lg in plan_free] == [(lg.name, None) for lg in plan_free], what
+        timed += [(what, g) for g in merge_groups(legs) if any(lg.speed == COMPLIANT_FREE_LINE_SPEED for lg in g)]
+    assert {what for what, _g in timed} == set(executions)
+    for what, legs in timed:
+        flown, info = as_flown(legs, params)
+        was, before = as_flown(legs, replace(params, junction_cruise=None), slow=True)
+        assert info["duration_s"] < before["duration_s"] and info["stops"] == before["stops"], (what, info, before)
+        assert all(v <= 1.02 * b + 1e-9 for v, b in zip(info["junction_speeds"], before["junction_speeds"])), (
+            what, info["junction_speeds"], before["junction_speeds"])
+        assert peak_accel(flown)[0] <= max(1.1 * peak_accel(was)[0], 10.0), (what, peak_accel(flown), peak_accel(was))
+        assert check_like_executor(flown, JOINT_VMAX) == [], what
+        q = np.asarray([p.positions for p in flown.points])
+        t = np.asarray([secs(p.time_from_start) for p in flown.points])
+        # each interval's joint speed, what the ceilings bound (the stamps whole nanoseconds: 4e-8 of a 25 ms one);
+        # the driver's quintic between two samples can run past it where the path turns, as it did at 0.3
+        qd = np.abs(np.diff(q, axis=0)) / np.diff(t)[:, None]
+        assert (qd[:, 4:] <= wrist * (1 + 1e-6)).all(), (what, qd[:, 4:].max(axis=0))
+        arm = 0.9 * max(lg.speed for lg in legs) * np.asarray(JOINT_VMAX[:4], float)  # the planned home's: 1.0
+        assert (qd[:, :4] <= arm * (1 + 1e-6)).all(), (what, qd[:, :4].max(axis=0))
+        if what == "way in":
+            k = next(i for i, lg in enumerate(legs) if lg.name in ("depth:approach", "depth:press"))
+            assert info["junction_speeds"][k - 1] <= before["junction_speeds"][k - 1] + 1e-9, (info, before)

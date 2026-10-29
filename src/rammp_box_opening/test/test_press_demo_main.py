@@ -88,10 +88,10 @@ HOME_FIRSTS = []  # the keywords of every home_first call, in order
 REACH_OUTS = []  # the scene fixes handed to the reach-out
 
 
-def run_main(monkeypatch, tmp_path, argv, approach, client=None):
+def run_main(monkeypatch, tmp_path, argv, approach, client=None, found=True):
     """press_demo.main() with `approach(ctx)` standing in for the reach-out:
-    its result's `failed` decides the exit code. Returns (exit code, client,
-    run-log rows)."""
+    its result's `failed` decides the exit code; `found` False, the scene
+    camera finds no box. Returns (exit code, client, run-log rows)."""
     import faulthandler
 
     import rclpy.executors
@@ -116,7 +116,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None):
         table_extent = None
 
     class _Locator:
-        last_why = None
+        last_why = None if found else "the OWL's 3 candidates refused"
         moved_note = None
         last_timing = {}
         grab = None
@@ -129,7 +129,7 @@ def run_main(monkeypatch, tmp_path, argv, approach, client=None):
 
         def locate(self, timeout):
             LOCATES.append(timeout)
-            return _Fix
+            return _Fix if found else None
 
         def base_to_link(self):
             return None
@@ -215,6 +215,45 @@ def test_the_first_look_for_the_box_keeps_at_it_longer_than_a_re_check(monkeypat
     run_main(monkeypatch, tmp_path, ["--execute", "--press-only"], _at_staging(), client=client)
     assert LOCATES[0] == press_demo.SCENE_FIRST_LOCATE_S > press_demo.SCENE_LOCATE_S
     assert len(REACH_OUTS) == 1  # a box within the straight-down staging reach goes to the reach-out too
+
+
+def test_a_run_whose_scene_camera_finds_no_box_says_so_in_its_record(monkeypatch, tmp_path):
+    """NO BOX is printed and the arm goes home: the record now says why the
+    reach-out never started, before the home it flies (reach_refused)."""
+    REACH_OUTS.clear()
+    code, _c, rows = run_main(monkeypatch, tmp_path, ["--execute"], _at_staging(), found=False)
+    assert code == 2 and not REACH_OUTS
+    refused = [r for r in rows if r["leg"] == "reach_refused"]
+    assert [r["why"] for r in refused] == ["NO BOX — scene camera: the OWL's 3 candidates refused"]
+    assert rows.index(refused[0]) < len(rows) - 1 and rows[-1]["kind"] == "motion"  # then the home
+
+
+class _Hears(FakeClient):
+    """A client that keeps what it heard and when it sent, as PlannerClient
+    does (nothing heard here): each execution says when it went out, so its
+    arrival's settle is due."""
+
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+        import time
+
+        outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+        info.update(sent_at=time.monotonic(), sent_traj=traj_, feedback_q=[])
+        return outcome, info
+
+    def joint_history(self, since=None):
+        return []
+
+    def goals_sent(self):
+        return []
+
+
+def test_the_last_arrivals_settle_is_noted_as_the_run_ends(monkeypatch, tmp_path):
+    """Nothing after a run's last motion goes out to note its settle: main's
+    exit does (runner.flush), the NO BOX run's home's after its own row, cut
+    where the run ended."""
+    code, _c, rows = run_main(monkeypatch, tmp_path, ["--execute"], _at_staging(), client=_Hears(), found=False)
+    assert code == 2 and rows[-2]["kind"] == "motion"
+    assert rows[-1]["leg"] == "settle" and rows[-1]["cut"] == "run end" and rows[-1]["legs"][-1] == rows[-2]["leg"]
 
 
 def _refused(ctx):

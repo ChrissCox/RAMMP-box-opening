@@ -72,6 +72,12 @@ class Leg:
     # every point of that motion (an open during a retreat that starts
     # clear of the box); the usual join still gates the next guarded leg.
     send_with_previous_motion: bool = False
+    # GRIPPER legs only: the command goes out once the arm stands still
+    # (Runner.wait_still, the run's 'still' note) — a close on what the hand
+    # has just come down to: in the joint impedance "arrived" is the
+    # trajectory's clock running out, the arm still settling. Never sent
+    # under the previous motion, send_with_previous_motion or not.
+    send_when_still: bool = False
     world_path: str = None  # generated world YAML to push (SetWorld wants a path)
     # MOTION legs planned with a vertical approach: (index into traj.points,
     # joints) of the waypoint the final straight line starts from, at rest.
@@ -104,6 +110,12 @@ class Leg:
     # per plan, and only these two numbers side by side say which half.
     plan_s: float = field(default=None, compare=False)
     plan_server_s: float = field(default=None, compare=False)
+    # What the run record keeps of the plan this leg flies (runner._log): the
+    # planner's message and solve time, its goal_mismatch_rad, how far the
+    # plan ends from `target`, plan_s and the client's refusals on the way
+    # (planner.plan_record). None for a leg no planner planned: a plan-free
+    # line, a gripper leg, a lazy leg until the Runner plans it.
+    plan: dict = field(default=None, compare=False, repr=False)
     # (fast_scale, slow_scale, slow_path_fraction) when a guarded descent
     # was time-warped; display only — leg.speed is 1.0 once it is baked in
     warp: tuple = field(default=None, compare=False)
