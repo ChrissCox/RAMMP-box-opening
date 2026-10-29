@@ -2204,8 +2204,9 @@ def run_reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
 
 def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     from rammp_box_opening.models.container import from_container
+    from rammp_box_opening.perception import camera_video
     from rammp_box_opening.runtime import approach
-    from rammp_box_opening.tasks.press_demo import dump_wrist_frame, refuse_open_box, touch_verdict
+    from rammp_box_opening.tasks.press_demo import CAPTURES_DIR, dump_wrist_frame, refuse_open_box, touch_verdict
 
     m = ctx.model
     why = unsupported(m)
@@ -2255,6 +2256,12 @@ def _reach_press(node, ctx, cfg, runner, watcher, args, scene_fix, locator):
     # where the arm stood when the scene camera found the box: its points
     # there are the arm, not the table (reach_lid_off.spot_map)
     eyes = (node, watcher, scene_fix, list(q0))
+    if args.execute and lid_off and camera_video.enabled():
+        # what the wrist and the scene cameras see from the grip's way down
+        # on, side by side (reach_lid_off.run_full starts and writes it)
+        ctx.scene_locator = locator
+        ctx.lid_video = camera_video.CameraVideo(
+            [("wrist", getattr(watcher, "grab", None)), ("scene", getattr(locator, "grab", None))], CAPTURES_DIR)
     if args.execute and soft:
         prime = getattr(ctx.client, "prime_compliant", None)
         if prime is not None and prime(q0):

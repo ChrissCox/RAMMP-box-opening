@@ -6,6 +6,7 @@ reachability on flatbot's URDF for the boxes of 2026-10-27/28."""
 
 import json
 import math
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -194,6 +195,93 @@ HOME = ["place:open", "place:retreat", "home"]
 def _executions(rec):
     """Each runner.run's legs with the gains of every execution it sent."""
     return [(names, gains) for names, gains in rec.runs]
+
+
+class _Video:
+    """camera_video.CameraVideo's stand-in: what the run says on it, and when."""
+
+    def __init__(self, sources, out_dir, rec=None, ctx=None):
+        self.sources, self.out_dir, self.rec, self.ctx = [n for n, _g in sources], out_dir, rec, ctx
+        self.said, self.started, self.finished = [], None, None
+
+    def start(self):
+        self.started = list(self.rec.events)
+        return self
+
+    def mark(self, text):
+        self.said.append(text)
+
+    def overlay(self, name, uv, text=""):
+        self.said.append("overlay %s" % name)
+
+    def finish(self, caption=None):
+        self.finished = (caption, len(self.ctx.client.lets_go))
+        return "/captures/lid-video-x.mp4"
+
+
+def _videoed(ctx, monkeypatch):
+    """A full run that records the lid video, as a run off the robot's tests
+    does not: the video made for it (reach_press._reach_press's) kept."""
+    from rammp_box_opening.perception import camera_video
+
+    made = []
+    monkeypatch.setenv("RAMMP_BOX_OPENING_VIDEO", "1")
+
+    def make(sources, out_dir):
+        made.append(_Video(sources, out_dir, made_rec[0], ctx))
+        return made[-1]
+
+    made_rec = [None]
+    monkeypatch.setattr(camera_video, "CameraVideo", make)
+    return made, made_rec
+
+
+def test_a_full_run_records_both_cameras_from_the_grip_on_says_each_step_and_writes_it_at_the_end(
+        ctx, monkeypatch, tmp_path, capsys):
+    """Owner 2026-10-29: "create a video of what the wrist and scene cameras
+    see during the lid placement so i can see too". A full --execute run
+    makes it of the wrist and the scene cameras; it starts after the press,
+    as the grip's way down begins; its caption says each step; the end is
+    its last picture, and the console says where the file is."""
+    made, made_rec = _videoed(ctx, monkeypatch)
+    real = _Rec
+
+    def rec_kept():
+        r = real()
+        made_rec[0] = r
+        return r
+
+    monkeypatch.setattr(sys.modules[__name__], "_Rec", rec_kept)
+    code, rec, _chain, _rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)])
+    assert code == 0
+    (v,) = made
+    assert v.sources == ["wrist", "scene"]
+    assert "hold" in v.started and "grip:open" not in v.started  # after the press, before the grip
+    steps = [t.split(" ")[0].rstrip(":") for t in v.said if not t.startswith("overlay")]
+    assert steps == ["GRIP", "CLOSE", "SPOT", "CARRY", "RELEASE,"]
+    assert v.finished[0] == "the end: the lid set down, the arm home"
+    assert "VIDEO: what the wrist and scene cameras saw from the grip on: /captures/lid-video-x.mp4" in (
+        capsys.readouterr().out)
+
+
+def test_a_ctrl_c_with_the_lid_in_the_fingers_lets_go_first_then_writes_the_video(ctx, monkeypatch, tmp_path):
+    made, made_rec = _videoed(ctx, monkeypatch)
+    real = _Rec
+
+    def rec_kept():
+        r = real()
+        made_rec[0] = r
+        return r
+
+    def ctrl_c():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sys.modules[__name__], "_Rec", rec_kept)
+    with pytest.raises(KeyboardInterrupt):
+        _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], at_spot_look=ctrl_c)
+    (v,) = made
+    caption, lets_go = v.finished
+    assert caption == "stopped: KeyboardInterrupt" and lets_go >= 1  # the arm let go before the video was written
 
 
 def test_a_knob_up_after_the_press_is_gripped_lifted_carried_set_down_and_the_arm_goes_home(
