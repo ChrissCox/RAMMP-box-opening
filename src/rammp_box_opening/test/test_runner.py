@@ -1393,6 +1393,33 @@ def test_a_failed_execution_logs_no_arrival_error(tmp_path, monkeypatch):
     assert row["mode"] == "impedance" and row["gains"] == 3  # how it flew, still
 
 
+def test_a_custom_specs_zeta_is_in_the_record_and_its_side_file_beside_its_name(tmp_path, monkeypatch):
+    """RIGID flew at zeta 0.7 from 14:21 to 16:23 2026-10-28: a run under
+    the same name at another zeta is told apart in the record by its zeta,
+    not its name. A driver profile's zeta is the driver's own: None."""
+    import json
+
+    from rammp_box_opening.constants import CustomGains
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: _TwoLink())
+    spec = CustomGains("RIGID", (400.0,) * 4 + (200.0,) * 3, 1.0, (39.0,) * 4 + (9.0,) * 3)
+
+    class Sends(_ArrivesOff):
+        def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
+            outcome, info = super().execute(traj_, speed, guard, while_running, stop_when, gains)
+            info.update(gains=spec, sent_at=time.monotonic(), sent_traj=traj_)
+            return outcome, info
+
+    res = runner(Sends(), tmp_path).run([leg("a", Q0, Q1)], execute=True)
+    assert res[0].ok and (res[0].gains, res[0].gains_zeta) == ("RIGID", 1.0)
+    assert (_rows(tmp_path)["a"]["gains"], _rows(tmp_path)["a"]["gains_zeta"]) == ("RIGID", 1.0)
+    doc = json.loads((tmp_path / res[0].flight).read_text())
+    assert (doc["gains"], doc["gains_zeta"]) == ("RIGID", 1.0)
+    res = runner(_ArrivesOff(), tmp_path / "profile").run([leg("a", Q0, Q1)], execute=True)
+    assert (res[0].gains, res[0].gains_zeta) == (3, None)
+
+
 def test_an_arrival_across_the_wrap_is_the_short_way_round(tmp_path, monkeypatch):
     """HOME's joint_3 sits 4.6 mrad from -pi and reads either side of it: an
     end at -3.137 with the arm reading +3.140 is 6 mrad off, not 6.28 rad."""
