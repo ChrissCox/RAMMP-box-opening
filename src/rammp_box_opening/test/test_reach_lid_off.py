@@ -67,7 +67,7 @@ def _walk_or_turn(ctx_, q_look, slide, start, quat, top_z=None):
 
 def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False, press_only=False, chain=None,
                extent=None, ends=None, home_refusals=0, wrist=None, scene=None, refuse_carry=False, rise=None,
-               at_spot_look=None):
+               at_spot_look=None, one_motion=True):
     """run_reach_press as a full run (compliant --depth-press, no
     --press-only), everything faked: `aims` the wrist's aims in order, each
     (press point, knob mm) or None — the look's, then each after a press
@@ -79,7 +79,9 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
     the wrist's points at the spot look, `scene` the scene camera's (None:
     no camera data); `rise` depth_press.rise_back_up's stand-in (None:
     back up the stroke); `at_spot_look()` what else happens at the spot
-    look. Returns
+    look; `one_motion` False: the grip's lookahead plans the lift alone,
+    as before the close flew on to the set-down — the lift, then the spot
+    look, then the carry. Returns
     (exit code, the record, the chain, the run log's rows)."""
     from conftest import leg as make_leg
 
@@ -118,6 +120,9 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
             rec.planning -= 1
 
     monkeypatch.setattr(rp, "_plan_motion", plan)
+    if not one_motion:
+        monkeypatch.setattr(rlo, "grip_ahead", lambda ctx_, cfg_, eyes, q, quat, room=None: (
+            *rlo.plan_lift(ctx_, cfg_, q, quat), None))
     monkeypatch.setattr(rp, "way_down", trp._way_down([], lambda tilt, tip: True))
     monkeypatch.setattr(rp, "walk_or_turn", _walk_or_turn)
     # the arm held on the button 32 mm above the stroke's end, the way up back along it
@@ -258,7 +263,7 @@ def test_a_full_run_records_both_cameras_from_the_grip_on_says_each_step_and_wri
     assert v.sources == ["wrist", "scene"]
     assert "hold" in v.started and "grip:open" not in v.started  # after the press, before the grip
     steps = [t.split(" ")[0].rstrip(":") for t in v.said if not t.startswith("overlay")]
-    assert steps == ["GRIP", "CLOSE", "SPOT", "CARRY", "RELEASE,"]
+    assert steps == ["GRIP", "CLOSE", "RELEASE,"] and "ONE MOTION: LIFT, CLEAR, CARRY to" in v.said[1]
     assert v.finished[0] == "the end: the lid set down, the arm home"
     assert "VIDEO: what the wrist and scene cameras saw from the grip on: /captures/lid-video-x.mp4" in (
         capsys.readouterr().out)
@@ -278,7 +283,7 @@ def test_a_ctrl_c_with_the_lid_in_the_fingers_lets_go_first_then_writes_the_vide
 
     monkeypatch.setattr(sys.modules[__name__], "_Rec", rec_kept)
     with pytest.raises(KeyboardInterrupt):
-        _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], at_spot_look=ctrl_c)
+        _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], at_spot_look=ctrl_c, one_motion=False)
     (v,) = made
     caption, lets_go = v.finished
     assert caption == "stopped: KeyboardInterrupt" and lets_go >= 1  # the arm let go before the video was written
@@ -288,11 +293,61 @@ def test_a_knob_up_after_the_press_is_gripped_lifted_carried_set_down_and_the_ar
         ctx, monkeypatch, tmp_path, capsys):
     """The full run: the way in, the hold, the way back to the look pose
     (the rise and the way down backwards), the look, then the grip's way
-    down with the fingers opening on it, the close, the lift, the clear, the
-    carry and the set-down, the release, the retreat and home — six
-    executions after the look's, every one RIGID and unguarded, the lid's
-    way to the table planned while the hand came down to the knob."""
+    down with the fingers opening on it; the close, then the lift, the
+    clear, the carry and the set-down in one motion (owner 2026-10-29:
+    "seemlesly grab the lid and move it to the safe location without
+    stopping or interuptions"); the release, the retreat and home — five
+    executions after the look's, every one RIGID and unguarded. The lid's
+    spot, its carry and home after the set-down all planned while the hand
+    came down to the knob, on the room judged while the press flew: no
+    spot look, no plan at rest."""
     code, rec, chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)])
+    assert code == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
+                          *CARRY, *HOME]
+    runs = _executions(rec)
+    assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE + CARRY, HOME]
+    # one goal each, every one under the run's one gains spec: the lift to the set-down one execution
+    for names, gains in runs[1:]:
+        assert gains == [dp.COMPLIANT_GAINS], names
+    assert all(lg.guard is None for lg in rec.legs.values() if lg.kind.value == "motion")
+    # the carry and home after the set-down planned once each, while the grip's way down flew (the record then
+    # ended with its legs); home before that from the look pose while the way back flew, for a stop there
+    planned = {name: at for name, at in rec.plans}
+    gripping = rec.events.index("grip:close")
+    assert planned["lid:carry"] == planned["home"] == gripping
+    assert [name for name, _at in rec.plans].count("lid:carry") == 1
+    assert [at for name, at in rec.plans if name == "home"] == [rec.events.index("aim:reach-after"), gripping]
+    # the spot chosen ahead, said before the close: no camera data, so beside the box
+    legs = [r["leg"] for r in rows]
+    assert legs.index("reach_grip") < legs.index("lid_spot") < legs.index("reach_grip_result")
+    spot, = [r for r in rows if r["leg"] == "lid_spot"]
+    assert (spot["tier"], spot["mapped"], spot["chosen"]) == ("beside the box", False, "ahead, with the scene camera")
+    assert spot["room_s"] is not None  # the room judged while the press flew
+    assert spot["xyz"] == pytest.approx(list(ctx.lid_drop.xyz), abs=1e-4)
+    hover = rec.legs["lid:carry"].target[1]
+    assert hover[:2] == pytest.approx(list(ctx.lid_drop.xyz[:2]))
+    assert ctx.lid_at is ctx.lid_drop  # the placed lid is in every world after the release
+    knob, = [r for r in rows if r["leg"] == "reach_knob"]
+    assert (knob["press"], knob["popped"], knob["looks"], knob["knob_up_mm"]) == (1, True, 1, 9.0)
+    # the grip goes by the lid where the hold held the pads (6 mm below the
+    # top) plus the button's stop, under the top: the top
+    grip, = [r for r in rows if r["leg"] == "reach_grip"]
+    assert grip["lid_z"] == pytest.approx(BUTTON[2]) and grip["pads_z"] == pytest.approx(BUTTON[2] - rlo.GRIP_BELOW_LID_M)
+    out = capsys.readouterr().out
+    assert "CLOSE, then ONE MOTION: lid:lift, lid:clear, lid:carry, place:down, place:touch" in out
+    assert "LID GRIPPED" in out and out.rstrip().endswith("arm home")
+    assert ctx.client.lets_go == []  # nothing stopped: nothing let go
+
+
+def test_where_nothing_was_planned_ahead_the_lift_flies_alone_and_the_spot_is_looked_at_after_it(
+        ctx, monkeypatch, tmp_path, capsys):
+    """No spot whose carry and home both plan found while the hand came
+    down to the knob (here: none looked for): as before, the close, the
+    lift and the clear, then the lid's one stop, the spot look; the carry
+    and the set-down; the release, the retreat and home — six executions
+    after the look's, every one RIGID and unguarded."""
+    code, rec, chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], one_motion=False)
     assert code == 0
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE, "spot-look", *CARRY,
                           *HOME]
@@ -341,7 +396,7 @@ def test_a_lid_that_rose_with_its_knob_up_is_the_box_open_and_the_grip_follows_i
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (risen, 7.8)])
     assert code == 0
     runs = _executions(rec)
-    assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE, CARRY, HOME]  # pressed once
+    assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE + CARRY, HOME]  # pressed once
     knob, = [r for r in rows if r["leg"] == "reach_knob"]
     assert (knob["popped"], knob["lid_rose"], knob["knob_up_mm"], knob["stop"]) == (True, True, 7.8, None)
     assert knob["lid_dz_mm"] == pytest.approx(9.6)
@@ -446,7 +501,7 @@ def test_a_knob_not_up_is_looked_at_again_then_pressed_once_more_and_its_lid_tak
     assert code == 0
     press = [*WAY_IN, "hold", *BACK]
     assert rec.events == ["reach:look", "aim:reach-aim", *press, "aim:reach-after", "aim:reach-after", *press,
-                          "aim:reach-after", *GRIP, *CLOSE, "spot-look", *CARRY, *HOME]
+                          "aim:reach-after", *GRIP, *CLOSE, *CARRY, *HOME]
     knobs = [(r["press"], r["popped"], r["looks"], r["knob_up_mm"]) for r in rows if r["leg"] == "reach_knob"]
     assert knobs == [(1, False, 2, 2.0), (2, True, 1, 8.0)]
     assert "pressing once more — the same press, from the look pose" in capsys.readouterr().out
@@ -476,8 +531,8 @@ def test_fingers_that_close_on_air_open_again_and_back_out_the_way_they_came(ctx
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], knuckle=AIR)
     assert code == 1
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
-                          "grip:open", *BACK_OUT, "aim:reach-regrip", "home"]
-    assert (CLOSE, []) in _executions(rec)  # the lift's run returned at the close: handed, nothing sent
+                          *CARRY, "grip:open", *BACK_OUT, "aim:reach-regrip", "home"]
+    assert (CLOSE + CARRY, []) in _executions(rec)  # the close's run returned at the close: handed, nothing sent
     assert [r["leg"] for r in rows if r["leg"].startswith(("lid:", "place:"))] == []
     result, = [r for r in rows if r["leg"] == "reach_grip_result"]
     assert result["ok"] is False and "0.790" in result["detail"]
@@ -520,7 +575,7 @@ def test_a_grip_on_air_is_aimed_again_from_the_look_pose_and_gripped_once_more_w
                                          knuckle=[AIR, KNOB_ON])
     assert code == 0
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
-                          "grip:open", *BACK_OUT, "aim:reach-regrip", *GRIP, *CLOSE, "spot-look", *CARRY, *HOME]
+                          *CARRY, "grip:open", *BACK_OUT, "aim:reach-regrip", *GRIP, *CLOSE, *CARRY, *HOME]
     assert rec.events.count("aim:reach-regrip") == 1 and rec.events.count("grip:close") == 2
     # the second way down solved for the re-aimed button, at the first's height, lid and tilt
     (first, lid1, tilt1), (second, lid2, tilt2) = asked
@@ -549,7 +604,8 @@ def test_a_grip_on_air_twice_backs_out_and_goes_home_after_one_retry_only(ctx, m
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=AIR)
     assert code == 1
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
-                          "grip:open", *BACK_OUT, "aim:reach-regrip", *GRIP, *CLOSE, "grip:open", *BACK_OUT, "home"]
+                          *CARRY, "grip:open", *BACK_OUT, "aim:reach-regrip", *GRIP, *CLOSE, *CARRY, "grip:open",
+                          *BACK_OUT, "home"]
     results = [(r["attempt"], r["ok"], r["on_air"], r["retry"]) for r in rows if r["leg"] == "reach_grip_result"]
     assert results == [(1, False, True, True), (2, False, True, False)]
     assert len([r for r in rows if r["leg"] == "reach_regrip"]) == 1
@@ -582,7 +638,7 @@ def test_a_re_aim_that_finds_no_knob_to_grip_sends_the_arm_home_from_the_look_po
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=[AIR, KNOB_ON])
     assert code == 1
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
-                          "grip:open", *BACK_OUT, "aim:reach-regrip", "home"]
+                          *CARRY, "grip:open", *BACK_OUT, "aim:reach-regrip", "home"]
     note, = [r for r in rows if r["leg"] == "reach_regrip"]
     assert (note["found"], note["outcome"]) == (found, "grip again" if refuse else "home")
     assert [r["attempt"] for r in rows if r["leg"] == "reach_grip_refused"] == ([2] if refuse else [])
@@ -601,7 +657,7 @@ def test_a_grip_that_fails_but_not_on_air_is_not_tried_again(ctx, monkeypatch, t
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0), (REGRIP, 9.0)],
                                          knuckle=0.2)
     assert code == 1
-    assert rec.events[-len(BACK_OUT) - 4:] == [*CLOSE[1:], "grip:open", *BACK_OUT, "home"]
+    assert rec.events[-len(BACK_OUT) - 5:] == [*CARRY, "grip:open", *BACK_OUT, "home"]
     assert "aim:reach-regrip" not in rec.events and not [r for r in rows if r["leg"] == "reach_regrip"]
     result, = [r for r in rows if r["leg"] == "reach_grip_result"]
     assert (result["on_air"], result["retry"]) == (False, False)
@@ -646,8 +702,9 @@ FREE_AIR_RUNS = {
     # no home plans after the set-down, the carry's lookahead's nor again (plan_home_after): the retreat alone,
     # then home from up there
     "no home after the set-down": {},
-    # the release's retreat and home turned down by the driver (the 7th goal): the retreat alone, then home
-    "the retreat and home refused": dict(ends={7: trp.REJECTED}, chain=_ReachingChain()),
+    # the release's retreat and home turned down by the driver (the 6th goal: the lift to the set-down is the
+    # 5th): the retreat alone, then home
+    "the retreat and home refused": dict(ends={6: trp.REJECTED}, chain=_ReachingChain()),
 }
 
 
@@ -753,7 +810,7 @@ def test_an_open_box_has_its_lid_taken_off_unpressed(ctx, monkeypatch, tmp_path,
     no stroke flown."""
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(UP, 9.0)])
     assert code == 0
-    assert rec.events == ["reach:look", "aim:reach-aim", *GRIP, *CLOSE, "spot-look", *CARRY, *HOME]
+    assert rec.events == ["reach:look", "aim:reach-aim", *GRIP, *CLOSE, *CARRY, *HOME]
     assert [(r["button_above_lid_mm"], r["opened"]) for r in rows if r["leg"] == "open_box"] == [(9.0, True)]
     grip, = [r for r in rows if r["leg"] == "reach_grip"]
     assert grip["lid_z"] == pytest.approx(BUTTON[2])  # the scene's top, above the aim's knob less its height
@@ -768,8 +825,8 @@ def test_an_open_box_s_grip_on_air_is_tried_once_more_at_the_knob_aimed_at_again
     again = (UP[0] + 0.011, UP[1], UP[2])
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(UP, 9.0), (again, 9.0)], knuckle=[AIR, KNOB_ON])
     assert code == 0
-    assert rec.events == ["reach:look", "aim:reach-aim", *GRIP, *CLOSE, "grip:open", *BACK_OUT, "aim:reach-regrip",
-                          *GRIP, *CLOSE, "spot-look", *CARRY, *HOME]
+    assert rec.events == ["reach:look", "aim:reach-aim", *GRIP, *CLOSE, *CARRY, "grip:open", *BACK_OUT,
+                          "aim:reach-regrip", *GRIP, *CLOSE, *CARRY, *HOME]
     assert [b[:2] for b, _lid, _tilt in asked] == [pytest.approx(UP[:2]), pytest.approx(again[:2])]
 
 
@@ -883,7 +940,7 @@ def test_the_home_planned_on_the_way_back_is_dropped_once_the_arm_moves_on(ctx, 
     from rammp_box_opening.constants import DRIFT_REPLAN_RAD
 
     plans = _home_plans(monkeypatch, refuse)
-    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=knuckle, ends=ends)
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=knuckle, ends=ends, one_motion=False)
     assert code == 1 and rec.events[-1] == "home"
     first = plans[0]  # the way back's
     home = rec.legs["home"]
@@ -948,7 +1005,7 @@ def test_a_press_only_run_chooses_no_lid_spot(ctx, monkeypatch, tmp_path, capsys
 
 def test_a_clear_spot_the_wrist_sees_after_the_lift_is_where_the_lid_goes(ctx, monkeypatch, tmp_path, capsys):
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], extent=ROOMY,
-                                         wrist=_table())
+                                         wrist=_table(), one_motion=False)
     assert code == 0
     spot, = [r for r in rows if r["leg"] == "lid_spot"]
     assert spot["tier"] == "clear" and spot["mapped"] is True and spot["wrist_points"] > 0
@@ -960,7 +1017,7 @@ def test_a_clear_spot_the_wrist_sees_after_the_lift_is_where_the_lid_goes(ctx, m
 
 def test_nothing_clear_still_sets_the_lid_down_at_the_most_room_seen(ctx, monkeypatch, tmp_path, capsys):
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], extent=ROOMY,
-                                         wrist=_wall(_table()))
+                                         wrist=_wall(_table()), one_motion=False)
     assert code == 0 and rec.events[-3:] == HOME
     spot, = [r for r in rows if r["leg"] == "lid_spot"]
     assert spot["tier"] == "most room"
@@ -972,8 +1029,97 @@ def test_no_camera_data_still_sets_the_lid_down_beside_the_box(ctx, monkeypatch,
     code, _rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], extent=ROOMY)
     assert code == 0
     spot, = [r for r in rows if r["leg"] == "lid_spot"]
-    assert (spot["tier"], spot["mapped"], spot["wrist_points"]) == ("beside the box", False, 0)
+    assert (spot["tier"], spot["mapped"], spot["wrist_points"]) == ("beside the box", False, None)
     assert "no camera shows the table: beside the box" in capsys.readouterr().out
+
+
+def test_a_clear_spot_the_scene_camera_sees_is_where_the_lid_goes_its_room_judged_while_the_press_flew(
+        ctx, monkeypatch, tmp_path, capsys):
+    """The scene camera's table round the box, nothing on it: the lid goes
+    to a clear spot, chosen before the close, and the close flies on to the
+    set-down. Every spot's room is judged on the thread the press flies
+    beside (room_ahead): the grip's lookahead ranks them from its cache."""
+    import threading
+
+    from rammp_box_opening.perception import clear_table
+
+    judged_on = []
+    real = clear_table.clearance
+
+    def counted(*a, **k):
+        judged_on.append(threading.current_thread().name)
+        return real(*a, **k)
+
+    monkeypatch.setattr(clear_table, "clearance", counted)
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], extent=ROOMY,
+                                         scene=_table())
+    assert code == 0 and "spot-look" not in rec.events
+    assert [names for names, _g in _executions(rec)][-2:] == [CLOSE + CARRY, HOME]
+    spot, = [r for r in rows if r["leg"] == "lid_spot"]
+    assert (spot["tier"], spot["mapped"], spot["chosen"]) == ("clear", True, "ahead, with the scene camera")
+    assert judged_on and set(judged_on) == {"lid-room"}
+    assert "where the cameras see room for it and the hand" in capsys.readouterr().out
+    d = math.hypot(ctx.lid_drop.xyz[0] - BOX_XY[0], ctx.lid_drop.xyz[1] - BOX_XY[1])
+    assert d >= 0.19  # lid_place_min_clear from the box
+
+
+def test_nothing_clear_the_scene_camera_sees_still_sets_the_lid_down_at_the_most_room_in_one_motion(
+        ctx, monkeypatch, tmp_path, capsys):
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], extent=ROOMY,
+                                         scene=_wall(_table()))
+    assert code == 0 and [names for names, _g in _executions(rec)][-2:] == [CLOSE + CARRY, HOME]
+    spot, = [r for r in rows if r["leg"] == "lid_spot"]
+    assert spot["tier"] == "most room"
+    out = capsys.readouterr().out
+    assert "nothing reads clear" in out and "STOP" not in out and out.rstrip().endswith("arm home")
+
+
+def test_a_spot_home_does_not_plan_from_after_the_set_down_is_passed_over(ctx, monkeypatch, tmp_path):
+    """2026-10-29 14:45: after the set-down j6 stood 0.09 rad from its
+    limit and home would not plan from there: the arm held the lid's spot.
+    Home after the set-down is planned with the carry, while the hand
+    comes down to the knob: a spot it does not plan from is passed over,
+    the next one's carry and home planned, and the lid goes there in one
+    motion."""
+    real, asked = rlo.plan_home_after, []
+
+    def home_after(ctx_, cfg_, carry):
+        asked.append(carry.drop)
+        if len(asked) == 1:
+            return None, "home after the set-down (planning failed for home: MotionGenStatus.INVALID_START_STATE)"
+        return real(ctx_, cfg_, carry)
+
+    monkeypatch.setattr(rlo, "plan_home_after", home_after)
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], extent=ROOMY)
+    assert code == 0 and [names for names, _g in _executions(rec)][-2:] == [CLOSE + CARRY, HOME]
+    assert len(asked) == 2 and not rlo._same_spot(asked[0], asked[1])
+    spot, = [r for r in rows if r["leg"] == "lid_spot"]
+    assert "home after the set-down" in spot["refused"]
+    assert spot["xyz"][:2] == pytest.approx(list(asked[1].xyz[:2]), abs=1e-4) and ctx.lid_drop is asked[1]
+
+
+def test_the_lid_s_way_to_the_table_stopped_part_way_holds_the_lid_and_lets_go(ctx, monkeypatch, tmp_path, capsys):
+    """The lift to the set-down is one goal (the 5th); stopped part way by
+    the driver, the arm holds the lid where it stopped, the springs let go
+    (rp.let_go): exit 1, never a release or home."""
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)],
+                                         ends={5: trp.STOPPED})
+    assert code == 1 and ctx.client.lets_go
+    assert "place:open" not in rec.events and "home" not in rec.events[rec.events.index("grip:close"):]
+    assert "STOP: the lid's way from the box to the table stopped during" in capsys.readouterr().out
+
+
+def test_the_room_judged_while_the_press_flew_is_the_box_s_only_where_it_still_stands():
+    """The room is judged round the box where ctx.cpose had it: the box
+    since put elsewhere (a re-aim), or the judging failed, it is judged
+    again."""
+    room = rlo.Room(at=(0.5, -0.4, 0.2))
+    here = SimpleNamespace(cpose=ContainerPose(xyz=(0.5, -0.4, 0.2), yaw=0.0))
+    assert rlo.room_for(here, room) is room and rlo.room_for(here, None) is None
+    moved = SimpleNamespace(cpose=ContainerPose(xyz=(0.505, -0.4, 0.2), yaw=0.0))
+    assert rlo.room_for(moved, room) is None
+    room.at = None
+    assert rlo.room_for(here, room) is None
 
 
 def test_the_wrist_points_of_the_held_lid_are_not_an_obstacle(ctx, monkeypatch):
@@ -1187,7 +1333,8 @@ def test_the_carry_planned_while_the_lift_flies_is_flown_where_the_spot_chosen_a
     in it choose the spot as before; it is the same, the arm where the
     clear was to end: that carry flies, no planner call at rest, the
     reach verdicts taken from it. The record says so and what it saved."""
-    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], wrist=_table(r=0.4),
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)],
+                                         one_motion=False, wrist=_table(r=0.4),
                                          **NEAR)
     assert code == 0 and rec.events[-3:] == HOME
     flight = _lift_flight(rec)
@@ -1212,7 +1359,8 @@ def test_the_carry_planned_while_the_lift_flies_is_not_flown_where_the_wrist_sho
     the wrist shows (owner: chosen with the lid lifted), not the scene's, and
     the carry is planned there at rest as before — the one planned while
     the lift flew is not flown, and the record says why."""
-    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], wrist=_wall(_table(r=0.4)),
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)],
+                                         one_motion=False, wrist=_wall(_table(r=0.4)),
                                          **NEAR)
     assert code == 0
     flight = _lift_flight(rec)
@@ -1241,7 +1389,8 @@ def test_the_carry_planned_while_the_lift_flies_is_flown_only_from_where_it_star
     def pushed():
         ctx.client.live[1] += push  # while the spot look waited
 
-    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], wrist=_table(r=0.4),
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)],
+                                         one_motion=False, wrist=_table(r=0.4),
                                          at_spot_look=pushed, **NEAR)
     assert code == 0
     spot, = [r for r in rows if r["leg"] == "lid_spot"]
@@ -1262,7 +1411,7 @@ def test_after_a_grip_once_more_the_carry_is_the_one_planned_while_its_own_lift_
     ahead for it. The grip once more lifts the lid, and the carry planned
     while that lift flew is the one flown — one carry plan in the run."""
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0), (REGRIP, 9.0)],
-                                         knuckle=[AIR, KNOB_ON], **NEAR)
+                                         knuckle=[AIR, KNOB_ON], one_motion=False, **NEAR)
     assert code == 0 and rec.events.count("grip:close") == 2
     second_lift = len(rec.events) - rec.events[::-1].index("lid:clear")  # events before the second lift's plans
     assert [at for name, at in rec.plans if name == "lid:carry"] == [second_lift]
@@ -1426,6 +1575,17 @@ def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ct
     assert names[:4] == ["lid:carry", "place:down", "place:touch", "place:retreat"] and names[-1] == "home"
     plan_free = [lg for lg in lift.legs + carry.legs + home_legs if lg.name not in ("lid:carry", "home")]
     assert [(lg.name, runner._refusal(lg)) for lg in plan_free] == [(lg.name, None) for lg in plan_free]
+    # the close flies on to the set-down: the lift, the clear, the carry and the set-down are one execution,
+    # re-timed as a compliant run flies it, that the driver's gates pass
+    from rammp_box_opening.constants import JOINT_VMAX
+    from rammp_box_opening.runtime.legs import merge_groups
+    from rammp_box_opening.runtime.retime import check_like_executor, retime_group
+
+    one = [*lift.legs, *carry.legs]
+    assert [[lg.name for lg in g] for g in merge_groups(one)] == [[lg.name for lg in one]]
+    ctx.client.compliant = True
+    flown, _info = retime_group([lg.traj for lg in one], [lg.speed for lg in one], JOINT_VMAX, runner.retime_params())
+    assert check_like_executor(flown, JOINT_VMAX) == []
     # the lid lifted straight up off the rim, then up and back toward the arm, clear of the box's padded volume
     lift_leg, clear = lift.legs
     _R, t_grip = chain.fk(legs[-1].goal_joints)

@@ -744,7 +744,7 @@ def lid_drop_candidates(m, cpose, table_z, prefer_xy=None, zone=None):
 CLEAR_SPOTS_Y_M = 0.45  # the map is searched for a drop spot this far either side of the box
 
 
-def clear_lid_drops(m, cpose, tmap, table_z, judged_out=None, hand_at=None):
+def clear_lid_drops(m, cpose, tmap, table_z, judged_out=None, hand_at=None, cache=None):
     """(drops, spots, why): where the lid may go among what the cameras see
     standing on the table (perception/clear_table), best first: as
     ContainerPoses on the table at `table_z` — each one's yaw the turn the
@@ -764,7 +764,8 @@ def clear_lid_drops(m, cpose, tmap, table_z, judged_out=None, hand_at=None):
     arm). None: as the reach-out grips the knob — the press attitude turned
     to the button's bearing (reach_press.reach_quat; depth_press.down_quat
     turns the hand down to it), where every spot's set-down (place_quat)
-    is the press attitude at the spot, turned."""
+    is the press attitude at the spot, turned. `cache`: clear_table.clear_spots'
+    (the room judged on this map before, kept)."""
     lid_h = float(m.lid_dims[2])
     bx, by = float(cpose.xyz[0]), float(cpose.xyz[1])
     if hand_at is None:
@@ -783,6 +784,7 @@ def clear_lid_drops(m, cpose, tmap, table_z, judged_out=None, hand_at=None):
         lid_h,
         judged_out=judged_out,
         hand_at=hand_at,
+        cache=cache,
     )
     return [ContainerPose(xyz=(s.xy[0], s.xy[1], float(table_z)), yaw=s.turn) for s in spots], spots, why
 

@@ -308,7 +308,7 @@ def _rank(s):
 
 
 def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_tips_h, lid_h,
-                step=SPOT_STEP_M, judged_out=None, hand_at=None):
+                step=SPOT_STEP_M, judged_out=None, hand_at=None, cache=None):
     """(spots, why): every spot in `zone` (x0, x1, y0, y1) at least
     `min_from_box` from the box, and at most SPOT_REACH_M more, where the
     hand comes down, at one of TURNS,
@@ -325,7 +325,10 @@ def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_
     that came within a step of clear: a spot's room changes no faster than
     it moves, and the one clear spot beside the 17:57 box fell between the
     coarse grid's points. `judged_out`, a list, receives every Spot judged
-    (tasks/lid_room_view draws them)."""
+    (tasks/lid_room_view draws them). `cache`, a dict, keeps each spot's
+    room at each turn and on the carry (clearance, carry_clearance): the
+    same map judged again — the hand facing another way (`hand_at`) — takes
+    them from it, only the ranking left to do (reach_lid_off.room_ahead)."""
     bx, by = float(box_xy[0]), float(box_xy[1])
     x0, x1, y0, y1 = zone
     held = hand_yaw(quat_at((bx, by))) if hand_at is None else float(hand_at)
@@ -343,14 +346,24 @@ def clear_spots(tmap, box_xy, zone, min_from_box, quat_at, lid_r, tips_h, carry_
         turned = []
         for t in TURNS:
             q = yaw_about_world_z(q0, t)
-            room, what = clearance(tmap, (sx, sy), q, lid_r, tips_h)
+            if cache is not None and (key, t) in cache:
+                room, what = cache[key, t]
+            else:
+                room, what = clearance(tmap, (sx, sy), q, lid_r, tips_h)
+                if cache is not None:
+                    cache[key, t] = room, what
             turned.append(Spot(xy=(float(sx), float(sy)), turn=t, room_m=room, what=what or "nothing",
                                rotation=ang_diff(hand_yaw(q), held)))
         clear = [s for s in turned if s.room_m >= 0.0]
         if not clear:
             judged[key] = max(turned, key=lambda s: s.room_m)
             return judged[key]
-        carry, c_what, _at = carry_clearance(tmap, (bx, by), (sx, sy), lid_r, carry_tips_h, lid_h)
+        if cache is not None and (key, "carry") in cache:
+            carry, c_what = cache[key, "carry"]
+        else:
+            carry, c_what, _at = carry_clearance(tmap, (bx, by), (sx, sy), lid_r, carry_tips_h, lid_h)
+            if cache is not None:
+                cache[key, "carry"] = carry, c_what
         clear = [replace(s, room_m=carry, what="%s on the carry" % c_what) if carry < s.room_m else s for s in clear]
         judged[key] = min(clear, key=lambda s: (*_rank(s), -s.room_m))
         return judged[key]

@@ -208,6 +208,24 @@ def test_the_hands_rotation_is_counted_from_where_it_holds_the_lid(pink):
     assert spots[0].turn == 0.0 and abs(spots[0].rotation) < ct.ROTATION_STEP_RAD / 2
 
 
+def test_the_room_judged_once_is_ranked_again_for_another_hand_without_judging_it_again(pink, monkeypatch):
+    """reach_lid_off.room_ahead judges the room while the press flies, the
+    way the hand will face not known yet; the grip's lookahead ranks the
+    spots from that cache for the hand as it faces: the spots judged
+    afresh, and no spot's room judged twice."""
+    tmap = ct.table_map([(np.concatenate([_table(holes=[BOX_AT]), _block(*BOX_AT, TABLE_Z + 0.121)]), TABLE_Z)], BOX)
+    facing = ct.hand_yaw(pink.press_quat((BOX[0], BOX[1], TABLE_Z))) - 2.0
+    fresh = _spots(pink, tmap, BOX, hand_at=facing)
+    cache = {}
+    _spots(pink, tmap, BOX, cache=cache)  # as the press flies: the hand as at the box
+    calls = []
+    real_c, real_cc = ct.clearance, ct.carry_clearance
+    monkeypatch.setattr(ct, "clearance", lambda *a, **k: calls.append(1) or real_c(*a, **k))
+    monkeypatch.setattr(ct, "carry_clearance", lambda *a, **k: calls.append(1) or real_cc(*a, **k))
+    again = _spots(pink, tmap, BOX, hand_at=facing, cache=cache)
+    assert again == fresh and fresh[0] and calls == []
+
+
 def test_no_lid_goes_past_the_tables_edge_or_where_the_camera_could_not_see(pink):
     """Past the table's far edge the camera sees the floor: no lid goes
     down there, and none where it saw nothing at all."""
