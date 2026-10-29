@@ -225,25 +225,98 @@ def test_a_knob_up_after_the_press_is_gripped_lifted_carried_set_down_and_the_ar
     assert ctx.client.lets_go == []  # nothing stopped: nothing let go
 
 
-def test_a_lid_that_rose_with_its_knob_flush_is_the_box_open_and_the_grip_follows_it_up(ctx, monkeypatch, tmp_path,
-                                                                                          capsys):
-    """2026-10-28 16:15:52: the press let the lid go and it rose 9.4 mm, the
-    button where it was aimed, its knob 0.9 mm above it — read as "the
+def test_a_lid_that_rose_with_its_knob_up_is_the_box_open_and_the_grip_follows_it_up(ctx, monkeypatch, tmp_path,
+                                                                                       capsys):
+    """2026-10-28 16:15:19: the press let the lid go and it rose 9.6 mm, the
+    button 5.8 mm from where it was aimed, its knob 7.8 mm up — read as "the
     press moved the box" and the arm went home with the box open. A lid
-    LID_POP_M higher with the button in place is the box open: no press
-    once more, and the grip goes by the lid where it now stands."""
-    risen = (BUTTON[0], BUTTON[1], BUTTON[2] + 0.0099)  # the lid +9.4 mm on the first aim's -0.4, its knob 0.9 above
-    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (risen, 0.9), (risen, 0.9)])
+    LID_POP_M higher with the button in place is the box open, and its knob
+    up is something to hold: no press once more, and the grip goes by the
+    lid where it now stands."""
+    risen = (BUTTON[0] + 0.0058, BUTTON[1], BUTTON[2] - 0.0004 + 0.0096 + 0.0078)  # on the first aim's lid
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (risen, 7.8)])
     assert code == 0
     runs = _executions(rec)
     assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE, CARRY, HOME]  # pressed once
     knob, = [r for r in rows if r["leg"] == "reach_knob"]
-    assert (knob["popped"], knob["lid_rose"], knob["knob_up_mm"]) == (True, True, 0.9)
-    assert knob["lid_dz_mm"] == pytest.approx(9.4)
+    assert (knob["popped"], knob["lid_rose"], knob["knob_up_mm"], knob["stop"]) == (True, True, 7.8, None)
+    assert knob["lid_dz_mm"] == pytest.approx(9.6)
     grip, = [r for r in rows if r["leg"] == "reach_grip"]
-    assert grip["lid_z"] == pytest.approx(BUTTON[2] + 0.0094)  # the held-pads lid (the top) raised by the rise
+    assert grip["lid_z"] == pytest.approx(BUTTON[2] + 0.0096)  # the held-pads lid (the top) raised by the rise
     out = capsys.readouterr().out
-    assert "LID ROSE +9 mm — the box is open" in out and "LID GRIPPED" in out
+    assert "knob UP 7.8 mm, and its LID ROSE +10 mm — the box is open" in out and "LID GRIPPED" in out
+
+
+@pytest.mark.parametrize("knob_mm, dz, shift", [(-0.6, 0.0082, 0.0046), (0.9, 0.0094, 0.0030)],
+                         ids=["16:23:53", "16:15:52"])
+def test_a_lid_that_rose_with_its_knob_flush_is_neither_gripped_nor_pressed_again_the_arm_goes_home(
+        ctx, monkeypatch, tmp_path, capsys, knob_mm, dz, shift):
+    """2026-10-28 16:23:53: the press let the lid go and it rose 8.2 mm, the
+    button 4.6 mm from where it was aimed, its knob -0.6 mm above it.
+    Gripped as the box open, the fingers closed on air (0.768 against the
+    band [0.30, 0.55]), opened, backed out and went home: a flush knob gives
+    them nothing to hold — nor would 16:15:52's (the lid 9.4 mm up, the
+    button 3.0 mm off, its knob 0.9). The look stops the run: home from the
+    look pose, the fingers never opened, no press once more (a released lid
+    is not pressed again), exit 1 — the record keeps the rise and says why."""
+    risen = (BUTTON[0] + shift, BUTTON[1], BUTTON[2] - 0.0004 + dz + knob_mm / 1000)  # on the first aim's lid
+    aims = [(BUTTON, 0.4), (risen, knob_mm), (risen, knob_mm)]
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=AIR)
+    assert code == 1
+    assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", "aim:reach-after",
+                          "home"]
+    assert ctx.client.gripper_sent == [] and ctx.client.lets_go == []
+    knob, = [r for r in rows if r["leg"] == "reach_knob"]
+    assert (knob["popped"], knob["lid_rose"], knob["knob_up_mm"], knob["looks"]) == (False, True, knob_mm, 2)
+    assert knob["lid_dz_mm"] == pytest.approx(1000 * dz) and knob["shift_mm"] == pytest.approx(1000 * shift)
+    assert knob["stop"].startswith("the lid rose %+.0f mm (released) but its knob is not up" % (1000 * dz))
+    assert not [r for r in rows if r["leg"] in ("reach_grip", "reach_grip_result", "lid_spot")]
+    out = capsys.readouterr().out
+    assert "knob %.1f mm above the lid, and its LID ROSE %+.0f mm — the box is open" % (knob_mm, 1000 * dz) in out
+    assert ("STOP: the lid rose %+.0f mm (released) but its knob is not up (%.1f mm above the lid) — the fingers have "
+            "nothing to hold, so the lid is not taken off; the box is left open: lift the lid off by hand, or shut it, "
+            "before the next run (which would take it for shut and press it) — returning home"
+            % (1000 * dz, knob_mm)) in out
+    assert "pressing once more" not in out and "GRIP" not in out
+
+
+def test_a_lid_that_rose_at_the_press_once_more_with_its_knob_flush_stops_the_run_there(ctx, monkeypatch, tmp_path,
+                                                                                      capsys):
+    """Not up after the first press, its lid where it was: pressed once more
+    (owner 2026-10-28). That press lets the lid go, its knob flush: the same
+    stop — home from the look pose, nothing gripped."""
+    risen = (BUTTON[0], BUTTON[1], BUTTON[2] + 0.0099)  # the lid +9.4 mm on the first aim's -0.4, its knob 0.9 above
+    aims = [(BUTTON, 0.4), (BUTTON, 2.0), (BUTTON, 1.5), (risen, 0.9), (risen, 0.9)]
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims)
+    assert code == 1
+    press = [*WAY_IN, "hold", *BACK]
+    assert rec.events == ["reach:look", "aim:reach-aim", *press, "aim:reach-after", "aim:reach-after", *press,
+                          "aim:reach-after", "aim:reach-after", "home"]
+    knobs = [(r["press"], r["popped"], r["lid_rose"], r["stop"] is None) for r in rows if r["leg"] == "reach_knob"]
+    assert knobs == [(1, False, False, True), (2, False, True, False)]
+    out = capsys.readouterr().out
+    assert "pressing once more" in out and "STOP: the lid rose +9 mm (released) but its knob is not up" in out
+    assert "pressed 2 times" not in out and ctx.client.gripper_sent == []
+
+
+@pytest.mark.parametrize("off_mm", [-0.1, 0.0], ids=["just under", "at"])
+def test_a_risen_lid_is_gripped_with_its_knob_up_as_a_shut_one_and_under_that_the_stop_says_not_up(
+        ctx, monkeypatch, tmp_path, capsys, off_mm):
+    """On a risen lid the knob is up where it is on a shut one
+    (press_demo.knob_is_up, KNOB_UP_MIN_MM or more): gripped. Just under,
+    flush or partly up, it is not up: the stop, which says so with the
+    reading."""
+    from rammp_box_opening.tasks.press_demo import KNOB_UP_MIN_MM
+
+    knob_mm, up = KNOB_UP_MIN_MM + off_mm, off_mm >= 0
+    risen = (BUTTON[0], BUTTON[1], BUTTON[2] - 0.0004 + 0.009 + knob_mm / 1000)  # the lid +9 mm on the first aim's -0.4
+    aims = [(BUTTON, 0.4), (risen, knob_mm)] + ([] if up else [(risen, knob_mm)])  # a knob not up is read twice
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims)
+    knob, = [r for r in rows if r["leg"] == "reach_knob"]
+    assert (code, knob["popped"], knob["lid_rose"], knob["stop"] is None) == (0 if up else 1, up, True, up)
+    assert any(n.startswith("grip:") for n in rec.events) == up
+    said = "STOP: the lid rose +9 mm (released) but its knob is not up (%.1f mm above the lid)" % knob_mm
+    assert (said in capsys.readouterr().out) == (not up)
 
 
 @pytest.mark.parametrize("dz", [-0.009, 0.040])
@@ -255,6 +328,7 @@ def test_a_lid_lower_or_far_higher_after_the_press_is_still_the_box_moved(ctx, m
     assert code == 1
     knob, = [r for r in rows if r["leg"] == "reach_knob"]
     assert (knob["popped"], knob["lid_rose"]) == (False, False)
+    assert knob["stop"].startswith("the press moved the box: its lid")
     assert not any(n.startswith("grip:") for n in rec.events)
 
 
