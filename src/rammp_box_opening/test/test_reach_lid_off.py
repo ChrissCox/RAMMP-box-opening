@@ -624,30 +624,43 @@ def test_a_grip_on_air_twice_backs_out_and_goes_home_after_one_retry_only(ctx, m
     assert "STOP: the grip failed twice, the second time 10 mm lower (grip 0.790" in out
 
 
-@pytest.mark.parametrize("regrip, found, said", [
-    (None, False, "the wrist does not find the button again from the look pose (no circle): gripping once more where "
-                  "the first grip went"),
-    ((BUTTON[0] + 0.0217, BUTTON[1], BUTTON[2] + 0.009), True,
-     "the wrist now sees the button 22 mm from where the first grip went (farther than a slid box is gripped, 15 mm): "
-     "gripping once more where the first grip went"),
-], ids=["no button", "the button 21.7 mm off"])
-def test_a_re_aim_that_finds_no_knob_or_one_too_far_grips_once_more_where_the_first_went(ctx, monkeypatch, tmp_path,
-                                                                                       capsys, regrip, found, said):
-    """2026-10-30 10:40: the close over the knob read air, and from the look
-    pose the wrist saw it 21.7 mm from where the grip went, past a slid
-    box (depth_press.SLIDE_OK_M): the run went home with the box open. A
-    re-aim that finds no button, or one that far, sends the second grip
-    where the first went — the press's and the look's aim —
-    GRIP_RETRY_LOWER_M lower: it holds the knob, and the lid comes off."""
+def test_a_re_aim_that_finds_no_knob_grips_once_more_where_the_first_went(ctx, monkeypatch, tmp_path, capsys):
+    """A re-aim that finds no button sends the second grip where the first
+    went — the press's and the look's aim — GRIP_RETRY_LOWER_M lower: it
+    holds the knob, and the lid comes off."""
     asked = _grip_ways(monkeypatch)
-    aims = [(BUTTON, 0.4), (UP, 9.0), None if regrip is None else (regrip, 4.2)]
-    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=[AIR, KNOB_ON])
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0), None],
+                                         knuckle=[AIR, KNOB_ON])
     assert code == 0 and rec.events.count("grip:close") == 2
     (first, lid1, _t1), (second, lid2, _t2) = asked
     assert second == pytest.approx(first) and lid2 == pytest.approx(lid1 - rlo.GRIP_RETRY_LOWER_M)
     note, = [r for r in rows if r["leg"] == "reach_regrip"]
-    assert (note["found"], note["outcome"]) == (found, "grip again where the first went")
-    assert said in capsys.readouterr().out
+    assert (note["found"], note["outcome"]) == (False, "grip again where the first went")
+    assert "the wrist does not find the button again from the look pose (no circle): gripping once more where the " \
+           "first grip went" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("shift, regrips", [(0.0193, True), (0.045, False)], ids=["19 mm: 10:58", "45 mm"])
+def test_a_knob_the_re_aim_finds_nudged_is_gripped_where_it_is_and_one_far_off_is_the_box_moved(
+        ctx, monkeypatch, tmp_path, capsys, shift, regrips):
+    """2026-10-30 10:58: the fingers closed over the knob, and the re-aim —
+    once it no longer took the lid's 60 mm ring for the knob — saw it 19 mm
+    from where the first grip went: the lid nudged. Within REGRIP_MAX_M the
+    second grip goes where the knob is now, GRIP_RETRY_LOWER_M lower;
+    farther, the box moved, and the arm goes home from the look pose."""
+    asked = _grip_ways(monkeypatch)
+    nudged = (BUTTON[0] + shift, BUTTON[1], BUTTON[2] + 0.009)
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0), (nudged, 7.7)],
+                                         knuckle=[AIR, KNOB_ON])
+    note, = [r for r in rows if r["leg"] == "reach_regrip"]
+    if regrips:
+        assert code == 0 and rec.events.count("grip:close") == 2 and note["outcome"] == "grip again"
+        (_first, lid1, _t1), (second, lid2, _t2) = asked
+        assert second[:2] == pytest.approx(nudged[:2]) and lid2 == pytest.approx(lid1 - rlo.GRIP_RETRY_LOWER_M)
+        assert "RE-AIMED from the look pose" in capsys.readouterr().out
+    else:
+        assert code == 1 and rec.events[-1] == "home" and note["outcome"] == "home" and len(asked) == 1
+        assert "mm from where the first grip went — the box moved" in capsys.readouterr().out
 
 
 def test_a_re_aim_with_no_way_down_to_the_knob_sends_the_arm_home_from_the_look_pose(ctx, monkeypatch, tmp_path,

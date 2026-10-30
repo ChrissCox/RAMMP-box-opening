@@ -182,12 +182,15 @@ GRIP_TRIES = 2
 # cm lower"). 10:40: the grip went by the scene camera's top (0.346, its
 # heights high that day) less the knob's stroke and a 6 mm "the lid rose",
 # its pads at 0.338 where the press had held them at 0.327, and closed on
-# air over the knob; 1 cm lower is 0.328. Where the re-aim finds no knob, or
-# one farther than a slid box from where the first grip went (10:40: 21.7
-# mm, the knob 4.2 mm up after the fingers closed over it), the grip goes
-# where the first one went, the press's and the look's aim: a box that did
-# move is missed once more, and the hand backs out and goes home.
+# air over the knob; 1 cm lower is 0.328. Where the re-aim finds no knob,
+# the grip goes where the first one went, the press's and the look's aim.
 GRIP_RETRY_LOWER_M = 0.010
+# ... and where it finds the knob, there, this far at most from where the
+# first grip went: fingers that closed over it can nudge the lid (10:40 and
+# 10:58 2026-10-30, the knob re-aimed 14 and 19 mm off once the aim no longer
+# took the lid's 60 mm ring for it, button_aim.TABLE_RECTIFY_M); farther is
+# the box moved, and the hand goes home
+REGRIP_MAX_M = 0.040
 # Straight up with the knob held, this much past the cap's own height: off
 # the canister's rim. Flatbot's URDF lifts the hand turned down only 60-140
 # mm straight up over boxes 0.60-0.78 m out (150 mm only at 0.58 m), so the
@@ -1277,11 +1280,12 @@ def _regrip(ctx, cfg, runner, eyes, way, button, yaw, detail):
     aims at the knob again (reach_press._aim, 'reach-regrip'), as
     knob_look does after a press. Returns (the button the grip goes to
     once more, None): the re-aim's x and y where it finds the knob no
-    farther from the aimed `button` than a box the grip takes
-    (depth_press.SLIDE_OK_M), else — no knob found, or one farther — the
-    aimed `button`'s, where the first grip went; its height the aimed
-    one's (take_lid_off lowers the grip's lid: GRIP_RETRY_LOWER_M). Or
-    (None, the exit code) where the back-out did not fly (the arm let go).
+    farther than REGRIP_MAX_M from the aimed `button`, else — no knob
+    found — the aimed `button`'s, where the first grip went; its height the
+    aimed one's (take_lid_off lowers the grip's lid: GRIP_RETRY_LOWER_M).
+    Or (None, the exit code) where the run stops: the back-out did not fly
+    (the arm let go), or the knob is farther than that — the box moved —:
+    home from the look pose, flying the home planned on the way back.
     Noted 'reach_regrip': the re-aim's point, its shift and what follows."""
     code = _back_to_look(ctx, cfg, runner, way, "the grip closed on air (%s)" % detail)
     if code is not None:
@@ -1289,22 +1293,19 @@ def _regrip(ctx, cfg, runner, eyes, way, button, yaw, detail):
         return None, code
     node, watcher = eyes[0], eyes[1]
     got, status, up, _measured = rp._aim(node, watcher, yaw, button[2], button[:2], runner, "reach-regrip")
-    first = tuple(float(v) for v in button)
     if got is None:
         runner.note("reach_regrip", found=False, why=status, outcome="grip again where the first went")
         print("[press_demo] the wrist does not find the button again from the look pose (%s): gripping once more "
               "where the first grip went" % status)
-        return first, None
+        return tuple(float(v) for v in button), None
     shift = rp.judge_box_moved(button, got[0])
-    moved = shift > dp.SLIDE_OK_M
+    moved = shift > REGRIP_MAX_M
     runner.note("reach_regrip", found=True, xyz=[round(v, 4) for v in got[0]], shift_mm=round(1000 * shift, 1),
-                knob_up_mm=None if up is None else round(float(up), 1),
-                outcome="grip again where the first went" if moved else "grip again")
+                knob_up_mm=None if up is None else round(float(up), 1), outcome="home" if moved else "grip again")
     if moved:
-        print("[press_demo] the wrist now sees the button %.0f mm from where the first grip went (farther than a "
-              "slid box is gripped, %.0f mm): gripping once more where the first grip went" % (
-                  1000 * shift, 1000 * dp.SLIDE_OK_M))
-        return first, None
+        return None, _stop_home(ctx, cfg, runner, "the grip closed on air (%s) and the wrist now sees the button %.0f "
+                                                  "mm from where the first grip went — the box moved; the lid is not "
+                                                  "taken off" % (detail, 1000 * shift))
     again = (float(got[0][0]), float(got[0][1]), float(button[2]))
     print("[press_demo] RE-AIMED from the look pose: the knob at [%.3f, %.3f], %.0f mm from where the first grip "
           "went%s — gripping once more there" % (again[0], again[1], 1000 * shift,

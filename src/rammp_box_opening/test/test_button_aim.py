@@ -945,7 +945,8 @@ def test_the_live_reach_out_aims_read_their_table_20_mm_low(pink, name, want, mo
     The wrist read its own table 21.6 and 18.1 mm below the scene camera's
     and its lid rings 22 mm below the scene's lid, 12-13 mm inside the 35
     mm gate; judged against the table they see, 31-35 mm inside it. The
-    press point stays as measured. The aimer's fix stands it that much
+    press point stays as measured, the frame rectified again a box's height
+    above that table moving it 2 mm at most. The aimer's fix stands it that much
     higher: 0.310, where the 15:19 touch met the lid at 0.3122 and the
     logged aims said 0.2881 and 0.2914."""
     from types import SimpleNamespace
@@ -961,7 +962,8 @@ def test_the_live_reach_out_aims_read_their_table_20_mm_low(pink, name, want, mo
     with monkeypatch.context() as mp:
         mp.setattr(button_aim, "_table_offset", _no_table_offset)
         s0, why0 = find_button(color, depth, k, rot, cam, table_z, pink, dist=dist, lid_z=lid_z, prior_xy=prior)
-    assert s0 is not None and s0.xyz == s.xyz, why0  # the gates moved, not the press point
+    # the gates moved; the press point only by the frame rectified again on that plane (TABLE_RECTIFY_M)
+    assert s0 is not None and np.hypot(s0.xyz[0] - s.xyz[0], s0.xyz[1] - s.xyz[1]) < 0.003, why0
     # the aimer on MIN_HITS still frames of it: the fix raised by the offset they agree on
     monkeypatch.setattr(depth_source, "camera_pose_at", lambda g, offset_s=None, stamp=None: (rot, cam))
     g = SimpleNamespace(color=color, depth=depth, k=k, dist=dist, color_stamp=None)
@@ -1014,6 +1016,28 @@ def test_the_1010_look_with_the_wrist_55mm_below_the_scene_camera_finds_the_butt
     assert s.table_offset_raw_m == pytest.approx(-0.055, abs=0.003) and not np.isfinite(s.table_offset_m)
     assert abs(s.above_lid_m) < 0.003 and s.xyz[2] == pytest.approx(lid_z - 0.052, abs=0.006)
     assert np.hypot(s.xyz[0] - prior[0], s.xyz[1] - prior[1]) < 0.035  # near where the scene camera put it
+
+
+def test_the_1059_regrip_rectified_on_the_wrists_own_lid_finds_the_knob_not_the_lids_ring(pink, monkeypatch):
+    """Flatbot 2026-10-30 10:58: after a close on air, the re-aim from the
+    look pose, the scene camera's lid 59 mm above the wrist's. Rectified
+    on the scene camera's lid the 44 mm knob read ~17% small, near the
+    radius window's floor, and the lid's ring (61 mm) was taken for it, 26
+    mm off. Rectified again a box's height above the table the wrist sees
+    (TABLE_RECTIFY_M), the circle is the knob's size, up, and ~19 mm from
+    where the first grip went."""
+    from rammp_box_opening.perception import button_aim
+
+    color, depth, k, rot, cam, dist, table_z, lid_z, prior = _reach_frame("wrist_reach_regrip_flatbot_20261030_1059.npz")
+    s, why = find_button(color, depth, k, rot, cam, table_z, pink, dist=dist, lid_z=lid_z, prior_xy=prior)
+    assert why is None, why
+    assert s.diameter_m == pytest.approx(0.049, abs=0.004) and s.above_lid_m > 0.004
+    assert s.table_offset_raw_m == pytest.approx(-0.059, abs=0.003)
+    assert np.hypot(s.xyz[0] - prior[0], s.xyz[1] - prior[1]) == pytest.approx(0.0205, abs=0.004)
+    with monkeypatch.context() as mp:  # as it was: one rectification, on the scene camera's lid
+        mp.setattr(button_aim, "TABLE_RECTIFY_M", 1.0)
+        s0, why0 = find_button(color, depth, k, rot, cam, table_z, pink, dist=dist, lid_z=lid_z, prior_xy=prior)
+    assert why0 is None and s0.diameter_m > 0.058, why0
 
 
 def test_still_frames_fuse_their_depth_and_a_moved_camera_starts_again():
