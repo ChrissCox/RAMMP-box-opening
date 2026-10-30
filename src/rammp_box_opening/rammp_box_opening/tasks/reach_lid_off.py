@@ -118,6 +118,14 @@ KNOB_RECHECK_AIMS = 1
 # 2026-10-28 14:26 and 14:30 met it 7.6 and 7.4 mm below their touches. A
 # compliant press that popped the knob held the pads on it there.
 KNOB_STROKE_M = 0.0075
+# Where the hold held the pads, the lid the grip goes by stands this much
+# above them — not the scene camera's top (owner 2026-10-30: the scene camera
+# gives the arm a general location). The grip went by that top, kept between
+# the held pads and KNOB_STROKE_M above them: of 2026-10-28..30's grips the
+# ten that held the knob stood 0.1-7.5 mm above (0.1-5.5 where the lid rose
+# as well), and 16:23, 10:40 and 10:58's three on air all at the 7.4-7.5 mm
+# cap with a rise added, the scene camera's top 9-19 mm above the touch.
+GRIP_LID_ABOVE_HELD_M = 0.004
 # A released lid RISES: on 2026-10-28 16:15:19 and 16:15:52 the press let
 # the pink canister's lid go and the wrist read it 9.6 and 9.4 mm higher
 # than before the press, the button 6 and 3 mm from where it was aimed, its
@@ -255,16 +263,13 @@ def grip_open_cmd(model):
 
 
 def grip_lid_z(top_z, held_z=None):
-    """The lid's height the grip goes by: the press's top (`top_z`, the
-    higher of the aim's and the scene camera's — on 2026-10-27/28 the
-    touched lid stood 1-13 mm above the scene camera's), no lower than
-    where the compliant hold held the pads on the button (`held_z`: the lid
-    is not below the button it held them on) and no higher than that plus
-    KNOB_STROKE_M (the button at its stop, as a popped one was). Without a
-    hold, `top_z`."""
+    """The lid's height the grip goes by: GRIP_LID_ABOVE_HELD_M above where
+    the compliant hold held the pads on the button (`held_z`), the arm's own
+    touch; without a hold, the press's top (`top_z`, the higher of the
+    aim's and the scene camera's)."""
     if held_z is None:
         return float(top_z)
-    return min(max(float(top_z), float(held_z)), float(held_z) + KNOB_STROKE_M)
+    return float(held_z) + GRIP_LID_ABOVE_HELD_M
 
 
 def setdown_poses(ctx, drop):
