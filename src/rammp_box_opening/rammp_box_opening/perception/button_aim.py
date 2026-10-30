@@ -111,8 +111,9 @@ OBLIQUE_WINDOW = 3.0  # of the circle's rectified radius: the cells a candidate'
 # aims, its lid rings 22-32 mm below the scene's lid), and the live aims
 # cleared LID_PRIOR_TOL_M by only 2.7-13.0 mm: a slightly worse day refuses
 # every frame and presses nothing. A common offset moves the wrist's table
-# and lid alike, so the two prior-height gates move by it. The rectifying
-# plane, the press point's xy and the heights reported stay as measured:
+# and lid alike, so the two prior-height gates move by it (and past
+# TABLE_RECTIFY_M the rectifying plane: the circles at their own scale). The
+# press point's xy and the heights reported stay as measured:
 # the 14:33 close-up found the button 4 mm from the measured aim, and 18 mm
 # from that aim re-slid to the scene camera's height.
 TABLE_OFFSET_MAX_M = 0.030  # a wrist farther off than this is recalibrated at the source, not aimed through
@@ -133,6 +134,13 @@ TABLE_AGREE_M = 0.004  # two of a fix's accepted offsets this close raise its z 
 # the scene camera's, past both bounds above, its lid with it, and every
 # frame was refused. Only a "table" farther off than this is no table.
 TABLE_GATE_MAX_M = 0.150
+# ... and past this the frame is rectified again on the plane a box's height
+# above that table: on the plane at the scene camera's lid the circles are
+# scaled by its error. 2026-10-30 10:40 and 10:58 the wrist's table stood
+# 57-59 mm below the scene camera's: the 44 mm knob read ~17% small, near
+# the radius window's floor, and both regrips' re-aims took the lid's 60 mm
+# ring (59.5, 61.2 mm) for it, 22-26 mm off
+TABLE_RECTIFY_M = 0.010
 
 
 @dataclass(frozen=True)
@@ -587,46 +595,31 @@ def _prior_miss_m(cu, cv, s, c0, g, h0, cam, prior_xy, h_gate=None):
     return float(np.hypot(*(w - t * seg)))
 
 
-def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=None, lid_z=None, prior_xy=None):
-    """The button seen from a tilted pose: (ButtonSighting, None) or (None, why).
-
-    The frame is resampled onto the horizontal plane z = h0 (lid_z, default
-    table_z + dims.z) on a metric grid centred on prior_xy (else where the
-    optical axis meets the plane). There a horizontal circle is a circle.
-    Each cell's depth is lifted along its own raw pixel's ray, so every gate
-    reads base z and the lid ring's height is measured, not assumed: it
-    must lie within LID_PRIOR_TOL_M of h0 moved by the table offset — a
-    box's height above the table this frame reads (_table_offset,
-    TABLE_GATE_MAX_M). The circle found on h0 is then moved along the
-    camera's rays to the disc's measured height h:
-    P = C + (P' - C) (Cz - h) / (Cz - h0)."""
-    import cv2
-
-    if color_bgr is None or depth is None or k is None:
-        return None, "no frame"
-    kk = np.asarray(k, float)
-    rot = np.asarray(rot_cam, float)
-    cam = np.asarray(trans_cam, float)
-    dd = np.asarray(dist, float).ravel() if dist is not None and np.any(np.asarray(dist, float)) else None
-    h0 = float(table_z) + float(model.dims[2]) if lid_z is None else float(lid_z)
-    rb = float(model.button_diameter_m) / 2.0
-    hh, ww = depth.shape[:2]
-    if cam[2] - h0 < MIN_RANGE_M:  # the range is at least this
-        return None, "camera %.0f mm above the lid — too close to aim" % (1000 * (cam[2] - h0))
+def _lid_plane(prior_xy, h0, kk, rot, cam, dd, hw):
+    """Where the rectified grid is centred on the plane z = h0: prior_xy
+    there, else where the optical axis meets it. (g, None), or (None, why)."""
+    hh, ww = hw
     if prior_xy is not None:
         g = np.array([float(prior_xy[0]), float(prior_xy[1]), h0])
         uv = _project(g, kk, rot, cam, dd, (hh, ww))[0]
         if not (np.all(np.isfinite(uv)) and 0 <= uv[0] <= ww - 1 and 0 <= uv[1] <= hh - 1):
             return None, "the prior button (%.3f, %.3f) projects outside the image" % (g[0], g[1])
-    else:
-        axis = rot[:, 2]
-        if axis[2] > -1e-3:
-            return None, "the optical axis does not meet the lid plane"
-        g = cam + axis * (h0 - cam[2]) / axis[2]
-    inc = _incidence_deg(g, cam)  # at the prior, not the button: a sanity bound only
-    if inc > OBLIQUE_PRIOR_MAX_DEG:
-        return None, "the lid seen %.0f deg off its normal — too oblique to aim" % inc
+        return g, None
+    axis = rot[:, 2]
+    if axis[2] > -1e-3:
+        return None, "the optical axis does not meet the lid plane"
+    return cam + axis * (h0 - cam[2]) / axis[2], None
 
+
+def _rectified(color_bgr, depth, kk, rot, cam, dd, g, rb):
+    """The frame resampled onto the horizontal plane through `g` on a metric
+    grid centred there (OBLIQUE_BUTTON_PX for the button's radius `rb`),
+    each cell's depth lifted along its own raw pixel's ray: ((s, c0, gray,
+    lifted), None) — px per metre, the grid's centre cell, the rectified
+    grey image, the cells' base points — or (None, why)."""
+    import cv2
+
+    hh, ww = depth.shape[:2]
     s = OBLIQUE_BUTTON_PX / rb  # rectified px per metre
     n = 2 * int(round(OBLIQUE_HALF_M * s)) + 1
     c0 = (n - 1) / 2.0
@@ -659,12 +652,60 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
     lifted = np.full((n * n, 3), np.nan, np.float32)
     lifted[np.flatnonzero(valid)[ok]] = np.c_[xn * d[ok], yn * d[ok], d[ok]] @ rot.T + cam
     lifted = lifted.reshape(n, n, 3)
+    return (s, c0, gray, lifted), None
+
+
+def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model, dist=None, lid_z=None, prior_xy=None):
+    """The button seen from a tilted pose: (ButtonSighting, None) or (None, why).
+
+    The frame is resampled onto the horizontal plane z = h0 (lid_z, default
+    table_z + dims.z) on a metric grid centred on prior_xy (else where the
+    optical axis meets the plane). There a horizontal circle is a circle.
+    Each cell's depth is lifted along its own raw pixel's ray, so every gate
+    reads base z and the lid ring's height is measured, not assumed: it
+    must lie within LID_PRIOR_TOL_M of h0 moved by the table offset — a
+    box's height above the table this frame reads (_table_offset,
+    TABLE_GATE_MAX_M). The circle found on h0 is then moved along the
+    camera's rays to the disc's measured height h:
+    P = C + (P' - C) (Cz - h) / (Cz - h0)."""
+    import cv2
+
+    if color_bgr is None or depth is None or k is None:
+        return None, "no frame"
+    kk = np.asarray(k, float)
+    rot = np.asarray(rot_cam, float)
+    cam = np.asarray(trans_cam, float)
+    dd = np.asarray(dist, float).ravel() if dist is not None and np.any(np.asarray(dist, float)) else None
+    h0 = float(table_z) + float(model.dims[2]) if lid_z is None else float(lid_z)
+    rb = float(model.button_diameter_m) / 2.0
+    hh, ww = depth.shape[:2]
+    if cam[2] - h0 < MIN_RANGE_M:  # the range is at least this
+        return None, "camera %.0f mm above the lid — too close to aim" % (1000 * (cam[2] - h0))
+    g, why = _lid_plane(prior_xy, h0, kk, rot, cam, dd, (hh, ww))
+    if g is None:
+        return None, why
+    inc = _incidence_deg(g, cam)  # at the prior, not the button: a sanity bound only
+    if inc > OBLIQUE_PRIOR_MAX_DEG:
+        return None, "the lid seen %.0f deg off its normal — too oblique to aim" % inc
+    got, why = _rectified(color_bgr, depth, kk, rot, cam, dd, g, rb)
+    if got is None:
+        return None, why
+    s, c0, gray, lifted = got
     # the lid where this frame should see it: a box's height above the table
     # it sees — h0 moved by that table's offset from table_z, as read
     # (TABLE_GATE_MAX_M); the fix's z is raised only by an offset taken out
-    # (TABLE_OFFSET_*, ButtonAimer.fix)
+    # (TABLE_OFFSET_*, ButtonAimer.fix). Past TABLE_RECTIFY_M the frame is
+    # rectified again on that plane, so the circles are measured at the
+    # scale they lie at (TABLE_RECTIFY_M's 10-30 regrips)
     table_off, table_raw = _table_offset(lifted, h0, table_z, inc)
-    h_gate = h0 + (table_raw if np.isfinite(table_raw) and abs(table_raw) <= TABLE_GATE_MAX_M else 0.0)
+    seen = bool(np.isfinite(table_raw) and abs(table_raw) <= TABLE_GATE_MAX_M)
+    h_gate = h0 + (table_raw if seen else 0.0)
+    if seen and abs(table_raw) > TABLE_RECTIFY_M:
+        g1, _why = _lid_plane(prior_xy, h_gate, kk, rot, cam, dd, (hh, ww))
+        got1, _why = (None, None) if g1 is None else _rectified(color_bgr, depth, kk, rot, cam, dd, g1, rb)
+        if got1 is not None:
+            h0, g = h_gate, g1
+            s, c0, gray, lifted = got1
 
     r0 = OBLIQUE_BUTTON_PX
     r_lo, r_hi = int(OBLIQUE_RADIUS_WINDOW[0] * r0), int(math.ceil(OBLIQUE_RADIUS_WINDOW[1] * r0))
