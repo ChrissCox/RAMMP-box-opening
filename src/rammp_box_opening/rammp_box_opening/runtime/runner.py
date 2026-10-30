@@ -715,6 +715,11 @@ class Runner:
                     continue  # dispatched under the previous motion; pending
                 if lead.send_when_still:
                     self.wait_still(lead.name)  # what the fingers close on stops moving first
+                    if lead.when_still is not None:
+                        try:
+                            lead.when_still()
+                        except Exception as e:  # what rides the wait is its caller's, never the leg's
+                            print("[runner] %s: what was to run once the arm stood still failed (%s)" % (lead.name, e))
                 if lead.defer_join and lead.verify is None:
                     handle = self.client.gripper_send(lead.gripper_cmd)
                     if handle is not None:

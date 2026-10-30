@@ -78,6 +78,10 @@ class Leg:
     # trajectory's clock running out, the arm still settling. Never sent
     # under the previous motion, send_with_previous_motion or not.
     send_when_still: bool = False
+    # ... and, so sent, called once the arm stands still, before the command
+    # goes out: what wants the arm at rest at that instant (the grip's
+    # close-up record, reach_lid_off._grip_shot). Its return is not kept.
+    when_still: object = field(default=None, compare=False, repr=False)
     world_path: str = None  # generated world YAML to push (SetWorld wants a path)
     # MOTION legs planned with a vertical approach: (index into traj.points,
     # joints) of the waypoint the final straight line starts from, at rest.
