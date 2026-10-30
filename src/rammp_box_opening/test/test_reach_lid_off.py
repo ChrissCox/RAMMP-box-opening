@@ -199,6 +199,8 @@ GRIP = ["grip:open", "reach:re-aim", "reach:slide-in", "depth:turn", "grip:appro
 CLOSE = ["grip:close", "lid:lift", "lid:clear"]
 CARRY = ["lid:carry", "place:down", "place:touch"]
 HOME = ["place:open", "place:retreat", "home"]
+# ... flown as two: the release riding the retreat, then home in POSITION (_in_position)
+RELEASED, HOMED = ["place:open", "place:retreat"], ["home"]
 
 
 def _executions(rec):
@@ -267,7 +269,7 @@ def test_a_full_run_records_both_cameras_from_the_grip_on_says_each_step_and_wri
     assert v.sources == ["wrist", "scene"]
     assert "hold" in v.started and "grip:open" not in v.started  # after the press, before the grip
     steps = [t.split(" ")[0].rstrip(":") for t in v.said if not t.startswith("overlay")]
-    assert steps == ["GRIP", "CLOSE", "RELEASE,"] and "ONE MOTION: LIFT, CLEAR, CARRY to" in v.said[1]
+    assert steps == ["GRIP", "CLOSE", "RELEASE"] and "ONE MOTION: LIFT, CLEAR, CARRY to" in v.said[1]
     assert v.finished[0] == "the end: the lid set down, the arm home"
     assert "VIDEO: what the wrist and scene cameras saw from the grip on: /captures/lid-video-x.mp4" in (
         capsys.readouterr().out)
@@ -305,15 +307,20 @@ def test_a_knob_up_after_the_press_is_gripped_lifted_carried_set_down_and_the_ar
     spot, its carry and home after the set-down all planned while the hand
     came down to the knob, on the room judged while the press flew: no
     spot look, no plan at rest."""
+    modes = []
+    real_execute = ctx.client.execute
+    monkeypatch.setattr(ctx.client, "execute", lambda *a, **k: (modes.append(ctx.client.compliant), real_execute(*a, **k))[1])
     code, rec, chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)])
     assert code == 0
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
                           *CARRY, *HOME]
     runs = _executions(rec)
-    assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE + CARRY, HOME]
-    # one goal each, every one under the run's one gains spec: the lift to the set-down one execution
+    assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE + CARRY, RELEASED, HOMED]
+    # one goal each, every one under the run's one gains spec: the lift to the set-down one execution; the
+    # release rides the retreat (sent, not waited on), and home after it flies in POSITION
     for names, gains in runs[1:]:
         assert gains == [dp.COMPLIANT_GAINS], names
+    assert modes == [True] * 6 + [False] and rec.legs["place:open"].defer_join
     assert all(lg.guard is None for lg in rec.legs.values() if lg.kind.value == "motion")
     # the carry and home after the set-down planned once each, while the grip's way down flew (the record then
     # ended with its legs); home before that from the look pose while the way back flew, for a stop there
@@ -357,7 +364,7 @@ def test_where_nothing_was_planned_ahead_the_lift_flies_alone_and_the_spot_is_lo
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE, "spot-look", *CARRY,
                           *HOME]
     runs = _executions(rec)
-    assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE, CARRY, HOME]
+    assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE, CARRY, RELEASED, HOMED]
     # one goal each, every one under the run's one gains spec
     for names, gains in runs[1:]:
         assert gains == [dp.COMPLIANT_GAINS], names
@@ -402,7 +409,7 @@ def test_a_lid_that_rose_with_its_knob_up_is_the_box_open_and_the_grip_follows_i
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (risen, 7.8)])
     assert code == 0
     runs = _executions(rec)
-    assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE + CARRY, HOME]  # pressed once
+    assert [names for names, _g in runs] == [["reach:look"], WAY_IN, BACK, GRIP, CLOSE + CARRY, RELEASED, HOMED]  # pressed once
     knob, = [r for r in rows if r["leg"] == "reach_knob"]
     assert (knob["popped"], knob["lid_rose"], knob["knob_up_mm"], knob["stop"]) == (True, True, 7.8, None)
     assert knob["lid_dz_mm"] == pytest.approx(9.6)
@@ -817,7 +824,7 @@ def test_the_full_runs_free_air_lines_fly_at_the_compliant_speed_and_only_under_
     elif case == "no home after the set-down":
         assert runs[-2:] == [["place:open", "place:retreat"], ["home"]], runs
     elif case == "the retreat and home refused":
-        assert runs[-3:] == [["place:open", "place:retreat", "home"], ["place:retreat"], ["home"]], runs
+        assert runs[-3:] == [RELEASED, ["place:retreat"], ["home"]], runs
     fast = [params for speeds, params in timed if COMPLIANT_FREE_LINE_SPEED in speeds]
     assert fast and all(p.qd_ceiling == COMPLIANT_QD_CEILING and p.junction_cruise == COMPLIANT_JUNCTION_SPEED
                         for p in fast)
@@ -1097,7 +1104,7 @@ def test_a_clear_spot_the_scene_camera_sees_is_where_the_lid_goes_its_room_judge
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], extent=ROOMY,
                                          scene=_table())
     assert code == 0 and "spot-look" not in rec.events
-    assert [names for names, _g in _executions(rec)][-2:] == [CLOSE + CARRY, HOME]
+    assert [names for names, _g in _executions(rec)][-3:] == [CLOSE + CARRY, RELEASED, HOMED]
     spot, = [r for r in rows if r["leg"] == "lid_spot"]
     assert (spot["tier"], spot["mapped"], spot["chosen"]) == ("clear", True, "ahead, with the scene camera")
     assert judged_on and set(judged_on) == {"lid-room"}
@@ -1110,7 +1117,7 @@ def test_nothing_clear_the_scene_camera_sees_still_sets_the_lid_down_at_the_most
         ctx, monkeypatch, tmp_path, capsys):
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], extent=ROOMY,
                                          scene=_wall(_table()))
-    assert code == 0 and [names for names, _g in _executions(rec)][-2:] == [CLOSE + CARRY, HOME]
+    assert code == 0 and [names for names, _g in _executions(rec)][-3:] == [CLOSE + CARRY, RELEASED, HOMED]
     spot, = [r for r in rows if r["leg"] == "lid_spot"]
     assert spot["tier"] == "most room"
     out = capsys.readouterr().out
@@ -1134,7 +1141,7 @@ def test_a_spot_home_does_not_plan_from_after_the_set_down_is_passed_over(ctx, m
 
     monkeypatch.setattr(rlo, "plan_home_after", home_after)
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], extent=ROOMY)
-    assert code == 0 and [names for names, _g in _executions(rec)][-2:] == [CLOSE + CARRY, HOME]
+    assert code == 0 and [names for names, _g in _executions(rec)][-3:] == [CLOSE + CARRY, RELEASED, HOMED]
     assert len(asked) == 2 and not rlo._same_spot(asked[0], asked[1])
     spot, = [r for r in rows if r["leg"] == "lid_spot"]
     assert "home after the set-down" in spot["refused"]
@@ -1442,7 +1449,7 @@ def test_the_carry_planned_while_the_lift_flies_is_flown_only_from_where_it_star
     carries = [at for name, at in rec.plans if name == "lid:carry"]
     assert len(carries) == (1 if flown else 2)
     start = rec.legs["lid:carry"].traj.points[0].positions
-    here = ctx.client.exec_starts[-2]  # the carry's execution, before the retreat and home's
+    here = ctx.client.exec_starts[-3]  # the carry's execution, before the retreat's and home's
     assert max(abs(a - b) for a, b in zip(start, here)) <= DRIFT_REPLAN_RAD
     if not flown:
         assert ahead["why"].startswith("the arm stands 0.050 rad from where it was planned from")
@@ -1480,11 +1487,13 @@ def test_the_fingers_close_on_the_knob_once_the_arm_stands_still(ctx, monkeypatc
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)])
     assert code == 0
     assert [name for name, lg in rec.legs.items() if lg.send_when_still] == ["grip:close"]
-    assert ctx.client.stills == [4]  # after the look, the way in, the way back and the way down to the knob
+    # after the look, the way in, the way back and the way down to the knob; and before home in POSITION
+    assert ctx.client.stills == [4, 6]
     legs = [r["leg"] for r in rows]
-    (still,) = [i for i, name in enumerate(legs) if name == "still"]
-    assert rows[still]["before"] == "grip:close"
-    assert legs.index("grip:down") < legs.index("grip:open") < still < legs.index("grip:close")
+    stills = [i for i, name in enumerate(legs) if name == "still"]
+    assert [rows[i]["before"] for i in stills] == ["grip:close", "home in position"]
+    assert legs.index("grip:down") < legs.index("grip:open") < stills[0] < legs.index("grip:close")
+    assert legs.index("place:retreat") < stills[1] < legs.index("home")
 
 
 # ---- flatbot's URDF: the five boxes of the owner's brief ------------------------

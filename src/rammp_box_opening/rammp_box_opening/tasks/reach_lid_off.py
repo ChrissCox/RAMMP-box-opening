@@ -61,12 +61,15 @@ after the press as before (reach_press._fly_way_in).
           out of it — pooled with the scene camera's map (choose_and_carry);
           the carry planned ahead flies where the spot chosen there is its
           own, else the carry to it is planned there.
-  PLACE   the fingers open; back up to the carry's height and home: ONE
-          execution, planned ahead.
+  PLACE   the fingers open as the retreat back up to the carry's height
+          starts; then home, planned ahead, in the driver's POSITION control
+          (_in_position): nothing in the fingers, the wrist free of the
+          impedance's ceiling.
 
-Every move flies in the driver's joint impedance under the run's one gains
-spec (depth_press.COMPLIANT_GAINS, RIGID), unguarded, merged where its legs
-meet: nothing the run reads stops the arm. Its free-air lines — the rise and
+Every move up to the release flies in the driver's joint impedance under the
+run's one gains spec (depth_press.COMPLIANT_GAINS, RIGID), unguarded, merged
+where its legs meet: nothing the run reads stops the arm. The way home after
+the release flies in POSITION, as home_arm's does. Its free-air lines — the rise and
 the way back, the grip's way up, the clear, the retreat — fly at
 reach_press.free_line_speed; the legs that meet the box, the knob or the
 table at their own. It decides only what it must:
@@ -84,6 +87,7 @@ between motions, never a stop.
 import math
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -1748,12 +1752,37 @@ def _touch_says(carry):
         1000 * (carry.over_m or 0.0), (carry.k_z or 0.0) * (carry.over_m or 0.0), carry.k_z or 0.0)
 
 
+@contextmanager
+def _in_position(ctx, runner):
+    """The legs flown inside it in the driver's POSITION control, the run's
+    own (client.compliant) put back after: the way home once the lid is on
+    the table, nothing in the fingers. Under the joint impedance the wrist
+    follows no faster than ~0.5 rad/s, its torque at the driver's clamp
+    (constants.COMPLIANT_QD_CEILING): 10:08 2026-10-30's retreat and home
+    took 4.2 s, arm_joint_6 at its 0.45 rad/s ceiling, and home_arm, in
+    POSITION, flies the same homes with the wrist at 0.9 x its limit. The
+    driver refuses a mode change while the arm moves: it is waited still
+    first (runner.wait_still)."""
+    client = ctx.client
+    was = bool(getattr(client, "compliant", False))
+    if was:
+        runner.wait_still("home in position")
+    client.compliant = False
+    try:
+        yield
+    finally:
+        client.compliant = was
+
+
 def _release_and_home(ctx, cfg, runner, carry, drop, tier, home, why):
     """The lid on the table at `drop` (`carry` flown): the knuckle read (the
-    lid slipped?); the release; the retreat and `home` — the legs after the
-    release planned ahead, None: the retreat alone, home planned after it
-    (`why` there was none) — ONE execution. Returns the exit code: 0 with
-    the lid set down and the arm home."""
+    lid slipped?); the release, the retreat starting as the fingers open
+    (defer_join: the pads leave the knob in the first millimetres, the
+    retreat's first ones come slower than that); then `home` — the legs
+    after the release planned ahead, None: home planned after the retreat
+    (`why` there was none) — in the driver's POSITION control (_in_position;
+    a mode change it refuses: in the run's own). Returns the exit code: 0
+    with the lid set down and the arm home."""
     world = _full_world(ctx)
     ok_q, pos, _stalled = ctx.client.gripper_cmd(None)  # query only: still on the knob?
     kept = not ok_q or pos is None or in_band(pos, cfg.grip_band)
@@ -1761,35 +1790,56 @@ def _release_and_home(ctx, cfg, runner, carry, drop, tier, home, why):
     if not kept:
         print("[press_demo] the fingers read %.3f at the table, outside the grip band %s: the lid slipped on the way"
               % (pos, list(cfg.grip_band)))
-    release = _gripper_leg(ctx, PlanState(joints=None, chain=0), "place:open", GRIPPER_CMD_OPEN, world)
+    release = _gripper_leg(ctx, PlanState(joints=None, chain=0), "place:open", GRIPPER_CMD_OPEN, world,
+                           defer_join=True)
     ctx.lid_at = drop  # every world from here holds the lid where it was set down
     retreat = home if home is not None else [
         dp.compliant_line(ctx, "place:retreat", carry.retreat, carry.quat, rp.free_line_speed(ctx), world)]
-    print("[press_demo] RELEASE, then ONE MOTION: %s" % ", ".join(lg.name for lg in retreat))
-    _video(ctx, "RELEASE, then RETREAT and HOME")
-    res = runner.run([release, *retreat], execute=True)
-    if not res[0].ok:
-        print("[press_demo] STOP: the fingers did not open at the table (%s) — the arm holds" % res[0].detail)
-        rp.let_go(ctx)  # the spring pressing the lid onto the table
+    up, home_legs = retreat[:1], retreat[1:]
+    print("[press_demo] RELEASE as the retreat starts (%s), then HOME in position control%s" % (
+        ", ".join(lg.name for lg in up), ": %s" % ", ".join(lg.name for lg in home_legs) if home_legs else ""))
+    _video(ctx, "RELEASE as the retreat starts, then HOME")
+    res = runner.run([release, *up], execute=True)
+    opened = runner.join_pending()
+    if opened is not None and not opened.ok:
+        print("[press_demo] STOP: the fingers did not open at the table (%s) — the arm holds" % opened.detail)
+        rp.let_go(ctx)  # the spring pressing the lid onto the table, or holding it over
         return 1
     if not all(r.ok for r in res):
         last = res[-1]
         if _started(last):
-            print("[press_demo] STOP: the way home from the lid stopped during %s (%s) — the arm holds" % (
-                rp._in_flight(retreat, last, runner.last_retime), last.detail or last.outcome))
+            print("[press_demo] STOP: the way up from the lid stopped during %s (%s) — the arm holds" % (
+                rp._in_flight(up, last, runner.last_retime), last.detail or last.outcome))
             rp.let_go(ctx)
             return 1
-        up, _why = rp._line(ctx, retreat[0].target[1], carry.quat)
-        if up:
-            res = runner.run([dp.compliant_line(ctx, "place:retreat", up, carry.quat, rp.free_line_speed(ctx), world)],
-                             execute=True)
+        line, _why = rp._line(ctx, up[0].target[1], carry.quat)
+        if line:
+            res = runner.run([dp.compliant_line(ctx, "place:retreat", line, carry.quat, rp.free_line_speed(ctx),
+                                                world)], execute=True)
             if not all(r.ok for r in res):
                 print("[press_demo] STOP: the way up from the lid stopped (%s) — the arm holds" % res[-1].detail)
                 rp.let_go_part_way(ctx, res)
                 return 1
-        home = None  # planned from where the arm stands now
-    if home is None and not rp._go_home(ctx, cfg, runner, "home from the lid (%s)" % why if why else ""):
-        return 1
+        home_legs = []  # planned from where the arm stands now
+    if home_legs:
+        with _in_position(ctx, runner):
+            res = runner.run(home_legs, execute=True)
+        if not all(r.ok for r in res) and not _started(res[-1]):
+            # the driver did not take it in POSITION (a mode change it refused): as the run flies
+            print("[press_demo] home in position control did not start (%s) — flying it as the run does" % (
+                res[-1].detail or res[-1].outcome))
+            res = runner.run(home_legs, execute=True)
+        if not all(r.ok for r in res):
+            print("[press_demo] STOP: the way home stopped during %s (%s) — the arm holds" % (
+                rp._in_flight(home_legs, res[-1], runner.last_retime), res[-1].detail or res[-1].outcome))
+            if _started(res[-1]):
+                rp.let_go(ctx)
+            return 1
+    else:
+        with _in_position(ctx, runner):
+            ok = rp._go_home(ctx, cfg, runner, "home from the lid (%s)" % why if why else "")
+        if not ok:
+            return 1
     runner.finish()
     if not kept:
         print("[press_demo] STOP: the arm is home, but the lid slipped out of the fingers on the way to [%.2f, %.2f]"
