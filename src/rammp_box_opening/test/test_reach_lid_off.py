@@ -25,14 +25,18 @@ KNOB_ON = 0.39  # the knuckle closed on the knob (bench 2026-08-26: 0.387)
 AIR = 0.79  # ... closed on air
 
 
-def test_the_grip_goes_by_the_lid_no_lower_than_the_held_pads_nor_higher_than_the_buttons_stop():
-    """The lid is not below the button the hold held the pads on, nor more
-    than the button's travel above it; between, the press's top. Without a
-    hold, the press's top."""
+def test_the_grip_goes_by_the_lid_where_the_hold_held_the_pads_not_by_the_scene_cameras_top():
+    """Owner 2026-10-30: the scene camera gives a general location. The lid
+    the grip goes by is GRIP_LID_ABOVE_HELD_M (4 mm) above where the hold
+    held the pads, whatever the press's top: 10:58's scene camera put the
+    top 15.8 mm above the touch, the grip went 7.4 mm above it (the button's
+    travel) plus the lid's rise, and closed on air. Without a hold, the
+    press's top."""
+    assert rlo.GRIP_LID_ABOVE_HELD_M == pytest.approx(0.004)
     assert rlo.grip_lid_z(0.3097) == 0.3097
-    assert rlo.grip_lid_z(0.3097, 0.3056) == 0.3097  # 13:43's: the scene's top within the button's travel
-    assert rlo.grip_lid_z(0.300, 0.3056) == 0.3056  # a top below the held pads is no lid
-    assert rlo.grip_lid_z(0.325, 0.3056) == pytest.approx(0.3056 + rlo.KNOB_STROKE_M)  # past the stop is no lid
+    for top in (0.3097, 0.300, 0.3426):  # 13:43's top within the travel, one below the pads, 10:58's 15.8 mm above
+        assert rlo.grip_lid_z(top, 0.3056) == pytest.approx(0.3056 + 0.004)
+    assert rlo.grip_lid_z(0.3426, 0.3268) == pytest.approx(0.3308)  # 10:58: 3.5 mm lower than it went (0.3343)
 
 
 class _Chain(trp._Chain):
@@ -330,10 +334,11 @@ def test_a_knob_up_after_the_press_is_gripped_lifted_carried_set_down_and_the_ar
     assert ctx.lid_at is ctx.lid_drop  # the placed lid is in every world after the release
     knob, = [r for r in rows if r["leg"] == "reach_knob"]
     assert (knob["press"], knob["popped"], knob["looks"], knob["knob_up_mm"]) == (1, True, 1, 9.0)
-    # the grip goes by the lid where the hold held the pads (6 mm below the
-    # top) plus the button's stop, under the top: the top
+    # the grip goes by the lid GRIP_LID_ABOVE_HELD_M above where the hold
+    # held the pads (6 mm below the top), whatever the top
     grip, = [r for r in rows if r["leg"] == "reach_grip"]
-    assert grip["lid_z"] == pytest.approx(BUTTON[2]) and grip["pads_z"] == pytest.approx(BUTTON[2] - rlo.GRIP_BELOW_LID_M)
+    lid = BUTTON[2] - 0.006 + rlo.GRIP_LID_ABOVE_HELD_M
+    assert grip["lid_z"] == pytest.approx(lid) and grip["pads_z"] == pytest.approx(lid - rlo.GRIP_BELOW_LID_M)
     out = capsys.readouterr().out
     assert "CLOSE, then ONE MOTION: lid:lift, lid:clear, lid:carry, place:down, place:touch" in out
     assert "LID GRIPPED" in out and out.rstrip().endswith("arm home")
@@ -375,10 +380,11 @@ def test_where_nothing_was_planned_ahead_the_lift_flies_alone_and_the_spot_is_lo
     assert ctx.lid_at is ctx.lid_drop  # the placed lid is in every world after the release
     knob, = [r for r in rows if r["leg"] == "reach_knob"]
     assert (knob["press"], knob["popped"], knob["looks"], knob["knob_up_mm"]) == (1, True, 1, 9.0)
-    # the grip goes by the lid where the hold held the pads (6 mm below the
-    # top) plus the button's stop, under the top: the top
+    # the grip goes by the lid GRIP_LID_ABOVE_HELD_M above where the hold
+    # held the pads (6 mm below the top), whatever the top
     grip, = [r for r in rows if r["leg"] == "reach_grip"]
-    assert grip["lid_z"] == pytest.approx(BUTTON[2]) and grip["pads_z"] == pytest.approx(BUTTON[2] - rlo.GRIP_BELOW_LID_M)
+    lid = BUTTON[2] - 0.006 + rlo.GRIP_LID_ABOVE_HELD_M
+    assert grip["lid_z"] == pytest.approx(lid) and grip["pads_z"] == pytest.approx(lid - rlo.GRIP_BELOW_LID_M)
     out = capsys.readouterr().out
     assert "LID GRIPPED" in out and out.rstrip().endswith("arm home")
     assert ctx.client.lets_go == []  # nothing stopped: nothing let go
@@ -401,7 +407,7 @@ def test_a_lid_that_rose_with_its_knob_up_is_the_box_open_and_the_grip_follows_i
     assert (knob["popped"], knob["lid_rose"], knob["knob_up_mm"], knob["stop"]) == (True, True, 7.8, None)
     assert knob["lid_dz_mm"] == pytest.approx(9.6)
     grip, = [r for r in rows if r["leg"] == "reach_grip"]
-    assert grip["lid_z"] == pytest.approx(BUTTON[2] + 0.0096)  # the held-pads lid (the top) raised by the rise
+    assert grip["lid_z"] == pytest.approx(BUTTON[2] - 0.006 + rlo.GRIP_LID_ABOVE_HELD_M + 0.0096)  # the held-pads lid raised by the rise
     out = capsys.readouterr().out
     assert "knob UP 7.8 mm, and its LID ROSE +10 mm — the box is open" in out and "LID GRIPPED" in out
 
