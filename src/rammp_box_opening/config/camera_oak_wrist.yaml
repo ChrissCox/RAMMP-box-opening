@@ -22,4 +22,8 @@ stamp_offset_s: 0.0
 # arm_end_effector_link, tool_frame 0.12 m past it); the hand-measured mount
 # deployed before it ([0, 0.10, -0.10]) put the 20:04 press on the lid's
 # edge. Re-measure after ANY bracket change.
-wrist_lens_in_hand_m: [0.0, 0.065, -0.105]
+# Refitted 2026-10-30 with the TF mount (rammp-deployments cameras.yaml, local:
+# [-0.012, 0.048, 0.022] from arm_end_effector_link): after the camera's 10-23
+# repair the old one put the lid 15-29 mm below the arm's touch over 17 reach-out
+# presses, the new one within 3.9 mm rms. Was [0.0, 0.065, -0.105].
+wrist_lens_in_hand_m: [-0.012, 0.048, -0.098]
