@@ -126,6 +126,13 @@ TABLE_MIN_CELLS = 500  # of those, below half the box's height (the live frames 
 TABLE_BIN_M = 0.002  # the table: the mode of their heights in bins this wide,
 TABLE_BAND_M = 0.004  # then the median of the heights within this of its centre
 TABLE_AGREE_M = 0.004  # two of a fix's accepted offsets this close raise its z (ButtonAimer.fix)
+# The two prior-height gates, though, judge the lid against the table THIS
+# frame sees however far that stands from the one given (owner 2026-10-30:
+# the scene camera gives the arm a general location, the wrist finds the
+# lid): 2026-10-30 10:09 and 10:10 the wrist's table stood 43-55 mm below
+# the scene camera's, past both bounds above, its lid with it, and every
+# frame was refused. Only a "table" farther off than this is no table.
+TABLE_GATE_MAX_M = 0.150
 
 
 @dataclass(frozen=True)
@@ -551,10 +558,15 @@ def _table_offset(lifted, h0, table_z, inc_deg):
 
 
 def _table_words(off, off_raw):
-    """What a refusal says of the table its frame saw (_table_offset)."""
+    """What a refusal says of the table its frame saw (_table_offset): the
+    lid judged against it, or not (TABLE_GATE_MAX_M); the fix's z raised by
+    it (taken out), or not."""
     if not np.isfinite(off_raw):
         return ""
-    return "; the table in view %+.0f mm from the one given, %s" % (
+    if abs(off_raw) > TABLE_GATE_MAX_M:
+        return "; the table in view %+.0f mm from the one given, too far to be the table: the lid judged against " \
+               "the one given" % (1000 * off_raw)
+    return "; the table in view %+.0f mm from the one given, the lid judged against it, %s" % (
         1000 * off_raw, "taken out" if np.isfinite(off) else "not taken out")
 
 
@@ -583,9 +595,9 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
     optical axis meets the plane). There a horizontal circle is a circle.
     Each cell's depth is lifted along its own raw pixel's ray, so every gate
     reads base z and the lid ring's height is measured, not assumed: it
-    must lie within LID_PRIOR_TOL_M of h0 — of h0 moved by the table
-    offset, when this frame reads its own table that far from table_z
-    (_table_offset). The circle found on h0 is then moved along the
+    must lie within LID_PRIOR_TOL_M of h0 moved by the table offset — a
+    box's height above the table this frame reads (_table_offset,
+    TABLE_GATE_MAX_M). The circle found on h0 is then moved along the
     camera's rays to the disc's measured height h:
     P = C + (P' - C) (Cz - h) / (Cz - h0)."""
     import cv2
@@ -647,10 +659,12 @@ def find_button_oblique(color_bgr, depth, k, rot_cam, trans_cam, table_z, model,
     lifted = np.full((n * n, 3), np.nan, np.float32)
     lifted[np.flatnonzero(valid)[ok]] = np.c_[xn * d[ok], yn * d[ok], d[ok]] @ rot.T + cam
     lifted = lifted.reshape(n, n, 3)
-    # the lid where this frame should see it: h0 moved by the offset of the
-    # table it sees from table_z, where that is taken out (TABLE_OFFSET_*)
+    # the lid where this frame should see it: a box's height above the table
+    # it sees — h0 moved by that table's offset from table_z, as read
+    # (TABLE_GATE_MAX_M); the fix's z is raised only by an offset taken out
+    # (TABLE_OFFSET_*, ButtonAimer.fix)
     table_off, table_raw = _table_offset(lifted, h0, table_z, inc)
-    h_gate = h0 + (table_off if np.isfinite(table_off) else 0.0)
+    h_gate = h0 + (table_raw if np.isfinite(table_raw) and abs(table_raw) <= TABLE_GATE_MAX_M else 0.0)
 
     r0 = OBLIQUE_BUTTON_PX
     r_lo, r_hi = int(OBLIQUE_RADIUS_WINDOW[0] * r0), int(math.ceil(OBLIQUE_RADIUS_WINDOW[1] * r0))

@@ -561,31 +561,31 @@ def test_the_table_offset_is_the_mode_of_the_heights_below_half_the_box():
     assert np.isnan(few[0]) and np.isnan(few[1])
 
 
-def test_an_offset_the_press_xy_cannot_carry_is_not_taken_out(pink, monkeypatch):
+def test_an_offset_the_press_xy_cannot_carry_judges_the_lid_but_does_not_raise_the_fix(pink, monkeypatch):
     """What a common offset cannot say is whether the wrist's depth is off
     (the press xy, slid along the rays by the measured heights, then off by
     tan(incidence) x the offset) or its pose in TF (the xy right). Past
-    TABLE_OFFSET_XY_MAX_M of that the offset is not taken out. A depth that
-    reads 45 mm long at 39 deg puts the table 29 mm low: 0.81 x 29 = 24 mm,
-    refused as it was — taken out, the press would go 29 mm off the
-    button's centre, past its 22 mm radius."""
-    from rammp_box_opening.perception import button_aim
-
+    TABLE_OFFSET_XY_MAX_M of that the offset is not taken out: the fix's z
+    is not raised by it. The lid is still judged against the table the
+    frame sees (owner 2026-10-30: the scene camera gives a general location,
+    the wrist finds the lid): a depth that reads 45 mm long at 39 deg puts
+    the table 29 mm low, and the button is found where the wrist sees it —
+    29 mm off its centre here, past its 22 mm radius: the wrist's
+    calibration keeps that right, not this gate. 10-28..10-30's wrist read
+    the lid 12-25 mm low with its xy within 10 mm (the fitted mount shift,
+    not its depth)."""
     color, depth, cam, rot, b = reach_out_frame(pink, 39)
     biased = np.where(depth > 0, depth + 0.045, 0.0).astype(np.float32)
     s, why = find_button(color, biased, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
-    assert s is None and "prior height" in why and "not taken out" in why, why
-    with monkeypatch.context() as mp:
-        mp.setattr(button_aim, "TABLE_OFFSET_XY_MAX_M", 1.0)
-        s1, why1 = find_button(color, biased, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
-    assert why1 is None, why1
-    assert s1.table_offset_m == pytest.approx(-0.029, abs=0.003)
-    assert np.hypot(s1.xyz[0] - b[0], s1.xyz[1] - b[1]) > BUTTON_R
+    assert why is None, why
+    assert not np.isfinite(s.table_offset_m) and s.table_offset_raw_m == pytest.approx(-0.029, abs=0.003)
+    assert np.hypot(s.xyz[0] - b[0], s.xyz[1] - b[1]) > BUTTON_R
     # the 29 deg case's 28 mm seen at 39 deg (42.8 at the prior, 37 mm above
-    # the lid): 0.93 x 28 = 26 mm, not taken out
+    # the lid): 0.93 x 28 = 26 mm, not taken out, the lid judged against it
     color, depth, cam, rot, b = reach_out_frame(pink, 39, lid_drop=0.037, table_drop=0.028)
     s, why = find_button(color, depth, OAK_K, rot, cam, FLAT_TABLE_Z, pink, prior_xy=tuple(b[:2]))
-    assert s is None and "lid ring -37 mm from its prior height" in why and "not taken out" in why, why
+    assert why is None, why
+    assert not np.isfinite(s.table_offset_m) and s.table_offset_raw_m == pytest.approx(-0.028, abs=0.003)
 
 
 @pytest.mark.parametrize(
@@ -724,9 +724,17 @@ def test_the_reach_out_aim_refuses_honestly(pink):
     s, why = aim(d=holed, prior_xy=tuple(b[:2]))
     assert s is None and "too little depth" in why
     far = np.where(depth > 0, depth + 0.08, 0.0).astype(np.float32)  # every surface 6 cm low
+    # its table too: the lid is judged against it, but no offset that large
+    # raises the fix (TABLE_OFFSET_MAX_M); a "table" past TABLE_GATE_MAX_M is
+    # none, and the lid is judged against the one given
     s, why = aim(d=far, prior_xy=tuple(b[:2]))
-    # its table too, and no offset that large is taken out (TABLE_OFFSET_MAX_M)
-    assert s is None and "none the button" in why and "prior height" in why and "not taken out" in why
+    assert why is None and not np.isfinite(s.table_offset_m), why
+    from rammp_box_opening.perception import button_aim
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(button_aim, "TABLE_GATE_MAX_M", 0.05)
+        s, why = aim(d=far, prior_xy=tuple(b[:2]))
+    assert s is None and "none the button" in why and "prior height" in why and "too far to be the table" in why
     # 55 deg at the button: judged there, after the circle is found
     cam55, rot55 = reach_out_pose(b, 55, 0.20, off_deg=0.0)
     c55, d55 = render(cam55, rot55, [(BUTTON_XY, b[2], 0.0)], b[2] - BOX_H)
@@ -968,19 +976,44 @@ def test_the_live_reach_out_aims_read_their_table_20_mm_low(pink, name, want, mo
     assert fx[:2] == pytest.approx(s.xyz[:2], abs=1e-6) and fx[2] == pytest.approx(0.310, abs=0.005)
 
 
-def test_the_1259_look_with_the_scene_camera_9cm_high_is_still_refused(pink):
+def test_the_1259_look_with_the_scene_camera_9cm_high_finds_the_button_the_wrist_sees(pink):
     """Flatbot 2026-10-27 12:59, a reach-out look while the scene camera read
     9 cm high: its table at 0.303 and its lid at 0.406, the wrist's table
-    106 mm below that. No offset that large is taken out: refused as it
-    was, and the refusal says what the table read."""
+    106 mm below that, and the look was refused. The lid is judged against
+    the table the wrist sees (owner 2026-10-30): the button is found, a
+    box's height above that table; no offset that large raises the fix's z.
+    A "table" past TABLE_GATE_MAX_M is still refused, and says so."""
     import re
+
+    from rammp_box_opening.perception import button_aim
 
     color, depth, k, rot, cam, dist, table_z, lid_z, prior = _reach_frame("wrist_reach_look_flatbot_20261027_1259.npz")
     s, why = find_button(color, depth, k, rot, cam, table_z, pink, dist=dist, lid_z=lid_z, prior_xy=prior)
+    assert why is None, why
+    assert s.table_offset_raw_m == pytest.approx(-0.106, abs=0.003) and not np.isfinite(s.table_offset_m)
+    assert s.xyz[2] == pytest.approx(lid_z - 0.106, abs=0.015)  # the lid as the wrist reads it, not raised
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(button_aim, "TABLE_GATE_MAX_M", 0.10)
+        s, why = find_button(color, depth, k, rot, cam, table_z, pink, dist=dist, lid_z=lid_z, prior_xy=prior)
     assert s is None and "prior height" in why, why
-    got = re.search(r"the table in view ([+-]\d+) mm from the one given, not taken out", why)
+    got = re.search(r"the table in view ([+-]\d+) mm from the one given, too far to be the table", why)
     assert got is not None, why
     assert int(got.group(1)) == pytest.approx(-106, abs=3)
+
+
+def test_the_1010_look_with_the_wrist_55mm_below_the_scene_camera_finds_the_button(pink):
+    """Flatbot 2026-10-30 10:10 (and 10:09): the wrist's table 55 mm below
+    the scene camera's, past TABLE_OFFSET_MAX_M, and its two circles were
+    refused — "disc -52 mm from the lid's prior height" — so nothing was
+    pressed. Judged against the table the wrist sees, the button is found
+    a box's height above it, flush with its lid; the fix's z is not
+    raised."""
+    color, depth, k, rot, cam, dist, table_z, lid_z, prior = _reach_frame("wrist_reach_look_flatbot_20261030_1010.npz")
+    s, why = find_button(color, depth, k, rot, cam, table_z, pink, dist=dist, lid_z=lid_z, prior_xy=prior)
+    assert why is None, why
+    assert s.table_offset_raw_m == pytest.approx(-0.055, abs=0.003) and not np.isfinite(s.table_offset_m)
+    assert abs(s.above_lid_m) < 0.003 and s.xyz[2] == pytest.approx(lid_z - 0.052, abs=0.006)
+    assert np.hypot(s.xyz[0] - prior[0], s.xyz[1] - prior[1]) < 0.035  # near where the scene camera put it
 
 
 def test_still_frames_fuse_their_depth_and_a_moved_camera_starts_again():
