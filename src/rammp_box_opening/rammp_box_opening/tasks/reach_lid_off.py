@@ -189,6 +189,16 @@ GRIP_SLOW_M = dp.TOUCH_SLOW_M  # the grip's last stretch down flies at TOUCH_SPE
 # something larger than the knob, or a gripper that failed, are not a miss a
 # re-aim mends. Never more than once.
 GRIP_TRIES = 2
+# The grip's close-up record (owner 2026-10-30, "a recorder first"): at each
+# close, once the arm stands still, the wrist's frame — the fingers open
+# round the knob — kept, with where the knob's circle sits in it and whether
+# the grip held. A centring before the close needs where a held grip has the
+# knob: with the grip centred the knob's centre is at or past the frame's
+# bottom edge, and the camera's TF puts the hand's centre line ~13 mm from
+# where the one held grip of 10-30 (10:08) had it; its five on air had it
+# 10-23 mm off along the frame's height and up to 18 mm across. The knob's
+# radius in those frames, px:
+GRIP_SHOT_R_PX = (45, 95)
 # ... and GRIP_RETRY_LOWER_M lower than the grip that closed on air (owner
 # 2026-10-30: "if it doesn't grab it, it tries again but this time going ~1
 # cm lower"). 10:40: the grip went by the scene camera's top (0.346, its
@@ -1282,6 +1292,71 @@ def _on_air(r, band):
             and float(r.gripper_pos) > float(band[1]))
 
 
+def grip_knob_circle(color):
+    """The knob's circle in the wrist's close-up at the grip (BGR): (u, v,
+    r) px — of HoughCircles' within GRIP_SHOT_R_PX, the one centred lowest
+    in the frame's bottom middle, where the knob sits — or None."""
+    import cv2
+
+    g = cv2.medianBlur(cv2.cvtColor(np.ascontiguousarray(color), cv2.COLOR_BGR2GRAY), 5)
+    h, w = g.shape[:2]
+    cs = cv2.HoughCircles(g, cv2.HOUGH_GRADIENT, dp=1, minDist=40, param1=80, param2=18,
+                          minRadius=GRIP_SHOT_R_PX[0], maxRadius=GRIP_SHOT_R_PX[1])
+    if cs is None:
+        return None
+    near = [c for c in cs[0] if 0.34 * w < c[0] < 0.72 * w and c[1] > 0.75 * h]
+    if not near:
+        return None
+    u, v, r = max(near, key=lambda c: c[1])
+    return float(u), float(v), float(r)
+
+
+class _GripShot:
+    """The grip's close-up (GRIP_SHOT_R_PX's record), taken once the arm
+    stands still before the close (Leg.when_still): the wrist's frame kept
+    (captures/wrist-grip-close-*, press_demo._save_wrist_frame on a thread)
+    and the knob's circle in it measured on another while the fingers
+    close; note() records both with whether the grip held."""
+
+    def __init__(self, watcher, model, attempt):
+        from rammp_box_opening.tasks.press_demo import CAPTURES_DIR, _prune_captures, _save_wrist_frame
+
+        g = getattr(watcher, "grab", None)
+        self.result, self.thread, self.frame = None, None, None
+        color = None if g is None else getattr(g, "color", None)
+        if color is None:
+            return
+        k = getattr(g, "k", None)
+        color, k = np.array(color, copy=True), None if k is None else np.asarray(k, float)
+        try:
+            out = _save_wrist_frame(g, CAPTURES_DIR / ("wrist-grip-close-%s-a%d" % (time.strftime("%Y%m%d-%H%M%S"),
+                                                                                   attempt)),
+                                    "the grip's close-up, attempt %d" % attempt, background=True,
+                                    after=lambda: _prune_captures("grip-close"))
+            self.frame = None if out is None else str(out)
+        except Exception:  # a frame not kept costs the record its folder, never the grip
+            self.frame = None
+        self.thread = threading.Thread(target=self._measure, args=(color, k, float(model.button_diameter_m)),
+                                       name="grip-shot", daemon=True)
+        self.thread.start()
+
+    def _measure(self, color, k, knob_d):
+        circle = grip_knob_circle(color)
+        cam = None
+        if circle is not None and k is not None:
+            u, v, r = circle
+            z = k[0, 0] * 0.5 * knob_d / r  # its range from its size
+            cam = [round(1000 * z * (u - k[0, 2]) / k[0, 0], 1), round(1000 * z * (v - k[1, 2]) / k[1, 1], 1),
+                   round(1000 * z, 1)]
+        self.result = dict(knob_px=None if circle is None else [round(c, 1) for c in circle], knob_cam_mm=cam)
+
+    def note(self, runner, attempt, held, detail):
+        if self.thread is not None:
+            self.thread.join(1.0)
+        runner.note("grip_close_look", attempt=attempt, held=held, detail=detail, frame=self.frame,
+                    **(self.result or dict(knob_px=None, knob_cam_mm=None, why="no wrist frame")))
+
+
 def _regrip(ctx, cfg, runner, eyes, way, button, yaw, detail):
     """After a first close on air (`detail`, what it read): the fingers
     open and the hand backs out the grip's way down to the look pose
@@ -1392,6 +1467,8 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
     # where it is settling past (Leg.send_when_still)
     close = _gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:close", GRIPPER_CMD_CLOSED, world,
                          verify=band_verify(cfg.grip_band), send_when_still=True)
+    shots = []  # the close-up, taken once the arm stands still (GRIP_SHOT_R_PX)
+    close.when_still = lambda: shots.append(_GripShot(eyes[1], ctx.model, attempt))
     # the spot, its carry and home after it planned while the hand came
     # down: the close, then the lid lifted, carried and set down without a
     # stop. A close that fails stops before anything lifts
@@ -1427,6 +1504,9 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
         res = runner.run(flying, execute=True, lookahead=lambda end: carry_ahead(ctx, cfg, eyes, end, room=room))
         carried = runner.lookahead_result
     grip = [r for r in res if r.leg_name in ("grip:open", "grip:close")]
+    for shot in shots:
+        shot.note(runner, attempt, bool(grip) and grip[-1].ok and grip[-1].leg_name == "grip:close",
+                  grip[-1].detail if grip else None)
     if not grip or not grip[-1].ok or grip[-1].leg_name != "grip:close":
         detail = grip[-1].detail if grip else res[-1].detail
         air = bool(grip) and _on_air(grip[-1], cfg.grip_band)

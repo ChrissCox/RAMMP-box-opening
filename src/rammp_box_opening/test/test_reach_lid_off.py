@@ -7,6 +7,7 @@ reachability on flatbot's URDF for the boxes of 2026-10-27/28."""
 import json
 import math
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -1794,3 +1795,70 @@ def test_the_fingers_come_down_to_the_knob_opened_to_its_width_not_fully(ctx, mo
     assert lid_r - width / 2 >= 0.02
     assert width / 2 - m.button_diameter_m / 2 >= 0.01
     assert rec.legs["place:open"].gripper_cmd == GRIPPER_CMD_OPEN  # the lid let go fully at the table
+
+
+# ---- the grip's close-up record ----------------------------------------------------------
+
+@pytest.mark.parametrize("name, want", [
+    ("wrist_grip_close_flatbot_20261030_1008_held.jpg", (345.5, 395.5, 48.5)),
+    ("wrist_grip_close_flatbot_20261030_1059_air.jpg", (287.5, 389.5, 62.2)),
+], ids=["10:08 held", "10:58 on air"])
+def test_the_knobs_circle_is_found_in_the_grips_close_up(name, want):
+    """2026-10-30's close-ups, the fingers open round the knob once the arm
+    stood still (rebuilt at the wrist's 640 x 400 from the lid videos, the
+    JPEG's): the knob's circle at the frame's bottom edge — 10:08's, held,
+    centred at the edge; 10:58's second, on air, ~58 px to its left. A
+    circle mostly past the edge is found to a few px (the held one's centre
+    moved 6 px and its radius 7 between the video's frame and this JPEG):
+    a record, not yet a correction."""
+    import cv2
+
+    img = cv2.imread(str(Path(__file__).parent / "data" / name))
+    got = rlo.grip_knob_circle(img)
+    assert got is not None
+    assert got[0] == pytest.approx(want[0], abs=3) and got[1] == pytest.approx(want[1], abs=3)
+    assert got[2] == pytest.approx(want[2], abs=3)
+    assert rlo.grip_knob_circle(np.full_like(img, 128)) is None  # no knob, no circle
+
+
+def test_the_grips_close_up_is_kept_with_where_the_knob_sits_and_whether_it_held(monkeypatch):
+    """Taken once the arm stands still before the close (Leg.when_still):
+    the frame kept on a thread, the knob's circle measured on another, its
+    place in the camera from its size (the button's 44 mm), noted with the
+    grip's result."""
+    import cv2
+
+    from rammp_box_opening.tasks import press_demo
+
+    img = cv2.imread(str(Path(__file__).parent / "data" / "wrist_grip_close_flatbot_20261030_1059_air.jpg"))
+    kept = []
+    monkeypatch.setattr(press_demo, "_save_wrist_frame", lambda g, folder, caption, **kw: kept.append(folder) or folder)
+    K = np.array([[398.4, 0.0, 338.0], [0.0, 398.3, 203.2], [0.0, 0.0, 1.0]])
+    watcher = SimpleNamespace(grab=SimpleNamespace(color=img, k=K))
+    shot = rlo._GripShot(watcher, SimpleNamespace(button_diameter_m=0.044), 2)
+    notes = []
+    runner = SimpleNamespace(note=lambda leg, **kw: notes.append((leg, kw)))
+    shot.note(runner, 2, False, "grip 0.769 vs band [0.3, 0.55]")
+    (leg, row), = notes
+    assert leg == "grip_close_look" and row["attempt"] == 2 and row["held"] is False
+    assert len(kept) == 1 and "wrist-grip-close-" in str(kept[0]) and str(kept[0]).endswith("-a2")
+    u, v, r = row["knob_px"]
+    z = 398.4 * 0.022 / r
+    assert row["knob_cam_mm"] == pytest.approx([1000 * z * (u - 338.0) / 398.4, 1000 * z * (v - 203.2) / 398.3,
+                                                1000 * z], abs=0.2)
+    # no wrist frame: noted all the same, nothing kept
+    notes.clear()
+    rlo._GripShot(SimpleNamespace(), SimpleNamespace(button_diameter_m=0.044), 1).note(runner, 1, True, "grip 0.41")
+    assert notes == [("grip_close_look", dict(attempt=1, held=True, detail="grip 0.41", frame=None, knob_px=None,
+                                              knob_cam_mm=None, why="no wrist frame"))]
+
+
+def test_each_grip_close_is_recorded_once_the_arm_stands_still(ctx, monkeypatch, tmp_path):
+    """The full run's close rides the runner's wait for the arm to stand
+    still (Leg.when_still), and the record says which attempt and whether
+    it held: here a close on air, then the grip once more that held."""
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0), (REGRIP, 9.0)],
+                                         knuckle=[AIR, KNOB_ON])
+    assert code == 0 and rec.legs["grip:close"].when_still is not None
+    looks = [(r["attempt"], r["held"], r["why"]) for r in rows if r["leg"] == "grip_close_look"]
+    assert looks == [(1, False, "no wrist frame"), (2, True, "no wrist frame")]
