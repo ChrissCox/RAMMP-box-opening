@@ -526,17 +526,22 @@ BACK_OUT = ["grip:up", "depth:turn-back", "reach:slide-out"]  # the grip's way d
 def test_fingers_that_close_on_air_open_again_and_back_out_the_way_they_came(ctx, monkeypatch, tmp_path, capsys):
     """The close reads air (outside the grip band): nothing is lifted. The
     fingers open, the hand backs out the grip's way down to the look pose,
-    the wrist aims at the knob again there (_regrip) — here it finds none —
-    and goes home from there: exit 1."""
+    the wrist aims at the knob again there (_regrip) — here it finds none,
+    so the second grip comes down where the first went, GRIP_RETRY_LOWER_M
+    lower; on air again, it backs out once more and goes home: exit 1."""
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], knuckle=AIR)
     assert code == 1
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
-                          *CARRY, "grip:open", *BACK_OUT, "aim:reach-regrip", "home"]
+                          *CARRY, "grip:open", *BACK_OUT, "aim:reach-regrip", *GRIP, *CLOSE, *CARRY, "grip:open",
+                          *BACK_OUT, "home"]
     assert (CLOSE + CARRY, []) in _executions(rec)  # the close's run returned at the close: handed, nothing sent
     assert [r["leg"] for r in rows if r["leg"].startswith(("lid:", "place:"))] == []
-    result, = [r for r in rows if r["leg"] == "reach_grip_result"]
-    assert result["ok"] is False and "0.790" in result["detail"]
-    assert "GRIP MISSED" in capsys.readouterr().out
+    results = [r for r in rows if r["leg"] == "reach_grip_result"]
+    assert [(r["ok"], r["retry"]) for r in results] == [(False, True), (False, False)] and "0.790" in results[0]["detail"]
+    out = capsys.readouterr().out
+    assert "GRIP MISSED" in out and "coming down 10 mm lower" in out
+    assert "the wrist does not find the button again from the look pose (no circle): gripping once more where the " \
+           "first grip went" in out
 
 
 # ---- a grip on air, tried once more at the knob aimed at again -----------------
@@ -567,9 +572,9 @@ def test_a_grip_on_air_is_aimed_again_from_the_look_pose_and_gripped_once_more_w
     band [0.30, 0.55]) 11 mm short of the knob, and the run went home, exit
     1. Now the fingers open, the hand backs out to the look pose, the wrist
     aims at the knob again from there — once — and the hand comes down to
-    the knob it sees, the first grip's tilt and lid height kept: the
-    second close holds it, and the lid comes off as ever, exit 0. The
-    record says each step."""
+    the knob it sees, the first grip's tilt kept, GRIP_RETRY_LOWER_M (1 cm)
+    lower (owner 2026-10-30): the second close holds it, and the lid comes
+    off as ever, exit 0. The record says each step."""
     asked = _grip_ways(monkeypatch)
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0), (REGRIP, 9.0)],
                                          knuckle=[AIR, KNOB_ON])
@@ -580,7 +585,10 @@ def test_a_grip_on_air_is_aimed_again_from_the_look_pose_and_gripped_once_more_w
     # the second way down solved for the re-aimed button, at the first's height, lid and tilt
     (first, lid1, tilt1), (second, lid2, tilt2) = asked
     assert first == pytest.approx(BUTTON) and second == pytest.approx((REGRIP[0], REGRIP[1], BUTTON[2]))
-    assert (lid2, tilt2) == (lid1, tilt1)
+    assert tilt2 == tilt1 and lid2 == pytest.approx(lid1 - rlo.GRIP_RETRY_LOWER_M) and rlo.GRIP_RETRY_LOWER_M == 0.010
+    grips = [r for r in rows if r["leg"] == "reach_grip"]
+    assert grips[1]["lid_z"] == pytest.approx(grips[0]["lid_z"] - 0.010, abs=1e-4)
+    assert grips[1]["pads_z"] == pytest.approx(grips[0]["pads_z"] - 0.010, abs=1e-4)
     grips = [r for r in rows if r["leg"] == "reach_grip"]
     assert [(g["attempt"], g["button"][:2]) for g in grips] == [(1, pytest.approx(list(BUTTON[:2]))),
                                                                  (2, pytest.approx(list(REGRIP[:2])))]
@@ -612,39 +620,55 @@ def test_a_grip_on_air_twice_backs_out_and_goes_home_after_one_retry_only(ctx, m
     # home flown is the one planned while the second back-out flew, from where it ends
     assert rec.legs["home"] is plans[-1][1][-1] and plans[-1][0] == pytest.approx(rec.legs["reach:slide-out"].goal_joints)
     out = capsys.readouterr().out
-    assert "GRIP FAILED AGAIN, at the re-aimed knob" in out
-    assert "STOP: the grip failed twice, the second time at the re-aimed knob (grip 0.790" in out
+    assert "GRIP FAILED AGAIN, 10 mm lower" in out
+    assert "STOP: the grip failed twice, the second time 10 mm lower (grip 0.790" in out
 
 
-@pytest.mark.parametrize("regrip, refuse, found, said", [
-    (None, (), False, "STOP: the grip closed on air (grip 0.790 vs band [0.3, 0.55]) and the wrist does not find the "
-                      "button again from the look pose (no circle) — the lid is not taken off"),
-    ((BUTTON[0] + 0.02, BUTTON[1], BUTTON[2] + 0.009), (), True,
-     "STOP: the grip closed on air (grip 0.790 vs band [0.3, 0.55]) and the wrist now sees the button 20 mm from where "
-     "the first grip went — the box moved; the lid is not taken off"),
-    (REGRIP, (2,), True, "STOP: the hand does not come down to the re-aimed knob (no straight-down hand reaches the "
-                         "knob) — the lid is not taken off"),
-], ids=["no button", "the box moved", "no way down to it"])
-def test_a_re_aim_that_finds_no_knob_to_grip_sends_the_arm_home_from_the_look_pose(ctx, monkeypatch, tmp_path, capsys,
-                                                                                  regrip, refuse, found, said):
-    """After a close on air the re-aim finds no button, or one farther
-    from where the first grip went than a slid box is gripped
-    (depth_press.SLIDE_OK_M), or no way down to it solves: home from the
-    look pose, flying the home planned while the back-out flew (no planner
-    call at rest), exit 1 — nothing gripped again."""
-    _grip_ways(monkeypatch, refuse)
+@pytest.mark.parametrize("regrip, found, said", [
+    (None, False, "the wrist does not find the button again from the look pose (no circle): gripping once more where "
+                  "the first grip went"),
+    ((BUTTON[0] + 0.0217, BUTTON[1], BUTTON[2] + 0.009), True,
+     "the wrist now sees the button 22 mm from where the first grip went (farther than a slid box is gripped, 15 mm): "
+     "gripping once more where the first grip went"),
+], ids=["no button", "the button 21.7 mm off"])
+def test_a_re_aim_that_finds_no_knob_or_one_too_far_grips_once_more_where_the_first_went(ctx, monkeypatch, tmp_path,
+                                                                                       capsys, regrip, found, said):
+    """2026-10-30 10:40: the close over the knob read air, and from the look
+    pose the wrist saw it 21.7 mm from where the grip went, past a slid
+    box (depth_press.SLIDE_OK_M): the run went home with the box open. A
+    re-aim that finds no button, or one that far, sends the second grip
+    where the first went — the press's and the look's aim —
+    GRIP_RETRY_LOWER_M lower: it holds the knob, and the lid comes off."""
+    asked = _grip_ways(monkeypatch)
+    aims = [(BUTTON, 0.4), (UP, 9.0), None if regrip is None else (regrip, 4.2)]
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=[AIR, KNOB_ON])
+    assert code == 0 and rec.events.count("grip:close") == 2
+    (first, lid1, _t1), (second, lid2, _t2) = asked
+    assert second == pytest.approx(first) and lid2 == pytest.approx(lid1 - rlo.GRIP_RETRY_LOWER_M)
+    note, = [r for r in rows if r["leg"] == "reach_regrip"]
+    assert (note["found"], note["outcome"]) == (found, "grip again where the first went")
+    assert said in capsys.readouterr().out
+
+
+def test_a_re_aim_with_no_way_down_to_the_knob_sends_the_arm_home_from_the_look_pose(ctx, monkeypatch, tmp_path,
+                                                                                   capsys):
+    """After a close on air the re-aim finds the knob, but no way down to it
+    solves: home from the look pose, flying the home planned while the
+    back-out flew (no planner call at rest), exit 1 — nothing gripped again."""
+    _grip_ways(monkeypatch, (2,))
     plans = _home_plans(monkeypatch)
-    aims = [(BUTTON, 0.4), (UP, 9.0), None if regrip is None else (regrip, 9.0)]
+    aims = [(BUTTON, 0.4), (UP, 9.0), (REGRIP, 9.0)]
     code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=[AIR, KNOB_ON])
     assert code == 1
     assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
                           *CARRY, "grip:open", *BACK_OUT, "aim:reach-regrip", "home"]
     note, = [r for r in rows if r["leg"] == "reach_regrip"]
-    assert (note["found"], note["outcome"]) == (found, "grip again" if refuse else "home")
-    assert [r["attempt"] for r in rows if r["leg"] == "reach_grip_refused"] == ([2] if refuse else [])
+    assert (note["found"], note["outcome"]) == (True, "grip again")
+    assert [r["attempt"] for r in rows if r["leg"] == "reach_grip_refused"] == [2]
     ahead, = [r for r in rows if r["leg"] == "home_ahead"]
     assert ahead["flown"] is True and rec.legs["home"] is plans[-1][1][-1]
-    assert said in capsys.readouterr().out
+    assert "STOP: the hand does not come down to the re-aimed knob (no straight-down hand reaches the knob) — the " \
+           "lid is not taken off" in capsys.readouterr().out
 
 
 def test_a_grip_that_fails_but_not_on_air_is_not_tried_again(ctx, monkeypatch, tmp_path, capsys):
@@ -922,7 +946,7 @@ def test_the_home_planned_on_the_way_back_flies_only_from_where_it_starts(ctx, m
 
 @pytest.mark.parametrize("aims, knuckle, ends, refuse, at_rest", [
     ([(BUTTON, 0.4), (UP, 9.0)], AIR, None, (), False),
-    ([(BUTTON, 0.4), (UP, 9.0)], AIR, None, (2,), True),
+    ([(BUTTON, 0.4), (UP, 9.0)], AIR, None, (2, 3), True),  # two back-outs (the second grip, 1 cm lower)
     ([(BUTTON, 0.4), (UP, 9.0)], KNOB_ON, {4: trp.REJECTED}, (), True),
     (NOT_UP_TWICE, KNOB_ON, None, (2,), True),
     (NOT_UP_TWICE[:3], KNOB_ON, {4: trp.REJECTED}, (), True),
