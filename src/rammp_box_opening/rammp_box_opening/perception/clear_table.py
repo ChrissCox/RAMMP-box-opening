@@ -55,9 +55,11 @@ MIN_SEEN_POINTS = 2
 # map's cells are 2 cm). The lid is the model's disc below them, and needs
 # the least: at the set-down's speed a lid brushing what stands beside it
 # is harmless. The wrist camera needs the most — it is what broke. It is the
-# OAK-D Pro (97 x 30 mm) TF mounts at +65 mm along hand y, its lens 116-123
+# OAK-D Pro (97 x 30 mm) TF mounted at +65 mm along hand y, its lens 116-123
 # mm above the pads (TF said 116, the touch measured 123, 2026-10-23), its
-# body a little lower toward the hand.
+# body a little lower toward the hand. Its mount refitted 2026-10-30 after
+# its repair — 12 mm along -x, 48 mm along hand y, 7 mm nearer the
+# fingertips — moves it less than its 40 mm margin: the rectangle stands.
 LID_CLEAR_M = 0.015
 HAND_PARTS = (
     ("the fingers", (-0.055, 0.055), (-0.035, 0.035), 0.0, 0.02),  # the 2F-85 shut on the knob, and its body
