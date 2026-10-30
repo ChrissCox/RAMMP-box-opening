@@ -72,7 +72,7 @@ def _walk_or_turn(ctx_, q_look, slide, start, quat, top_z=None):
 
 def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False, press_only=False, chain=None,
                extent=None, ends=None, home_refusals=0, wrist=None, scene=None, refuse_carry=False, rise=None,
-               at_spot_look=None, one_motion=True):
+               at_spot_look=None, one_motion=True, from_press=False):
     """run_reach_press as a full run (compliant --depth-press, no
     --press-only), everything faked: `aims` the wrist's aims in order, each
     (press point, knob mm) or None — the look's, then each after a press
@@ -86,7 +86,9 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
     back up the stroke); `at_spot_look()` what else happens at the spot
     look; `one_motion` False: the grip's lookahead plans the lift alone,
     as before the close flew on to the set-down — the lift, then the spot
-    look, then the carry. Returns
+    look, then the carry; `from_press` True: the first press's hold goes
+    straight on to the grip (GRIP_FROM_PRESS), else the way back, the look
+    and the grip from the look pose, as after that grip missed. Returns
     (exit code, the record, the chain, the run log's rows)."""
     from conftest import leg as make_leg
 
@@ -125,6 +127,7 @@ def _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=KNOB_ON, slipped=False,
             rec.planning -= 1
 
     monkeypatch.setattr(rp, "_plan_motion", plan)
+    monkeypatch.setattr(rlo, "GRIP_FROM_PRESS", from_press)
     if not one_motion:
         monkeypatch.setattr(rlo, "grip_ahead", lambda ctx_, cfg_, eyes, q, quat, room=None: (
             *rlo.plan_lift(ctx_, cfg_, q, quat), None))
@@ -1594,6 +1597,15 @@ def test_on_flatbot_the_whole_lid_off_is_reachable_for_every_box_of_the_brief(ct
         need = 0.245 - (float(lens0[2]) - LID)
         up, _why = chain.straight_line(way.stroke.q0, [t0[0], t0[1], t0[2] + need], way.stroke.quat)
         assert up is None
+    # the grip straight from the press: up off the hold onto the stroke's line and down it, lines the runner flies
+    rise, down, why = rlo.grip_from_hold_lines(ctx, way, q_held)
+    assert why is None, why
+    lines = [dp.compliant_line(ctx, "grip:rise", rise, way.stroke.quat, 0.55, rlo._full_world(ctx)),
+             dp.compliant_line(ctx, "grip:down", down, way.stroke.quat, dp.TOUCH_SPEED, rlo._full_world(ctx))]
+    assert [(lg.name, runner._refusal(lg)) for lg in lines] == [(lg.name, None) for lg in lines]
+    assert dp._pads_z(chain, down[-1]) == pytest.approx(
+        dp._pads_z(chain, q_held) + rlo.GRIP_LID_ABOVE_HELD_M - rlo.GRIP_BELOW_LID_M, abs=5e-4)
+    assert dp._pads_z(chain, rise[-1]) == pytest.approx(dp._pads_z(chain, q_held) + rlo.GRIP_RISE_M, abs=5e-4)
     # the grip, from the look pose the way back ends at
     lid_z = rlo.grip_lid_z(LID, dp._pads_z(chain, q_held))
     grip, why = rlo.solve_grip_way(ctx, cfg, button, plan.tilt_deg, back[-1].goal_joints, lid_z)
@@ -1862,3 +1874,136 @@ def test_each_grip_close_is_recorded_once_the_arm_stands_still(ctx, monkeypatch,
     assert code == 0 and rec.legs["grip:close"].when_still is not None
     looks = [(r["attempt"], r["held"], r["why"]) for r in rows if r["leg"] == "grip_close_look"]
     assert looks == [(1, False, "no wrist frame"), (2, True, "no wrist frame")]
+
+
+# ---- the grip straight from the press ---------------------------------------------------
+
+FROM_PRESS = ["grip:open", "grip:rise"]
+
+
+def test_the_grip_straight_from_the_press_takes_the_lid_off_with_no_way_back_and_no_look(ctx, monkeypatch, tmp_path,
+                                                                                     capsys):
+    """Owner 2026-10-30: after the first press's hold the hand rises
+    GRIP_RISE_M, the fingers opening to the knob's width as it does, comes
+    down the stroke's line to the grip's height — GRIP_LID_ABOVE_HELD_M
+    over where the hold held the pads, less GRIP_BELOW_LID_M — and closes:
+    no way back to the look pose, no look, no way down from it (10:08's
+    were 2.6 + 0.7 + 3.2 s). The lift, the spot, its carry and home are
+    planned while the hand rises; the fingers are open before it comes
+    down; the rest as from the look pose."""
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], from_press=True)
+    assert code == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *FROM_PRESS, "grip:down", *CLOSE, *CARRY,
+                          *HOME]
+    runs = [names for names, _g in _executions(rec)]
+    assert runs == [["reach:look"], WAY_IN, FROM_PRESS, ["grip:down"], CLOSE + CARRY, RELEASED, HOMED]
+    planned = {name: at for name, at in rec.plans}
+    assert planned["lid:carry"] == planned["home"] == rec.events.index("grip:down")  # while the hand rose
+    assert rec.legs["grip:open"].defer_join and rec.legs["grip:open"].gripper_cmd == pytest.approx(rlo.grip_open_cmd(ctx.model))
+    grip, = [r for r in rows if r["leg"] == "reach_grip"]
+    held = BUTTON[2] - 0.006  # the fake hold's pads
+    assert (grip["attempt"], grip["from_press"]) == (0, True)
+    assert grip["lid_z"] == pytest.approx(held + rlo.GRIP_LID_ABOVE_HELD_M)
+    assert grip["pads_z"] == pytest.approx(held + rlo.GRIP_LID_ABOVE_HELD_M - rlo.GRIP_BELOW_LID_M)
+    assert not [r for r in rows if r["leg"] in ("reach_knob", "reach-after")]  # no look
+    result, = [r for r in rows if r["leg"] == "reach_grip_result"]
+    assert result["ok"] is True and result["attempt"] == 0
+    out = capsys.readouterr().out
+    assert "GRIP STRAIGHT FROM THE PRESS" in out and out.rstrip().endswith("arm home")
+
+
+def test_the_grip_from_the_press_is_up_and_down_the_strokes_line(ctx, monkeypatch):
+    """grip_from_hold_lines: up GRIP_RISE_M from the hold onto the stroke's
+    line, then down it to the pads GRIP_LID_ABOVE_HELD_M - GRIP_BELOW_LID_M
+    over where they were held, the stroke's attitude."""
+    asked = []
+
+    class Chain:
+        def fk(self, q):
+            return np.eye(3), np.array([0.6 + q[0], -0.2 + q[1], 0.30 + q[2]])
+
+        def straight_line(self, q0, xyz, quat):
+            asked.append((list(xyz), list(quat)))
+            return [list(q0), [xyz[0] - 0.6, xyz[1] + 0.2, xyz[2] - 0.30] + [0.0] * 4], None
+
+    from rammp_box_opening.runtime import approach
+
+    monkeypatch.setattr(approach, "_chain", lambda: Chain())
+    monkeypatch.setattr(dp, "line_refusal", lambda chain, pts: None)
+    way = SimpleNamespace(stroke=SimpleNamespace(q0=[0.004, -0.003, 0.05, 0, 0, 0, 0], quat=[0, 1, 0, 0]))
+    rise, down, why = rlo.grip_from_hold_lines(ctx, way, [0.0, 0.0, 0.0, 0, 0, 0, 0])  # held, 4-3 mm off the line
+    assert why is None
+    (top, q_top), (bottom, q_bottom) = asked
+    assert top == pytest.approx([0.604, -0.203, 0.30 + rlo.GRIP_RISE_M])
+    assert bottom == pytest.approx([0.604, -0.203, 0.30 + rlo.GRIP_LID_ABOVE_HELD_M - rlo.GRIP_BELOW_LID_M])
+    assert q_top == q_bottom == [0, 1, 0, 0] and rise[0] == [0.0] * 7 and down[0] == rise[-1]
+
+
+def test_a_grip_from_the_press_on_air_goes_back_to_the_look_pose_and_grips_from_there(ctx, monkeypatch, tmp_path):
+    """The close straight from the press reads air: nothing lifted; the
+    hand goes back up the stroke and down backwards to the look pose (the
+    fingers shut on nothing: not opened first), the look sees the knob up,
+    and the grip from there (attempt 1) takes the lid off."""
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], knuckle=[AIR, KNOB_ON],
+                                         from_press=True)
+    assert code == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *FROM_PRESS, "grip:down", *CLOSE, *CARRY,
+                          *BACK, "aim:reach-after", *GRIP, *CLOSE, *CARRY, *HOME]
+    results = [(r["attempt"], r["ok"], r.get("from_press")) for r in rows if r["leg"] == "reach_grip_result"]
+    assert results == [(0, False, True), (1, True, None)]
+    looks = [(r["attempt"], r["held"]) for r in rows if r["leg"] == "grip_close_look"]
+    assert looks == [(0, False), (1, True)]
+
+
+def test_a_knob_not_up_after_the_grip_from_the_press_is_pressed_once_more_from_the_look_pose(ctx, monkeypatch, tmp_path,
+                                                                                         capsys):
+    """The knob did not pop: the grip straight from the press closes on
+    air, the hand goes back to the look pose, the look reads the knob down
+    (twice), and the press once more is as ever: its way back, the look,
+    and the grip from the look pose — no second grip from the press."""
+    aims = [(BUTTON, 0.4), (BUTTON, 2.0), (BUTTON, 1.5), (UP, 8.0)]
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, aims, knuckle=[AIR, KNOB_ON], from_press=True)
+    assert code == 0
+    press = [*WAY_IN, "hold"]
+    assert rec.events == ["reach:look", "aim:reach-aim", *press, *FROM_PRESS, "grip:down", *CLOSE, *CARRY, *BACK,
+                          "aim:reach-after", "aim:reach-after", *press, *BACK, "aim:reach-after", *GRIP, *CLOSE, *CARRY,
+                          *HOME]
+    assert rec.events.count("grip:rise") == 1
+    assert "pressing once more — the same press, from the look pose" in capsys.readouterr().out
+
+
+def test_where_the_grip_from_the_press_does_not_fly_the_way_back_and_the_look_follow(ctx, monkeypatch, tmp_path,
+                                                                                capsys):
+    """No straight rise off the button, or none down to the knob: nothing
+    moves for it; the way back to the look pose, the look and the grip from
+    there, as ever."""
+    monkeypatch.setattr(rlo, "grip_from_hold_lines", lambda ctx_, way, q: (None, None, "the rise off the button (no IK)"))
+    code, rec, _chain, rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], from_press=True)
+    assert code == 0
+    assert rec.events == ["reach:look", "aim:reach-aim", *WAY_IN, "hold", *BACK, "aim:reach-after", *GRIP, *CLOSE,
+                          *CARRY, *HOME]
+    refused, = [r for r in rows if r["leg"] == "reach_grip_refused"]
+    assert refused["attempt"] == 0 and refused["from_press"] is True
+    assert "no grip straight from the press (the rise off the button (no IK)): back to the look pose" in \
+        capsys.readouterr().out
+
+
+def test_with_the_grip_from_the_press_the_video_records_from_the_press_on(ctx, monkeypatch, tmp_path):
+    """The lid video starts as the first press does, the grip following its
+    hold: before the way in, and its end the run's."""
+    made, made_rec = _videoed(ctx, monkeypatch)
+    real = _Rec
+
+    def rec_kept():
+        r = real()
+        made_rec[0] = r
+        return r
+
+    monkeypatch.setattr(sys.modules[__name__], "_Rec", rec_kept)
+    code, rec, _chain, _rows = _full_flow(ctx, monkeypatch, tmp_path, [(BUTTON, 0.4), (UP, 9.0)], from_press=True)
+    assert code == 0
+    (v,) = made
+    assert "hold" not in v.started and "reach:re-aim" not in v.started
+    steps = [t.split(" ")[0].rstrip(":") for t in v.said if not t.startswith("overlay")]
+    assert steps == ["GRIP", "CLOSE", "RELEASE"] and "straight from the press" in v.said[0]
+    assert v.finished[0] == "the end: the lid set down, the arm home"
