@@ -109,6 +109,35 @@ def test_home_arm_steps_toward_home_until_the_planner_can_plan_it(monkeypatch, c
     assert out.count("CAUTION") == 1 and "CAUTION: no table is known" in out
 
 
+# 2026-10-30: home_arm refused with "no plan-free step toward HOME of up to
+# 0.35 rad per joint lets the planner plan HOME (last: None)": arm_joint_4 at
+# its limit, and joint_3 at +3.097 — HOME's -3.137 the other side of the wrap
+WRAPPED = [0.0617, -2.0919, 3.0970, -2.5701, -0.2357, -0.9522, 1.5790]
+
+
+def test_a_continuous_joint_the_other_side_of_the_wrap_steps_the_short_way_round(monkeypatch, capsys):
+    """joint_3 at +3.097 is 0.049 rad from HOME's -3.137 the short way and
+    6.23 rad the long way. The joint line taken literally turned it the long
+    way, so the first step that cleared joint_4's limit turned joint_3 2.49
+    rad and none up to the cap was offered. Its goal is now the short way
+    round (branches.on_branch): the first step, 40% of the way, clears the
+    margin, its largest joint 0.12 rad, joint_3 0.02 of it, the tool only
+    rising; HOME is planned from its end."""
+    ctx = _flatbot_ctx(monkeypatch, WRAPPED)
+    legs = home_arm.build_legs(ctx)
+    assert [x.name for x in legs] == ["clear-margin", "home"]
+    pts = np.array([p.positions for p in legs[0].traj.points])
+    assert np.allclose(pts[0], WRAPPED)
+    assert np.max(np.abs(pts[-1] - WRAPPED)) == pytest.approx(0.120, abs=2e-3)
+    assert 0.0 < pts[-1][2] - WRAPPED[2] < 0.03  # joint_3 toward +pi, the short way
+    assert min(pts[-1][3] - (-2.57), 2.57 - pts[-1][3]) == pytest.approx(core.CLEAR_MARGIN_FIRST_RAD, abs=1e-3)
+    fb = ArmChain(root="arm_mount", path=FLATBOT_URDF)
+    z = [fb.fk(q)[1][2] for q in pts]
+    assert min(z) == pytest.approx(z[0]) and z[-1] > z[0]
+    assert ctx.client.joint_starts == [pytest.approx(list(legs[0].goal_joints))]
+    assert "a plan-free step 40% of the way to HOME first (the largest joint 0.120 rad" in capsys.readouterr().out
+
+
 def test_a_joint_just_outside_the_margin_plans_from_the_start_first(monkeypatch):
     start = list(STUCK)
     start[3] = -2.42  # 0.15 rad of room: outside the margin, inside the trajopt's band

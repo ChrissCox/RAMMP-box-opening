@@ -552,10 +552,18 @@ class ClearMarginFree:
             raise RuntimeError(
                 "%s refused: chain root %s != planning frame %s" % (self.name, approach._ROOT, ctx.worlds.base_frame)
             )
+        from rammp_box_opening.runtime.branches import on_branch
+
         chain = _chain()
         names = list(ctx.client.joint_names)
         q0 = np.asarray(state.joints if state.joints is not None else ctx.client.joints(), float)
-        goal = np.asarray(self.goal, float)
+        # each continuous joint's goal the short way round from where it
+        # stands: 2026-10-30 joint_3 stood at +3.097 and HOME's is -3.137,
+        # 0.049 rad apart, and the line taken literally turned it 6.23 rad,
+        # so the first step that cleared joint_4's limit was a 2.49 rad one
+        # and none up to the cap was offered (the driver too goes the short
+        # way round, and the planner is handed HOME's branch: planner_branch)
+        goal = np.asarray(on_branch(self.goal, q0), float)
         limited = self._limited()
         first = 0.0
         for j, lo, hi in limited:
