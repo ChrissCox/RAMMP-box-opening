@@ -25,6 +25,11 @@ after the press as before (reach_press._fly_way_in).
           Not up on a lid that rose (released, LID_POP_M): STOP, home, the
           box left open — a flush knob gives the fingers nothing to hold,
           and a released lid is not pressed again.
+  DIRECT  first, straight from the first press's hold (GRIP_FROM_PRESS):
+          up GRIP_RISE_M, the fingers opening to the knob's width as the hand
+          rises, down the stroke's line to the grip's height (grip_lid_z),
+          the close and the LIFT below — no way back, no look. On air, back
+          to the look pose, and the LOOK as below, the GRIP from there.
   GRIP    up: the fingers open as the hand comes down from the look pose —
           the way in once more, its stroke the grip's: straight down until the
           closed pads' reference stands GRIP_BELOW_LID_M under the lid — ONE
@@ -189,6 +194,20 @@ GRIP_SLOW_M = dp.TOUCH_SLOW_M  # the grip's last stretch down flies at TOUCH_SPE
 # something larger than the knob, or a gripper that failed, are not a miss a
 # re-aim mends. Never more than once.
 GRIP_TRIES = 2
+# The grip straight from the press (owner 2026-10-30): after the first press's
+# hold the hand rises GRIP_RISE_M straight up, the fingers opening to the
+# knob's width as it does, and comes down again on the stroke's line to the
+# grip's height (grip_lid_z: where the hold held the pads), and closes — no
+# way back to the look pose, no look, no way down from it: 10:08's took 2.6
+# s back, 0.7 at the look and 3.2 down again. On air it goes back to the look
+# pose, and the look decides as before: the knob not up, the press once more;
+# up, the grip from there (attempt 1). Its own attempt is 0. With no look
+# there is no rise measured (KnobLook.lid_dz_m): a lid that rose meets the
+# fingertips before the way down ends, the spring on it, and they close round
+# the knob's base.
+GRIP_FROM_PRESS = True
+GRIP_RISE_M = 0.025  # over the popped knob (~7.5 mm proud) before the fingers spread
+_MISSED = "the grip straight from the press missed"  # _grip_from_hold's: back at the look pose
 # The grip's close-up record (owner 2026-10-30, "a recorder first"): at each
 # close, once the arm stands still, the wrist's frame — the fingers open
 # round the knob — kept, with where the knob's circle sits in it and whether
@@ -1037,16 +1056,20 @@ def _note_frames(ctx, **facts):
         frames.note(**facts)
 
 
-def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
+def _press_and_back(ctx, cfg, runner, way, legs, top_z, press, direct=None):
     """Press number `press`: the way in `legs` (way_in_legs of `way`) as
     one execution, the hold on the button whose top is at `top_z`, and the
-    way back to the look pose (way_back_legs) as one more. Returns (None,
+    way back to the look pose (_way_back) as one more. Returns (None,
     where the hold held the pads when it felt the button, else None) at the
     look pose, or (the exit code, None) where the run stopped: home from the
     look pose where the way in did not start, the arm let go and held where
     a move stopped part-way, up off the button and home from over the box
     where the way back did not start. Home is planned from the look pose
-    while the way back flies: ctx.home_ahead, for a stop there (_stop_home)."""
+    while the way back flies: ctx.home_ahead, for a stop there (_stop_home).
+    `direct(seen)` (the first press's, GRIP_FROM_PRESS): after a hold that
+    felt the button, the grip straight from it (_grip_from_hold) in place of
+    the way back — its exit code where it ended the run, else (_MISSED) the
+    arm back at the look pose, as after the way back."""
     from rammp_box_opening.tasks.press_demo import viz_hook
 
     names = [lg.name for lg in legs]
@@ -1075,17 +1098,32 @@ def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
     held = dp.compliant_hold(ctx, cfg, runner, way.stroke, top_z, seen)
     if held.felt:
         _note_frames(ctx, stage="pressed", touch_xyz=list(seen["touch_xyz"]) if seen.get("touch_xyz") else None)
-    back, kind, why = way_back_legs(ctx, way, seen.get("held_joints") or ctx.client.joints())
+    held_z = float(seen["touch_xyz"][2]) if held.felt and seen.get("touch_xyz") else None
+    if direct is not None and held_z is not None and seen.get("held_joints"):
+        got = direct(seen)
+        return (None, held_z) if got == _MISSED else (got, None)
+    code = _way_back(ctx, cfg, runner, way, seen.get("held_joints") or ctx.client.joints(), held)
+    return (None, held_z) if code is None else (code, None)
+
+
+def _way_back(ctx, cfg, runner, way, q, held):
+    """From the button under `way`'s stroke, the arm at joints `q`, back to
+    the look pose (way_back_legs), home planned from there while it flies
+    (ctx.home_ahead). None there; else the exit code where it stopped: the
+    arm let go and held where a move stopped part-way, up off the button
+    and home from over the box where the way back did not start. `held`:
+    the hold's (depth_press.DepthPress)."""
+    back, kind, why = way_back_legs(ctx, way, q)
     if kind == "up":
         print("[press_demo] STOP: the way up is not a straight line the arm can fly (%s) — the arm holds" % why)
         rp.let_go(ctx)
-        return 1, None
+        return 1
     if kind == "look":
         print("[press_demo] STOP: %s — up off the button, then home from over the box; the knob is not judged" % why)
         result, homed = rp._rise_then_home(ctx, cfg, runner, back, held, None, None)
         if not result.free or not homed:
             rp.let_go(ctx)
-        return 1, None
+        return 1
     groups = merge_groups(back)
     print("[press_demo] %s from the button back to the look pose: %s" % (
         "ONE MOTION" if len(groups) == 1 else "in %d goals" % len(groups), ", ".join(lg.name for lg in back)))
@@ -1103,12 +1141,12 @@ def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
         rp._note_flight(runner, "reach_way_back_flight", [lg.name for lg in groups[0]], last)
     if all(r.ok for r in res):
         ctx.home_ahead = runner.lookahead_result  # None where it failed: a stop plans home where the arm stands
-        return None, (float(seen["touch_xyz"][2]) if held.felt and seen.get("touch_xyz") else None)
+        return None
     if _started(last):
         print("[press_demo] STOP: the way back to the look pose stopped during %s (%s) — the arm holds" % (
             rp._in_flight(back, last, runner.last_retime), last.detail or last.outcome))
         rp.let_go(ctx)
-        return 1, None
+        return 1
     if len(res) == 1:
         # nothing moved, the pads still on the button: up on its own,
         # solved again from where the arm stands, then home from over the box
@@ -1116,7 +1154,7 @@ def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
         if up is None:
             print("[press_demo] STOP: the way up is not a straight line the arm can fly (%s) — the arm holds" % why)
             rp.let_go(ctx)
-            return 1, None
+            return 1
         print("[press_demo] STOP: the way back to the look pose did not start (%s) — up off the button, then home "
               "from over the box" % (last.detail or last.outcome))
         result, homed = rp._rise_then_home(ctx, cfg, runner, up, held, None, None)
@@ -1126,7 +1164,110 @@ def _press_and_back(ctx, cfg, runner, way, legs, top_z, press):
         result, homed = held, rp._home_from_over_box(ctx, cfg, runner, held)
     if not result.free or not homed:
         rp.let_go(ctx)
-    return 1, None
+    return 1
+
+
+def grip_from_hold_lines(ctx, way, q_held):
+    """The grip straight from the hold, the arm at joints `q_held` on the
+    button under `way`'s stroke: (rise, down, None) — GRIP_RISE_M straight
+    up onto the stroke's line, then down it to where the pads stand
+    GRIP_LID_ABOVE_HELD_M - GRIP_BELOW_LID_M over where the hold held them
+    (grip_lid_z), each as joint points — or (None, None, why)."""
+    from rammp_box_opening.runtime import approach
+
+    chain = approach._chain()
+    q_held = [float(v) for v in q_held]
+    _R, t_held = chain.fk(q_held)
+    _R, t_line = chain.fk([float(v) for v in way.stroke.q0])  # the stroke's line: the aimed knob
+    quat = way.stroke.quat
+    top = [float(t_line[0]), float(t_line[1]), float(t_held[2]) + GRIP_RISE_M]
+    rise, why = chain.straight_line(q_held, top, quat)
+    if rise is not None:
+        why = dp.line_refusal(chain, rise)
+    if rise is None or why is not None:
+        return None, None, "the rise off the button (%s)" % why
+    bottom = [top[0], top[1], float(t_held[2]) + GRIP_LID_ABOVE_HELD_M - GRIP_BELOW_LID_M]
+    down, why = chain.straight_line(rise[-1], bottom, quat)
+    if down is not None:
+        why = dp.line_refusal(chain, down)
+    if down is None or why is not None:
+        return None, None, "the way down to the knob (%s)" % why
+    return [[float(v) for v in p] for p in rise], [[float(v) for v in p] for p in down], None
+
+
+def _grip_from_hold(ctx, cfg, runner, eyes, way, seen, room):
+    """The grip straight from the first press's hold (GRIP_FROM_PRESS): the
+    fingers opening to the knob's width as the hand rises off the button,
+    the lift, the spot, its carry and home planned while it does
+    (grip_ahead, from the way down's end), the way down to the knob once
+    they are open, then the close and the lift to the set-down as from the
+    look pose (_close_and_carry). Returns its exit code where it ended the
+    run (0: the lid off, the arm home); _MISSED where the hand went back to
+    the look pose instead — the lines did not fly, the close did not hold
+    — for the look to judge the knob; the arm holding where it stopped part
+    way, 1."""
+    world = _full_world(ctx)
+    held_z = float(seen["touch_xyz"][2])
+    lid_z = grip_lid_z(None, held_z)
+    rise, down, why = grip_from_hold_lines(ctx, way, seen["held_joints"])
+    if rise is None:
+        runner.note("reach_grip_refused", attempt=0, why=why, from_press=True)
+        print("[press_demo] no grip straight from the press (%s): back to the look pose" % why)
+        return _MISSED if _way_back(ctx, cfg, runner, way, seen["held_joints"], dp.DepthPress(free=True)) is None \
+            else 1
+    quat = way.stroke.quat
+    runner.note("reach_grip", lid_z=round(lid_z, 4), pads_z=round(lid_z - GRIP_BELOW_LID_M, 4),
+                tilt_deg=way.plan.tilt_deg, how="straight from the press: %.0f mm over where the hold held the pads"
+                % (1000 * GRIP_LID_ABOVE_HELD_M), attempt=0, from_press=True)
+    print("[press_demo] GRIP STRAIGHT FROM THE PRESS: up %.0f mm, the fingers opening to the knob's width as it "
+          "rises, then down to the knob, the closed pads %.0f mm under the lid at %.3f (%.0f mm over where the press "
+          "held them)" % (1000 * GRIP_RISE_M, 1000 * GRIP_BELOW_LID_M, lid_z, 1000 * GRIP_LID_ABOVE_HELD_M))
+    _video(ctx, "GRIP straight from the press: up, the fingers open, down to the knob")
+    opened = _gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:open", grip_open_cmd(ctx.model), world,
+                          defer_join=True)
+    up = dp.compliant_line(ctx, "grip:rise", rise, quat, rp.free_line_speed(ctx), world)
+    lower = dp.compliant_line(ctx, "grip:down", down, quat, dp.TOUCH_SPEED, world)
+    res = runner.run([opened, up], execute=True,
+                     lookahead=lambda _end: grip_ahead(ctx, cfg, eyes, lower.goal_joints, quat, room))
+    ahead = runner.lookahead_result
+    spread = runner.join_pending()  # the fingers open before the hand comes down round the knob
+    if not all(r.ok for r in res) or (spread is not None and not spread.ok):
+        bad = res[-1] if not all(r.ok for r in res) else spread
+        if _started(res[-1]) and not all(r.ok for r in res):
+            print("[press_demo] STOP: the rise off the button stopped (%s) — the arm holds" % (bad.detail or bad.outcome))
+            rp.let_go(ctx)
+            return 1
+        print("[press_demo] the grip straight from the press did not start (%s): back to the look pose" % (
+            bad.detail or bad.outcome))
+        return _MISSED if _way_back(ctx, cfg, runner, way, ctx.client.joints(), dp.DepthPress(free=True)) is None else 1
+    res = runner.run([lower], execute=True)
+    if not all(r.ok for r in res):
+        if _started(res[-1]):
+            print("[press_demo] STOP: the way down to the knob stopped (%s) — the arm holds" % res[-1].detail)
+            rp.let_go(ctx)
+            return 1
+        return _MISSED if _way_back(ctx, cfg, runner, way, ctx.client.joints(), dp.DepthPress(free=True)) is None else 1
+
+    def back_out(why, opened=True):
+        print("[press_demo] the grip straight from the press: %s — back to the look pose to look at the knob" % why)
+        if opened:
+            res = runner.run([_gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:open", GRIPPER_CMD_OPEN,
+                                           world)], execute=True)
+            if not res[-1].ok:
+                print("[press_demo] STOP: the fingers did not open (%s) — the arm holds" % res[-1].detail)
+                rp.let_go(ctx)
+                return 1
+        code = _way_back(ctx, cfg, runner, way, ctx.client.joints(), dp.DepthPress(free=True))
+        return _MISSED if code is None else code
+
+    def miss(detail, air):
+        runner.note("reach_grip_result", ok=False, detail=detail, attempt=0, on_air=air, retry=True, from_press=True)
+        print("[press_demo] the grip straight from the press did not hold the knob (%s)" % detail)
+        _video(ctx, "the grip straight from the press missed (%s): back to the look pose" % detail)
+        return back_out("the fingers closed on air" if air else "the fingers closed on something else (%s)" % detail,
+                        opened=not air)
+
+    return _close_and_carry(ctx, cfg, runner, eyes, ahead, quat, 0, room, back_out, miss)
 
 
 def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
@@ -1136,7 +1277,11 @@ def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
     press once more where the knob is not up and the lid did not rise (risen
     with its knob flush: knob_look's STOP), then the lid off
     (take_lid_off) at the aimed `button` (its top the press's), the grip
-    going by the lid where the last hold held the pads (grip_lid_z).
+    going by the lid where the last hold held the pads (grip_lid_z). With
+    GRIP_FROM_PRESS the first press's hold goes straight on to the grip
+    (_grip_from_hold), the lid video recording from the press on; where
+    that grip misses, back at the look pose, the look and all after it as
+    above.
     `eyes` (node, watcher, scene_fix, the joints the scene camera looked
     at the arm in): the cameras. Returns the process exit code: 0 only with
     the lid set down and the arm home. From the way in's start on, anything raised lets go (as
@@ -1149,22 +1294,33 @@ def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
     held_z = None
     video = None
     room = room_ahead(ctx, eyes)  # the lid's spot judged on the scene camera's map while the press flies
+
+    def end(code):
+        _finish_video(video, "the end: %s" % ("the lid set down, the arm home" if code == 0 else "exit %d" % code))
+        return code
+
     try:
+        if GRIP_FROM_PRESS:
+            video = ctx.lid_video.start() if getattr(ctx, "lid_video", None) is not None else None
         for press in range(1, PRESSES + 1):
-            code, z = _press_and_back(ctx, cfg, runner, way, legs, top_z, press)
+            direct = None
+            if GRIP_FROM_PRESS and press == 1:
+                def direct(seen, way=way):
+                    return _grip_from_hold(ctx, cfg, runner, eyes, way, seen, room)
+            code, z = _press_and_back(ctx, cfg, runner, way, legs, top_z, press, direct=direct)
             if code is not None:
-                return code
+                return end(code)
             held_z = z if z is not None else held_z
             knob = knob_look(node, ctx, runner, watcher, button, yaw, lid_before, press)
             _note_frames(ctx, popped=bool(knob.popped) if knob.found else None)
             if knob.stop is not None:
-                return _stop_home(ctx, cfg, runner, knob.stop)
+                return end(_stop_home(ctx, cfg, runner, knob.stop))
             if knob.popped:
                 break
             if press == PRESSES:
-                return _stop_home(ctx, cfg, runner, "pressed %d times and the knob is not up (%s) — the lid is not "
-                                                    "taken off" % (PRESSES, "%.1f mm above the lid" % knob.up_mm
-                                                                   if knob.up_mm is not None else "not judged"))
+                return end(_stop_home(ctx, cfg, runner, "pressed %d times and the knob is not up (%s) — the lid is "
+                                                        "not taken off" % (PRESSES, "%.1f mm above the lid" % knob.up_mm
+                                                                           if knob.up_mm is not None else "not judged")))
             print("[press_demo] the knob is not up (%s): pressing once more — the same press, from the look pose" % (
                 "%.1f mm above the lid" % knob.up_mm if knob.up_mm is not None else "not judged"))
             way, why, _kind = rp.solve_way_in(ctx, cfg, button, tilt, ctx.client.joints())
@@ -1172,7 +1328,7 @@ def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
                 legs = rp.way_in_legs(ctx, cfg, way)
                 why = rp._not_one_execution(ctx, legs)
             if why is not None:
-                return _stop_home(ctx, cfg, runner, "the press once more does not fly (%s)" % why)
+                return end(_stop_home(ctx, cfg, runner, "the press once more does not fly (%s)" % why))
             runner.note("reach_way_in", press=press + 1, tilt_deg=way.plan.tilt_deg, walked=way.down.walked,
                         short_deg=way.down.short_deg, k=round(way.stroke.k, 1), end_z=round(way.stroke.end_z, 4))
         lid_z = grip_lid_z(top_z, held_z)
@@ -1184,11 +1340,11 @@ def run_full(ctx, cfg, runner, eyes, way, legs, button, yaw, lid_before):
             # cancels)
             lid_z += float(knob.lid_dz_m)
             rose = ", %+.0f mm: the lid rose" % (1000 * knob.lid_dz_m)
-        video = ctx.lid_video.start() if getattr(ctx, "lid_video", None) is not None else None
-        code = take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, "the lid at %.3f (the press's top %.3f%s%s)" % (
-            lid_z, top_z, "" if held_z is None else ", the pads held at %.3f" % held_z, rose), yaw=yaw, room=room)
-        _finish_video(video, "the end: %s" % ("the lid set down, the arm home" if code == 0 else "exit %d" % code))
-        return code
+        if video is None:
+            video = ctx.lid_video.start() if getattr(ctx, "lid_video", None) is not None else None
+        return end(take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, "the lid at %.3f (the press's top %.3f%s%s)"
+                                % (lid_z, top_z, "" if held_z is None else ", the pads held at %.3f" % held_z, rose),
+                                yaw=yaw, room=room))
     except BaseException as e:
         rp.let_go(ctx)
         _finish_video(video, "stopped: %s" % (type(e).__name__))  # after the let-go: the arm first
@@ -1457,12 +1613,49 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
             rp._in_flight(legs, last, runner.last_retime), last.detail or last.outcome))
         rp.let_go(ctx)
         return 1
+
+    def back_out(why, opened=True):
+        return _back_out(ctx, cfg, runner, way, why, opened=opened)
+
+    def miss(detail, air):
+        retry = air and attempt < GRIP_TRIES and yaw is not None
+        runner.note("reach_grip_result", ok=False, detail=detail, attempt=attempt, on_air=air, retry=retry)
+        if retry:
+            print("[press_demo] GRIP MISSED — %s: the fingers closed on air; opening them, backing out to the look "
+                  "pose, aiming at the knob once more and coming down %.0f mm lower" % (detail, 1000 * GRIP_RETRY_LOWER_M))
+            _video(ctx, "GRIP MISSED (%s): back out to the look pose, aim again, %.0f mm lower" % (
+                detail, 1000 * GRIP_RETRY_LOWER_M))
+            regrip, code = _regrip(ctx, cfg, runner, eyes, way, button, yaw, detail)
+            if regrip is None:
+                return code
+            lower = lid_z - GRIP_RETRY_LOWER_M
+            return take_lid_off(ctx, cfg, runner, eyes, regrip, tilt, lower, "%s, %.0f mm lower than the grip that "
+                                "closed on air: %.3f" % (how, 1000 * GRIP_RETRY_LOWER_M, lower), yaw=yaw,
+                                attempt=attempt + 1, room=room)
+        print("[press_demo] GRIP FAILED%s — %s: the fingers closed on air or on something else, so the knob is not "
+              "up or the grip missed it" % (" AGAIN, %.0f mm lower" % (1000 * GRIP_RETRY_LOWER_M) if attempt > 1 else "", detail))
+        return _back_out(ctx, cfg, runner, way, "the grip failed%s (%s) — the lid is not taken off" % (
+            " twice, the second time %.0f mm lower" % (1000 * GRIP_RETRY_LOWER_M) if attempt > 1 else "", detail))
+
+    return _close_and_carry(ctx, cfg, runner, eyes, ahead, way.stroke.quat, attempt, room, back_out, miss)
+
+
+def _close_and_carry(ctx, cfg, runner, eyes, ahead, quat, attempt, room, back_out, miss):
+    """The hand down round the knob, the fingers open, the hand at `quat`:
+    the close, judged by the grip band, then the lift, the clear, the carry
+    and the set-down — ONE execution, all planned while the hand came down
+    (`ahead`, grip_ahead's) — and the release and home (_release_and_home);
+    where no carry and home planned ahead, the lift and the clear alone and
+    the spot look there (choose_and_carry). `back_out(why, opened=True)`: the
+    hand's way off the knob, nothing lifted — no lift to fly, or one that
+    did not start; `miss(detail, on_air)`: a close that did not hold. Each
+    returns what this does: the exit code, or its caller's sentinel."""
+    world = _full_world(ctx)
     lift, why, placed = ahead if ahead is not None else (None, "the lookahead plan failed", None)
     if lift is None:
-        lift, why = plan_lift(ctx, cfg, ctx.client.joints(), way.stroke.quat)
+        lift, why = plan_lift(ctx, cfg, ctx.client.joints(), quat)
     if lift is None:
-        return _back_out(ctx, cfg, runner, way, "the lid has no way off the box (%s) — not gripping it" % why,
-                         opened=False)
+        return back_out("the lid has no way off the box (%s) — not gripping it" % why, opened=False)
     # closed once the arm stands still: the hand where it came down to, not
     # where it is settling past (Leg.send_when_still)
     close = _gripper_leg(ctx, PlanState(joints=None, chain=0), "grip:close", GRIPPER_CMD_CLOSED, world,
@@ -1509,25 +1702,7 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
                   grip[-1].detail if grip else None)
     if not grip or not grip[-1].ok or grip[-1].leg_name != "grip:close":
         detail = grip[-1].detail if grip else res[-1].detail
-        air = bool(grip) and _on_air(grip[-1], cfg.grip_band)
-        retry = air and attempt < GRIP_TRIES and yaw is not None
-        runner.note("reach_grip_result", ok=False, detail=detail, attempt=attempt, on_air=air, retry=retry)
-        if retry:
-            print("[press_demo] GRIP MISSED — %s: the fingers closed on air; opening them, backing out to the look "
-                  "pose, aiming at the knob once more and coming down %.0f mm lower" % (detail, 1000 * GRIP_RETRY_LOWER_M))
-            _video(ctx, "GRIP MISSED (%s): back out to the look pose, aim again, %.0f mm lower" % (
-                detail, 1000 * GRIP_RETRY_LOWER_M))
-            regrip, code = _regrip(ctx, cfg, runner, eyes, way, button, yaw, detail)
-            if regrip is None:
-                return code
-            lower = lid_z - GRIP_RETRY_LOWER_M
-            return take_lid_off(ctx, cfg, runner, eyes, regrip, tilt, lower, "%s, %.0f mm lower than the grip that "
-                                "closed on air: %.3f" % (how, 1000 * GRIP_RETRY_LOWER_M, lower), yaw=yaw,
-                                attempt=attempt + 1, room=room)
-        print("[press_demo] GRIP FAILED%s — %s: the fingers closed on air or on something else, so the knob is not "
-              "up or the grip missed it" % (" AGAIN, %.0f mm lower" % (1000 * GRIP_RETRY_LOWER_M) if attempt > 1 else "", detail))
-        return _back_out(ctx, cfg, runner, way, "the grip failed%s (%s) — the lid is not taken off" % (
-            " twice, the second time %.0f mm lower" % (1000 * GRIP_RETRY_LOWER_M) if attempt > 1 else "", detail))
+        return miss(detail, bool(grip) and _on_air(grip[-1], cfg.grip_band))
     runner.note("reach_grip_result", ok=True, detail=grip[-1].detail, attempt=attempt)
     print("[press_demo] LID GRIPPED — %s" % grip[-1].detail)
     moves = [r for r in res if r.leg_name not in ("grip:open", "grip:close")]
@@ -1535,8 +1710,8 @@ def take_lid_off(ctx, cfg, runner, eyes, button, tilt, lid_z, how, yaw=None, att
     if not moves or not all(r.ok for r in moves):
         if len(moves) <= 1 and not _started(last):
             # nothing moved: the knob in the fingers, the lid still on the canister
-            return _back_out(ctx, cfg, runner, way, "the lift did not start (%s) — the lid is let go where it lies, "
-                                                   "on the box" % (last.detail or last.outcome))
+            return back_out("the lift did not start (%s) — the lid is let go where it lies, on the box"
+                            % (last.detail or last.outcome))
         print("[press_demo] STOP: the %s stopped during %s (%s) — the arm holds the lid" % (
             "lid's way from the box to the table" if one else "lift", rp._in_flight(flying, last, runner.last_retime),
             last.detail or last.outcome))
