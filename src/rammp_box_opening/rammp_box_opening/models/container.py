@@ -12,7 +12,7 @@ import yaml
 
 from rammp_box_opening.primitives.look import SWEEP_RAD
 
-from rammp_curobo.geometry import euler_deg_to_quat_xyzw, yaw_about_world_z
+from rammp_box_opening.geometry import euler_deg_to_quat_xyzw, yaw_about_world_z
 
 from rammp_box_opening.constants import TRANSIT_SPEED
 
@@ -41,6 +41,10 @@ class ContainerModel:
     # keeps flipping"). Reach checked on the live planner: 20/20 positions
     # over the table, from HOME and from LOOK, straight descents everywhere.
     press_yaw_steer: bool = True
+    # True: the lid is a disc lid_dims[0] across (the Ankou canister): the
+    # scene camera may finish a box its frame cuts off from the arc of the
+    # lid's side it does see (perception/scene_source.lid_circle)
+    round: bool = False
 
     def press_quat(self, xyz):
         """The press/grip/place attitude at a base-frame point (xyzw)."""
@@ -61,6 +65,7 @@ class ContainerModel:
             hover_standoff=float(raw["hover_standoff"]),
             measure_me=bool(raw.get("measure_me", True)),
             press_yaw_steer=bool(raw.get("press_yaw_steer", True)),
+            round=bool(raw.get("round", False)),
         )
 
 
@@ -78,12 +83,6 @@ def from_container(cpose, offset):
 def attitude_quat(rpy_deg, yaw):
     """Primitive attitude from config rpy, yaw-steered about world z (xyzw)."""
     return list(yaw_about_world_z(euler_deg_to_quat_xyzw(rpy_deg), yaw))
-
-
-def load_lid_place(path):
-    with open(path) as f:
-        raw = yaml.safe_load(f)["open_container"]["lid_place"]
-    return ContainerPose(xyz=tuple(raw["xyz"]), yaw=math.radians(float(raw["yaw_deg"])))
 
 
 @dataclass(frozen=True)
@@ -130,12 +129,44 @@ class PressDemoCfg:
     vlm_target: str  # what to ask Claude to box — plain English
     vlm_timeout_s: float
     vlm_pad_px: int
+    # the scene camera's box from sheppy's always-on scene segmenter
+    # (perception/segmenter_source): the classes it boxes this container as,
+    # () for none — the scene OWL alone then finds it
+    segmenter_classes: tuple = ()
+    segmenter_box: str = "holder"  # "holder": its box is the holder the lid stands on; "as_is": the container
+
+
+SCENE_DETECT_KEYS = ("segmenter_classes", "segmenter_box")
+
+
+def scene_detect_cfg(raw):
+    """(segmenter_classes, segmenter_box) from a container config's
+    scene_detect block, validated; ((), "holder") without one."""
+    sd = raw.get("scene_detect")
+    if sd is None:
+        sd = {}
+    if not isinstance(sd, dict):
+        raise ValueError("scene_detect must be a mapping (%s)" % ", ".join(SCENE_DETECT_KEYS))
+    unknown = sorted(set(sd) - set(SCENE_DETECT_KEYS))
+    if unknown:
+        raise ValueError("scene_detect: unknown key(s) %s (known: %s)" % (", ".join(map(str, unknown)), ", ".join(SCENE_DETECT_KEYS)))
+    classes = sd.get("segmenter_classes")
+    if classes is None:
+        classes = []
+    if not isinstance(classes, list) or not all(isinstance(c, str) and c.strip() for c in classes):
+        raise ValueError("scene_detect.segmenter_classes must be a list of the scene segmenter's class names "
+                         "(e.g. [food container]); an empty list or none means the scene OWL alone")
+    box = sd.get("segmenter_box", "holder")
+    if box not in ("holder", "as_is"):
+        raise ValueError("scene_detect.segmenter_box must be 'holder' or 'as_is'")
+    return tuple(c.strip() for c in classes), box
 
 
 def load_press_demo(path):
     with open(path) as f:
         raw = yaml.safe_load(f)
     pd = raw["press_demo"]
+    segmenter_classes, segmenter_box = scene_detect_cfg(raw)
     cfg = PressDemoCfg(
         travel_m=float(pd["travel_m"]),
         contact_nm=float(raw["press"].get("contact_nm", 3.0)),
@@ -185,6 +216,8 @@ def load_press_demo(path):
         vlm_target=str(raw.get("vlm", {}).get("target", "the food-storage container")),
         vlm_timeout_s=float(raw.get("vlm", {}).get("timeout_s", 20.0)),
         vlm_pad_px=int(raw.get("vlm", {}).get("pad_px", 20)),
+        segmenter_classes=segmenter_classes,
+        segmenter_box=segmenter_box,
     )
     if not raw["open_box"]["grip_band"][0] < raw["open_box"]["grip_band"][1] < 0.8:
         raise ValueError(

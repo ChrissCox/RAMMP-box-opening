@@ -6,36 +6,40 @@ nothing merges across it, and what follows it is LAZY — planned by the
 Runner from the live arm once the guard has stopped it.
 
 Ctx.last_pose / last_world track the most recent commanded tool pose and
-the world it was planned against, so pose-relative primitives (Lift,
-Retreat) need no pose argument of their own.
+the world it was planned against.
 """
 
 import time
 from dataclasses import dataclass
 
 from rammp_box_opening.constants import (
-    JOINTS,
-    JOINT_ARC_PER_M,
-    JOINT_VMAX,
+    PLANNER_LIMIT_MARGIN_RAD,
     TCP_OFFSET_M,
     TIP_TO_TOOL_M,
     CONTACT_SPEED,
     GRIPPER_CMD_OPEN,
-    HOME,
     TRANSIT_SPEED,
 )
-from rammp_box_opening.models.container import from_container
 from rammp_box_opening.runtime.guards import (
     GuardSpec,
     in_band,
-    time_fraction_at_path_fraction,
 )
 from rammp_box_opening.runtime.legs import Kind, Leg
+from rammp_box_opening.runtime.planner import Refused, plan_record
 
 # a set-down's success IS the guard trip — overdrive the commanded depth
 # past nominal surface contact so the table is always felt (err-TALL world
 # modeling can otherwise leave an exact-height target arriving untouched)
 SETDOWN_OVERDRIVE_M = 0.005
+
+# a set-down trip with the fingertips more than this above where the lid
+# meets the table struck something on the way down. The descent's progress
+# cannot say so once it flies merged behind the carry: the guard reads the
+# whole group's, and flatbot 2026-10-23 17:57 tripped at 70 % of it — the
+# wrist camera on the microwave beside the drop spot, 134 mm up — and let
+# the lid go there. The slack covers the table under the spot differing
+# from the one measured at the box and the lid thickness's estimate.
+SETDOWN_HIGH_M = 0.04
 
 # clearance between the CARRIED lid's underside and the container top
 # during the place transit — the planner cannot model a held object
@@ -56,11 +60,20 @@ class Ctx:
     worlds: object
     lid_at: object = None  # set after Place(lid): later worlds carry the lid
     lid_drop: object = None  # runtime-resolved drop spot (adapts to the box)
+    lid_drops: list = None  # every spot the cameras saw room at, best first (press_demo.clear_lid_drops)
     config_path: str = None
     last_pose: tuple = None  # (xyz, quat_xyzw) of the last commanded pose
     last_world: tuple = None  # (name, path) of the last interaction world
     contact_pad: float = 0.0  # container xy padding once contact has happened
     mission_frames: object = None  # this run's detection record (detection_set.MissionFrames), --execute missions
+    # home's legs planned from the look pose while the way back to it flew
+    # (reach_lid_off), for a stop there; dropped once the arm moves on
+    home_ahead: list = None
+    # the scene camera's SceneLocator (its grabber streams the whole run) and
+    # the lid-off's video of both cameras (perception/camera_video), --execute
+    # full runs (reach_press._reach_press)
+    scene_locator: object = None
+    lid_video: object = None
 
 
 @dataclass
@@ -124,6 +137,14 @@ def descent_index(plan):
     return None if wp is None else int(wp[0])
 
 
+class PlanRefused(RuntimeError):
+    """_plan_motion's failure for a plan the planner called a success and
+    the client refused (runtime/planner.Refused): it ends elsewhere than it
+    was asked, or goes the long way round. A RuntimeError like any failed
+    plan's, so every caller's stop or fallback applies; home_arm, whose
+    fallback for a failed plan is a world that knows less, tells it apart."""
+
+
 def _plan_motion(
     ctx,
     state,
@@ -169,6 +190,7 @@ def _plan_motion(
     ok, msg = ctx.client.set_world(world_path)
     if not ok:
         raise RuntimeError("set_world before planning %s failed: %s" % (name, msg))
+    n_refused = len(getattr(ctx.client, "refusals", ()))
     t_plan = time.monotonic()
 
     if kind == "pose":
@@ -181,7 +203,7 @@ def _plan_motion(
         plan = ctx.client.plan_to_joints(rest[0], state.joints)
     plan_s = time.monotonic() - t_plan
     if plan is None or not plan.success:
-        raise RuntimeError(
+        raise (PlanRefused if isinstance(plan, Refused) else RuntimeError)(
             "planning failed for %s: %s"
             % (name, getattr(plan, "message", "no response"))
         )
@@ -204,6 +226,9 @@ def _plan_motion(
         verify=verify,
         plan_s=plan_s,
         plan_server_s=getattr(plan, "planning_time", None),
+        # the client's refusals while it planned this leg: none, or the
+        # joint plan the pose plan stood in for (PlannerClient.refusals)
+        plan=plan_record(plan, target, plan_s, getattr(ctx.client, "refusals", ())[n_refused:]),
         waypoint=getattr(plan, "waypoint", None),
         guard_from=descent_index(plan),
     )
@@ -225,6 +250,7 @@ def _gripper_leg(
     defer_join=False,
     join_before_motion=False,
     send_with_previous_motion=False,
+    send_when_still=False,
 ):
     world_name, world_path = world
     return Leg(
@@ -243,29 +269,8 @@ def _gripper_leg(
         defer_join=defer_join,
         join_before_motion=join_before_motion,
         send_with_previous_motion=send_with_previous_motion,
+        send_when_still=send_when_still,
     )
-
-
-class Lift:
-    """Planned ascent by dz from the last commanded pose. No grip-band check
-    here: a verify would close the lift's merge group and cost a dead stop
-    before the carry — the slip check sits at the set-down (Place)."""
-
-    def __init__(self, dz, name="lift", speed=CONTACT_SPEED):
-        self.dz = float(dz)
-        self.name = name
-        self.speed = float(speed)
-
-    def plan(self, ctx, state):
-        if ctx.last_pose is None:
-            raise RuntimeError("lift needs a preceding pose-directed leg")
-        xyz, quat = ctx.last_pose
-        target = [xyz[0], xyz[1], xyz[2] + self.dz]
-        world = ctx.last_world or _full_world(ctx)
-        leg, state = _plan_motion(
-            ctx, state, self.name, ("pose", target, list(quat)), world, self.speed
-        )
-        return [leg], state
 
 
 class Place:
@@ -319,17 +324,13 @@ class Place:
             ctx, self.target_xyz[2], SETDOWN_OVERDRIVE_M, self.name
         )
         ctx.last_world = world
-        # guard arms at this fraction of the stroke — verified closure must
-        # use the same value so an early-trip check stays live when arm_after
-        # is ever lowered
-        _arm_after = 0.5
         guard = GuardSpec(
             touch_nm=m.touch_nm if self.touch_nm is None else float(self.touch_nm),
             trip="setdown",
             # contact is only possible at the stroke's very end — the
             # fast segment's dynamics must not trip the gentler set-down
             # threshold (lid released 110 mm up, field 2026-09-02)
-            arm_after=_arm_after,
+            arm_after=0.5,
         )
 
         def verify(v):
@@ -339,7 +340,18 @@ class Place:
                 and not in_band(v.gripper_pos, self.band)
             )
             if v.outcome == "touch":
-                if v.progress is not None and v.progress < _arm_after:
+                high = (
+                    None
+                    if v.contact_xyz is None
+                    else float(v.contact_xyz[2]) - TIP_TO_TOOL_M - self.target_xyz[2]
+                )
+                if high is not None and high > SETDOWN_HIGH_M:
+                    return False, (
+                        "struck something %.0f mm above where the lid meets "
+                        "the table — set-down NOT confirmed, the lid is held"
+                        % (high * 1000)
+                    )
+                if v.progress is not None and v.progress < 0.5:
                     return False, (
                         "guard tripped at %.0f%% of the descent — struck "
                         "something on the way down, set-down NOT confirmed"
@@ -419,9 +431,17 @@ class LiftFree:
         self.touch_nm = float(touch_nm)
 
     def plan(self, ctx, state):
+        from rammp_box_opening.runtime import approach
         from rammp_box_opening.runtime.approach import _chain, line_trajectory
         from rammp_box_opening.runtime.kinematics import mat_to_quat_xyzw
 
+        # "vertical" is the chain root's z: on flatbot base_link leans 30 deg
+        # from the gravity-aligned arm_mount the planner works in, and a lift
+        # solved there moved the fingers 40 mm sideways for 69 mm up
+        if approach._ROOT != ctx.worlds.base_frame:
+            raise RuntimeError(
+                "plan-free lift refused: chain root %s != planning frame %s" % (approach._ROOT, ctx.worlds.base_frame)
+            )
         chain = _chain()
         q0 = list(state.joints if state.joints is not None else ctx.client.joints())
         R, t = chain.fk(q0)
@@ -435,7 +455,7 @@ class LiftFree:
         leg = Leg(
             name=self.name,
             kind=Kind.MOTION,
-            traj=line_trajectory(JOINTS, pts),
+            traj=line_trajectory(ctx.client.joint_names, pts),
             speed=self.speed,
             guard=guard,
             world=world_name,
@@ -449,166 +469,170 @@ class LiftFree:
         return [leg], PlanState(joints=list(leg.goal_joints), chain=state.chain + 1)
 
 
-class Retreat:
-    """Vertical disengage by dz from the last commanded pose. Planned
-    against the interaction world (a full-world plan would start inside
-    the container cuboid after contact). Lazy after a touch: the Runner
-    plans it from live once the guard has stopped the arm, and a failed
-    post-touch replan stops the mission with the arm holding — there is
-    no plan-free fallback."""
+# ClearMarginFree: a joint this near its limit is too near for the planner
+# to start from. It refuses a start inside its margin, and its finetune
+# trajopt (bound activation_distance 0.05 beyond that) failed every HOME from
+# 0.120-0.154 rad of room and planned it from 0.161 (2026-10-23)
+CLEAR_MARGIN_ROOM_RAD = PLANNER_LIMIT_MARGIN_RAD + 0.08
+# the shortest step leaves every joint this far from its limits, just
+# outside the margin; each next step moves the largest joint this much more
+CLEAR_MARGIN_FIRST_RAD = PLANNER_LIMIT_MARGIN_RAD + 0.02
+CLEAR_MARGIN_STRIDE_RAD = 0.05
+# it is plan-free, so it stays a step: no joint moves more than this
+CLEAR_MARGIN_MAX_STEP_RAD = 0.35
+# and the tool never goes lower than its start by more than this on the way
+# (the table and the box are below it)
+CLEAR_MARGIN_DROP_M = 0.005
+# The step's guard watches its first this-much of the step without tripping
+# and takes its baseline there. A pose held long at rest reads far under
+# the arm's weight (2026-10-23: arm_joint_4 4.6 of the 9.3 Nm the gravity
+# model holds there, arm_joint_6 0.6 of 2.2: a support or the joints'
+# friction carrying the rest), and the weight comes back onto the joints as
+# the step starts (arm_joint_4 at 8.9 Nm by 9% of it): judged from rest that
+# read as a 4.3 Nm strike, 1 mm into a lift.
+CLEAR_MARGIN_SETTLE = 0.2
 
-    def __init__(self, dz, name="retreat", speed=CONTACT_SPEED, lazy=False):
-        self.dz = float(dz)
+
+class ClearMarginFree:
+    """Plan-free steps along the straight joint line toward `goal`, for a
+    start with a joint too near its limit for the planner to plan from.
+
+    rammp-curobo refuses a start inside its joint-limit margin ("jog it away
+    from the limit first"), and its retiming fails from starts just outside
+    it, and from some farther out while the wrist is still folded:
+    2026-10-23, arm_joint_4 0.047 rad from -2.57 and the tool 268 mm above
+    arm_mount, HOME was refused from that joint jogged alone to 0.18-0.26
+    rad of room, and planned from 45% of the way along the joint line. So
+    steps() offers steps shortest first, from the one that just clears the
+    margin, and the caller plans from each until one plans. Along the line
+    each joint's room never falls below the smaller of its two ends (the
+    goal's is clear); a step is refused when the tool would drop on the way.
+    Guarded as an obstruction trip, compensated for the arm's weight, from a
+    baseline taken once the step is under way (CLEAR_MARGIN_SETTLE)."""
+
+    def __init__(self, goal, name="clear-margin", speed=None, touch_nm=4.0):
+        self.goal = [float(v) for v in goal]
         self.name = name
-        self.speed = float(speed)
-        self.lazy = lazy  # follows an expected touch: planned at execution
+        self.speed = CONTACT_SPEED if speed is None else float(speed)
+        self.touch_nm = float(touch_nm)
 
-    def plan(self, ctx, state):
-        if ctx.last_pose is None:
-            raise RuntimeError("retreat needs a preceding pose-directed leg")
-        xyz, quat = ctx.last_pose
-        target = [xyz[0], xyz[1], xyz[2] + self.dz]
-        world = ctx.last_world or _full_world(ctx)
-        leg, state = _plan_motion(
-            ctx,
-            state,
-            self.name,
-            ("pose", target, list(quat)),
-            world,
-            self.speed,
-            lazy=self.lazy,
-        )
-        return [leg], state
+    @staticmethod
+    def _limited():
+        from rammp_box_opening.runtime.approach import _chain
 
+        # continuous joints are left out: the planner's +-2 pi is never near
+        return [(j, lo, hi) for j, (lo, hi) in enumerate(_chain().limits) if lo is not None and hi is not None]
 
-# The last stretch of every press comes STRAIGHT down this far: a diagonal
-# descent touches the button before its lateral convergence finishes (10 mm
-# off-centre at 20 mm height from a 199 mm start — the edge presses of
-# 2026-09-01). runtime/approach.py builds it as the arm's own straight line.
-PRESS_APPROACH_M = 0.06
+    def near(self, ctx, q):
+        """[(joint name, room)] for each joint too near its limit for the
+        planner; [] when none is, or when there is no URDF to read the
+        limits from (the planner's own refusal stands, as before)."""
+        from rammp_box_opening.runtime import approach
 
+        if not approach.chain_ready()[0]:
+            return []
+        names = list(ctx.client.joint_names)
+        rooms = [(names[j], float(min(q[j] - lo, hi - q[j]))) for j, lo, hi in self._limited()]
+        return [(n, r) for n, r in rooms if r < CLEAR_MARGIN_ROOM_RAD]
 
-def press_stroke(ctx, state, cfg, name="press:down"):
-    """The TOUCH: one guarded stroke from staging toward travel_m below the
-    button, stopping at first contact (cfg.contact_nm). Returns (leg, state).
+    def steps(self, ctx, state):
+        """Yield (legs, PlanState, info) per step, shortest first: no legs
+        for a start already outside the margin, then one plan-free leg each.
+        info: {"fraction", "largest_rad", "tool_move" (m, planning frame)}."""
+        import math
 
-    A single hard stroke pressed the button flush and then compressed the
-    whole container until the torque built up (video, 2026-09-03): a force
-    the button can only produce by bottoming out must not be what ends the
-    stroke. So this stage only FINDS the surface — the arm's fingertip TF
-    at the trip is the button's true top — and press_push completes the
-    press a bounded distance from there.
+        import numpy as np
 
-    A trip counts only near where contact is EXPECTED: one well above the
-    button struck something else, and full travel with no trip found no
-    surface. Both are failures. Contact is expected after
-    staging/(staging+travel) of the stroke's PATH, but execution progress
-    is a TIME fraction and the two differ on any real velocity profile —
-    so the expectation lives in leg.retime, re-evaluated on whatever
-    trajectory actually flies (a replan, a merged group's profile)."""
-    m = ctx.model
-    button = from_container(ctx.cpose, m.button_offset)
-    quat = m.press_quat(button)
-    world = _interaction_world(ctx, button[2], cfg.travel_m, "button")
-    ctx.last_world = world
-    guard = GuardSpec(
-        touch_nm=cfg.contact_nm,
-        trip="touch",
-        # a light threshold must not judge the launch transient; a warped
-        # caller raises this to its slow-zone rebaseline (_apply_warp)
-        arm_after=0.25,
-    )
-    expect = {"frac": 1.0}  # TIME fraction; set by retime below
+        from rammp_box_opening.runtime import approach
+        from rammp_box_opening.runtime.approach import _chain, line_trajectory
 
-    def verify(v):
-        expected = expect["frac"]
-        if v.outcome == "touch":
-            if v.progress is not None and v.progress < expected - 0.15:
-                return False, (
-                    "guard tripped EARLY at %.0f%% of the stroke (contact "
-                    "expected ~%.0f%%) — struck something above the button"
-                    % (v.progress * 100, expected * 100)
-                )
-            peak = "" if v.torque_peak is None else " at %.1f Nm" % v.torque_peak
-            return True, "surface found%s" % peak
-        if v.outcome == "arrived":
-            return False, (
-                "no surface within %.0f mm below the estimated button — the "
-                "fix is high or the box moved" % (cfg.travel_m * 1000)
+        # the drop is the chain root's z: it must be the planning frame's
+        # (on flatbot base_link leans 30 deg from the gravity-aligned arm_mount)
+        if approach._ROOT != ctx.worlds.base_frame:
+            raise RuntimeError(
+                "%s refused: chain root %s != planning frame %s" % (self.name, approach._ROOT, ctx.worlds.base_frame)
             )
-        return False, "touch %s" % v.outcome
+        from rammp_box_opening.runtime.branches import on_branch
 
-    # press_offset_xy: a base-frame trim for where the closed pads actually
-    # meet the lid relative to the tool axis (a jammed-and-freed gripper can
-    # leave a few mm of offset — the 2026-09-03 miss and hit were the same
-    # stroke aimed 1.5 mm apart). Zero by default; dialled at the bench.
-    target = [
-        button[0] + cfg.press_offset_xy[0],
-        button[1] + cfg.press_offset_xy[1],
-        tcp_z(button[2] - cfg.travel_m),
-    ]
-    press, state = _plan_motion(
-        ctx,
-        state,
-        name,
-        ("pose", target, quat, PRESS_APPROACH_M),
-        world,
-        cfg.press_speed,
-        guard=guard,
-        invalidates=True,
-        verify=verify,
-    )
+        chain = _chain()
+        names = list(ctx.client.joint_names)
+        q0 = np.asarray(state.joints if state.joints is not None else ctx.client.joints(), float)
+        # each continuous joint's goal the short way round from where it
+        # stands: 2026-10-30 joint_3 stood at +3.097 and HOME's is -3.137,
+        # 0.049 rad apart, and the line taken literally turned it 6.23 rad,
+        # so the first step that cleared joint_4's limit was a 2.49 rad one
+        # and none up to the cap was offered (the driver too goes the short
+        # way round, and the planner is handed HOME's branch: planner_branch)
+        goal = np.asarray(on_branch(self.goal, q0), float)
+        limited = self._limited()
+        first = 0.0
+        for j, lo, hi in limited:
+            if min(goal[j] - lo, hi - goal[j]) < CLEAR_MARGIN_ROOM_RAD:
+                raise RuntimeError(
+                    "%s refused: the goal's %s is %.3f rad from its limit, too near for the planner"
+                    % (self.name, names[j], min(goal[j] - lo, hi - goal[j]))
+                )
+            # the room to each limit is linear along the line and clear at its end
+            for f0, f1 in ((q0[j] - lo, goal[j] - lo), (hi - q0[j], hi - goal[j])):
+                if f0 < CLEAR_MARGIN_FIRST_RAD:
+                    first = max(first, (CLEAR_MARGIN_FIRST_RAD - f0) / (f1 - f0))
+        span = float(np.max(np.abs(goal - q0)))
+        if first == 0.0:
+            yield [], state, {"fraction": 0.0, "largest_rad": 0.0, "tool_move": np.zeros(3)}
+            if span == 0.0:
+                return
+        k = 0
+        while True:
+            frac = min(1.0, first + k * CLEAR_MARGIN_STRIDE_RAD / span)
+            k += 1
+            if frac == 0.0:
+                continue
+            largest = frac * span
+            if largest > CLEAR_MARGIN_MAX_STEP_RAD + 1e-9:
+                return
+            q1 = q0 + frac * (goal - q0)
+            n = max(2, int(math.ceil(largest / 0.01)))
+            pts = [q0 + (i / n) * (q1 - q0) for i in range(n + 1)]
+            tool = [chain.fk(q)[1] for q in pts]
+            drop = float(tool[0][2] - min(t[2] for t in tool))
+            if drop > CLEAR_MARGIN_DROP_M:
+                # a longer step runs the same line: it drops as much or more
+                raise RuntimeError(
+                    "%s refused: the joint line toward the goal drops the tool %.0f mm — jog the "
+                    "arm clear by hand first" % (self.name, 1000 * drop)
+                )
+            world_name, world_path = ctx.worlds.push_name("bench", model=None, tag="bare")
+            leg = Leg(
+                name=self.name,
+                kind=Kind.MOTION,
+                traj=line_trajectory(ctx.client.joint_names, [[float(v) for v in q] for q in pts]),
+                speed=self.speed,
+                # the arm's weight changes along the step: compensated, from
+                # a baseline past its start (CLEAR_MARGIN_SETTLE)
+                guard=GuardSpec(
+                    touch_nm=self.touch_nm, trip="obstruction", gravity=approach._gravity().wrist_holding,
+                    rebaseline_after=CLEAR_MARGIN_SETTLE, arm_after=CLEAR_MARGIN_SETTLE,
+                ),
+                world=world_name,
+                world_path=str(world_path),
+                chain=state.chain,
+                target=("joints", [float(v) for v in q1]),
+                goal_joints=[float(v) for v in q1],
+                plan_s=0.0,
+            )
+            info = {"fraction": float(frac), "largest_rad": float(largest), "tool_move": tool[-1] - tool[0]}
+            yield [leg], PlanState(joints=list(leg.goal_joints), chain=state.chain + 1), info
+            if frac >= 1.0:
+                return
 
-    def retime(traj):
-        # a replan swaps the trajectory — the expected-contact fraction
-        # must follow the one actually flown (review 2026-09-02)
-        expect["frac"] = time_fraction_at_path_fraction(traj, press.contact_path_frac)
 
-    press.contact_path_frac = cfg.staging_m / (cfg.staging_m + cfg.travel_m)
-    press.retime = retime
-    retime(press.traj)
-    return press, state
-
-
-def press_push(ctx, state, cfg, contact_xyz, world, name="press:push"):
-    """The PUSH stage: from the measured first contact, drive the
-    fingertips button_travel_m further — position-bounded — with the
-    old trip threshold left only as a backstop.
-
-    contact_xyz is the fingertip TF the runner read when the touch
-    tripped: the arm's own measurement of where the button top is, in
-    the frame it is commanded in (via TIP_TO_TOOL_M) — no camera, no
-    dims.z, no TCP constant in this chain. Arriving at the bound IS the
-    press (the button latches inside its travel); a trip means the push
-    met a stop early, which is also a press.
-    """
-    m = ctx.model
-    button = from_container(ctx.cpose, m.button_offset)
-    quat = m.press_quat(button)
-    tip_z = float(contact_xyz[2])
-    tool_at_contact = tip_z - TIP_TO_TOOL_M
-    bottom = tool_at_contact - cfg.button_travel_m
-    xy = ctx.last_pose[0][:2] if ctx.last_pose else [button[0], button[1]]
-    guard, verify = _push_guard_and_verify(m, cfg)
-
-    return _plan_motion(
-        ctx,
-        state,
-        name,
-        ("pose", [float(xy[0]), float(xy[1]), float(bottom)], quat, 0.0),
-        world,
-        cfg.press_speed,
-        guard=guard,
-        invalidates=True,
-        verify=verify,
-    )
-
-
-def _push_guard_and_verify(m, cfg):
+def _push_guard_and_verify(m, cfg, depth_m=None):
+    """The push's backstop and its verdict; `depth_m` the push's own bound
+    when it is not button_travel_m (the reach-out's shallower push)."""
     guard = GuardSpec(touch_nm=max(0.5, m.touch_nm - cfg.contact_nm), trip="press")
 
     def verify(v):
-        mm = cfg.button_travel_m * 1000
+        mm = (cfg.button_travel_m if depth_m is None else float(depth_m)) * 1000
         if v.outcome == "touch":
             peak = "" if v.torque_peak is None else " at %.1f Nm" % v.torque_peak
             return True, "pressed — met a stop%s inside the %.0f mm push" % (peak, mm)
@@ -617,70 +641,3 @@ def _push_guard_and_verify(m, cfg):
         return False, "push %s" % v.outcome
 
     return guard, verify
-
-
-def press_push_from_touch(ctx, state, cfg, touch_leg, live, contact_xyz, world):
-    """The PUSH cut from the touch's own trajectory: its unexecuted
-    continuation past the stop is a validated path straight on through
-    the contact, so the push needs no planner call while the fingers sit
-    on the button (the planner round trip was ~0.5 s of pressing at
-    contact_nm, 2026-09-04). Re-timed like any motion at press_speed.
-    Returns (leg, state) or None when too little of the stroke remains —
-    the caller then plans it (press_push)."""
-    from rammp_box_opening.runtime.retime import (
-        RetimeParams,
-        forward_tail,
-        positions_to_traj,
-        retime_group,
-    )
-
-    m = ctx.model
-    if touch_leg.traj is None:
-        return None
-    path = forward_tail(touch_leg.traj, live, cfg.button_travel_m * JOINT_ARC_PER_M)
-    if path is None:
-        return None
-    traj, _ = retime_group(
-        [positions_to_traj(touch_leg.traj.joint_names, path)],
-        [cfg.press_speed],
-        JOINT_VMAX,
-        RetimeParams(),
-    )
-    tool_at_contact = float(contact_xyz[2]) - TIP_TO_TOOL_M
-    guard, verify = _push_guard_and_verify(m, cfg)
-    button = from_container(ctx.cpose, m.button_offset)
-    quat = m.press_quat(button)
-    xy = ctx.last_pose[0][:2] if ctx.last_pose else [button[0], button[1]]
-    world_name, world_path = world
-    leg = Leg(
-        name="press:push",
-        kind=Kind.MOTION,
-        traj=traj,
-        speed=1.0,  # the profile is baked in
-        guard=guard,
-        world=world_name,
-        world_path=str(world_path),
-        chain=state.chain,
-        # a replan (drift at execution) falls back to the planned push
-        target=("pose", [float(xy[0]), float(xy[1]), tool_at_contact - cfg.button_travel_m], quat, 0.0),
-        goal_joints=[float(v) for v in path[-1]],
-        verify=verify,
-    )
-    ctx.last_pose = ([float(xy[0]), float(xy[1]), tool_at_contact - cfg.button_travel_m], list(quat))
-    return leg, PlanState(joints=list(path[-1]), chain=state.chain + 1)
-
-
-class Home:
-    """Return to the rest joints (factory HOME, or the look pose when the
-    mission rests tool-down) via plan_to_joints (spec §5). Lazy when it
-    follows a lazy retreat (its start is unknown until then)."""
-
-    def __init__(self, joints=None):
-        self.joints = list(HOME if joints is None else joints)
-
-    def plan(self, ctx, state):
-        world = _full_world(ctx)
-        leg, state = _plan_motion(
-            ctx, state, "home", ("joints", list(self.joints)), world, TRANSIT_SPEED
-        )
-        return [leg], state

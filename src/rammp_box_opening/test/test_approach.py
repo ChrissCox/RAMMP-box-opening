@@ -155,70 +155,6 @@ def test_no_answer_from_the_planner_is_no_plan():
     assert plan_with_vertical_approach(Planner([None]), GOAL, QUAT, START, 0.06) is None
 
 
-def test_a_refit_corrects_sideways_at_the_top_then_descends_in_one_straight_line():
-    """The aim moves the target 10 mm. The correction happens FIRST, at the
-    height the leg starts from — where the arm stands still after aiming —
-    and the whole descent is then one straight line onto the new target; no
-    planner call (2026-09-17).
-
-    It used to keep the planner's descent over the OLD target down to the
-    waypoint and jog sideways there, 56 mm above the button: the arm came
-    down over the wrong spot and swerved onto the button at the last
-    moment — "shifted to the right as it was pressing, almost missing it"
-    (bench 2026-09-21; the press itself landed 0.4 mm from the aim)."""
-    from rammp_box_opening.models.container import attitude_quat
-    from rammp_box_opening.runtime.approach import REFIT_MAX_M, refit_descent
-    from rammp_box_opening.runtime.kinematics import ArmChain
-    from rammp_box_opening.runtime.legs import Kind, Leg
-
-    chain = ArmChain()
-    q_wp = [0.1208, 0.5375, 3.3522, -1.8057, -0.1478, -0.8136, 0.1407]  # a live planner waypoint
-    goal = [0.4264, -0.1151, 0.0815]
-    quat = attitude_quat([180.0, 0.0, 0.0], math.atan2(goal[1], goal[0]))
-    _R, t_wp = chain.fk(q_wp)
-    up, why = chain.straight_line(q_wp, [t_wp[0], t_wp[1], t_wp[2] + 0.064], quat)
-    assert up is not None, why
-    q_staging = [float(v) for v in up[-1]]  # staging: 64 mm above the waypoint
-    first = Plan(True, _traj([q_staging, q_wp], [0.0, 1.0]), 0.2)
-    plan = plan_with_vertical_approach(Planner([first]), goal, quat, q_staging, 0.06)
-    assert plan.waypoint == (1, q_wp)
-    leg = Leg(name="press:down", kind=Kind.MOTION, traj=plan.trajectory, speed=0.35, guard=None, world="w",
-              chain=0, target=("pose", goal, list(quat), 0.06), goal_joints=list(plan.trajectory.points[-1].positions),
-              waypoint=plan.waypoint, guard_from=plan.waypoint[0])
-    new_goal = [goal[0] + 0.007, goal[1] - 0.007, goal[2]]
-    assert refit_descent(leg, new_goal, quat)
-
-    tool = [chain.fk(p.positions)[1] for p in leg.traj.points]
-    assert list(leg.traj.points[0].positions) == pytest.approx(q_staging)  # starts where the arm stands
-    z0 = tool[0][2]
-    level = [i for i, t in enumerate(tool) if abs(t[2] - z0) < 1e-4]
-    jog = level[-1]
-    assert level == list(range(jog + 1)) and jog >= 3  # ~10 mm in 2 mm steps, before anything else
-    # the sideways correction ends over the NEW target ...
-    assert np.hypot(*(tool[jog][:2] - np.array(new_goal[:2]))) < 1e-4
-    # ... and from there it is straight down onto it, all the way
-    assert max(np.hypot(*(t[:2] - np.array(new_goal[:2]))) for t in tool[jog:]) < 1e-4
-    zs = [t[2] for t in tool[jog:]]
-    assert all(b < a for a, b in zip(zs, zs[1:]))
-    assert np.allclose(tool[-1], new_goal, atol=1e-4)
-    assert np.allclose(chain.fk(leg.goal_joints)[1], new_goal, atol=1e-4)
-    assert leg.target[1] == pytest.approx(new_goal)
-    # the final descent is the one every planned leg ends with: from REST,
-    # the approach offset above the (new) target — and the guard arms from there
-    idx, q_above = leg.waypoint
-    assert leg.guard_from == idx > jog
-    assert tool[idx][2] == pytest.approx(new_goal[2] + (t_wp[2] - goal[2]), abs=1e-4)
-    assert t_wp[2] - goal[2] == pytest.approx(0.06, abs=1e-3)
-    assert list(leg.traj.points[idx].positions) == pytest.approx(list(q_above))
-    assert max(abs(v) for v in leg.traj.points[idx].velocities) < 1e-9
-    ts = [_secs(p) for p in leg.traj.points]
-    assert all(b > a for a, b in zip(ts, ts[1:]))
-    # too far: not refitted, the caller re-plans
-    assert not refit_descent(leg, [goal[0] + REFIT_MAX_M + 0.01, goal[1], goal[2]], quat)
-    leg.waypoint = None
-    assert not refit_descent(leg, new_goal, quat)
-
-
 def test_the_line_carries_a_real_velocity_profile_not_placeholder_stamps():
     """A guarded descent flown on its own reaches the driver as planned (the
     Runner re-times only unguarded and merged groups). With placeholder
@@ -256,3 +192,47 @@ def test_every_vertical_approach_says_where_its_descent_begins():
     )
     assert fallback.success and "PLANNER descent" in fallback.message
     assert fallback.waypoint == (2, [0.2] * 7)
+
+
+def test_a_plan_is_written_on_the_branch_of_the_line_it_continues():
+    """The planner is handed planner_branch(start), HOME's side of the wrap:
+    a plan-free line ending at joint_3 +0.450 gets a home plan starting at
+    -5.833 (review 2026-10-27), and one goal through both turns joint_3 a
+    full revolution at the junction. on_branch_of moves each continuous
+    joint (1, 3, 5, 7) by the one whole number of turns that puts the
+    plan's first point within half a turn of the line's end: every
+    difference kept — the same motion to the arm, whose driver flies the
+    differences — the other joints untouched, the plan itself as it was."""
+    import copy
+
+    from rammp_box_opening.runtime.approach import on_branch_of
+    from rammp_box_opening.runtime.branches import CONTINUOUS_JOINTS
+
+    turn = 2.0 * math.pi
+    end = [0.2, -0.3, 0.450, 1.0, -0.4, 0.8, 1.7]  # the line's end, as the arm's joints were read
+    start = [0.2 - turn, -0.3 + 1e-7, 0.450 - turn, 1.0, -0.4 + turn, 0.8, 1.7 - 2.0 * turn]
+    rows = [start]
+    for d in ((0.1, -0.2, 0.3, 0.05, -0.1, 0.2, -0.3), (0.3, -0.5, -2.0, 0.1, 0.4, -0.2, 0.6)):
+        rows.append([v + dv for v, dv in zip(start, d)])
+    plan = _traj(rows, [0.0, 0.5, 1.2])
+    for p, v in zip(plan.points, (0.0, 0.7, 0.0)):
+        p.velocities = [v] * 7
+    before = copy.deepcopy(plan)
+    out = on_branch_of(plan, end)
+    got, was = np.array([p.positions for p in out.points]), np.array(rows)
+    turns = (got - was) / turn
+    assert turns == pytest.approx(np.round(turns), abs=1e-9)  # whole turns ...
+    assert [int(round(v)) for v in turns[0]] == [1, 0, 1, 0, -1, 0, 2]
+    assert (np.round(turns) == np.round(turns[0])).all()  # ... the same for every point
+    others = [j for j in range(7) if j not in CONTINUOUS_JOINTS]
+    assert (got[:, others] == was[:, others]).all()
+    assert np.diff(got, axis=0) == pytest.approx(np.diff(was, axis=0), abs=1e-12)  # every difference kept
+    assert all(abs(got[0][j] - end[j]) <= math.pi for j in CONTINUOUS_JOINTS)
+    assert got[0] == pytest.approx(end, abs=1e-6)
+    assert [_secs(p) for p in out.points] == [_secs(p) for p in plan.points]
+    assert [list(p.velocities) for p in out.points] == [list(p.velocities) for p in plan.points]
+    assert [list(p.positions) for p in plan.points] == [list(p.positions) for p in before.points]  # a copy
+    # a plan already on the line's side of the wrap is left as it is, and so is one half a turn less off
+    assert [list(p.positions) for p in on_branch_of(out, end).points] == [list(p.positions) for p in out.points]
+    near = _traj([[v + 3.0 for v in end], [v + 3.1 for v in end]], [0.0, 1.0])
+    assert [list(p.positions) for p in on_branch_of(near, end).points] == [list(p.positions) for p in near.points]

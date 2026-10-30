@@ -35,6 +35,8 @@ and the arm stop-started every 2 mm: 2.98 s for the 45 mm grip descent
 and 3 Nm of torque ripple in free air on the live run of 2026-09-17.
 """
 
+import math
+
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from rammp_box_opening.constants import JOINT_VMAX
@@ -42,23 +44,71 @@ from rammp_box_opening.runtime.retime import RetimeParams, positions_to_traj, re
 from rammp_box_opening.runtime.stamps import secs, set_stamp
 
 _CHAIN = None
+_ROOT = "base_link"
+_URDF_PATH = None  # None = use kinematics.urdf_path() (the installed bench URDF)
+
+
+def set_chain_root(root, urdf_path=None):
+    """Switch the URDF chain's root frame ('base_link' on bench, 'arm_mount'
+    on flatbot). `urdf_path` overrides the default installed URDF when the
+    active robot's description differs (e.g. the nightly arm on flatbot, whose
+    URDF is rendered with arm_mount as root and published on
+    /arm/robot_description). Resets the singleton so the next _chain() call
+    rebuilds with the new root and path."""
+    global _ROOT, _URDF_PATH, _CHAIN, _GRAVITY
+    _ROOT = str(root)
+    _URDF_PATH = urdf_path
+    _CHAIN = None
+    _GRAVITY = None
+
+
+def chain_ready():
+    """(ok, why): whether _chain() has a URDF for its root. Off the bench
+    root there is no installed URDF to fall back to — the bench one has no
+    arm_mount — so a root set without the robot's own description has no
+    kinematics at all, and every plan-free line and FK must refuse."""
+    if _ROOT != "base_link" and _URDF_PATH is None:
+        return False, "no arm URDF rooted at %s (is /arm/robot_description published?)" % _ROOT
+    return True, ""
 
 
 def _chain():
     """The arm's kinematic chain, parsed once from the driver's URDF."""
     global _CHAIN
     if _CHAIN is None:
+        ok, why = chain_ready()
+        if not ok:
+            raise RuntimeError(why)
         from rammp_box_opening.runtime.kinematics import ArmChain
 
-        _CHAIN = ArmChain()
+        _CHAIN = ArmChain(root=_ROOT, path=_URDF_PATH)
     return _CHAIN
+
+
+_GRAVITY = None
+
+
+def _gravity():
+    """The arm's gravity model, from the same URDF and root as _chain()."""
+    global _GRAVITY
+    if _GRAVITY is None:
+        ok, why = chain_ready()
+        if not ok:
+            raise RuntimeError(why)
+        from rammp_box_opening.runtime.kinematics import GravityModel
+
+        _GRAVITY = GravityModel(root=_ROOT, path=_URDF_PATH)
+    return _GRAVITY
 
 
 def line_trajectory(joint_names, points):
     """A JointTrajectory through joint-space `points` with a rest-to-rest
     velocity profile at full cruise (positions untouched, runtime/retime):
     exactly what a planner trajectory is, so a leg's speed dilates it, a
-    warp reshapes it and a merged group re-profiles it like any other."""
+    warp reshapes it and a merged group re-profiles it like any other.
+    Only a guarded leg flown on its own flies this timing (dilated by its
+    speed, or warped): the runner re-times every other motion's positions
+    itself (Runner.retime_params, a compliant run's own profile)."""
     traj, _info = retime_group(
         [positions_to_traj(joint_names, points)], [1.0], JOINT_VMAX, RetimeParams()
     )
@@ -84,6 +134,34 @@ def _point(p, t):
     q.accelerations = list(p.accelerations)
     set_stamp(q.time_from_start, t)
     return q
+
+
+def on_branch_of(traj, q_ref):
+    """A copy of planned trajectory `traj` with each continuous joint
+    (branches.CONTINUOUS_JOINTS) moved by the one whole number of turns that
+    puts its first point within half a turn of `q_ref`: every difference
+    kept, so the same motion to the arm, whose driver compares every target
+    with the measurement the short way round (runtime/branches) — written
+    to continue a path that ends at `q_ref`. The planner is handed
+    planner_branch(start), HOME's side of the wrap, which can sit a turn from
+    a plan-free line's raw end (review 2026-10-27: joint_3 +0.450 against
+    -5.833), and a junction between them is a full revolution in one goal
+    (legs.MERGE_GAP_RAD)."""
+    from rammp_box_opening.runtime.branches import CONTINUOUS_JOINTS
+
+    first = [float(v) for v in traj.points[0].positions]
+    shift = [0.0] * len(first)
+    for j in CONTINUOUS_JOINTS:
+        if j < len(first):
+            shift[j] = 2.0 * math.pi * round((float(q_ref[j]) - first[j]) / (2.0 * math.pi))
+    out = JointTrajectory()
+    out.header = traj.header
+    out.joint_names = list(traj.joint_names)
+    for p in traj.points:
+        q = _point(p, secs(p.time_from_start))
+        q.positions = [float(v) + s for v, s in zip(p.positions, shift)]
+        out.points.append(q)
+    return out
 
 
 def chain(first, second):
@@ -148,105 +226,3 @@ def plan_with_vertical_approach(plan_pose, xyz, quat_xyzw, start_joints, offset_
         # planner's bowing descent with the straight line
         waypoint=(len(first.trajectory.points) - 1, list(end)),
     )
-
-
-def human_timed_above_waypoint(leg):
-    """Re-time the PLANNER's part of a planned-with-vertical-approach leg —
-    the free air above its waypoint — on the mission's human-motion profile
-    (runtime/retime: what every unguarded motion flies, per-joint velocity
-    capped under the limits), the straight line below it untouched and the
-    rest at the waypoint kept. Positions are never moved. Returns True when
-    it made the leg faster (and moves leg.waypoint / guard_from to the new
-    indices); a leg it would not speed up is left as it was.
-
-    cuRobo times a short segment by its own horizon, not by its length: a
-    guarded descent flown on its own kept that timing, so the few
-    centimetres above the waypoint flew like a long move (bench
-    2026-09-24: 1.66 s for grip:down's 45 mm)."""
-    if leg.waypoint is None or leg.traj is None:
-        return False
-    idx = int(leg.waypoint[0])
-    pts = leg.traj.points
-    if idx < 1 or idx >= len(pts) - 1:
-        return False
-    names = list(leg.traj.joint_names)
-    upper = line_trajectory(names, [list(p.positions) for p in pts[: idx + 1]])
-    if secs(upper.points[-1].time_from_start) >= secs(pts[idx].time_from_start):
-        return False  # the planner's own timing was already as brisk
-    lower = JointTrajectory()
-    lower.joint_names = names
-    t0 = secs(pts[idx].time_from_start)
-    for p in pts[idx:]:
-        lower.points.append(_point(p, secs(p.time_from_start) - t0))
-    leg.traj = chain(upper, lower)
-    k = len(upper.points) - 1
-    leg.waypoint = (k, list(leg.waypoint[1]))
-    if leg.guard_from is not None:
-        leg.guard_from = k
-    return True
-
-
-REFIT_MAX_M = 0.03  # a corrected target further than this from the planned one is re-planned
-
-
-def refit_descent(leg, xyz, quat_xyzw, chain_model=None, start_joints=None):
-    """Re-fit a planned-with-vertical-approach leg to a corrected target
-    `xyz` WITHOUT the planner, from the arm's own kinematics: a short level
-    move at the height the leg STARTS from (or from `start_joints`, where
-    the arm stands now: after a move over the button at staging height the
-    leg's own start is behind it), to above the new target; one
-    straight line down to the approach offset above it; and from there the
-    same final line a planned leg ends with, from rest — the guarded part
-    keeps the dynamics it has on every other press. Returns True and
-    rewrites leg.traj / target / goal_joints / waypoint / guard_from, or
-    False (no waypoint on the leg, the start not within REFIT_MAX_M of
-    above the new target, a line refused) — the caller then re-plans.
-
-    None of it is collision-checked: it stays within REFIT_MAX_M of the
-    path the planner did check, in the air above the container.
-
-    The correction used to be made at the WAYPOINT, keeping the planner's
-    descent over the old target down to there: the arm came down over the
-    wrong spot and swerved onto the button 56 mm above it — "it shifted to
-    the right as it was pressing, almost missing it" (bench 2026-09-21; the
-    touch itself landed 0.4 mm from the aim). Where the arm stands still
-    after aiming is where a correction belongs.
-
-    The pre-planned descent used to be discarded whenever the wrist's aim
-    moved the target by more than 5 mm (the scene camera is good to about
-    that), costing a planner round trip (0.4 s) at the one moment the arm
-    is stopped above the box (2026-09-17)."""
-    if leg.waypoint is None or leg.traj is None:
-        return False
-    kin = chain_model if chain_model is not None else _chain()
-    _idx, q_wp = leg.waypoint
-    q0 = [float(v) for v in (leg.traj.points[0].positions if start_joints is None else start_joints)]
-    _R, t0 = kin.fk(q0)
-    _R, t_wp = kin.fk(q_wp)
-    _R, t_end = kin.fk(leg.traj.points[-1].positions)
-    xyz = [float(v) for v in xyz]
-    above = [xyz[0], xyz[1], xyz[2] + float(t_wp[2] - t_end[2])]  # the approach offset the leg was planned with
-    top = [xyz[0], xyz[1], float(t0[2])]
-    d = ((top[0] - t0[0]) ** 2 + (top[1] - t0[1]) ** 2) ** 0.5
-    if d > REFIT_MAX_M or top[2] <= above[2]:
-        return False  # not a descent from (nearly) above the new target
-    pts = [q0]
-    if d > 1e-4:
-        pts, _why = kin.straight_line(q0, top, quat_xyzw)
-        if pts is None:
-            return False
-    upper, _why = kin.straight_line(pts[-1], above, quat_xyzw)
-    if upper is None:
-        return False
-    pts = list(pts) + list(upper[1:])
-    lower, _why = kin.straight_line(pts[-1], xyz, quat_xyzw)
-    if lower is None:
-        return False
-    names = list(leg.traj.joint_names)
-    leg.traj = chain(line_trajectory(names, pts), line_trajectory(names, lower))
-    leg.waypoint = (len(pts) - 1, [float(v) for v in pts[-1]])
-    leg.guard_from = leg.waypoint[0]
-    leg.goal_joints = [float(v) for v in lower[-1]]
-    if leg.target and leg.target[0] == "pose":
-        leg.target = ("pose", xyz, list(quat_xyzw)) + tuple(leg.target[3:])
-    return True

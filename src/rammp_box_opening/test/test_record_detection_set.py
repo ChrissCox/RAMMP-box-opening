@@ -156,3 +156,72 @@ def test_a_mission_that_saw_nothing_keeps_nothing_and_a_miss_is_never_an_empty_s
     doc = json.loads((rec.close(exit_code=2) / "truth.json").read_text())
     assert doc["truth_suspect"] is True and doc["truth_xyz"] is None
     assert doc["scene_why"].startswith("the scene OWL") and doc["exit_code"] == 2
+    assert doc["scene_source"] is None and doc["scene_boxes"] == {}
+
+
+def test_a_mission_keeps_which_detector_found_the_box_and_the_boxes_it_gated(tmp_path):
+    """The raw boxes of the last message the locate gated, per detector: a
+    live run replays exactly (SceneLocator.last_boxes)."""
+    from rammp_box_opening.detection_set import MissionFrames
+
+    rec = MissionFrames(tmp_path, "ankou_pink.yaml", 0.05, now=0)
+    boxes = {"segmenter": [["food container", 0.88, 157.75, 216.38, 255.62, 260.5]], "owl": [[0.31, 170.0, 195.0, 243.0, 222.0]]}
+    rec.scene(scene_frame_arrays(), fix_xyz=[0.661, -0.265, 0.31], score=0.88, source="segmenter", boxes=boxes)
+    boxes["segmenter"].clear()  # the locator's next look: what the mission kept does not change with it
+    doc = json.loads((rec.close(exit_code=0) / "truth.json").read_text())
+    assert doc["scene_source"] == "segmenter" and doc["scene_owl"] == 0.88  # the score behind the fix, for the evaluator
+    assert doc["scene_boxes"] == {"segmenter": [["food container", 0.88, 157.75, 216.38, 255.62, 260.5]],
+                                  "owl": [[0.31, 170.0, 195.0, 243.0, 222.0]]}
+
+
+_CONFIG = __import__("pathlib").Path(__file__).resolve().parents[1] / "config"
+
+
+def test_the_recorder_refuses_flatbot_before_anything_starts(tmp_path, monkeypatch):
+    """world_flatbot.yaml has no surveyed table (the mission measures it per
+    run), and sheppy_task.sh always passes it: the recorder refused with a
+    TypeError on lid_z after rclpy and the Runner were up. It refuses
+    before rclpy now, saying nothing moved."""
+    import pytest
+
+    from rammp_box_opening.tasks import cli_common
+    from rammp_box_opening.tasks import record_detection_set as rds
+    from rammp_box_opening.worlds import WorldStore
+
+    flatbot = str(_CONFIG / "world_flatbot.yaml")
+    why = rds.table_refusal(WorldStore(flatbot, out_dir=tmp_path))
+    assert why and "needs a surveyed table" in why and "Nothing moved" in why
+
+    def no_rclpy(execute):
+        raise AssertionError("must refuse before rclpy")
+
+    monkeypatch.setenv("RAMMP_BOX_OPENING_STATE", str(tmp_path))
+    monkeypatch.setattr(cli_common, "init_runtime", no_rclpy)
+    monkeypatch.setattr("sys.argv", ["record_detection_set", "--bench-world", flatbot,
+                                     "--container", str(_CONFIG / "containers" / "ankou_pink.yaml")])
+    with pytest.raises(SystemExit) as e:
+        rds.main()
+    assert "needs a surveyed table" in str(e.value.code)
+
+
+def test_the_bench_world_is_not_refused(tmp_path):
+    from rammp_box_opening.tasks import record_detection_set as rds
+    from rammp_box_opening.worlds import WorldStore
+
+    worlds = WorldStore(str(_CONFIG / "world_bench.yaml"), out_dir=tmp_path)
+    assert isinstance(worlds.table_top_z, float)
+    assert rds.table_refusal(worlds) is None
+
+
+def test_the_recorder_plans_and_watches_in_the_worlds_frames():
+    """The planning root and the wrist camera's config come from the world
+    (arm_mount and the OAK on flatbot), as build_ctx and press_demo do."""
+    import inspect
+
+    from rammp_box_opening.tasks import record_detection_set as rds
+
+    src = inspect.getsource(rds.main)
+    assert "client._base_frame = worlds.base_frame" in src
+    call = src[src.index("BoxTopWatcher(pnode"):]
+    call = call[:call.index(")\n")]
+    assert "base_frame=worlds.base_frame" in call and "camera_cfg_name=worlds.wrist_camera_config" in call

@@ -9,14 +9,23 @@ without effort fields (enforced by the Runner, which owns the streams).
 import math
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from rammp_curobo.geometry import ang_diff
+from rammp_box_opening.geometry import ang_diff
 
 from rammp_box_opening.runtime.stamps import secs
 
 
 RECENT_SAMPLES = 60  # effort readings kept for a trip's report (~1.5 s of a live stream)
+# The pull at the fingertip (CompensatedGuard `hang`) is judged on the mean of
+# this many distinct readings (~0.1 s of /joint_states at ~46 Hz), never on
+# one: 0.1 s into a depth press's unload, 23 ms after the recoil stopped,
+# joint_4 rang 6.6-8.7 Nm reading to reading, -3.9 to +3.3 N of "pull" about
+# a mean under 0.5, and the one high reading stopped the arm over the pressed
+# box with nothing on the hand (field 2026-10-23 17:18; the 16:02 run rang as
+# hard and passed by luck). A box coming along pulls steadily: the mean finds
+# it two or three readings later, about a millimetre of the unload.
+HANG_SAMPLES = 5
 
 
 class TorqueGuard:
@@ -46,6 +55,7 @@ class TorqueGuard:
         self._recent = deque(maxlen=RECENT_SAMPLES)
         self._baseline_at = None  # (monotonic s, progress) the baseline in force was taken
         self._trip = None
+        self._recent_key = None  # the reading last kept in _recent
 
     def on_progress(self, progress):
         self._progress = float(progress)
@@ -64,7 +74,7 @@ class TorqueGuard:
             return False
         now = time.monotonic()
         eff = [float(v) for v in wrist_efforts]
-        self._recent.append((now, self._progress, eff))
+        self._remember(now, eff, eff)
         if self._baseline is None:
             self._baseline = eff
             self._baseline_at = (now, self._progress)
@@ -85,6 +95,15 @@ class TorqueGuard:
             return True
         return False
 
+    def _remember(self, now, eff, key):
+        # the client polls once per callback it spins (~1 kHz of execution
+        # feedback) and /joint_states arrives at ~46 Hz: the same message is
+        # handed in 10-20 times running, and kept each time it filled the
+        # run-up with copies of four to seven readings (field 2026-10-22)
+        if key != self._recent_key:
+            self._recent_key = key
+            self._recent.append((now, self._progress, eff))
+
     def trip_report(self):
         """What tripped the guard, for the run log — or None. `joint` indexes
         the efforts the guard is fed (the client's wrist joints); `recent`
@@ -102,6 +121,100 @@ class TorqueGuard:
             "progress": round(self._progress, 4),
             "recent": [[round(ts - t, 3), round(p, 4)] + [round(v, 3) for v in e] for ts, p, e in self._recent],
         }
+
+
+class CompensatedGuard(TorqueGuard):
+    """A TorqueGuard that judges only what gravity does NOT explain.
+
+    Fed the live joints with every effort reading (client.execute), it takes
+    out the change the arm's own weight makes between the baseline's joints
+    and these (kinematics.GravityModel). A plan-free reach line 15 cm long
+    at 0.8-0.9 m changes joint_4's gravity torque by 1.1-1.9 Nm — the size
+    of a canister hanging off a finger — so a raw guard either trips on the
+    reach itself or misses the canister (review 2026-10-22).
+
+    `reference`: (efforts, joints) read at rest in free air, used as the
+    baseline instead of the first moving sample: a leg that STARTS on
+    something (the lift off the button) is judged against the arm with
+    nothing on it, not against the load it is leaving.
+
+    `hang`: (k, newtons), k the wrist joints' holding torque per newton
+    pulling straight down at the fingertip (GravityModel.tip_load). The
+    residual's projection on k reads as that pull, and past `newtons` over
+    HANG_SAMPLES readings the guard trips. A surface pushes UP and reads
+    negative: leaving the button never trips it, a box coming along with the
+    finger does."""
+
+    wants_joints = True
+
+    def __init__(self, touch_nm, gravity, reference=None, hang=None, rebaseline_after=None, arm_after=None):
+        super().__init__(touch_nm, rebaseline_after=None if reference is not None else rebaseline_after,
+                         arm_after=arm_after)
+        self._gravity = gravity
+        self._g0 = None
+        self._k = None if hang is None else [float(v) for v in hang[0]]
+        self._kk = None if hang is None else sum(v * v for v in self._k)
+        self.hang_n = None if hang is None else float(hang[1])
+        self.down_n = None  # the pull at the fingertip (N, + down): the mean of the latest HANG_SAMPLES readings
+        self.peak_down_n = None
+        self._pulls = deque(maxlen=HANG_SAMPLES)
+        self._why = None
+        self._g_key = self._g_last = None  # the joints gravity was last evaluated at, and its value
+        if reference is not None:
+            eff, q = reference
+            self._baseline = [float(v) for v in eff]
+            self._g0 = [float(v) for v in gravity(q)]
+            self._baseline_at = (time.monotonic(), 0.0)
+
+    def on_efforts(self, wrist_efforts, joints=None):
+        if joints is None:
+            # no joints, nothing to take gravity out with: judged raw, the
+            # guard trips sooner, never later
+            return super().on_efforts(wrist_efforts)
+        if not self.armed or wrist_efforts is None:
+            return False
+        now = time.monotonic()
+        eff = [float(v) for v in wrist_efforts]
+        key = tuple(float(v) for v in joints)
+        if key != self._g_key:
+            # gravity is a function of the joints alone: one model
+            # evaluation (0.7 ms on the Orin) per /joint_states message,
+            # not one per feedback callback the client spun
+            self._g_key, self._g_last = key, [float(v) for v in self._gravity(joints)]
+        g = self._g_last
+        fresh = (tuple(eff), key) != self._recent_key  # a new /joint_states message, not a repeat
+        self._remember(now, eff, (tuple(eff), key))
+        if self._baseline is None or self._g0 is None:
+            self._baseline, self._g0 = eff, g
+            self._baseline_at = (now, self._progress)
+            self.peak = 0.0
+            return False
+        r = [(a - b) - (gq - g0) for a, b, gq, g0 in zip(eff, self._baseline, g, self._g0)]
+        devs = [abs(v) for v in r]
+        dev = max(devs)
+        self.peak = max(self.peak, dev)
+        if self._k is not None and self._kk > 0.0:
+            if fresh or not self._pulls:
+                self._pulls.append(sum(k * v for k, v in zip(self._k, r)) / self._kk)
+            self.down_n = sum(self._pulls) / len(self._pulls)
+            self.peak_down_n = self.down_n if self.peak_down_n is None else max(self.peak_down_n, self.down_n)
+        if self.arm_after is not None and self._progress < self.arm_after:
+            return False
+        if dev > self.touch_nm:
+            self._trip, self._why = (now, devs.index(dev), dev, eff), "torque"
+            return True
+        if self.down_n is not None and len(self._pulls) == HANG_SAMPLES and self.down_n > self.hang_n:
+            self._trip, self._why = (now, devs.index(dev), dev, eff), "hang"
+            return True
+        return False
+
+    def trip_report(self):
+        rep = super().trip_report()
+        if rep is not None:
+            rep["compensated"] = True
+            rep["why"] = self._why
+            rep["down_n"] = None if self.down_n is None else round(self.down_n, 2)
+        return rep
 
 
 # Time fraction a speed change needs to settle after a guard's rebaseline
@@ -147,6 +260,15 @@ class GuardSpec:
     # progress fraction before which the guard observes but cannot trip
     # (set-down: contact is only possible at the stroke's very end)
     arm_after: float = None
+    # The arm's own weight, judged on the live joints: a callable joints ->
+    # the wrist joints' holding torque (kinematics.GravityModel.wrist_holding).
+    # Set, the Runner builds a CompensatedGuard with the two below.
+    gravity: object = field(default=None, compare=False)
+    # (efforts, joints) at rest in free air: the baseline, in place of the
+    # first moving sample
+    reference: tuple = field(default=None, compare=False)
+    # (k, newtons): trip on this much pull straight down at the fingertip
+    hang: tuple = field(default=None, compare=False)
 
 
 def sanity_violations(traj, margin_rad):

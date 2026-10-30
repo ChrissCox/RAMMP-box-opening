@@ -114,7 +114,7 @@ def _tag_image(centre, side=60, shape=(720, 1280)):
     from rammp_box_opening.perception.scene_calib import TAG_DICT, TAG_ID
 
     img = np.full(shape + (3,), 180, np.uint8)
-    marker = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(TAG_DICT), TAG_ID, side)
+    marker = cv2.aruco.drawMarker(cv2.aruco.getPredefinedDictionary(TAG_DICT), TAG_ID, side)
     pad = 12  # the white quiet zone a detector needs around the marker
     tile = np.full((side + 2 * pad, side + 2 * pad), 255, np.uint8)
     tile[pad:-pad, pad:-pad] = marker

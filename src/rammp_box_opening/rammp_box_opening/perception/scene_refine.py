@@ -1,8 +1,9 @@
 """Refining the scene camera's calibration from what the wrist measured.
 
-Every staging run records one pair: where the scene camera put the button
-top and where the wrist's aim found it, both in base_link (press_demo
-record_residual). The pairs are the calibration's own residuals, and a
+Every staging run recorded one pair: where the scene camera put the button
+top and where the wrist's aim found it, both in base_link — until the
+staging mode was scrapped (2026-10-28): the reach-out records none, so the
+pairs on file are the last there are. The pairs are the calibration's own residuals, and a
 rigid correction fitted to them is the refinement — no marker, no motion.
 
 With few pairs, or pairs all at one spot, only a translation is

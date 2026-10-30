@@ -56,6 +56,9 @@ class OwlDetector(Node):
         # the arm moves). One model per instance; each infers only inside
         # its own enable window, so two instances never load the GPU at once.
         self.camera = str(self.declare_parameter("camera", "wrist").value)
+        # camera_config: name of the camera YAML this instance reads (e.g.
+        # "camera_oak_wrist.yaml" / "camera_oak_scene.yaml" on flatbot).
+        self._camera_cfg_name = str(self.declare_parameter("camera_config", "").value) or None
         bbox_topic, enable_topic = topics_for(self.camera)
         # the score floor; the container yaml's owl_min_score unless the
         # launch says otherwise. The scene instance runs lower: from a metre
@@ -113,13 +116,15 @@ class OwlDetector(Node):
         )
 
         if self.camera == "scene":
+            from rammp_box_opening.perception.d405 import camera_config
             from rammp_box_opening.perception.scene import SceneGrabber
 
-            self.grab = SceneGrabber(self, keep=1, need_depth=False)
+            _scfg = camera_config(self._camera_cfg_name) if self._camera_cfg_name else None
+            self.grab = SceneGrabber(self, keep=1, need_depth=False, scene_cfg=_scfg)
         else:
             from rammp_box_opening.perception.d405 import D405Grabber
 
-            self.grab = D405Grabber(self, need_depth=False)
+            self.grab = D405Grabber(self, need_depth=False, cfg_name=self._camera_cfg_name)
         self.pub = self.create_publisher(Float32MultiArray, bbox_topic, 1)
         self._last_stamp = None
         self._last_new_frame_t = time.monotonic()
@@ -134,7 +139,7 @@ class OwlDetector(Node):
         # the mission's container (owl_source.announce_container): its
         # prompts and floor replace this node's own the moment it is run
         self.create_subscription(String, CONTAINER_TOPIC, self._on_container, latched)
-        self.create_timer(period, self._tick)
+        self._timer = self.create_timer(period, self._tick)
 
     def _on_container(self, msg):
         from rammp_box_opening.models.container import load_press_demo
@@ -155,7 +160,15 @@ class OwlDetector(Node):
         )
 
     def _on_enable(self, msg):
+        rising = bool(msg.data) and not self.enabled
         self._enabled_until = (time.monotonic() + ENABLE_MAX_S) if msg.data else 0.0
+        if rising:
+            # infer the newest frame NOW, not at the next tick: waiting
+            # cost every locate 0-0.5 s before its 0.65 s inference. The
+            # reset leaves the timer overdue when the inference returns,
+            # so the next one follows back to back as it always did.
+            self._timer.reset()
+            self._tick()
 
     @property
     def enabled(self):

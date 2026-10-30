@@ -17,6 +17,12 @@ def test_protocol_surface():
         "gripper_send": ["position"],
         "gripper_join": ["handle"],
         "contact_xyz": ["timeout_s"],
+        # reach_press asks for it by name (getattr): renamed, nothing would prime
+        "prime_compliant": ["q"],
+        # the runner asks for them by name (getattr): renamed, no arrival's
+        # settle would be noted
+        "joint_history": ["since"],
+        "goals_sent": [],
     }
     for name, params in required.items():
         fn = getattr(PlannerClient, name)

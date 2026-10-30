@@ -4,12 +4,15 @@ FAIL (nonzero exit): this shell not on Cyclone DDS; /joint_states missing
 or without effort fields; the driver's trajectory action or the planner's
 actions unreachable; the planner unable to load a world this repo writes
 (it runs in a container, so the worlds directory must be mounted into it
-at the same path); no TF for the finger tips; no gripper reported; a
-wrist camera stream the mission reads silent (colour, camera_info, and the
+at the same path); no TF for the finger tips, or for the wrist camera's
+parent frame; another program that moves this arm on the graph (both of
+which press_demo --execute refuses on); no gripper reported; a wrist
+camera stream the mission reads silent (colour, camera_info, and the
 ALIGNED depth, which only exists with align_depth.enable:=true).
-WARN (exit unaffected — the mission has a fallback): a silent scene camera
-stream (it searches with the wrist instead), an owl_detector not running,
-or running but deaf (no frame reaching it).
+WARN (exit unaffected): no TF for the scene camera where TF places it
+(flatbot), a silent scene camera stream (the mission then finds no box and
+stops before the arm moves toward one: the wrist no longer searches), an
+owl_detector not running, or running but deaf (no frame reaching it).
 Report-only: the gripper's position.
 
 Preflight never moves anything: its client is not armed.
@@ -24,36 +27,95 @@ from rammp_box_opening.constants import FINGERTIP_FRAMES, GRIPPER_STATE_TOPIC
 from rammp_box_opening.runtime.client import PlannerClient
 from rammp_box_opening.runtime.driver import rmw_refusal
 from rammp_box_opening.tasks import cli_common
-from rammp_box_opening.worlds import WorldStore
+from rammp_box_opening.worlds import PLANNER_WORLD, WorldStore
 
 
 STREAM_WINDOW_S = 3.0  # how long every camera and detector topic is listened to
 
 
-def camera_topics():
+def camera_topics(store=None):
     """(topic, required, fix) for every camera stream the mission reads:
-    required ones FAIL preflight when silent, the rest WARN. The wrist
-    namespace comes from the same config the mission's grabber uses."""
+    required ones FAIL preflight when silent, the rest WARN. Topic paths
+    come from the camera configs named in the world YAML (OAK-D on flatbot,
+    D405+Gemini on the bench)."""
     from rammp_box_opening.perception.d405 import camera_config
-    from rammp_box_opening.perception.scene import COLOR_INFO, COLOR_TOPIC, DEPTH_INFO, DEPTH_TOPIC
+    from rammp_box_opening.perception.scene import COLOR_INFO, COLOR_TOPIC, DEPTH_INFO, DEPTH_TOPIC, SCENE_NS
 
-    ns = camera_config()["depth_topic"].rsplit("/depth/", 1)[0]
-    wrist = "is sheppy's wrist_camera node up, and the D405 on USB (lsusb | grep 8086)?"
-    scene = "the mission will search with the wrist instead — is sheppy's scene_camera node up?"
+    # wrist camera topics from the config file the grabber uses
+    wcfg_name = (store.wrist_camera_config if store is not None else None)
+    wcfg = camera_config(wcfg_name) if wcfg_name else camera_config()
+    wrist_color = wcfg.get("color_topic")
+    wrist_info = wcfg.get("color_info_topic")
+    wrist_depth = wcfg.get("aligned_depth_topic")
+    if wrist_color is None:
+        # D405 fallback: derive from depth_topic namespace
+        _ns = wcfg.get("depth_topic", "").rsplit("/depth/", 1)
+        ns = _ns[0] if len(_ns) == 2 else "/wrist_camera"
+        wrist_color = ns + "/color/image_raw"
+        wrist_info = ns + "/color/camera_info"
+        wrist_depth = ns + "/aligned_depth_to_color/image_raw"
+
+    # scene camera topics from the scene config, or module defaults (Gemini)
+    scfg = (store.scene_camera_cfg if store is not None else None) or {}
+    sns = scfg.get("ns", SCENE_NS)
+    scene_color = sns + scfg.get("color_topic_suffix", "/color/image_raw")
+    scene_cinfo = sns + scfg.get("color_info_topic_suffix", "/color/camera_info")
+    scene_depth = sns + scfg.get("depth_topic_suffix", "/depth/image_raw")
+    scene_dinfo = sns + scfg.get("depth_info_topic_suffix", "/depth/camera_info")
+
+    wrist_fix = "is sheppy's wrist_camera node up and the camera powered?"
+    scene_fix = "without it the mission finds no box and stops — is sheppy's scene_camera node up?"
+    depth_fix = "the wrist camera must publish aligned depth (D405: align_depth.enable:=true; OAK-D: spatial alignment enabled)"
     return [
-        (ns + "/color/image_raw", True, wrist),
-        (ns + "/color/camera_info", True, wrist),
-        (
-            ns + "/aligned_depth_to_color/image_raw",
-            True,
-            "the wrist camera must launch with align_depth.enable:=true (sheppy manifest, "
-            "wrist_camera command) — without it every wrist fix fails",
-        ),
-        (COLOR_TOPIC, False, scene),
-        (COLOR_INFO, False, scene),
-        (DEPTH_TOPIC, False, scene),
-        (DEPTH_INFO, False, scene),
+        (wrist_color, True, wrist_fix),
+        (wrist_info, True, wrist_fix),
+        (wrist_depth, True, depth_fix),
+        (scene_color, False, scene_fix),
+        (scene_cinfo, False, scene_fix),
+        (scene_depth, False, scene_fix),
+        (scene_dinfo, False, scene_fix),
     ]
+
+
+def tf_checks(store):
+    """(target, source, required, fix) for every TF lookup the mission
+    refuses on (required) or loses the scene camera without. The wrist
+    frame is the one press_demo.readiness_refusal looks up."""
+    from rammp_box_opening.perception.d405 import CAMERA_CONFIG, camera_config
+    from rammp_box_opening.perception.scene import LINK_FRAME
+
+    parent = camera_config(store.wrist_camera_config or CAMERA_CONFIG)["parent_frame"]
+    out = [(store.base_frame, parent, True,
+            "is sheppy's `box_opening` node up (`sheppy up box-opening`)? press_demo --execute refuses without it")]
+    if store.external_static_tf:
+        # flatbot: the scene camera is placed by TF, not by a calibration
+        # (SceneLocator.base_to_link looks up the config's link_frame)
+        scfg = store.scene_camera_cfg or {}
+        out.append((store.base_frame, scfg.get("link_frame", LINK_FRAME), False,
+                    "the mission cannot place the scene camera — is sheppy's static_tf node up?"))
+    return out
+
+
+def tf_verdicts(checks, ok):
+    """[("PASS" | "FAIL" | "WARN", text)] from tf_checks and whether each
+    lookup succeeded (ok[i]). Pure."""
+    out = []
+    for (target, source, required, fix), got in zip(checks, ok):
+        if got:
+            out.append(("PASS", "TF %s -> %s" % (target, source)))
+        else:
+            out.append(("FAIL" if required else "WARN", "no TF %s -> %s — %s" % (target, source, fix)))
+    return out
+
+
+def other_clients_verdict(others):
+    """("PASS" | "FAIL", text) from client.other_arm_clients(). Pure."""
+    if others:
+        return "FAIL", (
+            "another program that moves this arm is running (%s) — `sheppy up box-opening` stops it"
+            % ", ".join(others)
+        )
+    return "PASS", "no other arm client on the graph"
 
 
 def stream_verdicts(topics, counts, window_s=STREAM_WINDOW_S):
@@ -142,6 +204,26 @@ def _gripper_state(node, timeout_s=3.0):
     return got[0] if got else None
 
 
+def planner_world(node, timeout_s=3.0):
+    """The planner node's `world` parameter (rammp_curobo's own name for the
+    world it was started with), or None when it does not answer."""
+    from rcl_interfaces.srv import GetParameters
+
+    cli = node.create_client(GetParameters, "/rammp_curobo/get_parameters")
+    try:
+        if not cli.wait_for_service(timeout_sec=timeout_s):
+            return None
+        fut = cli.call_async(GetParameters.Request(names=["world"]))
+        t_end = time.monotonic() + timeout_s
+        while not fut.done() and time.monotonic() < t_end:
+            rclpy.spin_once(node, timeout_sec=0.05)
+        if not fut.done() or fut.result() is None or not fut.result().values:
+            return None
+        return fut.result().values[0].string_value or None
+    finally:
+        node.destroy_client(cli)
+
+
 def main():
     args = cli_common.make_parser(__doc__).parse_args()
     why = rmw_refusal(os.environ)
@@ -185,31 +267,41 @@ def main():
         print("FAIL  planner actions unreachable — is sheppy's `planner` node up?")
         failures += 1
 
-    # 4. the planner can read the worlds this repo writes. It runs in a
-    #    container: a path that exists here is invisible there unless its
-    #    directory is mounted at the same path.
+    # 4. the world the planner plans in: the one its deployment started it
+    #    with (box opening sends none, worlds.py) — world_empty.yaml, the arm
+    #    and nothing else. Said, not failed: the deployment owns it.
     store = WorldStore(args.bench_world or cli_common.default_bench_yaml())
-    _name, path = store.push_name("bench")
-    ok, msg = client.set_world(path)
-    if ok:
-        print("PASS  planner loaded %s" % path)
+    client._base_frame = store.base_frame
+    world = planner_world(node)
+    if world == PLANNER_WORLD:
+        print("PASS  planner started with %s" % world)
     else:
-        print(
-            "FAIL  planner could not load %s (%s) — mount %s into the planner "
-            "container at the same path" % (path, msg, path.parent)
-        )
-        failures += 1
+        print("WARN  planner started with %s, not %s — box opening plans in it as it is (the deployment's "
+              "planner `world` parameter sets it)" % (world or "an unknown world", PLANNER_WORLD))
 
     # 5. TF for the finger tips (robot_state_publisher from the launch)
     tips = client.contact_xyz(timeout_s=3.0)
     if tips is not None:
-        print("PASS  TF base_link -> %s" % ", ".join(FINGERTIP_FRAMES))
+        print("PASS  TF %s -> %s" % (store.base_frame, ", ".join(client._tip_frames)))
     else:
         print(
             "FAIL  no TF for the finger tips — run press_demo.launch.py "
             "(tf:=true starts robot_state_publisher)"
         )
         failures += 1
+
+    # 5b. TF for the wrist camera (press_demo --execute refuses without it)
+    #     and, where TF places it, the scene camera
+    checks = tf_checks(store)
+    ok = [client.tf_ready(target, source, timeout_s=3.0) for target, source, _r, _f in checks]
+    for level, text in tf_verdicts(checks, ok):
+        print("%-4s  %s" % (level, text))
+        failures += level == "FAIL"
+
+    # 5c. no other program that moves this arm (press_demo --execute refuses)
+    level, text = other_clients_verdict(client.other_arm_clients())
+    print("%-4s  %s" % (level, text))
+    failures += level == "FAIL"
 
     # 6. the gripper
     state = _gripper_state(node)
@@ -224,7 +316,7 @@ def main():
 
     # 7. the camera streams the mission reads, and the two OWL detectors
     #    (a mission used to discover a missing stream mid-run: 2026-09-22)
-    topics = camera_topics()
+    topics = camera_topics(store)
     counts, owl = _listen(node, topics)
     for _topic, level, text in stream_verdicts(topics, counts):
         print("%-4s  %s" % (level, text))

@@ -160,22 +160,28 @@ class MissionFrames:
         self.doc = {
             "source": "mission",
             "container": container,
-            "table_z": float(table_z),
+            "table_z": float(table_z) if table_z is not None else float("nan"),
             "stage": "started",
             "truth_xyz": None,
             "truth_source": None,
             "popped": None,
         }
 
-    def scene(self, arrays, fix_xyz=None, score=None, why=None):
+    def scene(self, arrays, fix_xyz=None, score=None, why=None, source=None, boxes=None):
         """The scene camera's capture at the locate, and its answer (the
-        box's top) or why it had none."""
+        box's top) or why it had none; which detector the fix came from
+        ("segmenter" | "owl") and, per detector, the raw boxes of the last
+        message the locate gated (SceneLocator.last_boxes) — so a live run
+        replays exactly. `scene_owl` stays the score behind the fix, for the
+        evaluator."""
         if arrays is not None:
             self.frames.append(("scene_%d" % sum(n.startswith("scene_") for n, _ in self.frames), arrays))
         self.doc.update(
             scene_fix_xyz=None if fix_xyz is None else [round(float(v), 5) for v in fix_xyz],
             scene_owl=None if score is None else round(float(score), 3),
             scene_why=why,
+            scene_source=source,
+            scene_boxes={str(k): [list(b) for b in v] for k, v in (boxes or {}).items()},
         )
 
     def wrist(self, pose, arrays):

@@ -9,6 +9,8 @@ world's name as its path. `leg` and `runner` build Runner inputs; the
 with a detected pose on the bench.
 """
 
+import os
+
 import pytest
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -16,6 +18,9 @@ from rammp_box_opening.models.container import ContainerModel, ContainerPose
 from rammp_box_opening.primitives.core import Ctx
 from rammp_box_opening.runtime.legs import Kind, Leg
 from rammp_box_opening.runtime.runner import Runner
+
+# no test run records the lid-off's video of the cameras (perception/camera_video) unless it asks
+os.environ.setdefault("RAMMP_BOX_OPENING_VIDEO", "0")
 
 CFG = "src/rammp_box_opening/config/containers/oxo_pop.yaml"
 
@@ -42,6 +47,7 @@ class FakeClient:
         self.live = list(Q0)
         self.efforts = True
         self.armed = True  # the client's motion latch (only --execute sets it)
+        self.joint_names = ["joint_%d" % i for i in range(1, 8)]
         self.gripper_sent = []  # every gripper command that went out
         self.executed = []  # (n_points, speed)
         self.exec_starts = []  # first waypoint of each executed trajectory
@@ -53,15 +59,28 @@ class FakeClient:
         self.joint_starts = []  # per plan_to_joints call
         self.joint_targets = []  # the q7 each plan_to_joints was asked for
         self.contact_at = [0.45, 0.0, 0.085]  # fingertip TF at a guard trip
+        self.primes = []  # the joints each prime_compliant was handed (None: the live ones)
+        self.stills = []  # each wait_still: how many executions had gone out by then
 
     def joints(self):
         return list(self.live)
+
+    def prime_compliant(self, q=None):
+        self.primes.append(None if q is None else [float(v) for v in q])
+        return True
+
+    def wait_still(self):
+        self.stills.append(len(self.executed))
+        return 0.0, False  # standing still at once: nothing settles here
 
     def wrist_efforts(self):
         return [0.0] * 4 if self.efforts else None
 
     def efforts_present(self):
         return self.efforts
+
+    def settled_efforts(self, duration_s=0.15, settle_s=0.15, timeout_s=2.0):
+        return ([0.0] * 4, list(self.live)) if self.efforts else None
 
     def contact_xyz(self, timeout_s=0.25):
         return list(self.contact_at) if self.contact_at is not None else None
@@ -87,8 +106,9 @@ class FakeClient:
             return self.plans.pop(0)
         return self._plan(list(q7), start_joints)
 
-    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None):
+    def execute(self, traj_, speed, guard=None, while_running=None, stop_when=None, gains=None):
         self.executed.append((len(traj_.points), speed))
+        self.gains_sent = getattr(self, "gains_sent", []) + [gains]
         self.exec_starts.append(list(traj_.points[0].positions))
         self.guards.append(guard)
         info_extra = {}
@@ -137,6 +157,9 @@ class FakeClient:
 class FakeStore:
     def __init__(self):
         self.pushes = []  # (kind, kwargs) — world-shape assertions
+        self.table_extent = None  # the surveyed bench: no measured table
+        self.table_top_z = -0.027  # world_bench.yaml's surveyed table top
+        self.base_frame = "base_link"  # the bench's planning frame (WorldStore.base_frame)
 
     def push_name(self, kind, **kw):
         self.pushes.append((kind, kw))
@@ -177,41 +200,20 @@ def runner(client, tmp_path):
     return r
 
 
+# where the lid goes in the `ctx` fixture: a run resolves its own before the
+# press (reach_lid_off.resolve_lid_drop); nowhere is configured to fall back to
+LID_SPOT = ContainerPose(xyz=(0.45, -0.25, -0.027), yaw=0.0)
+
+
 @pytest.fixture
 def ctx():
-    """A mission context: the shipped container, detected on the bench."""
+    """A mission context: the shipped container, detected on the bench,
+    its lid's spot resolved (LID_SPOT)."""
     return Ctx(
         model=ContainerModel.load(CFG),
         cpose=ContainerPose(xyz=(0.45, 0.0, -0.07), yaw=0.0),
         client=FakeClient(),
         worlds=FakeStore(),
         config_path=CFG,
+        lid_drop=LID_SPOT,
     )
-
-
-def predicted_contact(ctx):
-    """Where the fingertip TF WOULD read if the touch met the button exactly
-    at the camera's estimate — the offline stand-in for a measured contact
-    (the tip-link origin sits TIP_TO_TOOL_M + TCP_OFFSET_M above the pad
-    face)."""
-    from rammp_box_opening.constants import TCP_OFFSET_M, TIP_TO_TOOL_M
-    from rammp_box_opening.models.container import from_container
-
-    button = from_container(ctx.cpose, ctx.model.button_offset)
-    return [button[0], button[1], button[2] + TCP_OFFSET_M + TIP_TO_TOOL_M]
-
-
-def build_demo_legs(ctx, cfg):
-    """The whole mission as one leg list, the way main() composes it in
-    phases — with the push starting from the predicted contact, since no
-    touch has measured one offline."""
-    from rammp_box_opening.tasks import press_demo
-
-    approach = press_demo.build_approach_leg(ctx, cfg)
-    return [
-        approach,
-        *press_demo.build_press_legs(ctx, cfg, start_joints=approach.goal_joints),
-        *press_demo.build_push_legs(ctx, cfg, predicted_contact(ctx)),
-        *press_demo.build_grip_legs(ctx, cfg),
-        *press_demo.build_place_legs(ctx, cfg),
-    ]

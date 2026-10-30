@@ -1,0 +1,32 @@
+# OWLv2 persistent detectors + press_demo.launch.py, containerised.
+# Starts two owl_detector nodes (wrist + scene) that load the model once
+# and run inference on enable windows. press_demo --execute is run by the
+# operator in a separate host shell; it is not managed by sheppy.
+#
+# Requires --runtime nvidia: OWLv2 runs on the Jetson's CUDA cores.
+# rammp-cuda owns LD_LIBRARY_PATH and RMW_IMPLEMENTATION; do not override either.
+#
+# tf:=false  — TF comes from sheppy's arm_state_publisher + static_tf nodes.
+# bench_world:=world_flatbot.yaml  — flatbot collision world, camera config names.
+# camera:=false (default) — sheppy's wrist_camera node owns the OAK-D.
+id: box_opening_docker
+kind: docker
+container:
+  # Pin to a release tag in a deployment. The SHA below is the first build
+  # from feature/flatbot (7e71bb4); replace with the published tag once CI
+  # is wired (rammp-org/RAMMP-box-opening#1).
+  image: ghcr.io/rammp-org/rammp-box-opening:sha-7e71bb4
+  runtime: nvidia
+  network_mode: host
+  ipc: host
+  user: "1000:1000"
+  environment:
+    ROS_DOMAIN_ID: "0"
+    HOME: /tmp
+publishes:
+  - /rammp_box_opening/owl_bbox
+  - /rammp_box_opening/owl_bbox_scene
+subscribes:
+  - /wrist_camera/color/image_raw
+  - /scene_camera/color/image_raw
+  - /rammp_box_opening/owl_container

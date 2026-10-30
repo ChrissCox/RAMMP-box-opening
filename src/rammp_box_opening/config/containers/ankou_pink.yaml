@@ -23,6 +23,7 @@
 # default_container_yaml): every CLI and both OWL detector nodes fall back
 # to this file; the OXOs stay selectable with --container.
 measure_me: false                 # height and button measured 2026-09-23 (above)
+round: true                       # the lid is a disc lid_dims[0] across (ContainerModel.round)
 
 dims: [0.105, 0.105, 0.121]       # ROUND: x = y = the lid's outer diameter
                                   # (depth edge ~54 mm from the button
@@ -83,6 +84,9 @@ press:
                                   # in-contact baseline, i.e. the same ~7 Nm
                                   # total as before, but reaching it is the
                                   # exception, not how the press ends.
+                                  # The reach-out and depth presses bound
+                                  # the TOTAL instead: touch_nm off the
+                                  # free-air reading taken before the touch.
                                   # 7.0 -> 7.5 (2026-09-16): a press 6 mm off
                                   # centre met the 7.0 backstop at 5.6 Nm over
                                   # its baseline without popping the button;
@@ -107,10 +111,10 @@ press_yaw_steer: false            # FIXED in the world (above). true = yaw
                                   # keeps flipping" (owner, 2026-09-16)
 hover_standoff: 0.08              # m above the lid set-down spot for the carry
                                   # hover (plus a lid height; Place.hover_for)
-open_container:
-  lid_place:                      # the one non-container-derived pose (spec §5)
-    xyz: [0.45, -0.25, -0.027]
-    yaw_deg: 0.0
+# No lid pose is configured (it was open_container.lid_place, a bench
+# point): the lid goes where the cameras see room for it and the hand,
+# every run (perception/clear_table; owner 2026-10-27: nothing in the
+# environment is hard coded).
 
 # --- open_box (step 2, owner 2026-08-26): pull the lid off ---------------
 open_box:
@@ -225,11 +229,11 @@ press_demo:
                                   # touch stage may search before reporting
                                   # "no surface" — it must cover the camera's
                                   # run-to-run lid-height spread (+/-6 mm)
-                                  # AND leave the push's 4 mm of validated
-                                  # path below the real top: the push is cut
-                                  # from this stroke's own continuation, so
-                                  # no planner runs while the fingers press
-                                  # (2026-09-04). The touch stops at contact;
+                                  # — nothing more: the push is not cut from
+                                  # this stroke but flown as the arm's own
+                                  # straight line, button_travel_m below the
+                                  # MEASURED contact, so no planner runs while
+                                  # the fingers press. The touch stops at contact;
                                   # a deeper plan costs nothing.
                                   # Old note: press depth below the lid plane. This is
                                   # the HARD bound on how deep the stroke can
@@ -294,10 +298,17 @@ vlm:                              # detect.source: vlm — the semantic gate
                                   # scores; the RANKING is what carries.
   owl_min_score: 0.18             # false positives sat at 0.12-0.18 on the
                                   # captures; the true box at 0.235-0.249
-  owl_min_score_scene: 0.12       # the scene camera's floor (was the launch
+  owl_min_score_scene: 0.05       # the scene camera's floor (was the launch
                                   # file's): from a metre the box scores lower,
                                   # and the lid-slab geometry behind it rejects
-                                  # anything that is not this box's top
+                                  # anything that is not this box's top.
+                                  # 0.12 -> 0.05 (2026-10-27): 16:22 and 16:24
+                                  # ("saw no box in 15 s") were floor misses,
+                                  # the pale lid at 0.07-0.10; with no floor at
+                                  # all the gate refused every distractor, and
+                                  # on upright frames the OWL goes from 32/37
+                                  # to 34/37 detbench frames with no wrong fix.
+                                  # The OWL is the FALLBACK here (scene_detect)
   model: claude-opus-5            # measured 2026-09-01: 3.3 s, box dead-on;
                                   # claude-haiku-4-5 was 0.4 s faster and
                                   # boxed the ROBOT'S OWN BASE. Fast loses.
@@ -305,6 +316,12 @@ vlm:                              # detect.source: vlm — the semantic gate
   timeout_s: 20.0                 # API budget; past it the mission falls
                                   # back to plain depth, never stalls
   pad_px: 20                      # bbox padding before it gates the depth
+scene_detect:                     # the scene camera's box, from sheppy's always-on scene_segmenter
+  segmenter_classes: [food container]  # RF-DETR boxes the blue holder as COCO "bowl" = food container: 37/37
+                                  # detbench frames, nothing else boxed as one at the node's 0.25. Never other
+                                  # classes: class-agnostic boxes gave the only wrong fixes (keyboard, TV)
+  segmenter_box: holder           # its box is the HOLDER: the band above it is gated (object geometry: the lid
+                                  # stands on its holder). as_is: the box is the container itself
 detect:
   confirm_in_flight: false        # true: with the scene camera's coarse fix,
                                   # the approach and the guarded descent fly

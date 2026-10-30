@@ -17,11 +17,17 @@ The profile, along the path's joint-space arc length:
   - corners (direction changes along the path, including the junction
     between two chained legs) are taken at the speed their turning
     acceleration allows — a shallow corner flows, a sharp one slows, a
-    reversal (> reversal_deg) is a genuine stop;
+    reversal (> reversal_deg) is a genuine stop — and a chained junction,
+    where one is set, at no more than junction_cruise, whatever its legs'
+    own fractions (a compliant run's, runtime/runner.py
+    Runner.retime_params);
   - per-joint velocity never exceeds vmax_margin x the joint limit, so the
     gates runtime/driver.py applies before every goal (URDF velocity
     limits, per-interval continuity at 3 x vmax x dt) hold by
-    construction — and refuse the goal if not.
+    construction — and refuse the goal if not;
+  - nor, where one is set (qd_ceiling), an ABSOLUTE per-joint ceiling the
+    cruise fraction does not scale: what a compliant arm's wrist follows
+    (runtime/runner.py Runner.retime_params).
 
 Guarded strokes are NOT re-timed here: their fast-then-slow warp and the
 guard's rebaseline/arm fractions are tuned to contact and stay in warp.py.
@@ -69,8 +75,34 @@ class RetimeParams:
     # that would otherwise become nanosecond intervals on the wire
     min_ds: float = 2e-4
     # uniform time dilation applied AFTER profiling (1.0 = as profiled): the
-    # operator's whole-run slow mode (--speed-scale), not a per-leg speed
+    # operator's whole-run slow mode (--speed-scale), not a per-leg speed.
+    # Positions are untouched; the intervals stretch by 1/time_scale, so the
+    # velocities annotating them scale by time_scale and the accelerations
+    # by time_scale**2 (driver.dilate's rule). The driver's quintic fits
+    # through all three: full-speed velocities on stretched intervals made
+    # its reference wobble and run backwards, for 20-255 ms of a run at 0.5
+    # and over a third of it at 0.3 and below (review 2026-10-27)
     time_scale: float = 1.0
+    # an ABSOLUTE per-joint speed ceiling, rad/s (None: none), no margin
+    # applied: it bounds what a leg's cruise fraction of vmax leaves and is
+    # never scaled by it, so a slow leg it does not bind keeps its speed.
+    # Written as a smaller vmax instead (0.5, which the 0.9 margin makes
+    # 0.45 at full speed) it is 0.3 x 0.9 x 0.5 = 0.135 rad/s on a 0.3 line
+    # (16:23's way in 7.25 -> 12.4 s, offline 2026-10-28). A compliant run
+    # sets it (constants.COMPLIANT_QD_CEILING): in the driver's joint
+    # impedance the wrist follows no faster than ~0.54 rad/s
+    qd_ceiling: tuple = None
+    # a chained junction's cruise fraction ceiling (None: none): neither its
+    # sample nor the one on either side of it — the ends of the two
+    # intervals the driver's quintic turns the junction in — cruises faster,
+    # whatever the legs' speeds. Without it a junction takes the lower of its
+    # two legs' fractions, so lines that cruise faster meet faster too, up to
+    # what the corner bounds allow, and those budget a kink over both
+    # adjacent intervals while the quintic turns it in the shorter one. A
+    # compliant run sets it (constants.COMPLIANT_JUNCTION_SPEED): its
+    # free-air lines cruise faster and still meet as they did at
+    # FREE_LINE_SPEED
+    junction_cruise: float = None
 
 
 def _dedup(positions, min_ds):
@@ -162,6 +194,16 @@ def velocity_caps(positions, vmax, margin):
     return cap, ds
 
 
+def joint_caps(positions, vmax, params):
+    """velocity_caps at params.vmax_margin, lowered where params.qd_ceiling
+    binds (rad/s, no margin): the per-sample path-speed bound under which
+    every interval keeps every joint below both. Returns (cap, ds)."""
+    cap, ds = velocity_caps(positions, vmax, params.vmax_margin)
+    if params.qd_ceiling is not None:
+        cap = np.minimum(cap, velocity_caps(positions, params.qd_ceiling, 1.0)[0])
+    return cap, ds
+
+
 def corner_caps(positions, ds, params):
     """Per-sample speed cap from the direction change at that sample, and
     which samples are genuine stops (reversal apexes).
@@ -223,14 +265,19 @@ def corner_caps(positions, ds, params):
     return cap, stop
 
 
-def cruise_per_sample(seg, speeds):
+def cruise_per_sample(seg, speeds, junction_cruise=None):
     """Segment speed (the leg's cruise fraction) per sample; the sample a
-    junction shares takes the lower of the two."""
+    junction shares takes the lower of the two. Under `junction_cruise`
+    (RetimeParams.junction_cruise) neither that sample nor the one on
+    either side of it cruises faster than it."""
     speeds = np.asarray(speeds, dtype=float)
     cr = speeds[seg].astype(float)
     for k in range(1, len(seg)):
         if seg[k] != seg[k - 1]:
             cr[k - 1] = min(cr[k - 1], cr[k])
+            if junction_cruise is not None:
+                lo, hi = max(0, k - 2), min(len(seg), k + 1)
+                cr[lo:hi] = np.minimum(cr[lo:hi], junction_cruise)
     return cr
 
 
@@ -239,6 +286,10 @@ def speed_profile(positions, cruise, vmax, params, v_start=0.0, v_end=0.0):
     cap, ds = velocity_caps(positions, vmax, params.vmax_margin)
     ccap, _stop = corner_caps(positions, ds, params)
     target = np.minimum(np.minimum(np.asarray(cruise) * cap, ccap), cap)
+    # the ceiling after the cruise fraction, never scaled by it; from here
+    # on `cap` is the bound both set (the rounding's fill, the ends)
+    cap, _ = joint_caps(positions, vmax, params)
+    target = np.minimum(target, cap)
     n = len(positions)
     if params.smooth_pts > 0 and n > 2 * params.smooth_pts + 2:
         # round the tops of the TARGET (its lower envelope with a moving
@@ -259,6 +310,13 @@ def speed_profile(positions, cruise, vmax, params, v_start=0.0, v_end=0.0):
     return v, ds
 
 
+def _time_scale(params):
+    """The slow-mode factor with the one clamp both of its uses share: the
+    intervals stretch by 1/ts and the wire velocities shrink by ts, and a
+    clamp on only one of them would put the two out of step."""
+    return max(float(params.time_scale), 1e-3)
+
+
 def times_from_profile(v, ds, params, cap=None):
     dt = ds / np.maximum(0.5 * (v[:-1] + v[1:]), params.v_floor)
     # an interval between two rest samples (a 2-point path, the two sides
@@ -277,7 +335,7 @@ def times_from_profile(v, ds, params, cap=None):
             dt[both_rest] = vpk / a + vpk / d + np.maximum(cruise, 0.0)
         else:
             dt[both_rest] = vpk / a + vpk / d
-    dt = dt / max(float(params.time_scale), 1e-3)
+    dt = dt / _time_scale(params)
     t = np.empty(len(v))
     t[0] = params.first_dt
     t[1:] = params.first_dt + np.cumsum(dt)
@@ -344,9 +402,9 @@ def retime_group(trajs, speeds, vmax, params=RetimeParams()):
     )
     if len(positions) < 2:
         return trajs[0], {"duration_s": 0.0, "junction_speeds": [], "stops": 0, "n_points": len(positions)}
-    cruise = cruise_per_sample(seg, speeds)
+    cruise = cruise_per_sample(seg, speeds, params.junction_cruise)
     v, ds = speed_profile(positions, cruise, vmax, params)
-    cap, _ = velocity_caps(positions, vmax, params.vmax_margin)
+    cap, _ = joint_caps(positions, vmax, params)
     t = times_from_profile(v, ds, params, cap)
     junctions = [k for k in range(1, len(seg)) if seg[k] != seg[k - 1]]
     jspeeds = [float(v[k - 1]) for k in junctions]
@@ -361,7 +419,12 @@ def retime_group(trajs, speeds, vmax, params=RetimeParams()):
         # dynamics (runner._run_motion).
         "seg_start_fracs": _segment_start_fracs(seg, t, len(trajs)),
     }
-    return to_message(trajs[0].joint_names, positions, t, v), info
+    # v is the FULL-speed profile and t is stretched by 1/time_scale, so
+    # the wire velocities shrink by the same factor; to_message
+    # differentiates them over t, so the accelerations shrink by its
+    # square. Only this copy is scaled: the report stays on the profile,
+    # and slow mode counts the same junctions as stops as full speed does.
+    return to_message(trajs[0].joint_names, positions, t, v * _time_scale(params)), info
 
 
 def positions_to_traj(joint_names, positions):

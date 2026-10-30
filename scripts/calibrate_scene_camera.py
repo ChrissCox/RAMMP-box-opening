@@ -82,10 +82,10 @@ def tf_4x4(buf, parent, child):
     return transform(quat_to_mat(r.x, r.y, r.z, r.w), [t.x, t.y, t.z])
 
 
-def wrist_side(node, wrist, frames):
+def wrist_side(node, wrist, frames, wrist_cfg=None, base_frame="base_link"):
     """(p_tag_base, (n_door_base, c_door_base), n_seen) from `frames` wrist
     captures, each giving the tag centre via the door plane in depth."""
-    cfg = camera_config()
+    cfg = camera_config(wrist_cfg)
     p_tags, normals, centres, seen = [], [], [], 0
     last = None
     while seen < frames:
@@ -127,7 +127,7 @@ def wrist_side(node, wrist, frames):
         normals.append(n)
         centres.append(cen)
         seen += 1
-    tf_base_ee = tf_4x4(wrist.tf_buffer, "base_link", cfg["parent_frame"])
+    tf_base_ee = tf_4x4(wrist.tf_buffer, base_frame, cfg["parent_frame"])
     T_base_wcam = tf_base_ee @ transform(quat_to_mat(*cfg["mount_quat_xyzw"]), cfg["mount_xyz"])
     p_w = np.median(np.array(p_tags), axis=0)
     n_w = np.mean(np.array(normals), axis=0)
@@ -183,7 +183,7 @@ def scene_side(node, scene, frames):
     return p_tag_scene, (n_d, c_d), (n_t, c_t), pc[low][inl], (float(ctr[0]), float(ctr[1]))
 
 
-def report(scene, wrist, T_base_scene, table_pts, table_survey, stamp):
+def report(scene, wrist, T_base_scene, table_pts, table_survey, stamp, base_frame="base_link"):
     """What the calibration implies for things it was not fitted to."""
     zs = (table_pts @ T_base_scene[:3, :3].T + T_base_scene[:3, 3])[:, 2]
     print(
@@ -194,7 +194,7 @@ def report(scene, wrist, T_base_scene, table_pts, table_survey, stamp):
     img = scene.color.copy()
     for f in (*FINGERTIP_FRAMES, "end_effector_link"):
         try:
-            p = tf_4x4(wrist.tf_buffer, "base_link", f)[:3, 3]
+            p = tf_4x4(wrist.tf_buffer, base_frame, f)[:3, 3]
         except Exception:
             print("check: no TF for %s" % f)
             continue
@@ -210,11 +210,42 @@ def report(scene, wrist, T_base_scene, table_pts, table_survey, stamp):
     print("check: the arm's fingertips drawn on the scene image -> %s (they should sit on the fingers)" % out)
 
 
+def update_transforms_yaml(path, entry_name, parent, child, xyz, quat_xyzw):
+    """Update (or add) one entry in a sheppy static_tf mounts.yaml.
+
+    Reads the existing file, replaces the named entry under
+    mounts.ros__parameters, and writes it back. Other entries are untouched."""
+    import yaml as _yaml
+
+    p = Path(path)
+    doc = _yaml.safe_load(p.read_text()) if p.exists() else {}
+    doc.setdefault("mounts", {}).setdefault("ros__parameters", {})
+    rp = doc["mounts"]["ros__parameters"]
+    transforms = list(rp.get("transforms", []))
+    if entry_name not in transforms:
+        transforms.append(entry_name)
+    rp["transforms"] = transforms
+    rp[entry_name] = {
+        "parent": parent,
+        "child": child,
+        "xyz": [round(float(v), 5) for v in xyz],
+        "quat_xyzw": [round(float(v), 6) for v in quat_xyzw],
+    }
+    p.write_text(_yaml.dump(doc, default_flow_style=False, sort_keys=False))
+    print("updated %s: %s -> %s  xyz %s  quat %s" % (path, parent, child, rp[entry_name]["xyz"], rp[entry_name]["quat_xyzw"]))
+    print("restart sheppy's static_tf node to pick up the calibration: sheppy restart static_tf")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--frames", type=int, default=20, help="captures averaged per camera")
     ap.add_argument("--check", action="store_true", help="report against the saved calibration; write nothing")
     ap.add_argument("--out", default=str(CONFIG_DIR / SCENE_CALIB_FILE), help="where the yaml goes")
+    ap.add_argument("--bench-world", default=None,
+                    help="world YAML (default: world_bench.yaml); pass world_flatbot.yaml for the wheelchair platform")
+    ap.add_argument("--transforms-out", default=None,
+                    help="also write the calibrated scene_camera entry to this transforms/cameras.yaml "
+                         "(sheppy static_tf format); auto-required when the world YAML sets external_static_tf")
     args = ap.parse_args()
 
     import rclpy
@@ -222,27 +253,41 @@ def main():
     rclpy.init()
     node = rclpy.create_node("calibrate_scene_camera")
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    bench = WorldStore(str(CONFIG_DIR / "world_bench.yaml"))
-    table_survey = bench.table_top_z
-    up_base = bench.table_normal
+    store = WorldStore(str(args.bench_world or CONFIG_DIR / "world_bench.yaml"))
+    table_survey = store.table_top_z
+    up_base = store.table_normal
+    base_frame = store.base_frame
+    wrist_cfg = store.wrist_camera_config  # None on bench (D405 defaults), filename on flatbot
+    scene_cfg = store.scene_camera_cfg    # None on bench (Gemini defaults), dict on flatbot
+    # child frame for write_scene_yaml: the camera link in the TF tree
+    link_frame = (scene_cfg or {}).get("link_frame", LINK_FRAME)
+    color_frame = (scene_cfg or {}).get("color_frame", COLOR_FRAME)
+    transforms_out = args.transforms_out
+    if transforms_out is None and store.external_static_tf:
+        sys.exit(
+            "world YAML sets external_static_tf — pass --transforms-out <path/to/transforms/cameras.yaml> "
+            "so the calibrated transform reaches sheppy's static_tf node"
+        )
     try:
         # The wrist FIRST, alone on the node. The scene camera's 30 Hz of
         # 2.7 MB colour frames over best-effort loopback starves the wrist
         # streams once both are subscribed (2026-09-16: the same script got
         # wrist frames on one run and none for 15 s on the next).
-        wrist = D405Grabber(node, need_depth=True)
-        p_tag_base, door_base = (None, None) if args.check else wrist_side(node, wrist, args.frames)
-        scene = SceneGrabber(node, keep=args.frames)
+        wrist = D405Grabber(node, need_depth=True, cfg_name=wrist_cfg)
+        p_tag_base, door_base = (None, None) if args.check else wrist_side(
+            node, wrist, args.frames, wrist_cfg=wrist_cfg, base_frame=base_frame)
+        scene = SceneGrabber(node, keep=args.frames, scene_cfg=scene_cfg)
         p_tag_scene, door_scene, table_scene, table_pts, tag_px = scene_side(node, scene, args.frames)
         T_link_color = scene.link_to_color()
         if T_link_color is None:
-            sys.exit("no TF %s -> %s from the scene camera driver" % (LINK_FRAME, COLOR_FRAME))
+            sys.exit("no TF %s -> %s from the scene camera driver" % (link_frame, color_frame))
         if args.check:
             p = Path(args.out)
             if not p.exists():
                 sys.exit("no calibration at %s" % p)
             _doc, T_base_link = load_scene_yaml(str(p))
-            report(scene, wrist, T_base_link @ T_link_color, table_pts, table_survey, stamp)
+            report(scene, wrist, T_base_link @ T_link_color, table_pts, table_survey, stamp,
+                   base_frame=base_frame)
             return
         cal = scene_pose_from_planes(p_tag_base, door_base, p_tag_scene, door_scene, table_scene,
                                      up_base=up_base, table_point_base=(0.0, 0.0, table_survey))
@@ -255,15 +300,28 @@ def main():
         if cal.plane_angle_mismatch_deg > PLANE_ANGLE_TOL_DEG:
             sys.exit("REFUSED: the two cameras do not agree on the scene's geometry — nothing written")
         T = cal.T_base_scene
-        print("SCENE CAMERA in base_link: [%.3f %.3f %.3f], looking along %s"
-              % (*T[:3, 3], np.round(T[:3, 2], 3)))
-        report(scene, wrist, T, table_pts, table_survey, stamp)
+        print("SCENE CAMERA in %s: [%.3f %.3f %.3f], looking along %s"
+              % (base_frame, *T[:3, 3], np.round(T[:3, 2], 3)))
+        report(scene, wrist, T, table_pts, table_survey, stamp, base_frame=base_frame)
         T_base_link = optical_to_link(T, T_link_color)
         note = ("tag position via the wrist camera + door and table planes; %s; mismatch %.2f deg; "
                 "%d frames per camera" % (stamp, cal.plane_angle_mismatch_deg, args.frames))
-        doc = write_scene_yaml(args.out, T_base_link, LINK_FRAME, note=note, tag_px=tag_px)
+        doc = write_scene_yaml(args.out, T_base_link, link_frame, note=note, tag_px=tag_px,
+                               parent_frame=base_frame)
         print("wrote %s: xyz %s quat %s" % (args.out, doc["xyz"], doc["quat_xyzw"]))
-        print("rebuild (colcon) to install it; press_demo.launch.py then publishes base_link -> %s" % LINK_FRAME)
+        if transforms_out:
+            from rammp_box_opening.perception.d405 import mat_to_quat_xyzw
+            update_transforms_yaml(
+                transforms_out,
+                entry_name="scene_camera",
+                parent=base_frame,
+                child=link_frame,
+                xyz=doc["xyz"],
+                quat_xyzw=doc["quat_xyzw"],
+            )
+        else:
+            print("rebuild (colcon) to install it; press_demo.launch.py then publishes %s -> %s"
+                  % (base_frame, link_frame))
     finally:
         node.destroy_node()
         rclpy.shutdown()

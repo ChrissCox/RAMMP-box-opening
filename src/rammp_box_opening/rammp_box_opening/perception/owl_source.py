@@ -57,7 +57,10 @@ def owl_floor(cfg, camera):
 def owl_detect(proc, model, rgb, queries, floor, device="cuda", k=None):
     """OWLv2 on one RGB frame: the top boxes above `floor`, best first —
     [(score, [x0, y0, x1, y1])]. What the owl_detector node publishes, and
-    what an offline replay of recorded frames computes the same way."""
+    what an offline replay of recorded frames computes the same way. The
+    frame must be upright: OWLv2 scored flatbot's pink lid 0.04 upside down,
+    0.44 upright (2026-10-22), and the cameras now rotate on the device
+    (rammp-deployments #133)."""
     import torch
 
     h, w = rgb.shape[:2]
@@ -67,10 +70,11 @@ def owl_detect(proc, model, rgb, queries, floor, device="cuda", k=None):
     res = proc.post_process_object_detection(
         out, threshold=float(floor), target_sizes=torch.tensor([[h, w]]).to(device)
     )[0]
-    return top_boxes(
+    top = top_boxes(
         res["scores"].tolist(), res["labels"].tolist(), [b.tolist() for b in res["boxes"]], floor,
         **({} if k is None else {"k": k}),
     )
+    return top
 
 
 def topics_for(camera):
